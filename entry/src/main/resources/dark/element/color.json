@@ -1,0 +1,76 @@
+{
+  "color": [
+    {
+      "name": "start_window_background",
+      "value": "#000000"
+    },
+    {
+      "name": "page_background",
+      "value": "#000000"
+    },
+    {
+      "name": "nav_bar_blur_bg",
+      "value": "#70080808"
+    },
+    {
+      "name": "nav_bar_gradient_mid",
+      "value": "#2E080808"
+    },
+    {
+      "name": "nav_mask",
+      "value": "#00000000"
+    },
+    {
+      "name": "card_glass_bg",
+      "value": "#CC121212"
+    },
+    {
+      "name": "divider",
+      "value": "#33FFFFFF"
+    },
+    {
+      "name": "text_primary",
+      "value": "#FFFFFFFF"
+    },
+    {
+      "name": "text_secondary",
+      "value": "#FFFFFFFF"
+    },
+    {
+      "name": "text_tertiary",
+      "value": "#FFFFFFFF"
+    },
+    {
+      "name": "text_muted",
+      "value": "#FFFFFFFF"
+    },
+    {
+      "name": "text_faint",
+      "value": "#FFFFFFFF"
+    },
+    {
+      "name": "control_text",
+      "value": "#FFFFFFFF"
+    },
+    {
+      "name": "icon_primary",
+      "value": "#FFFFFFFF"
+    },
+    {
+      "name": "icon_muted",
+      "value": "#FFFFFFFF"
+    },
+    {
+      "name": "surface_card",
+      "value": "#1C1C1EFF"
+    },
+    {
+      "name": "surface_input",
+      "value": "#1C1C1EFF"
+    },
+    {
+      "name": "surface_selected",
+      "value": "#263B6B"
+    }
+  ]
+}

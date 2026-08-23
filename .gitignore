@@ -1,0 +1,24 @@
+/node_modules
+/oh_modules
+/local.properties
+/.idea
+**/build
+/.hvigor
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+/.appanalyzer
+
+# Local signing material and machine-specific DevEco configuration
+/signing/
+/build-profile.json5
+
+# Generated packages, logs, and temporary inspection files
+*.hap
+*.log
+/tmp_*
+/tmp-*
+/current_*
+/screenshot_*

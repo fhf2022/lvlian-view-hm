@@ -1,0 +1,765 @@
+import { http } from '@kit.NetworkKit'
+import { FileEntry, RootDirectory, LoginResult, DownloadDescriptor } from '../model/FileEntry'
+import { UgreenSession } from '../model/Session'
+import { SessionStore } from '../core/session/SessionStore'
+import { UgreenCrypto } from '../core/crypto/UgreenCrypto'
+import { HttpTransport } from '../core/network/HttpTransport'
+import { HttpResult, JsonObject } from '../core/network/HttpTypes'
+import { UGREENLINK_RESOLVE_URL, UgreenEndpoints } from './UgreenEndpoints'
+import { UgreenError, UgreenErrorKind } from './UgreenErrors'
+
+interface PendingLogin {
+  username: string
+  password: string
+}
+
+export interface UgreenDirectoryPage {
+  pageIndex: number
+  entries: FileEntry[]
+  totalCount: number
+  hasMore: boolean
+}
+
+export class UgreenRemoteClient {
+  private static readonly DIRECTORY_PAGE_SIZE: number = 200
+  private static readonly MAX_DIRECTORY_PAGES: number = 100
+  private transport: HttpTransport
+  private sessionStore: SessionStore
+  private endpoints: UgreenEndpoints | null = null
+  private pendingLogin: PendingLogin | null = null
+  private reconnectCredentials: PendingLogin | null = null
+  private reconnectPromise: Promise<boolean> | null = null
+
+  constructor(transport: HttpTransport = new HttpTransport(), sessionStore: SessionStore = new SessionStore()) {
+    this.transport = transport
+    this.sessionStore = sessionStore
+  }
+
+  /**
+   * Supplies credentials that the user explicitly chose to remember. This is
+   * used only to rebuild an expired session; the active token is still kept in
+   * memory and is never persisted here.
+   */
+  setReconnectCredentials(username: string, password: string): void {
+    const cleanUsername = username.trim()
+    if (cleanUsername.length === 0 || password.length === 0) {
+      return
+    }
+    this.reconnectCredentials = { username: cleanUsername, password: password }
+  }
+
+  clearSession(): void {
+    this.sessionStore.clear()
+    this.pendingLogin = null
+    this.reconnectCredentials = null
+    this.reconnectPromise = null
+  }
+
+  /** Reconnect once for transient network/auth failures. */
+  async withReconnect<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation()
+    } catch (error) {
+      if (!this.shouldReconnect(error)) {
+        throw error as Error
+      }
+      if (!await this.reconnect()) {
+        throw error as Error
+      }
+      return await operation()
+    }
+  }
+
+  cacheScope(): string {
+    const session = this.sessionStore.get()
+    if (session === null) {
+      return ''
+    }
+    const identity = session.uid.length > 0 ? session.uid : session.tokenId
+    return session.baseUrl + '|' + identity
+  }
+
+  async resolve(ugreenLinkId: string): Promise<string> {
+    const alias = ugreenLinkId.trim()
+    if (alias.length === 0) {
+      throw new UgreenError(UgreenErrorKind.API_CHANGED, '请输入 UGREENlink ID')
+    }
+    const resolveBody: JsonObject = {}
+    resolveBody['alias'] = alias
+    const response = await this.transport.requestJson(UGREENLINK_RESOLVE_URL, http.RequestMethod.POST, resolveBody)
+    const data = this.successData(response.body, 'UGREENlink 解析失败')
+    const relayDomain = this.stringValue(data['relayDomain'])
+    if (relayDomain.length === 0) {
+      throw new UgreenError(UgreenErrorKind.API_CHANGED, '解析结果缺少远程域名')
+    }
+    const baseUrl = relayDomain.includes('://') ? relayDomain : 'https://' + alias + '.' + relayDomain
+    this.endpoints = new UgreenEndpoints(baseUrl)
+    return this.endpoints.baseUrl
+  }
+
+  async login(username: string, password: string): Promise<LoginResult> {
+    const cleanUsername = username.trim()
+    if (cleanUsername.length === 0 || password.length === 0) {
+      throw new UgreenError(UgreenErrorKind.LOGIN_FAILED, '请输入 NAS 用户名和密码')
+    }
+    const urls = this.requireEndpoints()
+    const rsaBody: JsonObject = {}
+    rsaBody['username'] = cleanUsername
+    const rsaResponse = await this.transport.requestJson(urls.rsaCheck(), http.RequestMethod.POST, rsaBody)
+    this.successData(rsaResponse.body, '获取 RSA 公钥失败')
+    const rsaToken = this.headerValue(rsaResponse.headers, 'x-rsa-token')
+    if (rsaToken.length === 0) {
+      throw new UgreenError(UgreenErrorKind.API_CHANGED, '登录接口没有返回 RSA 公钥')
+    }
+    const encryptedPassword = await UgreenCrypto.encryptBase64(password, rsaToken)
+    const pending: PendingLogin = { username: cleanUsername, password: password }
+    this.pendingLogin = pending
+    const loginRequestBody: JsonObject = {}
+    loginRequestBody['username'] = cleanUsername
+    loginRequestBody['password'] = encryptedPassword
+    loginRequestBody['otp'] = true
+    loginRequestBody['is_simple'] = true
+    const loginResponse = await this.transport.requestJson(urls.login(), http.RequestMethod.POST, loginRequestBody)
+    const loginResponseBody = loginResponse.body
+    const loginCode = this.numberValue(loginResponseBody['code'])
+    const loginData = this.asRecord(loginResponseBody['data'])
+    if (this.needsOtp(loginResponseBody, loginData)) {
+      return new LoginResult(true, '需要输入 6 位验证码')
+    }
+    if (loginCode !== 200) {
+      this.pendingLogin = null
+      throw new UgreenError(UgreenErrorKind.LOGIN_FAILED,
+        this.stringValue(loginResponseBody['msg'], 'NAS 登录失败'), 0, loginCode)
+    }
+    const tokenId = this.stringValue(loginData['token_id'])
+    const token = this.stringValue(loginData['token'])
+    const publicKey = this.stringValue(loginData['public_key'])
+    if (tokenId.length === 0 || token.length === 0 || publicKey.length === 0) {
+      this.pendingLogin = null
+      throw new UgreenError(UgreenErrorKind.API_CHANGED, '登录成功但会话字段不完整')
+    }
+    this.sessionStore.set(new UgreenSession(
+      urls.baseUrl,
+      tokenId,
+      token,
+      this.stringValue(loginData['uid']),
+      publicKey
+    ))
+    this.reconnectCredentials = pending
+    this.pendingLogin = null
+    return new LoginResult(false, '登录成功')
+  }
+
+  async verifyOtp(code: string, trustDevice: boolean = false): Promise<LoginResult> {
+    const urls = this.requireEndpoints()
+    const cleanCode = code.trim()
+    if (cleanCode.length !== 6) {
+      throw new UgreenError(UgreenErrorKind.OTP_REQUIRED, '请输入 6 位验证码')
+    }
+    const pending = this.pendingLogin
+    const body: JsonObject = {}
+    body['code'] = cleanCode
+    body['trust'] = trustDevice
+    if (pending !== null) {
+      body['username'] = pending.username
+    }
+    const response = await this.transport.requestJson(urls.otpLogin(), http.RequestMethod.POST, body)
+    const data = this.successData(response.body, '验证码登录失败')
+    const tokenId = this.stringValue(data['token_id'])
+    const token = this.stringValue(data['token'])
+    const publicKey = this.stringValue(data['public_key'])
+    if (tokenId.length === 0 || token.length === 0 || publicKey.length === 0) {
+      throw new UgreenError(UgreenErrorKind.API_CHANGED, '验证码登录成功但会话字段不完整')
+    }
+    this.sessionStore.set(new UgreenSession(
+      urls.baseUrl,
+      tokenId,
+      token,
+      this.stringValue(data['uid']),
+      publicKey
+    ))
+    if (pending !== null) {
+      this.reconnectCredentials = pending
+    }
+    this.pendingLogin = null
+    return new LoginResult(false, '登录成功')
+  }
+
+  async getRoot(): Promise<RootDirectory> {
+    const root = new RootDirectory()
+    const result = await Promise.all([
+      this.list('', 4),
+      this.list('', 3)
+    ])
+    root.personal = result[0].filter((item: FileEntry) => item.isDirectory)
+    root.shared = result[1].filter((item: FileEntry) => item.isDirectory)
+    return root
+  }
+
+  async list(path: string, rootType: number = 4): Promise<FileEntry[]> {
+    const pages = await this.listPages(path, rootType)
+    const result: FileEntry[] = []
+    for (const page of pages) {
+      for (const entry of page.entries) {
+        result.push(entry)
+      }
+    }
+    this.sortEntries(result)
+    return result
+  }
+
+  async listPages(path: string, rootType: number = 4): Promise<UgreenDirectoryPage[]> {
+    const pages: UgreenDirectoryPage[] = []
+    for (let pageIndex = 1; pageIndex <= UgreenRemoteClient.MAX_DIRECTORY_PAGES; pageIndex++) {
+      const page = await this.listPage(path, rootType, pageIndex)
+      pages.push(page)
+      if (!page.hasMore || page.entries.length === 0) {
+        break
+      }
+    }
+    return pages
+  }
+
+  async listPage(path: string, rootType: number, pageIndex: number): Promise<UgreenDirectoryPage> {
+    return await this.withReconnect(() => this.listPageOnce(path, rootType, pageIndex))
+  }
+
+  private async listPageOnce(path: string, rootType: number, pageIndex: number): Promise<UgreenDirectoryPage> {
+    const urls = this.requireEndpoints()
+    const headers = await this.authHeaders()
+    const requestPath = this.normalizePath(path)
+    // UGOS uses root_type=4/3 to enumerate the two root collections. Once a
+    // concrete path is supplied, the web/Node client switches to root_type=3
+    // for normal file-manager traversal, including personal folders.
+    const effectiveRootType = requestPath.length > 0 ? 3 : rootType
+    const listBody: JsonObject = {}
+    listBody['path'] = requestPath
+    listBody['limit'] = UgreenRemoteClient.DIRECTORY_PAGE_SIZE
+    listBody['page'] = pageIndex
+    listBody['is_shield_recycle'] = false
+    listBody['data_type'] = 0
+    listBody['left_no_page_show'] = false
+    listBody['left_count'] = 5000
+    listBody['sort_type'] = 1
+    listBody['reverse'] = false
+    listBody['permission'] = 4
+    listBody['root_type'] = effectiveRootType
+    const listHeaders = this.withHeaders(headers, 'content-type', 'application/json')
+    listHeaders['referer'] = urls.baseUrl + '/filemgr/?_filemgr=a58981e8'
+    const response = await this.transport.requestJson(urls.listDirectory(), http.RequestMethod.POST, listBody, listHeaders)
+    const data = this.successData(response.body, '目录读取失败')
+    const rightFiles = this.asRecord(data['right_files'])
+    const files = rightFiles['files']
+    if (!(files instanceof Array)) {
+      return {
+        pageIndex: pageIndex,
+        entries: [],
+        totalCount: 0,
+        hasMore: false
+      }
+    }
+    const result: FileEntry[] = []
+    for (const value of files as Object[]) {
+      const raw = this.asRecord(value)
+      const entry = new FileEntry()
+      entry.name = this.stringValue(raw['name'], '未命名')
+      const remotePath = this.firstString(raw, ['path', 'full_path', 'file_path', 'filepath'])
+      entry.path = this.normalizePath(remotePath.length > 0 ? remotePath : this.joinPath(requestPath, entry.name))
+      entry.isDirectory = this.isDirectory(raw)
+      entry.size = this.numberValue(raw['size'])
+      entry.modifiedTime = this.numberValue(raw['mtime'])
+      entry.childCount = this.directoryChildCount(raw)
+      entry.rootType = effectiveRootType
+      entry.thumbnailUrl = this.remotePreviewUrl(urls, raw, [
+        'thumbnail_url', 'thumbnailUrl', 'thumb_url', 'thumbUrl', 'thumbnail', 'thumb',
+        'preview_url', 'previewUrl', 'preview', 'poster_url', 'posterUrl', 'poster',
+        'small_url', 'smallUrl', 'small', 'file_thumbnail', 'fileThumbnail', 'file_thumb', 'fileThumb'
+      ])
+      entry.coverUrl = this.remotePreviewUrl(urls, raw, [
+        'cover_url', 'coverUrl', 'cover', 'album_art_url', 'albumArtUrl', 'album_art', 'albumArt',
+        'artwork_url', 'artworkUrl', 'artwork', 'album_cover', 'albumCover', 'song_cover', 'songCover'
+      ])
+      entry.mimeType = this.firstString(raw, ['mime_type', 'mimetype', 'content_type', 'type_name'])
+      result.push(entry)
+    }
+    this.sortEntries(result)
+    let totalCount = this.firstCount(rightFiles, [
+      'total', 'total_count', 'count', 'file_count', 'items_count'
+    ])
+    if (totalCount < 0) {
+      totalCount = this.firstCount(data, [
+        'total', 'total_count', 'count', 'file_count', 'items_count'
+      ])
+    }
+    const hasMore = totalCount >= 0
+      ? pageIndex * UgreenRemoteClient.DIRECTORY_PAGE_SIZE < totalCount
+      : result.length >= UgreenRemoteClient.DIRECTORY_PAGE_SIZE
+    return {
+      pageIndex: pageIndex,
+      entries: result,
+      totalCount: totalCount,
+      hasMore: hasMore
+    }
+  }
+
+  async download(path: string): Promise<DownloadDescriptor> {
+    return await this.withReconnect(() => this.downloadOnce(path))
+  }
+
+  private async downloadOnce(path: string): Promise<DownloadDescriptor> {
+    const urls = this.requireEndpoints()
+    const sessionHeaders = await this.authHeaders()
+    // Downloads are issued from the web file-manager session. Some relay
+    // gateways validate the referer on the permission/token requests and on
+    // the signed file request, while thumbnail requests already carried it.
+    // Keep the original-file path in the same authenticated context.
+    sessionHeaders['referer'] = urls.baseUrl + '/filemgr/?_filemgr=a58981e8'
+    const permissionBody: JsonObject = {}
+    permissionBody['paths'] = [path]
+    permissionBody['type'] = 4
+    permissionBody['intranet_share_id'] = 0
+    const permissionHeaders = this.withHeaders(sessionHeaders, 'content-type', 'application/json')
+    let permissionResponse: HttpResult<JsonObject>
+    try {
+      permissionResponse = await this.transport.requestJson(urls.detectPermissions(), http.RequestMethod.POST,
+        permissionBody, permissionHeaders)
+    } catch (error) {
+      console.warn('[UgreenDownload] permission request failed for ' + path + ' :: ' + String(error))
+      throw error as Error
+    }
+    this.successData(permissionResponse.body, '没有文件下载权限')
+    let tokenResponse: HttpResult<JsonObject>
+    try {
+      tokenResponse = await this.transport.requestJson(urls.downloadToken([path]), http.RequestMethod.GET,
+        undefined, sessionHeaders)
+    } catch (error) {
+      console.warn('[UgreenDownload] token request failed for ' + path + ' :: ' + String(error))
+      throw error as Error
+    }
+    const tokenData = this.successData(tokenResponse.body, '获取下载令牌失败')
+    const downloadPath = this.stringValue(tokenData['dl_url'])
+    if (downloadPath.length === 0) {
+      throw new UgreenError(UgreenErrorKind.API_CHANGED, '下载接口没有返回文件地址')
+    }
+    return new DownloadDescriptor(
+      urls.downloadLink(downloadPath),
+      this.fileName(path),
+      this.numberValue(tokenData['size']),
+      sessionHeaders
+    )
+  }
+
+  async thumbnail(entry: FileEntry): Promise<DownloadDescriptor> {
+    const candidates = await this.thumbnailCandidates(entry)
+    return candidates.length > 0 ? candidates[0] : new DownloadDescriptor()
+  }
+
+  async thumbnailCandidates(entry: FileEntry): Promise<DownloadDescriptor[]> {
+    return await this.withReconnect(() => this.thumbnailCandidatesOnce(entry))
+  }
+
+  private async thumbnailCandidatesOnce(entry: FileEntry): Promise<DownloadDescriptor[]> {
+    const urls = this.requireEndpoints()
+    const headers = await this.authHeaders()
+    const thumbnailHeaders = this.withHeaders(headers, 'accept', 'image/*')
+    // The web file manager sends this referer for preview requests. Keep the
+    // binary request in the same authenticated context instead of accepting
+    // a successful HTML/JSON error body as an image.
+    thumbnailHeaders['referer'] = urls.baseUrl + '/filemgr/?_filemgr=a58981e8'
+    const result: DownloadDescriptor[] = []
+    // The file manager's thumbnail endpoint is the authoritative image
+    // route. Some list responses expose preview_url/thumbnail_url values
+    // that return a successful non-image body for remote sessions.
+    result.push(new DownloadDescriptor(urls.thumbnail(entry.path),
+      entry.name + '.thumbnail', 0, thumbnailHeaders))
+    const previewPath = this.previewPath(entry)
+    const previewUrl = previewPath.length > 0 ? urls.downloadLink(previewPath) : ''
+    if (previewUrl.length > 0 && previewUrl !== result[0].url) {
+      result.push(new DownloadDescriptor(previewUrl, entry.name + '.thumbnail', 0, thumbnailHeaders))
+    }
+    return result
+  }
+
+  async rename(path: string, newName: string): Promise<void> {
+    await this.withReconnect(async (): Promise<void> => {
+      const urls = this.requireEndpoints()
+      const headers = this.withHeaders(await this.authHeaders(), 'content-type', 'application/json')
+      const body: JsonObject = {}
+      body['path'] = path
+      body['new_name'] = newName
+      const response = await this.transport.requestJson(urls.rename(), http.RequestMethod.POST, body, headers)
+      this.successData(response.body, '文件重命名失败')
+    })
+  }
+
+  async copy(paths: string[], targetPath: string): Promise<void> {
+    await this.withReconnect(async (): Promise<void> => {
+      const urls = this.requireEndpoints()
+      const headers = this.withHeaders(await this.authHeaders(), 'content-type', 'application/json')
+      const body: JsonObject = {}
+      body['paths'] = paths
+      body['target_path'] = targetPath
+      const response = await this.transport.requestJson(urls.copyPaths(), http.RequestMethod.POST, body, headers)
+      this.successData(response.body, '文件复制失败')
+    })
+  }
+
+  async move(paths: string[], targetPath: string): Promise<void> {
+    await this.withReconnect(async (): Promise<void> => {
+      const urls = this.requireEndpoints()
+      const headers = this.withHeaders(await this.authHeaders(), 'content-type', 'application/json')
+      const body: JsonObject = {}
+      body['paths'] = paths
+      body['target_path'] = targetPath
+      const response = await this.transport.requestJson(urls.movePaths(), http.RequestMethod.POST, body, headers)
+      this.successData(response.body, '文件移动失败')
+    })
+  }
+
+  async createFolder(path: string): Promise<void> {
+    await this.withReconnect(async (): Promise<void> => {
+      const urls = this.requireEndpoints()
+      const headers = this.withHeaders(await this.authHeaders(), 'content-type', 'application/json')
+      const body: JsonObject = {}
+      body['path'] = path
+      body['no_recursive_creation'] = true
+      const response = await this.transport.requestJson(urls.createFolder(),
+        http.RequestMethod.POST, body, headers)
+      this.successData(response.body, '文件夹创建失败')
+    })
+  }
+
+  async trash(path: string): Promise<void> {
+    await this.withReconnect(async (): Promise<void> => {
+      const urls = this.requireEndpoints()
+      const headers = this.withHeaders(await this.authHeaders(), 'content-type', 'application/json')
+      const body: JsonObject = {}
+      body['paths'] = [path]
+      body['forever'] = false
+      const response = await this.transport.requestJson(urls.deletePaths(), http.RequestMethod.POST, body, headers)
+      this.successData(response.body, '文件删除失败')
+    })
+  }
+
+  private async reconnect(): Promise<boolean> {
+    if (this.reconnectCredentials === null) {
+      return false
+    }
+    if (this.reconnectPromise !== null) {
+      return await this.reconnectPromise
+    }
+    const credentials = this.reconnectCredentials
+    const task = this.performReconnect(credentials)
+    this.reconnectPromise = task
+    try {
+      return await task
+    } finally {
+      if (this.reconnectPromise === task) {
+        this.reconnectPromise = null
+      }
+    }
+  }
+
+  private async performReconnect(credentials: PendingLogin): Promise<boolean> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0) {
+        await new Promise<void>((resolve: () => void) => {
+          setTimeout(resolve, 600)
+        })
+      }
+      try {
+        const result = await this.login(credentials.username, credentials.password)
+        if (!result.requiresOtp) {
+          return true
+        }
+        return false
+      } catch (_) {
+        // A second attempt covers a short Wi-Fi/mobile-network handoff.
+      }
+    }
+    return false
+  }
+
+  private shouldReconnect(error: Object): boolean {
+    if (!(error instanceof UgreenError)) {
+      return false
+    }
+    if (error.kind === UgreenErrorKind.AUTH_EXPIRED) {
+      return true
+    }
+    if (error.status === 401 || error.status === 403 || error.status === 408 || error.status === 429 ||
+      error.apiCode === 401 || error.apiCode === 403 || error.apiCode === 419) {
+      return true
+    }
+    return error.kind === UgreenErrorKind.NETWORK &&
+      (error.status === 0 || error.status >= 500)
+  }
+
+  private async authHeaders(): Promise<Record<string, string>> {
+    const session = this.sessionStore.get()
+    if (session === null) {
+      throw new UgreenError(UgreenErrorKind.AUTH_EXPIRED, '登录状态已失效，请重新登录')
+    }
+    return {
+      'x-ugreen-security-key': session.tokenId,
+      'x-ugreen-token': await UgreenCrypto.encryptBase64(session.token, session.publicKey)
+    }
+  }
+
+  private requireEndpoints(): UgreenEndpoints {
+    const value = this.endpoints
+    if (value === null) {
+      throw new UgreenError(UgreenErrorKind.API_CHANGED, '请先解析 UGREENlink ID')
+    }
+    return value
+  }
+
+  private successData(body: JsonObject, context: string): JsonObject {
+    const code = this.numberValue(body['code'])
+    if (code !== 200) {
+      const message = this.stringValue(body['msg'], context)
+      const kind = this.isAuthenticationFailure(code, message)
+        ? UgreenErrorKind.AUTH_EXPIRED : UgreenErrorKind.UNKNOWN
+      throw new UgreenError(kind, message, 0, code)
+    }
+    return this.asRecord(body['data'])
+  }
+
+  /**
+   * UGOS can report an expired session as HTTP 200 with a non-200 business
+   * code. The relay has used several English messages for this condition,
+   * including the misspelled "token cannnot be empty". Keep the matching
+   * narrow enough that ordinary API errors still reach the UI unchanged.
+   */
+  private isAuthenticationFailure(code: number, message: string): boolean {
+    if (code === 401 || code === 403 || code === 419) {
+      return true
+    }
+    const normalized = message.toLowerCase()
+    const expired = normalized.includes('expired') || normalized.includes('experied') ||
+      normalized.includes('过期') || normalized.includes('失效')
+    if ((normalized.includes('login') || normalized.includes('session') ||
+      normalized.includes('authentication')) && expired) {
+      return true
+    }
+    if (normalized.includes('please login again') || normalized.includes('please log in again') ||
+      normalized.includes('请重新登录')) {
+      return true
+    }
+    if (!normalized.includes('token')) {
+      return normalized.includes('登录状态') || normalized.includes('会话失效') ||
+        normalized.includes('未登录') || normalized.includes('not logged in')
+    }
+    return normalized.includes('empty') || normalized.includes('expired') ||
+      normalized.includes('invalid') || normalized.includes('missing') ||
+      normalized.includes('失效') || normalized.includes('过期')
+  }
+
+  private needsOtp(body: JsonObject, data: JsonObject): boolean {
+    if (this.booleanValue(body['need_otp']) || this.booleanValue(body['otp_required']) ||
+      this.booleanValue(data['need_otp']) || this.booleanValue(data['otp_required'])) {
+      return true
+    }
+    const text = (this.stringValue(body['msg']) + ' ' + this.stringValue(data['msg'])).toLowerCase()
+    return text.includes('otp') || text.includes('verification code') || text.includes('verify code') ||
+      text.includes('验证码')
+  }
+
+  private asRecord(value: Object | undefined): JsonObject {
+    if (value === undefined || value === null) {
+      return {}
+    }
+    return value as JsonObject
+  }
+
+  private stringValue(value: Object | undefined, fallback: string = ''): string {
+    if (typeof value === 'string') {
+      return value
+    }
+    if (value !== undefined && value !== null) {
+      return String(value)
+    }
+    return fallback
+  }
+
+  private numberValue(value: Object | undefined): number {
+    if (typeof value === 'number') {
+      return value
+    }
+    if (typeof value === 'string') {
+      return Number(value)
+    }
+    return 0
+  }
+
+  private booleanValue(value: Object | undefined): boolean {
+    return value === true || value === 'true'
+  }
+
+  private booleanFlag(value: Object | undefined): boolean {
+    return value === true || value === 1 || value === 'true' || value === '1'
+  }
+
+  private isDirectory(raw: JsonObject): boolean {
+    const fileType = this.stringValue(raw['file_type']).toLowerCase()
+    if (this.numberValue(raw['file_type']) === 1 || fileType === 'dir' || fileType === 'directory' ||
+      fileType === 'folder') {
+      return true
+    }
+    return this.booleanFlag(raw['is_dir']) || this.booleanFlag(raw['is_directory']) ||
+      this.booleanFlag(raw['is_folder']) || this.booleanFlag(raw['directory'])
+  }
+
+  private directoryChildCount(raw: JsonObject): number {
+    const keys = [
+      'child_count', 'children_count', 'file_count', 'folder_count',
+      'items_count', 'total_count'
+    ]
+    for (const key of keys) {
+      const rawValue = raw[key]
+      if (rawValue === undefined || rawValue === null ||
+        (typeof rawValue === 'string' && rawValue.trim().length === 0)) {
+        continue
+      }
+      const value = this.numberValue(rawValue)
+      if (value >= 0 && Number.isFinite(value)) {
+        return Math.floor(value)
+      }
+    }
+    return -1
+  }
+
+  private firstCount(raw: JsonObject, keys: string[]): number {
+    for (const key of keys) {
+      const rawValue = raw[key]
+      if (rawValue === undefined || rawValue === null ||
+        (typeof rawValue === 'string' && rawValue.trim().length === 0)) {
+        continue
+      }
+      const value = this.numberValue(rawValue)
+      if (value >= 0 && Number.isFinite(value)) {
+        return Math.floor(value)
+      }
+    }
+    return -1
+  }
+
+  private sortEntries(entries: FileEntry[]): void {
+    entries.sort((left: FileEntry, right: FileEntry): number => {
+      if (left.isDirectory !== right.isDirectory) {
+        return left.isDirectory ? -1 : 1
+      }
+      return left.name.localeCompare(right.name)
+    })
+  }
+
+  private firstString(raw: JsonObject, keys: string[]): string {
+    for (const key of keys) {
+      const value = this.stringValue(raw[key]).trim()
+      if (value.length > 0) {
+        return value
+      }
+    }
+    return ''
+  }
+
+  private remotePreviewUrl(urls: UgreenEndpoints, raw: JsonObject, keys: string[]): string {
+    const direct = this.firstRemoteValue(raw, keys)
+    if (direct.length === 0) {
+      return ''
+    }
+    return urls.downloadLink(direct)
+  }
+
+  private firstRemoteValue(raw: JsonObject, keys: string[]): string {
+    for (const key of keys) {
+      const direct = this.remoteValue(raw[key])
+      if (direct.length > 0) {
+        return direct
+      }
+    }
+
+    const containers = [
+      'metadata', 'meta', 'file_info', 'fileInfo', 'media', 'extra', 'preview_info', 'previewInfo'
+    ]
+    for (const containerName of containers) {
+      const container = this.asRecord(raw[containerName])
+      for (const key of keys) {
+        const nested = this.remoteValue(container[key])
+        if (nested.length > 0) {
+          return nested
+        }
+      }
+    }
+    return ''
+  }
+
+  private remoteValue(value: Object | undefined): string {
+    if (typeof value === 'string') {
+      return value.trim()
+    }
+    if (value === undefined || value === null || typeof value !== 'object') {
+      return ''
+    }
+    const record = this.asRecord(value)
+    return this.firstString(record, [
+      'url', 'uri', 'src', 'path', 'value', 'small', 'small_url', 'smallUrl',
+      'thumbnail_url', 'thumbnailUrl', 'preview_url', 'previewUrl', 'cover_url', 'coverUrl'
+    ])
+  }
+
+  private previewPath(entry: FileEntry): string {
+    if (entry.coverUrl.length > 0 && this.isAudioFile(entry.name)) {
+      return entry.coverUrl
+    }
+    return entry.thumbnailUrl
+  }
+
+  private isAudioFile(name: string): boolean {
+    const dot = name.lastIndexOf('.')
+    if (dot <= 0 || dot === name.length - 1) {
+      return false
+    }
+    const extension = name.substring(dot + 1).toLowerCase()
+    return ['mp3', 'wav', 'm4a', 'flac', 'aac', 'ogg', 'amr'].indexOf(extension) >= 0
+  }
+
+  private normalizePath(path: string): string {
+    const value = path.trim()
+    if (value.length === 0) {
+      return ''
+    }
+    return value.replace(/\/{2,}/g, '/')
+  }
+
+  private headerValue(headers: Record<string, string>, target: string): string {
+    for (const key of Object.keys(headers)) {
+      if (key.toLowerCase() === target.toLowerCase()) {
+        return headers[key]
+      }
+    }
+    return ''
+  }
+
+  private joinPath(parent: string, name: string): string {
+    if (parent.length === 0 || parent === '/') {
+      return '/' + name
+    }
+    return parent.replace(/\/+$/, '') + '/' + name
+  }
+
+  private fileName(path: string): string {
+    const normalized = path.replace(/\/+$/, '')
+    const separator = normalized.lastIndexOf('/')
+    return separator >= 0 ? normalized.substring(separator + 1) : normalized
+  }
+
+  private withHeaders(source: Record<string, string>, key: string, value: string): Record<string, string> {
+    const result: Record<string, string> = {}
+    for (const headerKey of Object.keys(source)) {
+      result[headerKey] = source[headerKey]
+    }
+    result[key] = value
+    return result
+  }
+}
