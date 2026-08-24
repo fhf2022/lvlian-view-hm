@@ -30,6 +30,7 @@ type SearchReturnMode = 'none' | 'directory' | 'image' | 'audio' | 'download'
 type FileAction = 'share' | 'openWith' | 'quickView' | 'multiSelect' | 'download' |
   'saveGallery' | 'releaseCache' | 'rename' | 'details' | 'delete' | 'copy' | 'move'
 type DestinationOperation = 'copy' | 'move'
+type ViewerHandoffLayer = 'preview' | 'original' | 'waterfall'
 
 // Shared-element transitions are deliberately separate from the 180 ms
 // Swiper animation.  The image should have enough time to travel from its
@@ -255,6 +256,10 @@ struct Index {
   // viewer swiper animation uses viewerTransitionActive and remains separate.
   @State viewerEntryTransitionActive: boolean = false
   @State viewerEntryTransitionPath: string = ''
+  // Freeze the visible source used by the one-shot shared-element handoff.
+  // Normal viewing may use the preview/original composite; the transition
+  // itself must contain exactly one image.
+  @State viewerHandoffLayer: ViewerHandoffLayer = 'preview'
   // Keep the viewer capsule size stable across device rotation. Only its
   // bottom-safe-area position should be recalculated by the new layout.
   @State viewerBottomBarWidthVp: number = 0
@@ -4004,6 +4009,16 @@ struct Index {
     return this.viewerImageDecoded(this.viewerImageEntry as FileEntry)
   }
 
+  /**
+   * The original URI only means that the decoder has a source to work on.
+   * It is not safe to remove or hide the preview until Image.onComplete has
+   * reported that the original frame is actually drawable.
+   */
+  private viewerOriginalReady(entry: FileEntry): boolean {
+    return this.viewerOriginalUri(entry).length > 0 &&
+      this.viewerDecodedImages[entry.path] === true
+  }
+
   private viewerProgress(entry: FileEntry): number {
     if (this.viewerImageDecoded(entry)) {
       return 100
@@ -4093,6 +4108,16 @@ struct Index {
     return viewerEntry !== null && viewerEntry.path === entry.path && this.isImage(entry)
   }
 
+  /**
+   * A geometry transition must expose one visual layer. During normal viewing
+   * the preview and original are intentionally composited, but that composite
+   * must not become a second live image beside ArkUI's shared-element snapshot.
+   */
+  private viewerHandoffActive(entry: FileEntry): boolean {
+    return this.viewerEntryTransitionActive &&
+      this.viewerEntryTransitionPath === entry.path
+  }
+
   private fileImageTransitionId(entry: FileEntry): string {
     // The file surface stays mounted under the viewer. During the shared
     // element state change the source id must be removed while the viewer
@@ -4135,6 +4160,7 @@ struct Index {
     }
     this.viewerEntryTransitionActive = false
     this.viewerEntryTransitionPath = ''
+    this.viewerHandoffLayer = 'preview'
   }
 
   private scheduleViewerEntryTransitionCleanup(): void {
@@ -4152,8 +4178,26 @@ struct Index {
       }
       this.viewerEntryTransitionActive = false
       this.viewerEntryTransitionPath = ''
+      this.viewerHandoffLayer = 'preview'
       this.viewerEntryTransitionTimer = 0
     }, IMAGE_GEOMETRY_TRANSITION_SETTLE)
+  }
+
+  private viewerHandoffLayerFor(entry: FileEntry): ViewerHandoffLayer {
+    if (this.viewerOriginalReady(entry)) {
+      return 'original'
+    }
+    // The handoff must first match what is visibly on the viewer. A waterfall
+    // original is only a last-resort source when the viewer has no thumbnail;
+    // switching from the visible preview to it at gesture start would itself
+    // look like a second image.
+    if (this.previewUri(entry).length > 0) {
+      return 'preview'
+    }
+    if (this.waterfallUri(entry).length > 0) {
+      return 'waterfall'
+    }
+    return 'preview'
   }
 
   private startViewerEntryTransition(entry: FileEntry): void {
@@ -4162,6 +4206,7 @@ struct Index {
       return
     }
     this.viewerEntryTransitionPath = entry.path
+    this.viewerHandoffLayer = this.viewerHandoffLayerFor(entry)
     this.viewerEntryTransitionActive = true
   }
 
@@ -4186,6 +4231,7 @@ struct Index {
       return
     }
     this.viewerEntryTransitionPath = (entry as FileEntry).path
+    this.viewerHandoffLayer = this.viewerHandoffLayerFor(entry as FileEntry)
     this.viewerEntryTransitionActive = true
   }
 
@@ -4331,6 +4377,10 @@ struct Index {
         })
         .orientation(this.viewerImageOrientation(entry))
         .objectFit(ImageFit.Contain)
+        // Binding the URI is not the same as having a drawable frame. Keep
+        // the preview visible until this image reports onComplete, then swap
+        // opacity without removing either layer from the fixed frame.
+        .opacity(this.viewerOriginalReady(entry) ? 1 : 0)
         .onComplete((event?: ViewerImageCompleteEvent): void => {
           this.logViewerRenderGeometry(entry.path, 'original', event)
           this.markViewerImageDecoded(entry.path)
@@ -4345,6 +4395,7 @@ struct Index {
           .height('100%')
           .orientation(this.viewerImageOrientation(entry))
           .objectFit(ImageFit.Contain)
+          .opacity(this.viewerOriginalReady(entry) ? 1 : 0)
           .onComplete((event?: ViewerImageCompleteEvent): void => {
             this.logViewerRenderGeometry(entry.path, 'original', event)
             this.markViewerImageDecoded(entry.path)
@@ -4354,22 +4405,57 @@ struct Index {
   }
 
   @Builder
+  ViewerHandoffImage(entry: FileEntry): void {
+    if (this.viewerHandoffLayer === 'original' && this.viewerOriginalUri(entry).length > 0) {
+      // The original was already decoded when the handoff was captured. Use
+      // only this one visual node while geometryTransition is running.
+      this.ViewerOriginalImage(entry)
+    } else if (this.viewerHandoffLayer === 'waterfall' && this.waterfallUri(entry).length > 0) {
+      Image(this.waterfallUri(entry))
+        .width('100%')
+        .height('100%')
+        .sourceSize(this.waterfallSourceSize(entry))
+        .orientation(this.fileListImageBaseOrientation(entry))
+        .objectFit(ImageFit.Contain)
+    } else if (this.previewUri(entry).length > 0) {
+      Image(this.previewUri(entry))
+        .width('100%')
+        .height('100%')
+        .orientation(this.viewerPreviewImageOrientation(entry))
+        .objectFit(ImageFit.Contain)
+    } else if (this.viewerOriginalUri(entry).length > 0) {
+      // A source can be reclaimed between the source capture and the first
+      // target layout pass. Keep the transition usable with the remaining
+      // original instead of introducing a blank frame.
+      this.ViewerOriginalImage(entry)
+    }
+  }
+
+  @Builder
   ViewerImageLayers(entry: FileEntry): void {
     Stack() {
-      // Both sources are rendered into the same fixed frame.  The original
-      // remains above its preview so the preview is never removed while the
-      // decoder is working, but neither source can change the frame's layout.
-      if (this.previewUri(entry).length > 0) {
-        Image(this.previewUri(entry))
-          .width('100%')
-          .height('100%')
-          .orientation(this.viewerPreviewImageOrientation(entry))
-          .objectFit(ImageFit.Contain)
-          .onComplete((event?: ViewerImageCompleteEvent): void =>
-            this.logViewerRenderGeometry(entry.path, 'preview', event))
-      }
-      if (this.viewerOriginalUri(entry).length > 0) {
-        this.ViewerOriginalImage(entry)
+      if (this.viewerHandoffActive(entry)) {
+        // The shared-element system owns the handoff snapshot. Do not feed it
+        // the normal two-layer stack or the live viewer can appear beside the
+        // system snapshot during the return flight.
+        this.ViewerHandoffImage(entry)
+      } else {
+        // Both sources are rendered into the same fixed frame. The original
+        // remains above its preview while decoding; only opacity changes after
+        // onComplete, so there is no blank frame and no layout replacement.
+        if (this.previewUri(entry).length > 0) {
+          Image(this.previewUri(entry))
+            .width('100%')
+            .height('100%')
+            .orientation(this.viewerPreviewImageOrientation(entry))
+            .objectFit(ImageFit.Contain)
+            .opacity(this.viewerOriginalReady(entry) ? 0 : 1)
+            .onComplete((event?: ViewerImageCompleteEvent): void =>
+              this.logViewerRenderGeometry(entry.path, 'preview', event))
+        }
+        if (this.viewerOriginalUri(entry).length > 0) {
+          this.ViewerOriginalImage(entry)
+        }
       }
     }
     .width('100%')
