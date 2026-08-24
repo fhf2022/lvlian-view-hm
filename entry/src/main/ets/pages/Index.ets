@@ -36,6 +36,13 @@ type DestinationOperation = 'copy' | 'move'
 // file-row frame to the viewer without delaying network/decode work.
 const IMAGE_GEOMETRY_TRANSITION_DURATION: number = 420
 const IMAGE_GEOMETRY_TRANSITION_SETTLE: number = 520
+// Pull-to-dismiss is deliberately a short, proportional gesture. The
+// threshold is calculated from the viewer height so it remains usable on
+// portrait and landscape windows without changing the image layout.
+const IMAGE_DISMISS_TRIGGER_RATIO: number = 0.20
+const IMAGE_DISMISS_FAST_TRIGGER_VELOCITY: number = 900
+const IMAGE_DISMISS_FAST_TRIGGER_DISTANCE: number = 42
+const IMAGE_DISMISS_MAX_SCALE_REDUCTION: number = 0.28
 // HarmonyOS bottom-tab examples use a 56vp bar on phone-sized breakpoints.
 // Keep the custom glass capsules on the same 8vp grid and only adapt their
 // distance from the navigation-indicator avoid area across window heights.
@@ -238,6 +245,12 @@ struct Index {
   @State imageBottomChromeOffsetY: number = 0
   @State imageViewportWidthVp: number = 360
   @State imageViewportHeightVp: number = 600
+  // These are render transforms for the unzoomed pull-to-dismiss gesture.
+  // They are kept separate from imageScale/imageOffset so pinch-zoom and
+  // horizontal Swiper navigation keep their existing state machine.
+  @State imageDismissScale: number = 1
+  @State imageDismissOffsetY: number = 0
+  @State imageDismissBackdropOpacity: number = 1
   // The entry animation is limited to the image that was tapped. The normal
   // viewer swiper animation uses viewerTransitionActive and remains separate.
   @State viewerEntryTransitionActive: boolean = false
@@ -374,6 +387,7 @@ struct Index {
   private imageTouchMoved: boolean = false
   private imageTouchStartX: number = 0
   private imageTouchStartY: number = 0
+  private imageDismissDragging: boolean = false
   private viewerSwiperController: SwiperController = new SwiperController()
   private viewerLoadQueue: FileEntry[] = []
   private viewerLoadRequests: Record<string, boolean> = {}
@@ -1679,12 +1693,6 @@ struct Index {
           })
         }, (entry: FileEntry) => entry.path)
 
-        ListItem() {
-          Row()
-            .width('100%')
-            .height(this.floatingBarContentInset())
-        }
-        .width('100%')
       }
       .width('100%')
       .layoutWeight(1)
@@ -1696,16 +1704,6 @@ struct Index {
       .onReachEnd(() => this.loadNextDirectoryPage())
       .padding({ left: 0, right: 0 })
       .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
-      .linearGradientBlur(9, {
-        fractionStops: [
-          [1.0, 0.0],
-          [1.0, 0.025],
-          [0.28, 0.065],
-          [0.0, 0.10],
-          [0.0, 1.0]
-        ],
-        direction: GradientDirection.Bottom
-      })
       }
       if (!this.isBusy && ((this.fileViewMode === 'waterfall'
         && this.waterfallEntries.length === 0) || (this.fileViewMode !== 'waterfall'
@@ -1718,6 +1716,7 @@ struct Index {
       }
     }
     .width('100%')
+    .height('100%')
     .layoutWeight(1)
   }
 
@@ -1946,17 +1945,7 @@ struct Index {
     .layoutWeight(1)
     .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
     .padding({ left: 10, right: 10, top: this.fileContentTopInset(),
-      bottom: this.floatingBarContentInset() })
-    .linearGradientBlur(9, {
-      fractionStops: [
-        [1.0, 0.0],
-        [1.0, 0.025],
-        [0.28, 0.065],
-        [0.0, 0.10],
-        [0.0, 1.0]
-      ],
-      direction: GradientDirection.Bottom
-    })
+      bottom: 0 })
   }
 
   @Builder
@@ -2009,6 +1998,13 @@ struct Index {
           .aspectRatio(this.waterfallAspectRatio(entry))
           .backgroundColor('#12000000')
           .borderRadius(10)
+          // Outline does not participate in WaterFlow measurement, so the
+          // selection state cannot change the card size or column positions.
+          .outline({
+            width: this.selectionMode && this.isSelected(entry) ? 2 : 0,
+            color: '#2E6BFF',
+            radius: 10
+          })
           .onClick(() => this.handleFileEntryClick(entry))
           .priorityGesture(
             LongPressGesture({ repeat: false })
@@ -2047,13 +2043,14 @@ struct Index {
       }
     })
     .width('100%')
+    .height('100%')
     .layoutWeight(1)
     .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
     // Match list/grid content origin: this is layout breathing room, not a
     // second mask. The existing TopFileOverlay remains the only top visual
     // gradient, while the first waterfall row starts below it instead of
     // being covered by the gradient.
-    .padding({ left: 10, right: 10, top: 0, bottom: this.floatingBarContentInset() })
+    .padding({ left: 10, right: 10, top: 0, bottom: 0 })
   }
 
   @Builder
@@ -2109,26 +2106,10 @@ struct Index {
           }
         }, (entry: FileEntry) => entry.path)
 
-        ListItem() {
-          Row()
-            .width('100%')
-            .height(this.floatingBarContentInset())
-        }
-        .width('100%')
       }
       .width('100%')
       .layoutWeight(1)
       .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
-      .linearGradientBlur(9, {
-        fractionStops: [
-          [1.0, 0.0],
-          [1.0, 0.025],
-          [0.28, 0.065],
-          [0.0, 0.10],
-          [0.0, 1.0]
-        ],
-        direction: GradientDirection.Bottom
-      })
     }
     .width('100%')
     .height('100%')
@@ -3958,8 +3939,13 @@ struct Index {
     return index === this.viewerImageIndex ? this.imageScale : 1
   }
 
+  private viewerPageDismissScale(index: number): number {
+    return index === this.viewerImageIndex ? this.imageDismissScale : 1
+  }
+
   private viewerPageVisualScale(entry: FileEntry, index: number): number {
-    return this.viewerPageScale(index) * this.viewerManualRotationFitScale(entry)
+    return this.viewerPageScale(index) * this.viewerPageDismissScale(index) *
+      this.viewerManualRotationFitScale(entry)
   }
 
   /**
@@ -4008,7 +3994,7 @@ struct Index {
   }
 
   private viewerPageOffsetY(index: number): number {
-    return index === this.viewerImageIndex ? this.imageOffsetY : 0
+    return index === this.viewerImageIndex ? this.imageOffsetY + this.imageDismissOffsetY : 0
   }
 
   private viewerCurrentImageReady(): boolean {
@@ -4095,8 +4081,16 @@ struct Index {
   }
 
   private shouldReplaceViewerTransitionSource(entry: FileEntry): boolean {
-    return this.showImageViewer && this.viewerEntryTransitionActive &&
-      this.viewerEntryTransitionPath === entry.path && this.isImage(entry)
+    // Keep the source slot blank for the entire viewer lifetime, including
+    // the close animation. The official geometryTransition pattern changes
+    // the hierarchy once: the source thumbnail is restored only in the same
+    // state update that removes the viewer. Restoring it earlier would leave
+    // a live thumbnail underneath the viewer and produce a second image.
+    if (!this.showImageViewer) {
+      return false
+    }
+    const viewerEntry = this.currentViewerEntry()
+    return viewerEntry !== null && viewerEntry.path === entry.path && this.isImage(entry)
   }
 
   private fileImageTransitionId(entry: FileEntry): string {
@@ -4223,6 +4217,17 @@ struct Index {
   @Builder
   ImageViewer(entry: FileEntry): void {
     Stack() {
+      // Keep the file surface mounted underneath the viewer. During a
+      // downward pull this is the only layer that fades, so the unchanged
+      // list/grid/waterfall page is revealed progressively behind the image.
+      // The image itself remains the same fixed preview+original frame.
+      Row()
+        .width('100%')
+        .height('100%')
+        .backgroundColor($r('app.color.page_background'))
+        .opacity(this.imageDismissBackdropOpacity)
+        .hitTestBehavior(HitTestMode.None)
+
       Swiper(this.viewerSwiperController) {
         LazyForEach(this.viewerImageDataSource, (item: FileEntry, index: number) => {
           this.ViewerImagePage(item, index)
@@ -4311,7 +4316,7 @@ struct Index {
     }
     .width('100%')
     .height('100%')
-    .backgroundColor($r('app.color.page_background'))
+    .backgroundColor(Color.Transparent)
   }
 
   @Builder
@@ -4476,6 +4481,22 @@ struct Index {
               })
               .onActionEnd((event) => this.handleImagePanEnd(event))
               .onActionCancel(() => this.handleImagePanCancel())
+            ,
+            // At the base zoom level, vertical dragging belongs to the
+            // pull-to-dismiss interaction. Horizontal dragging remains owned
+            // by Swiper, and zoomed images continue to use the PanGesture
+            // above, so the three interactions do not steal one another.
+            PanGesture({
+              fingers: 1,
+              direction: PanDirection.Vertical,
+              distance: this.imageDismissGestureEnabled(index) ? 10 : 100000
+            })
+              .onActionStart(() => this.handleImageDismissStart(index))
+              .onActionUpdate((event: GestureEvent) =>
+                this.handleImageDismissUpdate(index, event))
+              .onActionEnd((event: GestureEvent) =>
+                this.handleImageDismissEnd(index, event))
+              .onActionCancel(() => this.handleImageDismissCancel())
           )
         )
       )
@@ -7967,6 +7988,101 @@ struct Index {
     this.animateImageTransform(2, 0, 0)
   }
 
+  private imageDismissGestureEnabled(index: number): boolean {
+    return this.showImageViewer && !this.viewerClosePending &&
+      index === this.viewerImageIndex && this.imageScale <= 1.001 &&
+      !this.viewerTransitionActive && !this.viewerEntryTransitionActive &&
+      !this.showImageMoreMenu && !this.showImageDetails && !this.showRenameDialog
+  }
+
+  private resetImageDismissTransform(): void {
+    this.imageDismissDragging = false
+    this.imageDismissScale = 1
+    this.imageDismissOffsetY = 0
+    this.imageDismissBackdropOpacity = 1
+  }
+
+  private imageDismissProgress(offsetY: number): number {
+    const dragRange = Math.max(1, this.imageViewportHeightVp * 0.42)
+    return Math.min(1, Math.max(0, offsetY) / dragRange)
+  }
+
+  private startImageDismissClose(): void {
+    if (this.viewerClosePending || !this.showImageViewer) {
+      return
+    }
+    this.imageDismissDragging = false
+    this.imageTouchMoved = true
+    // Do not calculate a second destination from screen coordinates. The
+    // current viewer frame is already the shared-element source; the file
+    // surface is restored with the same geometryTransition id in the single
+    // state change below. This makes the detail image fly to the real
+    // thumbnail, including list/grid/waterfall positions.
+    this.closeImageViewer()
+  }
+
+  private handleImageDismissStart(index: number): void {
+    if (!this.imageDismissGestureEnabled(index)) {
+      return
+    }
+    this.imageDismissDragging = true
+    this.imageTouchMoved = true
+  }
+
+  private handleImageDismissUpdate(index: number, event: GestureEvent): void {
+    if (!this.imageDismissDragging || !this.imageDismissGestureEnabled(index)) {
+      return
+    }
+    // A downward pull is the dismiss gesture. Keep a small, resisted upward
+    // movement so a slight reverse drag does not create a hard edge.
+    const rawOffsetY = event.offsetY
+    const effectiveOffsetY = rawOffsetY >= 0 ? rawOffsetY : rawOffsetY * 0.18
+    const progress = this.imageDismissProgress(effectiveOffsetY)
+    this.imageDismissOffsetY = effectiveOffsetY
+    this.imageDismissScale = 1 - progress * IMAGE_DISMISS_MAX_SCALE_REDUCTION
+    this.imageDismissBackdropOpacity = Math.max(0, 1 - progress * 1.25)
+  }
+
+  private animateImageDismissBack(): void {
+    this.getUIContext().animateTo({
+      curve: curves.interpolatingSpring(0, 1, 320, 30)
+    }, () => {
+      this.imageDismissOffsetY = 0
+      this.imageDismissScale = 1
+      this.imageDismissBackdropOpacity = 1
+    })
+  }
+
+  private handleImageDismissEnd(index: number, event: GestureEvent): void {
+    if (!this.imageDismissDragging) {
+      return
+    }
+    this.imageDismissDragging = false
+    if (!this.showImageViewer || index !== this.viewerImageIndex ||
+      this.imageScale > 1.001) {
+      this.animateImageDismissBack()
+      return
+    }
+
+    const offsetY = Math.max(0, this.imageDismissOffsetY)
+    const triggerDistance = Math.max(120, this.imageViewportHeightVp * IMAGE_DISMISS_TRIGGER_RATIO)
+    const fastEnough = offsetY >= IMAGE_DISMISS_FAST_TRIGGER_DISTANCE &&
+      event.velocityY >= IMAGE_DISMISS_FAST_TRIGGER_VELOCITY
+    if (offsetY >= triggerDistance || fastEnough) {
+      this.startImageDismissClose()
+      return
+    }
+    this.animateImageDismissBack()
+  }
+
+  private handleImageDismissCancel(): void {
+    if (!this.imageDismissDragging) {
+      return
+    }
+    this.imageDismissDragging = false
+    this.animateImageDismissBack()
+  }
+
   private animateImageTransform(targetScale: number, targetOffsetX: number, targetOffsetY: number): void {
     const scale = Math.min(5, Math.max(1, targetScale))
     this.getUIContext().animateTo({ duration: 180, curve: Curve.FastOutSlowIn }, () => {
@@ -8057,6 +8173,7 @@ struct Index {
     this.imageOffsetY = 0
     this.imageSavedOffsetX = 0
     this.imageSavedOffsetY = 0
+    this.resetImageDismissTransform()
   }
 
   private imageEntriesInCurrentDirectory(): FileEntry[] {
