@@ -1,9 +1,10 @@
-import { promptAction, uiMaterial, curves, window, LengthMetrics } from '@kit.ArkUI'
+import { promptAction, uiMaterial, curves, window, LengthMetrics, FrameCallback } from '@kit.ArkUI'
 import { systemShare, harmonyShare } from '@kit.ShareKit'
 import { Context, Want, common, wantConstant } from '@kit.AbilityKit'
 import { Environment, fileIo, fileUri } from '@kit.CoreFileKit'
 import { preferences, uniformTypeDescriptor as utd } from '@kit.ArkData'
 import { image } from '@kit.ImageKit'
+import { hilog } from '@kit.PerformanceAnalysisKit'
 import { DownloadTaskRecord, FileEntry } from '../model/FileEntry'
 import { CacheManager } from '../download/CacheManager'
 import { DownloadQueueManager } from '../download/DownloadQueueManager'
@@ -18,6 +19,7 @@ import { FileEntryDataSource } from '../model/FileEntryDataSource'
 import { PreviewLoadQueue } from '../media/PreviewLoadQueue'
 import { ThumbnailPolicy, ThumbnailSize } from '../media/ThumbnailPolicy'
 import { ThumbnailCacheStore } from '../media/ThumbnailCacheStore'
+import { ViewerBitmapRecord, ViewerBitmapStore } from '../media/ViewerBitmapStore'
 import { NetworkClass, NetworkPolicy } from '../core/network/NetworkPolicy'
 
 type RemoteScreen = 'login' | 'otp' | 'files' | 'downloads' | 'settings'
@@ -35,7 +37,11 @@ type DestinationOperation = 'copy' | 'move'
 // Swiper animation.  The image should have enough time to travel from its
 // file-row frame to the viewer without delaying network/decode work.
 const IMAGE_GEOMETRY_TRANSITION_DURATION: number = 420
-const IMAGE_GEOMETRY_TRANSITION_SETTLE: number = 520
+const IMAGE_FALLBACK_TRANSITION_DURATION: number = 160
+const IMAGE_RETURN_MOUNT_FRAME_LIMIT: number = 8
+const IMAGE_VIEWER_DIAGNOSTICS: boolean = true
+const IMAGE_VIEWER_HILOG_DOMAIN: number = 0xD003
+const IMAGE_VIEWER_HILOG_TAG: string = 'ImageViewerDiag'
 // Pull-to-dismiss is deliberately a short, proportional gesture. The
 // threshold is calculated from the viewer height so it remains usable on
 // portrait and landscape windows without changing the image layout.
@@ -84,6 +90,69 @@ interface ViewerImageCompleteEvent {
   contentHeight: number
   contentOffsetX: number
   contentOffsetY: number
+}
+
+type ViewerImageLayer = 'thumbnail' | 'original'
+type ViewerDecodeState = 'idle' | 'loading' | 'decoded' | 'displayed' | 'failed'
+type ViewerTransitionKind = 'none' | 'entry' | 'exit'
+type ThumbnailSurfaceKind = 'none' | 'list' | 'grid' | 'waterfall' | 'search'
+
+class ImageVisualState {
+  thumbnailUri: string = ''
+  thumbnailSignature: string = ''
+  transitionThumbnailUri: string = ''
+  originalUri: string = ''
+  thumbnailOrientation: ImageRotateOrientation = ImageRotateOrientation.AUTO
+  originalOrientation: ImageRotateOrientation = ImageRotateOrientation.AUTO
+  userRotation: number = 0
+  physicalWidth: number = 0
+  physicalHeight: number = 0
+  displayWidth: number = 0
+  displayHeight: number = 0
+  thumbnailDisplayWidth: number = 0
+  thumbnailDisplayHeight: number = 0
+  frameWidth: number = 0
+  frameHeight: number = 0
+  frameLocked: boolean = false
+  decodeState: ViewerDecodeState = 'idle'
+  visibleLayer: ViewerImageLayer = 'thumbnail'
+  progress: number = 0
+  progressKnown: boolean = false
+  thumbnailIndex: number = -1
+  thumbnailSurface: ThumbnailSurfaceKind = 'none'
+  thumbnailVisibleRatio: number = 0
+  thumbnailX: number = 0
+  thumbnailY: number = 0
+  thumbnailWidth: number = 0
+  thumbnailHeight: number = 0
+  // The URI that completed decoding on the currently mounted file-page Image.
+  // Keeping this separate from transitionThumbnailUri prevents a recycled
+  // WaterFlow item from being accepted merely because its old area survived.
+  thumbnailDecodedUri: string = ''
+}
+
+class ViewerImageGeometry {
+  physicalWidth: number = 0
+  physicalHeight: number = 0
+  displayWidth: number = 0
+  displayHeight: number = 0
+  orientation: ImageRotateOrientation = ImageRotateOrientation.AUTO
+}
+
+class ViewerFrameCallback extends FrameCallback {
+  private action: () => void
+
+  constructor(action: () => void) {
+    super()
+    this.action = action
+  }
+
+  onFrame(_frameTimeInNano: number): void {
+    this.action()
+  }
+
+  onIdle(_timeLeftInNano: number): void {
+  }
 }
 
 interface SearchSession {
@@ -225,14 +294,7 @@ struct Index {
   @State showImageMoreMenu: boolean = false
   @State showImageDetails: boolean = false
   @State viewerLastNavigationDirection: number = 1
-  @State viewerManualRotations: Record<string, number> = {}
-  @State viewerOriginalUris: Record<string, string> = {}
-  @State viewerImageSourceSizes: Record<string, ThumbnailSize> = {}
-  @State viewerImageLayoutSizes: Record<string, ThumbnailSize> = {}
-  @State viewerImageOrientations: Record<string, ImageRotateOrientation> = {}
-  @State viewerDecodedImages: Record<string, boolean> = {}
-  @State viewerDownloadProgress: Record<string, number> = {}
-  @State viewerDownloadProgressKnown: Record<string, boolean> = {}
+  @State imageVisualStates: Record<string, ImageVisualState> = {}
   @State imageScale: number = 1
   @State imageSavedScale: number = 1
   @State imageOffsetX: number = 0
@@ -251,10 +313,15 @@ struct Index {
   @State imageDismissScale: number = 1
   @State imageDismissOffsetY: number = 0
   @State imageDismissBackdropOpacity: number = 1
+  @State viewerSurfaceOpacity: number = 1
   // The entry animation is limited to the image that was tapped. The normal
   // viewer swiper animation uses viewerTransitionActive and remains separate.
   @State viewerEntryTransitionActive: boolean = false
   @State viewerEntryTransitionPath: string = ''
+  @State viewerTransitionKind: ViewerTransitionKind = 'none'
+  @State viewerTransitionLayer: ViewerImageLayer = 'thumbnail'
+  @State viewerGeometryBound: boolean = false
+  @State viewerFallbackEntryActive: boolean = false
   // Keep the viewer capsule size stable across device rotation. Only its
   // bottom-safe-area position should be recalculated by the new layout.
   @State viewerBottomBarWidthVp: number = 0
@@ -265,12 +332,12 @@ struct Index {
   @State audioPlaying: boolean = false
   @State audioCurrentMs: number = 0
   @State audioDurationMs: number = 0
-  @State previewUris: Record<string, string> = {}
-  @State previewUriSignatures: Record<string, string> = {}
   @State previewCanonicalPaths: Record<string, boolean> = {}
-  @State fileListImageRotations: Record<string, number> = {}
-  @State fileListImageBaseOrientations: Record<string, ImageRotateOrientation> = {}
   @State waterfallOriginalUris: Record<string, string> = {}
+  // PixelMap source changes are committed on a render frame.  The epoch is
+  // intentionally the only reactive value; native PixelMap objects stay in
+  // the private store and are never copied through @State records.
+  @State viewerBitmapEpoch: number = 0
   @State waterfallAspectRatios: Record<string, number> = {}
   @State waterfallVisiblePaths: Record<string, boolean> = {}
   @State waterfallColumnWidthVp: number = 0
@@ -307,6 +374,11 @@ struct Index {
   private downloadQueue: DownloadQueueManager = new DownloadQueueManager()
   private audioManager: AudioPlaybackManager = new AudioPlaybackManager()
   private mediaPreviewManager: MediaPreviewManager = new MediaPreviewManager()
+  private viewerBitmapStore: ViewerBitmapStore = new ViewerBitmapStore()
+  private viewerPreviewBitmaps: Record<string, ViewerBitmapRecord> = {}
+  private viewerPreviewBitmapAliases: Record<string, boolean> = {}
+  private viewerOriginalBitmaps: Record<string, ViewerBitmapRecord> = {}
+  private waterfallBitmaps: Record<string, ViewerBitmapRecord> = {}
   private imageRotationStore: ImageRotationStore = new ImageRotationStore()
   // Keep the already rendered parent pages so system/back navigation does not
   // need to round-trip to the NAS again.
@@ -327,9 +399,8 @@ struct Index {
   private viewerImageDataSource: FileEntryDataSource = new FileEntryDataSource()
   private fileListScroller: Scroller = new Scroller()
   private waterfallScroller: Scroller = new Scroller()
-  // ImageViewer temporarily replaces the file surface with Blank(). Keep the
-  // exact offset of the surface that launched it so returning from a preview
-  // does not recreate the list/grid/waterfall at position zero.
+  // Keep the exact offset of the file surface below ImageViewer so returning
+  // from a preview does not recreate list/grid/waterfall at position zero.
   private viewerReturnScrollOffset: ViewerReturnScrollOffset | null = null
   private viewerReturnScrollPath: string = ''
   private viewerReturnScrollMode: FileViewMode = 'list'
@@ -378,16 +449,21 @@ struct Index {
   private pageTransitionTimer: number = 0
   private bottomBarAnimationToken: number = 0
   private imageChromeAnimationToken: number = 0
-  private viewerEntryTransitionTimer: number = 0
   private viewerEntryTransitionToken: number = 0
-  private viewerCloseCleanupTimer: number = 0
   private viewerClosePending: boolean = false
+  private viewerCloseRequested: boolean = false
+  private viewerReturnReadyPath: string = ''
+  private viewerRevealTokens: Record<string, number> = {}
+  private viewerPendingBitmapReveals: Record<string, boolean> = {}
+  private viewerPendingRotationPath: string = ''
+  private viewerDiagnosticSequence: number = 0
   private lastImageDoubleTapAt: number = 0
   private imageTouchActive: boolean = false
   private imageTouchMoved: boolean = false
   private imageTouchStartX: number = 0
   private imageTouchStartY: number = 0
   private imageDismissDragging: boolean = false
+  private imageDismissChromeWasVisible: boolean = true
   private viewerSwiperController: SwiperController = new SwiperController()
   private viewerLoadQueue: FileEntry[] = []
   private viewerLoadRequests: Record<string, boolean> = {}
@@ -801,7 +877,9 @@ struct Index {
     return this.screen === 'files' && !this.showSearch &&
       !this.shouldShowBottomBar() && !this.contextMenuVisible &&
       !this.showRenameDialog &&
-      !this.showImageViewer && !this.showAudioPlayer && !this.selectionMode
+      !this.showImageViewer && !this.viewerEntryTransitionActive &&
+      !this.viewerFallbackEntryActive &&
+      !this.showAudioPlayer && !this.selectionMode
   }
 
   private updateBottomBarVisibility(animated: boolean = true): void {
@@ -1055,6 +1133,8 @@ struct Index {
         !this.contextMenuVisible && !this.showRenameDialog &&
         !this.showDestinationPicker &&
         !this.showImageViewer &&
+        !this.viewerEntryTransitionActive &&
+        !this.viewerFallbackEntryActive &&
         !this.showAudioPlayer && !this.selectionMode) {
         Stack({ alignContent: Alignment.Bottom }) {
           this.FloatingBottomBar()
@@ -1071,7 +1151,8 @@ struct Index {
 
       if (this.screen === 'files' && this.selectionMode &&
         !this.showDestinationPicker && !this.showRenameDialog &&
-        !this.showImageViewer && !this.showAudioPlayer) {
+        !this.showImageViewer && !this.viewerEntryTransitionActive &&
+        !this.viewerFallbackEntryActive && !this.showAudioPlayer) {
         Stack({ alignContent: Alignment.Bottom }) {
           this.SelectionBottomBar()
         }
@@ -1096,7 +1177,8 @@ struct Index {
       }
 
       if ((this.screen === 'files' || this.screen === 'downloads' || this.screen === 'settings') &&
-        !this.showDestinationPicker && !this.showImageViewer) {
+        !this.showDestinationPicker && !this.showImageViewer &&
+        !this.viewerEntryTransitionActive && !this.viewerFallbackEntryActive) {
         Stack({ alignContent: Alignment.TopStart }) {
           this.TopFileOverlay()
         }
@@ -1365,46 +1447,54 @@ struct Index {
   }
 
   @Builder
-  FileLeadingVisual(entry: FileEntry): void {
-    if (this.shouldReplaceViewerTransitionSource(entry)) {
-      // Keep the row's measured leading slot, but remove the old shared
-      // element node itself. This is the source-side state change required
-      // for the documented geometryTransition enter animation.
-      Blank()
-        .width(40)
-        .height(34)
-    } else {
-      Stack() {
-        if (this.previewUri(entry).length > 0) {
-          Image(this.previewUri(entry))
+  FileLeadingVisual(entry: FileEntry, index: number = -1,
+    surface: ThumbnailSurfaceKind = 'none'): void {
+    Stack() {
+      if (this.shouldReplaceViewerTransitionSource(entry)) {
+        Blank()
+          .width(40)
+          .height(34)
+      } else if (this.fileImageSourceAvailable(entry, surface)) {
+        Image(this.fileImageSource(entry, surface))
             .width(40)
             .height(34)
-            .orientation(this.fileListImageBaseOrientation(entry))
+            .orientation(this.fileImageSourceOrientation(entry, surface))
             .objectFit(ImageFit.Cover)
-            .rotate({ angle: this.fileListImageRotation(entry.path) })
             .borderRadius(6)
-          if (this.isVideo(entry)) {
-            SymbolGlyph($r('sys.symbol.play'))
-              .fontSize(13)
-              .fontColor([Color.White])
-              .backgroundColor('#88000000')
-              .borderRadius(10)
-              .width(22)
-              .height(22)
-          }
-        } else if (entry.isDirectory) {
-          this.FolderIcon(32)
-        } else {
-          Image(this.fileIcon(entry))
-            .width(32)
-            .height(32)
-            .objectFit(ImageFit.Contain)
+            .geometryTransition(this.fileImageTransitionId(entry, surface))
+            .rotate({ angle: this.fileListImageRotation(entry.path) })
+            .scale({
+              x: this.fileThumbnailRotationFitScale(entry, surface),
+              y: this.fileThumbnailRotationFitScale(entry, surface)
+            })
+            .syncLoad(this.fileImageShouldSyncLoad(entry))
+            .onComplete((event?: ViewerImageCompleteEvent): void =>
+              this.recordThumbnailComplete(entry, this.previewUri(entry), index, surface, event))
+        if (this.isVideo(entry)) {
+          SymbolGlyph($r('sys.symbol.play'))
+            .fontSize(13)
+            .fontColor([Color.White])
+            .backgroundColor('#88000000')
+            .borderRadius(10)
+            .width(22)
+            .height(22)
         }
+      } else if (entry.isDirectory) {
+        this.FolderIcon(32)
+      } else {
+        Image(this.fileIcon(entry))
+          .width(32)
+          .height(32)
+          .objectFit(ImageFit.Contain)
       }
-      .width(40)
-      .height(34)
-      .geometryTransition(this.fileImageTransitionId(entry))
     }
+    .width(40)
+    .height(34)
+    .borderRadius(6)
+    .clip(true)
+    .onAreaChange((_, area) => this.recordThumbnailArea(entry, index, surface, area))
+    .onVisibleAreaChange([0.0, 0.999], (_isExpanding: boolean, ratio: number): void =>
+      this.recordThumbnailVisibility(entry, index, surface, ratio))
   }
 
   @Builder
@@ -1557,10 +1647,10 @@ struct Index {
             }
           }
 
-          ForEach(this.searchResults, (entry: FileEntry) => {
+          ForEach(this.searchResults, (entry: FileEntry, index: number) => {
             ListItem() {
               Row() {
-                this.FileLeadingVisual(entry)
+                this.FileLeadingVisual(entry, index, 'search')
                 Column() {
                   Text(entry.name)
                     .fontSize(16)
@@ -1643,7 +1733,7 @@ struct Index {
             Column() {
               Row() {
                 Row() {
-                  this.FileLeadingVisual(entry)
+                  this.FileLeadingVisual(entry, index, 'list')
                 }
                 .margin({ right: 8 })
                 Column() {
@@ -1689,8 +1779,10 @@ struct Index {
           }
           .onAppear(() => {
             this.loadEntryPreview(entry, 0)
+            this.recordThumbnailMountedSource(entry, this.previewUri(entry), index, 'list')
             this.scheduleCachedDirectoryCount(entry)
           })
+          .onDisAppear(() => this.recordThumbnailVisibility(entry, index, 'list', 0))
         }, (entry: FileEntry) => entry.path)
 
       }
@@ -1866,33 +1958,45 @@ struct Index {
         GridItem() {
           Stack({ alignContent: Alignment.TopEnd }) {
             Column({ space: 6 }) {
-              if (this.shouldReplaceViewerTransitionSource(entry)) {
-                Blank()
-                  .width('100%')
-                  .height(82)
-              } else {
-                Stack({ alignContent: Alignment.Center }) {
-                  if (this.previewUri(entry).length > 0) {
-                    Image(this.previewUri(entry))
+              Stack({ alignContent: Alignment.Center }) {
+                if (this.shouldReplaceViewerTransitionSource(entry)) {
+                  Blank()
+                    .width('100%')
+                    .height(82)
+                } else if (this.fileImageSourceAvailable(entry, 'grid')) {
+                  Image(this.fileImageSource(entry, 'grid'))
                       .width('100%')
                       .height(82)
-                      .orientation(this.fileListImageBaseOrientation(entry))
+                      .orientation(this.fileImageSourceOrientation(entry, 'grid'))
                       .objectFit(ImageFit.Cover)
-                      .rotate({ angle: this.fileListImageRotation(entry.path) })
                       .borderRadius(10)
-                  } else if (entry.isDirectory) {
-                    this.FolderIcon(44)
-                  } else {
-                    Image(this.fileIcon(entry))
-                      .width(48)
-                      .height(48)
-                      .objectFit(ImageFit.Contain)
-                  }
+                      .geometryTransition(this.fileImageTransitionId(entry, 'grid'))
+                      .rotate({ angle: this.fileListImageRotation(entry.path) })
+                      .scale({
+                        x: this.fileThumbnailRotationFitScale(entry, 'grid'),
+                        y: this.fileThumbnailRotationFitScale(entry, 'grid')
+                      })
+                      .syncLoad(this.fileImageShouldSyncLoad(entry))
+                      .onComplete((event?: ViewerImageCompleteEvent): void =>
+                        this.recordThumbnailComplete(entry, this.previewUri(entry), index,
+                          'grid', event))
+                } else if (entry.isDirectory) {
+                  this.FolderIcon(44)
+                } else {
+                  Image(this.fileIcon(entry))
+                    .width(48)
+                    .height(48)
+                    .objectFit(ImageFit.Contain)
                 }
-                .width('100%')
-                .height(82)
-                .geometryTransition(this.fileImageTransitionId(entry))
               }
+              .width('100%')
+              .height(82)
+              .borderRadius(10)
+              .clip(true)
+              .onAreaChange((_, area) => this.recordThumbnailArea(entry, index, 'grid', area))
+              .onVisibleAreaChange([0.0, 0.999],
+                (_isExpanding: boolean, ratio: number): void =>
+                  this.recordThumbnailVisibility(entry, index, 'grid', ratio))
 
               Text(entry.name)
                 .fontSize(14)
@@ -1928,8 +2032,10 @@ struct Index {
         }
         .onAppear(() => {
           this.loadEntryPreview(entry, index)
+          this.recordThumbnailMountedSource(entry, this.previewUri(entry), index, 'grid')
           this.scheduleCachedDirectoryCount(entry)
         })
+        .onDisAppear(() => this.recordThumbnailVisibility(entry, index, 'grid', 0))
       }, (entry: FileEntry) => entry.path)
     }
     .columnsTemplate('1fr 1fr')
@@ -1956,9 +2062,6 @@ struct Index {
     }) {
       LazyForEach(this.waterfallDataSource, (entry: FileEntry, index: number) => {
         FlowItem() {
-          // Keep the shared-element frame separate from the clipped render
-          // layer.  Clipping the node that owns geometryTransition can cut
-          // the flight snapshot at the card bounds on some releases.
           Stack() {
             if (this.shouldReplaceViewerTransitionSource(entry)) {
               Blank()
@@ -1967,15 +2070,25 @@ struct Index {
             } else {
               Stack() {
                 Stack({ alignContent: Alignment.Center }) {
-                  if (this.waterfallUri(entry).length > 0) {
-                    Image(this.waterfallUri(entry))
+                  if (this.fileImageSourceAvailable(entry, 'waterfall')) {
+                    Image(this.fileImageSource(entry, 'waterfall'))
                       .width('100%')
                       .height('100%')
                       .sourceSize(this.waterfallSourceSize(entry))
-                      .orientation(this.fileListImageBaseOrientation(entry))
+                      .orientation(this.fileImageSourceOrientation(entry, 'waterfall'))
                       .objectFit(ImageFit.Contain)
+                      .geometryTransition(this.fileImageTransitionId(entry, 'waterfall'))
                       .rotate({ angle: this.fileListImageRotation(entry.path) })
-                      .onComplete(() => this.completeWaterfallDecode(entry))
+                      .scale({
+                        x: this.fileThumbnailRotationFitScale(entry, 'waterfall'),
+                        y: this.fileThumbnailRotationFitScale(entry, 'waterfall')
+                      })
+                      .syncLoad(this.fileImageShouldSyncLoad(entry))
+                      .onComplete((event?: ViewerImageCompleteEvent): void => {
+                        this.recordThumbnailComplete(entry, this.waterfallUri(entry), index,
+                          'waterfall', event)
+                        this.completeWaterfallDecode(entry)
+                      })
                       .onError(() => this.failWaterfallDecode(entry))
                   } else {
                     LoadingProgress()
@@ -1991,7 +2104,6 @@ struct Index {
               }
               .width('100%')
               .height('100%')
-              .geometryTransition(this.fileImageTransitionId(entry))
             }
           }
           .width('100%')
@@ -2005,6 +2117,10 @@ struct Index {
             color: '#2E6BFF',
             radius: 10
           })
+          .onAreaChange((_, area) => this.recordThumbnailArea(entry, index, 'waterfall', area))
+          .onVisibleAreaChange([0.0, 0.999],
+            (_isExpanding: boolean, ratio: number): void =>
+              this.recordThumbnailVisibility(entry, index, 'waterfall', ratio))
           .onClick(() => this.handleFileEntryClick(entry))
           .priorityGesture(
             LongPressGesture({ repeat: false })
@@ -2020,9 +2136,13 @@ struct Index {
         .margin({ top: index < 2 ? this.fileContentTopInset() : 0 })
         .onAppear(() => {
           this.markWaterfallVisible(entry, true)
+          this.recordThumbnailMountedSource(entry, this.waterfallUri(entry), index, 'waterfall')
           this.enqueueWaterfallOriginal(entry, index)
         })
-        .onDisAppear(() => this.markWaterfallVisible(entry, false))
+        .onDisAppear(() => {
+          this.markWaterfallVisible(entry, false)
+          this.recordThumbnailVisibility(entry, index, 'waterfall', 0)
+        })
       }, (entry: FileEntry) => entry.path)
     }
     .columnsTemplate('1fr 1fr')
@@ -3907,9 +4027,358 @@ struct Index {
     .hitTestBehavior(HitTestMode.Default)
   }
 
+  private copyImageVisualState(source?: ImageVisualState): ImageVisualState {
+    const next = new ImageVisualState()
+    if (source === undefined) {
+      return next
+    }
+    next.thumbnailUri = source.thumbnailUri
+    next.thumbnailSignature = source.thumbnailSignature
+    next.transitionThumbnailUri = source.transitionThumbnailUri
+    next.originalUri = source.originalUri
+    next.thumbnailOrientation = source.thumbnailOrientation
+    next.originalOrientation = source.originalOrientation
+    next.userRotation = source.userRotation
+    next.physicalWidth = source.physicalWidth
+    next.physicalHeight = source.physicalHeight
+    next.displayWidth = source.displayWidth
+    next.displayHeight = source.displayHeight
+    next.thumbnailDisplayWidth = source.thumbnailDisplayWidth
+    next.thumbnailDisplayHeight = source.thumbnailDisplayHeight
+    next.frameWidth = source.frameWidth
+    next.frameHeight = source.frameHeight
+    next.frameLocked = source.frameLocked
+    next.decodeState = source.decodeState
+    next.visibleLayer = source.visibleLayer
+    next.progress = source.progress
+    next.progressKnown = source.progressKnown
+    next.thumbnailIndex = source.thumbnailIndex
+    next.thumbnailSurface = source.thumbnailSurface
+    next.thumbnailVisibleRatio = source.thumbnailVisibleRatio
+    next.thumbnailX = source.thumbnailX
+    next.thumbnailY = source.thumbnailY
+    next.thumbnailWidth = source.thumbnailWidth
+    next.thumbnailHeight = source.thumbnailHeight
+    next.thumbnailDecodedUri = source.thumbnailDecodedUri
+    return next
+  }
+
+  private imageVisualState(path: string): ImageVisualState {
+    const state = this.imageVisualStates[path]
+    return state === undefined ? new ImageVisualState() : state
+  }
+
+  private updateImageVisualState(path: string, update: (state: ImageVisualState) => void): void {
+    if (path.length === 0) {
+      return
+    }
+    const nextStates: Record<string, ImageVisualState> = {}
+    for (const key of Object.keys(this.imageVisualStates)) {
+      nextStates[key] = this.imageVisualStates[key]
+    }
+    const next = this.copyImageVisualState(this.imageVisualStates[path])
+    update(next)
+    nextStates[path] = next
+    this.imageVisualStates = nextStates
+  }
+
+  private nextRenderFrame(): Promise<void> {
+    return new Promise<void>((resolve: () => void): void => {
+      this.getUIContext().postFrameCallback(new ViewerFrameCallback(resolve))
+    })
+  }
+
+  private postRenderFrame(action: () => void): void {
+    this.getUIContext().postFrameCallback(new ViewerFrameCallback(action))
+  }
+
   private viewerOriginalUri(entry: FileEntry): string {
-    const uri = this.viewerOriginalUris[entry.path]
-    return typeof uri === 'string' ? uri : ''
+    return this.imageVisualState(entry.path).originalUri
+  }
+
+  /**
+   * PixelMaps are kept outside @State because they are native resources.  A
+   * monotonically increasing epoch is read here so a source swap still
+   * invalidates the ArkUI builder after the private map is changed.
+   */
+  private viewerBitmap(entry: FileEntry, originalOnly: boolean = false): ViewerBitmapRecord | null {
+    const epoch = this.viewerBitmapEpoch
+    if (epoch < 0) {
+      return null
+    }
+    const original = this.viewerOriginalBitmaps[entry.path]
+    if (original !== undefined && (originalOnly ||
+      this.imageVisualState(entry.path).visibleLayer === 'original')) {
+      return original
+    }
+    if (originalOnly) {
+      return null
+    }
+    const preview = this.viewerPreviewBitmaps[entry.path]
+    return preview === undefined ? null : preview
+  }
+
+  private viewerImageSource(entry: FileEntry): image.PixelMap | string {
+    const bitmap = this.viewerBitmap(entry)
+    if (bitmap !== null) {
+      return bitmap.pixelMap
+    }
+    const state = this.imageVisualState(entry.path)
+    if (state.visibleLayer === 'original' && state.originalUri.length > 0) {
+      return state.originalUri
+    }
+    return this.viewerThumbnailUri(entry)
+  }
+
+  private fileImageSource(entry: FileEntry, surface: ThumbnailSurfaceKind): image.PixelMap | string {
+    if (this.viewerEntryTransitionActive && this.viewerEntryTransitionPath === entry.path) {
+      const transitionBitmap = this.viewerTransitionKind === 'exit' &&
+        this.viewerTransitionLayer === 'original'
+        ? this.viewerOriginalBitmaps[entry.path] : this.viewerPreviewBitmaps[entry.path]
+      if (transitionBitmap !== undefined) {
+        return transitionBitmap.pixelMap
+      }
+    }
+    if (surface === 'waterfall') {
+      const waterfallBitmap = this.waterfallBitmaps[entry.path]
+      if (waterfallBitmap !== undefined) {
+        return waterfallBitmap.pixelMap
+      }
+    }
+    if (surface === 'waterfall') {
+      return this.waterfallUri(entry)
+    }
+    return this.previewUri(entry)
+  }
+
+  private fileImageSourceAvailable(entry: FileEntry, surface: ThumbnailSurfaceKind): boolean {
+    const source = this.fileImageSource(entry, surface)
+    return typeof source === 'string' ? source.length > 0 : true
+  }
+
+  private fileImageSourceOrientation(entry: FileEntry,
+    surface: ThumbnailSurfaceKind): ImageRotateOrientation {
+    return typeof this.fileImageSource(entry, surface) === 'string'
+      ? this.fileListImageBaseOrientation(entry) : ImageRotateOrientation.UP
+  }
+
+  private viewerImageSourceOrientation(entry: FileEntry): ImageRotateOrientation {
+    if (this.viewerBitmap(entry) !== null) {
+      return ImageRotateOrientation.UP
+    }
+    const state = this.imageVisualState(entry.path)
+    return state.visibleLayer === 'original'
+      ? state.originalOrientation : this.viewerPreviewImageOrientation(entry)
+  }
+
+  private async ensureViewerPreviewBitmap(entry: FileEntry): Promise<ViewerBitmapRecord | null> {
+    const existing = this.viewerPreviewBitmaps[entry.path]
+    if (existing !== undefined) {
+      return existing
+    }
+    const waterfallBitmap = this.waterfallBitmaps[entry.path]
+    if (waterfallBitmap !== undefined) {
+      const next: Record<string, ViewerBitmapRecord> = {}
+      for (const key of Object.keys(this.viewerPreviewBitmaps)) {
+        next[key] = this.viewerPreviewBitmaps[key]
+      }
+      next[entry.path] = waterfallBitmap
+      this.viewerPreviewBitmaps = next
+      this.viewerPreviewBitmapAliases[entry.path] = true
+      this.bumpViewerBitmapEpoch()
+      this.applyDecodedBitmapGeometry(entry.path, waterfallBitmap, false)
+      return waterfallBitmap
+    }
+    let localPath = this.previewLocalPaths[entry.path]
+    if (typeof localPath !== 'string' || localPath.length === 0 || !CacheManager.exists(localPath)) {
+      localPath = this.waterfallLocalPaths[entry.path]
+    }
+    if (typeof localPath !== 'string' || localPath.length === 0 || !CacheManager.exists(localPath)) {
+      return null
+    }
+    const record = await this.viewerBitmapStore.decode(localPath, 'viewerPreview')
+    if (record === null) {
+      return null
+    }
+    const raced = this.viewerPreviewBitmaps[entry.path]
+    if (raced !== undefined) {
+      await this.viewerBitmapStore.release(record)
+      return raced
+    }
+    this.installViewerBitmap(this.viewerPreviewBitmaps, entry.path, record)
+    this.viewerPreviewBitmapAliases[entry.path] = false
+    this.updateImageVisualState(entry.path, (state: ImageVisualState): void => {
+      if (state.physicalWidth <= 0 || state.physicalHeight <= 0) {
+        state.physicalWidth = record.physicalWidth
+        state.physicalHeight = record.physicalHeight
+      }
+      if (state.displayWidth <= 0 || state.displayHeight <= 0) {
+        state.displayWidth = record.displayWidth
+        state.displayHeight = record.displayHeight
+      }
+      if (state.thumbnailDisplayWidth <= 0 || state.thumbnailDisplayHeight <= 0) {
+        state.thumbnailDisplayWidth = record.displayWidth
+        state.thumbnailDisplayHeight = record.displayHeight
+      }
+      if (!state.frameLocked) {
+        state.frameWidth = record.displayWidth
+        state.frameHeight = record.displayHeight
+      }
+    })
+    return record
+  }
+
+  private async decodeViewerOriginalBitmap(entry: FileEntry,
+    localPath: string): Promise<ViewerBitmapRecord | null> {
+    const existing = this.viewerOriginalBitmaps[entry.path]
+    if (existing !== undefined) {
+      return existing
+    }
+    const record = await this.viewerBitmapStore.decode(localPath, 'viewerZoom')
+    if (record === null) {
+      return null
+    }
+    const raced = this.viewerOriginalBitmaps[entry.path]
+    if (raced !== undefined) {
+      await this.viewerBitmapStore.release(record)
+      return raced
+    }
+    this.installViewerBitmap(this.viewerOriginalBitmaps, entry.path, record)
+    return record
+  }
+
+  private applyDecodedBitmapGeometry(path: string, record: ViewerBitmapRecord,
+    original: boolean): void {
+    this.updateImageVisualState(path, (state: ImageVisualState): void => {
+      if (original) {
+        state.originalOrientation = ImageRotateOrientation.UP
+      }
+      state.physicalWidth = record.physicalWidth
+      state.physicalHeight = record.physicalHeight
+      state.displayWidth = record.displayWidth
+      state.displayHeight = record.displayHeight
+      if (!state.frameLocked) {
+        state.frameWidth = record.displayWidth
+        state.frameHeight = record.displayHeight
+        state.frameLocked = true
+      }
+    })
+  }
+
+  private bumpViewerBitmapEpoch(): void {
+    this.viewerBitmapEpoch += 1
+  }
+
+  private installViewerBitmap(target: Record<string, ViewerBitmapRecord>,
+    path: string, record: ViewerBitmapRecord): void {
+    const next: Record<string, ViewerBitmapRecord> = {}
+    for (const key of Object.keys(target)) {
+      next[key] = target[key]
+    }
+    next[path] = record
+    if (target === this.viewerPreviewBitmaps) {
+      this.viewerPreviewBitmaps = next
+      this.viewerPreviewBitmapAliases[path] = false
+    } else if (target === this.viewerOriginalBitmaps) {
+      this.viewerOriginalBitmaps = next
+    } else {
+      this.waterfallBitmaps = next
+    }
+    this.bumpViewerBitmapEpoch()
+  }
+
+  private removeViewerBitmap(target: Record<string, ViewerBitmapRecord>, path: string): ViewerBitmapRecord | null {
+    const existing = target[path]
+    if (existing === undefined) {
+      return null
+    }
+    const next: Record<string, ViewerBitmapRecord> = {}
+    for (const key of Object.keys(target)) {
+      if (key !== path) {
+        next[key] = target[key]
+      }
+    }
+    if (target === this.viewerPreviewBitmaps) {
+      this.viewerPreviewBitmaps = next
+    } else if (target === this.viewerOriginalBitmaps) {
+      this.viewerOriginalBitmaps = next
+    } else {
+      this.waterfallBitmaps = next
+    }
+    this.bumpViewerBitmapEpoch()
+    return existing
+  }
+
+  private async releaseViewerBitmap(target: Record<string, ViewerBitmapRecord>,
+    path: string): Promise<void> {
+    const record = this.removeViewerBitmap(target, path)
+    if (record !== null) {
+      await this.viewerBitmapStore.release(record)
+    }
+  }
+
+  private async releaseViewerSessionBitmaps(entries: FileEntry[]): Promise<void> {
+    const previews = this.viewerPreviewBitmaps
+    const originals = this.viewerOriginalBitmaps
+    this.viewerPreviewBitmaps = {}
+    this.viewerOriginalBitmaps = {}
+    const previewAliases = this.viewerPreviewBitmapAliases
+    this.viewerPreviewBitmapAliases = {}
+    this.bumpViewerBitmapEpoch()
+    for (const entry of entries) {
+      const preview = previews[entry.path]
+      if (preview !== undefined && previewAliases[entry.path] !== true) {
+        await this.viewerBitmapStore.release(preview)
+      }
+      const original = originals[entry.path]
+      if (original !== undefined) {
+        await this.viewerBitmapStore.release(original)
+      }
+    }
+  }
+
+  private viewerThumbnailUri(entry: FileEntry): string {
+    const state = this.imageVisualState(entry.path)
+    if (state.transitionThumbnailUri.length > 0) {
+      return state.transitionThumbnailUri
+    }
+    return this.previewUri(entry)
+  }
+
+  private logViewerDiagnostic(stage: string, path: string = ''): void {
+    if (!IMAGE_VIEWER_DIAGNOSTICS) {
+      return
+    }
+    const resolvedPath = path.length > 0 ? path :
+      (this.viewerImageEntry === null ? '' : this.viewerImageEntry.path)
+    const state = this.imageVisualState(resolvedPath)
+    const entry = this.viewerImages.find((item: FileEntry): boolean => item.path === resolvedPath)
+    const currentThumbnailUri = entry === undefined ? '' :
+      this.thumbnailSurfaceUri(entry, state.thumbnailSurface)
+    this.viewerDiagnosticSequence += 1
+    const message = 'seq=' + this.viewerDiagnosticSequence.toString() +
+      ' stage=' + stage +
+      ' path=' + resolvedPath +
+      ' index=' + this.viewerImageIndex.toString() +
+      ' chrome=' + this.viewerChromeIndex.toString() +
+      ' pending=' + this.viewerPendingIndex.toString() +
+      ' surface=' + state.thumbnailSurface +
+      ' thumb=' + state.thumbnailDisplayWidth.toString() + 'x' +
+      state.thumbnailDisplayHeight.toString() +
+      ' frame=' + state.frameWidth.toString() + 'x' + state.frameHeight.toString() +
+      ' physical=' + state.physicalWidth.toString() + 'x' + state.physicalHeight.toString() +
+      ' display=' + state.displayWidth.toString() + 'x' + state.displayHeight.toString() +
+      ' rotation=' + state.userRotation.toString() +
+      ' decode=' + state.decodeState +
+      ' layer=' + state.visibleLayer +
+      ' bitmap=' + (this.viewerOriginalBitmaps[resolvedPath] !== undefined
+        ? 'original' : (this.viewerPreviewBitmaps[resolvedPath] !== undefined ? 'preview' : 'uri')) +
+      ' epoch=' + this.viewerBitmapEpoch.toString() +
+      ' transition=' + this.viewerTransitionKind +
+      ' geometry=' + this.viewerGeometryBound.toString() +
+      ' uriReady=' + (currentThumbnailUri.length > 0 &&
+        state.thumbnailDecodedUri === currentThumbnailUri).toString()
+    hilog.info(IMAGE_VIEWER_HILOG_DOMAIN, IMAGE_VIEWER_HILOG_TAG, '%{public}s', message)
   }
 
   /**
@@ -3929,10 +4398,19 @@ struct Index {
       event.componentHeight.toString() + ' content=' + event.contentWidth.toString() +
       'x' + event.contentHeight.toString() + ' offset=' + event.contentOffsetX.toString() +
       ',' + event.contentOffsetY.toString() + ' status=' + event.loadingStatus.toString())
+    if (IMAGE_VIEWER_DIAGNOSTICS) {
+      hilog.info(IMAGE_VIEWER_HILOG_DOMAIN, IMAGE_VIEWER_HILOG_TAG, '%{public}s',
+        'render layer=' + layer + ' path=' + path +
+          ' source=' + event.width.toString() + 'x' + event.height.toString() +
+          ' component=' + event.componentWidth.toString() + 'x' + event.componentHeight.toString() +
+          ' content=' + event.contentWidth.toString() + 'x' + event.contentHeight.toString() +
+          ' offset=' + event.contentOffsetX.toString() + ',' + event.contentOffsetY.toString())
+    }
   }
 
   private viewerImageDecoded(entry: FileEntry): boolean {
-    return this.viewerDecodedImages[entry.path] === true
+    const state = this.imageVisualState(entry.path)
+    return state.decodeState === 'decoded' || state.decodeState === 'displayed'
   }
 
   private viewerPageScale(index: number): number {
@@ -3955,9 +4433,9 @@ struct Index {
    * Keep the frame ratio from the first known display geometry instead.
    */
   private viewerImageFrameAspectRatio(entry: FileEntry): number {
-    const size = this.viewerImageLayoutSize(entry)
-    if (size !== null && size.width > 0 && size.height > 0) {
-      return Math.max(0.05, Math.min(20, size.width / size.height))
+    const state = this.imageVisualState(entry.path)
+    if (state.frameWidth > 0 && state.frameHeight > 0) {
+      return Math.max(0.05, Math.min(20, state.frameWidth / state.frameHeight))
     }
     const viewportWidth = Math.max(1, this.imageViewportWidthVp)
     const viewportHeight = Math.max(1, this.imageViewportHeightVp)
@@ -3976,17 +4454,43 @@ struct Index {
    * thumbnail cannot expose metadata, reserve a viewport-ratio frame now;
    * original-file metadata must never replace it later and cause a jump.
    */
-  private ensureViewerImageFrame(entry: FileEntry): void {
-    if (this.viewerImageLayoutSize(entry) !== null) {
+  private viewerImageFrameCandidate(entry: FileEntry): ThumbnailSize | null {
+    const state = this.imageVisualState(entry.path)
+    if (state.thumbnailDisplayWidth > 0 && state.thumbnailDisplayHeight > 0) {
+      return { width: state.thumbnailDisplayWidth, height: state.thumbnailDisplayHeight }
+    }
+    if (state.displayWidth > 0 && state.displayHeight > 0) {
+      return { width: state.displayWidth, height: state.displayHeight }
+    }
+    const waterfallRatio = this.waterfallAspectRatios[entry.path]
+    if (typeof waterfallRatio === 'number' && waterfallRatio > 0) {
+      return { width: waterfallRatio, height: 1 }
+    }
+    return null
+  }
+
+  private ensureViewerImageFrame(entry: FileEntry,
+    allowViewportFallback: boolean = true): void {
+    const state = this.imageVisualState(entry.path)
+    if (state.frameLocked) {
       return
     }
-    this.setViewerImageLayoutSize(entry.path, {
-      width: Math.max(1, this.imageViewportWidthVp),
-      height: Math.max(1, this.imageViewportHeightVp)
+    const candidate = this.viewerImageFrameCandidate(entry)
+    if (candidate === null && !allowViewportFallback) {
+      return
+    }
+    const width = candidate === null
+      ? Math.max(1, this.imageViewportWidthVp) : candidate.width
+    const height = candidate === null
+      ? Math.max(1, this.imageViewportHeightVp) : candidate.height
+    this.updateImageVisualState(entry.path, (next: ImageVisualState): void => {
+      next.frameWidth = width
+      next.frameHeight = height
+      next.frameLocked = true
     })
-    console.info('[UgreenViewerGeometry] frame-locked-fallback path=' + entry.path +
-      ' size=' + this.imageViewportWidthVp.toString() + 'x' +
-      this.imageViewportHeightVp.toString())
+    console.info('[UgreenViewerGeometry] frame-locked path=' + entry.path +
+      ' size=' + width.toString() + 'x' + height.toString() +
+      ' source=' + (candidate === null ? 'viewport-fallback' : 'image-metadata'))
   }
 
   private viewerPageOffsetX(index: number): number {
@@ -4005,15 +4509,11 @@ struct Index {
   }
 
   private viewerProgress(entry: FileEntry): number {
-    if (this.viewerImageDecoded(entry)) {
-      return 100
-    }
-    const value = this.viewerDownloadProgress[entry.path]
-    return typeof value === 'number' ? value : 0
+    return this.imageVisualState(entry.path).progress
   }
 
   private viewerProgressKnown(entry: FileEntry): boolean {
-    return this.viewerDownloadProgressKnown[entry.path] === true
+    return this.imageVisualState(entry.path).progressKnown
   }
 
   private updateViewerDownloadProgress(path: string, progress: BinaryDownloadProgress): void {
@@ -4041,8 +4541,9 @@ struct Index {
       return
     }
     const nextValue = Math.min(100, Math.max(0, value))
-    const previousValue = this.viewerDownloadProgress[path]
-    const previousKnown = this.viewerDownloadProgressKnown[path] === true
+    const state = this.imageVisualState(path)
+    const previousValue = state.progress
+    const previousKnown = state.progressKnown
     const now = Date.now()
     const lastUpdate = this.viewerProgressLastUpdateAt[path]
     if (!force && typeof lastUpdate === 'number' && now - lastUpdate < 80) {
@@ -4051,20 +4552,138 @@ struct Index {
     if (previousValue === nextValue && previousKnown === known) {
       return
     }
-    const nextValues: Record<string, number> = {}
-    for (const key of Object.keys(this.viewerDownloadProgress)) {
-      nextValues[key] = this.viewerDownloadProgress[key]
-    }
-    nextValues[path] = nextValue
-    this.viewerDownloadProgress = nextValues
-
-    const nextKnown: Record<string, boolean> = {}
-    for (const key of Object.keys(this.viewerDownloadProgressKnown)) {
-      nextKnown[key] = this.viewerDownloadProgressKnown[key]
-    }
-    nextKnown[path] = known
-    this.viewerDownloadProgressKnown = nextKnown
+    this.updateImageVisualState(path, (next: ImageVisualState): void => {
+      next.progress = nextValue
+      next.progressKnown = known
+    })
     this.viewerProgressLastUpdateAt[path] = now
+  }
+
+  private thumbnailSurfaceIsCurrent(surface: ThumbnailSurfaceKind): boolean {
+    if (surface === 'search') {
+      return this.screen === 'files' && this.showSearch
+    }
+    if (this.screen !== 'files' || this.showSearch) {
+      return false
+    }
+    return surface === this.fileViewMode
+  }
+
+  private thumbnailSurfaceUri(entry: FileEntry, surface: ThumbnailSurfaceKind): string {
+    if (surface === 'waterfall') {
+      const uri = this.waterfallOriginalUris[entry.path]
+      return typeof uri === 'string' ? uri : ''
+    }
+    return this.previewUri(entry)
+  }
+
+  private recordThumbnailMountedSource(entry: FileEntry, uri: string, index: number,
+    surface: ThumbnailSurfaceKind): void {
+    if (!this.isImage(entry) || !this.thumbnailSurfaceIsCurrent(surface)) {
+      return
+    }
+    const resolvedUri = uri.length > 0 ? uri : this.thumbnailSurfaceUri(entry, surface)
+    this.updateImageVisualState(entry.path, (state: ImageVisualState): void => {
+      state.thumbnailIndex = index
+      state.thumbnailSurface = surface
+      if (resolvedUri.length > 0) {
+        state.thumbnailDecodedUri = ''
+        state.transitionThumbnailUri = resolvedUri
+      }
+    })
+  }
+
+  private recordThumbnailComplete(entry: FileEntry, uri: string, index: number,
+    surface: ThumbnailSurfaceKind, event?: ViewerImageCompleteEvent): void {
+    if (event === undefined || !this.isImage(entry) ||
+      !this.thumbnailSurfaceIsCurrent(surface)) {
+      return
+    }
+    // contentWidth/contentHeight are the fitted rectangle inside the current
+    // component (Cover can make them equal to the card), not source metadata.
+    // Keep the decoder dimensions here; frame locking is performed only from
+    // Image Kit metadata before a viewer transition.
+    const displayWidth = event.width
+    const displayHeight = event.height
+    if (displayWidth <= 0 || displayHeight <= 0) {
+      return
+    }
+    this.updateImageVisualState(entry.path, (state: ImageVisualState): void => {
+      state.thumbnailIndex = index
+      state.thumbnailSurface = surface
+      state.transitionThumbnailUri = uri
+      state.thumbnailDecodedUri = uri
+      state.thumbnailDisplayWidth = displayWidth
+      state.thumbnailDisplayHeight = displayHeight
+    })
+    if (surface === 'waterfall' &&
+      (this.waterfallAspectRatios[entry.path] === undefined ||
+        this.waterfallAspectRatios[entry.path] <= 0)) {
+      const ratioWidth = displayWidth > 0 ? displayWidth : event.width
+      const ratioHeight = displayHeight > 0 ? displayHeight : event.height
+      if (ratioWidth > 0 && ratioHeight > 0) {
+        this.setWaterfallAspectRatio(entry.path, ratioWidth, ratioHeight)
+      }
+    }
+    if (this.showImageViewer && this.viewerImageEntry !== null &&
+      this.viewerImageEntry.path === entry.path) {
+      this.logViewerDiagnostic('file-source-decoded', entry.path)
+    }
+  }
+
+  private recordViewerThumbnailComplete(path: string,
+    event?: ViewerImageCompleteEvent): void {
+    if (event === undefined || path.length === 0) {
+      return
+    }
+    const displayWidth = event.width
+    const displayHeight = event.height
+    if (displayWidth <= 0 || displayHeight <= 0) {
+      return
+    }
+    this.updateImageVisualState(path, (state: ImageVisualState): void => {
+      if (state.thumbnailDisplayWidth <= 0 || state.thumbnailDisplayHeight <= 0) {
+        state.thumbnailDisplayWidth = displayWidth
+        state.thumbnailDisplayHeight = displayHeight
+      }
+    })
+  }
+
+  private recordThumbnailArea(entry: FileEntry, index: number,
+    surface: ThumbnailSurfaceKind, area: Area): void {
+    if (!this.isImage(entry) || !this.thumbnailSurfaceIsCurrent(surface) ||
+      typeof area.width !== 'number' || typeof area.height !== 'number' ||
+      typeof area.globalPosition.x !== 'number' || typeof area.globalPosition.y !== 'number') {
+      return
+    }
+    const uri = this.thumbnailSurfaceUri(entry, surface)
+    this.updateImageVisualState(entry.path, (state: ImageVisualState): void => {
+      state.thumbnailIndex = index
+      state.thumbnailSurface = surface
+      state.thumbnailX = area.globalPosition.x as number
+      state.thumbnailY = area.globalPosition.y as number
+      state.thumbnailWidth = area.width as number
+      state.thumbnailHeight = area.height as number
+      if (uri.length > 0) {
+        state.transitionThumbnailUri = uri
+      }
+    })
+  }
+
+  private recordThumbnailVisibility(entry: FileEntry, index: number,
+    surface: ThumbnailSurfaceKind, ratio: number): void {
+    if (!this.isImage(entry) || !this.thumbnailSurfaceIsCurrent(surface)) {
+      return
+    }
+    const uri = this.thumbnailSurfaceUri(entry, surface)
+    this.updateImageVisualState(entry.path, (state: ImageVisualState): void => {
+      state.thumbnailIndex = index
+      state.thumbnailSurface = surface
+      state.thumbnailVisibleRatio = Math.min(1, Math.max(0, ratio))
+      if (uri.length > 0) {
+        state.transitionThumbnailUri = uri
+      }
+    })
   }
 
   /**
@@ -4081,47 +4700,74 @@ struct Index {
   }
 
   private shouldReplaceViewerTransitionSource(entry: FileEntry): boolean {
-    // Keep the source slot blank for the entire viewer lifetime, including
-    // the close animation. The official geometryTransition pattern changes
-    // the hierarchy once: the source thumbnail is restored only in the same
-    // state update that removes the viewer. Restoring it earlier would leave
-    // a live thumbnail underneath the viewer and produce a second image.
     if (!this.showImageViewer) {
       return false
     }
-    const viewerEntry = this.currentViewerEntry()
+    if (this.viewerFallbackEntryActive) {
+      return false
+    }
+    // The Swiper target is not committed until onAnimationEnd. Keep hiding
+    // the previously committed source while pages are moving; otherwise a
+    // fast swipe exposes the incoming thumbnail below the wrong detail page.
+    const viewerEntry = this.viewerImageEntry
     return viewerEntry !== null && viewerEntry.path === entry.path && this.isImage(entry)
   }
 
-  private fileImageTransitionId(entry: FileEntry): string {
-    // The file surface stays mounted under the viewer. During the shared
-    // element state change the source id must be removed while the viewer
-    // target id is present; otherwise ArkUI sees two live components with
-    // the same geometry-transition id instead of one source/one target.
-    if (this.showImageViewer) {
+  private fileThumbnailRotationFitScale(entry: FileEntry,
+    surface: ThumbnailSurfaceKind): number {
+    const angle = ((this.fileListImageRotation(entry.path) % 360) + 360) % 360
+    if (angle !== 90 && angle !== 270) {
+      return 1
+    }
+    const state = this.imageVisualState(entry.path)
+    let width = state.thumbnailSurface === surface ? state.thumbnailWidth : 0
+    let height = state.thumbnailSurface === surface ? state.thumbnailHeight : 0
+    if (width <= 0 || height <= 0) {
+      if (surface === 'list' || surface === 'search') {
+        width = 40
+        height = 34
+      } else if (surface === 'waterfall') {
+        width = this.waterfallColumnWidthVp > 0 ? this.waterfallColumnWidthVp : 160
+        height = width / this.waterfallAspectRatio(entry)
+      } else {
+        width = Math.max(1, (this.pageWidthVp - 28) / 2 - 12)
+        height = 82
+      }
+    }
+    return Math.min(width / height, height / width)
+  }
+
+  private fileImageShouldSyncLoad(entry: FileEntry): boolean {
+    return this.viewerEntryTransitionActive &&
+      this.viewerEntryTransitionPath === entry.path && this.isImage(entry)
+  }
+
+  private viewerImageShouldSyncLoad(entry: FileEntry,
+    layer: ViewerImageLayer): boolean {
+    return this.viewerEntryTransitionActive &&
+      this.viewerEntryTransitionPath === entry.path &&
+      this.viewerTransitionLayer === layer
+  }
+
+  private fileImageTransitionId(entry: FileEntry,
+    surface: ThumbnailSurfaceKind): string {
+    if (this.showImageViewer || !this.viewerGeometryBound) {
+      return ''
+    }
+    if (!this.thumbnailSurfaceIsCurrent(surface)) {
       return ''
     }
     if (!this.viewerEntryTransitionActive ||
       this.viewerEntryTransitionPath !== entry.path || !this.isImage(entry)) {
       return ''
     }
-    // A transition is only created when the source has something rendered.
-    // This avoids animating a loading placeholder into a full-screen image.
-    // During the return state change WaterFlow has not fired onAppear yet;
-    // its retained URI is still a valid source and must keep the id alive for
-    // that first layout pass.
-    const retainedWaterfallUri = this.viewerEntryTransitionPath === entry.path
-      ? this.waterfallOriginalUris[entry.path] : ''
-    if (this.previewUri(entry).length === 0 && this.waterfallUri(entry).length === 0 &&
-      (typeof retainedWaterfallUri !== 'string' || retainedWaterfallUri.length === 0)) {
-      return ''
-    }
     return this.imageTransitionId(entry.path)
   }
 
-  private viewerImageTransitionId(entry: FileEntry): string {
+  private viewerImageTransitionId(entry: FileEntry, layer: ViewerImageLayer): string {
     if (!this.viewerEntryTransitionActive ||
-      this.viewerEntryTransitionPath !== entry.path) {
+      this.viewerEntryTransitionPath !== entry.path ||
+      !this.viewerGeometryBound || this.viewerTransitionLayer !== layer) {
       return ''
     }
     return this.imageTransitionId(entry.path)
@@ -4129,64 +4775,62 @@ struct Index {
 
   private clearViewerEntryTransition(): void {
     this.viewerEntryTransitionToken += 1
-    if (this.viewerEntryTransitionTimer !== 0) {
-      clearTimeout(this.viewerEntryTransitionTimer)
-      this.viewerEntryTransitionTimer = 0
-    }
     this.viewerEntryTransitionActive = false
     this.viewerEntryTransitionPath = ''
-  }
-
-  private scheduleViewerEntryTransitionCleanup(): void {
-    if (!this.viewerEntryTransitionActive) {
-      return
-    }
-    if (this.viewerEntryTransitionTimer !== 0) {
-      clearTimeout(this.viewerEntryTransitionTimer)
-    }
-    const token = this.viewerEntryTransitionToken + 1
-    this.viewerEntryTransitionToken = token
-    this.viewerEntryTransitionTimer = setTimeout((): void => {
-      if (token !== this.viewerEntryTransitionToken) {
-        return
-      }
-      this.viewerEntryTransitionActive = false
-      this.viewerEntryTransitionPath = ''
-      this.viewerEntryTransitionTimer = 0
-    }, IMAGE_GEOMETRY_TRANSITION_SETTLE)
+    this.viewerTransitionKind = 'none'
+    this.viewerTransitionLayer = 'thumbnail'
+    this.viewerGeometryBound = false
   }
 
   private startViewerEntryTransition(entry: FileEntry): void {
     this.clearViewerEntryTransition()
-    if (!this.hasViewerTransitionSource(entry)) {
+    if (!this.hasViewerTransitionSource(entry, false)) {
       return
     }
     this.viewerEntryTransitionPath = entry.path
+    this.viewerTransitionKind = 'entry'
+    this.viewerTransitionLayer = 'thumbnail'
+    this.viewerGeometryBound = true
     this.viewerEntryTransitionActive = true
   }
 
-  private hasViewerTransitionSource(entry: FileEntry | null): boolean {
+  private hasViewerTransitionSource(entry: FileEntry | null,
+    requireFullyVisible: boolean): boolean {
     if (entry === null || !this.isImage(entry)) {
       return false
     }
-    if (this.previewUri(entry).length > 0 || this.waterfallUri(entry).length > 0) {
-      return true
-    }
-    // WaterFlow can briefly report an item as not visible while its layout
-    // window is being rebuilt. The URI is still a valid local source for the
-    // shared-element return, so do not discard the transition for that
-    // transient visibility flag.
-    const waterfallUri = this.waterfallOriginalUris[entry.path]
-    return typeof waterfallUri === 'string' && waterfallUri.length > 0
+    const state = this.imageVisualState(entry.path)
+    const currentThumbnailUri = this.thumbnailSurfaceUri(entry, state.thumbnailSurface)
+    const requiredRatio = requireFullyVisible ? 0.999 : 0.001
+    const topBoundary = state.thumbnailSurface === 'search'
+      ? this.topSafeInset() + 124 : this.fileContentTopInset()
+    const bottomBoundary = Math.max(topBoundary,
+      this.pageHeightVp - this.bottomSafeInset() - 8)
+    const fitsReturnViewport = !requireFullyVisible ||
+      (state.thumbnailY >= topBoundary &&
+        state.thumbnailY + state.thumbnailHeight <= bottomBoundary)
+    const transitionBitmapReady = this.viewerPreviewBitmaps[entry.path] !== undefined
+    return transitionBitmapReady && currentThumbnailUri.length > 0 &&
+      state.transitionThumbnailUri === currentThumbnailUri &&
+      state.displayWidth > 0 && state.displayHeight > 0 &&
+      state.thumbnailWidth > 0 && state.thumbnailHeight > 0 &&
+      state.thumbnailVisibleRatio >= requiredRatio &&
+      fitsReturnViewport && this.thumbnailSurfaceIsCurrent(state.thumbnailSurface)
   }
 
-  private startViewerExitTransition(entry: FileEntry | null): void {
+  private startViewerExitTransition(entry: FileEntry | null,
+    layer: ViewerImageLayer): boolean {
     this.clearViewerEntryTransition()
-    if (!this.hasViewerTransitionSource(entry)) {
-      return
+    if (!this.hasViewerTransitionSource(entry, true)) {
+      return false
     }
-    this.viewerEntryTransitionPath = (entry as FileEntry).path
+    const targetEntry = entry as FileEntry
+    this.viewerEntryTransitionPath = targetEntry.path
+    this.viewerTransitionKind = 'exit'
+    this.viewerTransitionLayer = layer
+    this.viewerGeometryBound = false
     this.viewerEntryTransitionActive = true
+    return true
   }
 
   /**
@@ -4259,16 +4903,14 @@ struct Index {
         if (index !== targetIndex) {
           this.viewerTransitionActive = true
           this.viewerPendingIndex = targetIndex
-          // Switch the chrome binding as soon as the new page is entered.
-          // The Swiper index remains externally stable until animation end.
+          // During motion only the title/progress chrome follows the target.
+          // The committed image, hidden file-page source and load window are
+          // changed together from onAnimationEnd.
           if (targetIndex >= 0 && targetIndex < this.viewerImages.length) {
             this.viewerChromeIndex = targetIndex
-            this.viewerImageEntry = this.viewerImages[targetIndex]
             this.viewerHeaderTitle = this.viewerImages[targetIndex].name
-            this.ensureViewerImageFrame(this.viewerImages[targetIndex])
+            this.logViewerDiagnostic('swiper-start', this.viewerImages[targetIndex].path)
           }
-          this.resetImageTransform()
-          this.prefetchViewerImages(targetIndex)
         }
       })
       // onChange can arrive while the page is still moving. Keep the
@@ -4276,8 +4918,14 @@ struct Index {
       // new page only from the documented animation-end callback.
       .onAnimationEnd((index: number) => {
         this.viewerPendingIndex = -1
-        this.onViewerImageChanged(index)
         this.viewerTransitionActive = false
+        this.onViewerImageChanged(index)
+        this.logViewerDiagnostic('swiper-end')
+        this.flushDeferredViewerVisualCommits()
+        if (this.viewerCloseRequested) {
+          this.viewerCloseRequested = false
+          this.closeImageViewer()
+        }
       })
 
       Column() {
@@ -4317,63 +4965,37 @@ struct Index {
     .width('100%')
     .height('100%')
     .backgroundColor(Color.Transparent)
-  }
-
-  @Builder
-  ViewerOriginalImage(entry: FileEntry): void {
-    if (this.viewerImageSourceSize(entry) !== null) {
-      Image(this.viewerOriginalUri(entry))
-        .width('100%')
-        .height('100%')
-        .sourceSize({
-          width: (this.viewerImageSourceSize(entry) as ThumbnailSize).width,
-          height: (this.viewerImageSourceSize(entry) as ThumbnailSize).height
-        })
-        .orientation(this.viewerImageOrientation(entry))
-        .objectFit(ImageFit.Contain)
-        .onComplete((event?: ViewerImageCompleteEvent): void => {
-          this.logViewerRenderGeometry(entry.path, 'original', event)
-          this.markViewerImageDecoded(entry.path)
-        })
-        .onError(() => this.markViewerImageFailed(entry.path))
-    } else {
-      // Do not invent a square decode target when metadata is unavailable.
-      // ImageFit.Contain still guarantees a proportional display, and the
-      // next load will populate the aspect-aware decode size.
-        Image(this.viewerOriginalUri(entry))
-          .width('100%')
-          .height('100%')
-          .orientation(this.viewerImageOrientation(entry))
-          .objectFit(ImageFit.Contain)
-          .onComplete((event?: ViewerImageCompleteEvent): void => {
-            this.logViewerRenderGeometry(entry.path, 'original', event)
-            this.markViewerImageDecoded(entry.path)
-          })
-          .onError(() => this.markViewerImageFailed(entry.path))
-    }
+    .opacity(this.viewerSurfaceOpacity)
   }
 
   @Builder
   ViewerImageLayers(entry: FileEntry): void {
-    Stack() {
-      // Both sources are rendered into the same fixed frame.  The original
-      // remains above its preview so the preview is never removed while the
-      // decoder is working, but neither source can change the frame's layout.
-      if (this.previewUri(entry).length > 0) {
-        Image(this.previewUri(entry))
-          .width('100%')
-          .height('100%')
-          .orientation(this.viewerPreviewImageOrientation(entry))
-          .objectFit(ImageFit.Contain)
-          .onComplete((event?: ViewerImageCompleteEvent): void =>
-            this.logViewerRenderGeometry(entry.path, 'preview', event))
-      }
-      if (this.viewerOriginalUri(entry).length > 0) {
-        this.ViewerOriginalImage(entry)
-      }
-    }
-    .width('100%')
-    .height('100%')
+    // There is deliberately one visible Image node per viewer page.  The
+    // original is decoded into a PixelMap off the render path and replaces
+    // the source of this same node on a frame callback; a second Image/Stack
+    // is never kept around to produce an opacity ghost.
+    this.ViewerImage(entry)
+  }
+
+  @Builder
+  ViewerImage(entry: FileEntry): void {
+    Image(this.viewerImageSource(entry))
+      .width('100%')
+      .height('100%')
+      .orientation(this.viewerImageSourceOrientation(entry))
+      .objectFit(ImageFit.Contain)
+      .geometryTransition(this.viewerImageTransitionId(entry, this.viewerTransitionLayer))
+      .rotate({ angle: this.viewerManualRotation(entry.path) })
+      .syncLoad(this.viewerImageShouldSyncLoad(entry, this.viewerTransitionLayer))
+      .onComplete((event?: ViewerImageCompleteEvent): void => {
+        const original = this.viewerBitmap(entry, true)
+        this.logViewerRenderGeometry(entry.path,
+          original === null ? 'preview-pixelmap' : 'original-pixelmap', event)
+        if (original === null || this.imageVisualState(entry.path).visibleLayer !== 'original') {
+          this.recordViewerThumbnailComplete(entry.path, event)
+        }
+      })
+      .onError(() => this.markViewerImageFailed(entry.path))
   }
 
   @Builder
@@ -4385,7 +5007,6 @@ struct Index {
         }
         .width('100%')
         .aspectRatio(this.viewerImageFrameAspectRatio(entry))
-        .geometryTransition(this.viewerImageTransitionId(entry))
         .scale({
           x: this.viewerPageVisualScale(entry, index),
           y: this.viewerPageVisualScale(entry, index),
@@ -4396,14 +5017,12 @@ struct Index {
           y: this.viewerPageOffsetY(index),
           z: 0
         })
-        .rotate({ angle: this.viewerManualRotation(entry.path) })
       } else {
         Stack() {
           this.ViewerImageLayers(entry)
         }
         .height('100%')
         .aspectRatio(this.viewerImageFrameAspectRatio(entry))
-        .geometryTransition(this.viewerImageTransitionId(entry))
         .scale({
           x: this.viewerPageVisualScale(entry, index),
           y: this.viewerPageVisualScale(entry, index),
@@ -4414,7 +5033,6 @@ struct Index {
           y: this.viewerPageOffsetY(index),
           z: 0
         })
-        .rotate({ angle: this.viewerManualRotation(entry.path) })
       }
     }
     .width('100%')
@@ -5747,6 +6365,17 @@ struct Index {
     this.waterfallActiveDecodes = 0
     this.waterfallOriginalUris = {}
     this.waterfallVisiblePaths = {}
+    const bitmaps = this.waterfallBitmaps
+    this.waterfallBitmaps = {}
+    this.bumpViewerBitmapEpoch()
+    for (const key of Object.keys(bitmaps)) {
+      if (this.viewerPreviewBitmapAliases[key] === true &&
+        this.viewerPreviewBitmaps[key] === bitmaps[key]) {
+        this.viewerPreviewBitmapAliases[key] = false
+        continue
+      }
+      this.viewerBitmapStore.release(bitmaps[key]).catch((): void => {})
+    }
   }
 
   private waterfallUri(entry: FileEntry): string {
@@ -5759,9 +6388,17 @@ struct Index {
 
   private waterfallAspectRatio(entry: FileEntry): number {
     const value = this.waterfallAspectRatios[entry.path]
-    const ratio = typeof value === 'number' && value > 0 ? value : 1
-    const rotation = ((this.fileListImageRotation(entry.path) % 360) + 360) % 360
-    return rotation === 90 || rotation === 270 ? 1 / ratio : ratio
+    // A persisted user rotation is a visual transform, not new source
+    // metadata. Keep masonry measurement stable and fit the rotated Image
+    // inside this immutable card instead of changing row heights.
+    if (typeof value === 'number' && value > 0) {
+      return value
+    }
+    const state = this.imageVisualState(entry.path)
+    if (state.displayWidth > 0 && state.displayHeight > 0) {
+      return state.displayWidth / state.displayHeight
+    }
+    return 1
   }
 
   private waterfallSourceSize(entry: FileEntry): ThumbnailSize {
@@ -5800,6 +6437,7 @@ struct Index {
       return
     }
     if (!visible && !retainedForViewer) {
+      this.releaseViewerBitmap(this.waterfallBitmaps, entry.path).catch((): void => {})
       const nextUris: Record<string, string> = {}
       for (const key of Object.keys(this.waterfallOriginalUris)) {
         if (key !== entry.path) {
@@ -5831,6 +6469,12 @@ struct Index {
       next[path] = uri
     }
     this.waterfallOriginalUris = next
+    this.updateImageVisualState(path, (state: ImageVisualState): void => {
+      state.thumbnailDecodedUri = ''
+      if (uri.length > 0) {
+        state.transitionThumbnailUri = uri
+      }
+    })
   }
 
   private setWaterfallAspectRatio(path: string, width: number, height: number): void {
@@ -5917,7 +6561,35 @@ struct Index {
       const localPath = this.waterfallLocalPaths[entry.path]
       this.waterfallActiveDecodes += 1
       this.waterfallActiveDecodePaths[entry.path] = true
+      this.decodeWaterfallBitmap(entry, localPath, this.waterfallGeneration)
+    }
+  }
+
+  private async decodeWaterfallBitmap(entry: FileEntry, localPath: string,
+    generation: number): Promise<void> {
+    try {
+      const record = await this.viewerBitmapStore.decode(localPath, 'viewerPreview',
+        this.waterfallSourceSize(entry))
+      if (record === null || generation !== this.waterfallGeneration ||
+        this.fileViewMode !== 'waterfall' || this.waterfallVisiblePaths[entry.path] !== true) {
+        return
+      }
+      this.installViewerBitmap(this.waterfallBitmaps, entry.path, record)
+      this.applyDecodedBitmapGeometry(entry.path, record, false)
+      this.setWaterfallAspectRatio(entry.path, record.displayWidth, record.displayHeight)
       this.setWaterfallOriginalUri(entry.path, fileUri.getUriFromPath(localPath))
+      this.waterfallDecodedPaths[entry.path] = true
+    } catch (error) {
+      console.warn('[UgreenWaterfall] PixelMap decode failed: ' + entry.path + ': ' +
+        JSON.stringify(error))
+      this.waterfallDecodedPaths[entry.path] = false
+      this.setWaterfallOriginalUri(entry.path, '')
+    } finally {
+      if (generation === this.waterfallGeneration) {
+        this.waterfallActiveDecodePaths[entry.path] = false
+        this.waterfallActiveDecodes = Math.max(0, this.waterfallActiveDecodes - 1)
+        this.drainWaterfallDecodes()
+      }
     }
   }
 
@@ -5937,6 +6609,7 @@ struct Index {
       this.waterfallActiveDecodes = Math.max(0, this.waterfallActiveDecodes - 1)
     }
     this.waterfallDecodedPaths[entry.path] = false
+    this.releaseViewerBitmap(this.waterfallBitmaps, entry.path).catch((): void => {})
     this.setWaterfallOriginalUri(entry.path, '')
     this.drainWaterfallDecodes()
   }
@@ -5963,9 +6636,9 @@ struct Index {
         return
       }
       this.waterfallLocalPaths[entry.path] = localPath
-      const sourceSize = await this.readViewerImageSourceSize(localPath, entry.path)
-      if (sourceSize !== null && generation === this.waterfallGeneration) {
-        this.setWaterfallAspectRatio(entry.path, sourceSize.width, sourceSize.height)
+      const geometry = await this.readViewerImageGeometry(localPath, entry.path)
+      if (geometry !== null && generation === this.waterfallGeneration) {
+        this.setWaterfallAspectRatio(entry.path, geometry.displayWidth, geometry.displayHeight)
       }
       if (this.waterfallVisiblePaths[entry.path] === true) {
         this.enqueueWaterfallDecode(entry)
@@ -7489,8 +8162,6 @@ struct Index {
     const generation = this.fileListRotationGeneration + 1
     this.fileListRotationGeneration = generation
     if (entries.length === 0) {
-      this.fileListImageRotations = {}
-      this.fileListImageBaseOrientations = {}
       return
     }
     const snapshot = entries.slice()
@@ -7498,16 +8169,28 @@ struct Index {
       if (generation !== this.fileListRotationGeneration) {
         return
       }
-      this.fileListImageRotations = state.rotations
-      this.fileListImageBaseOrientations = state.previewOrientations
+      const nextStates: Record<string, ImageVisualState> = {}
+      for (const key of Object.keys(this.imageVisualStates)) {
+        nextStates[key] = this.imageVisualStates[key]
+      }
+      for (const entry of snapshot) {
+        const next = this.copyImageVisualState(this.imageVisualStates[entry.path])
+        const rotation = state.rotations[entry.path]
+        const orientation = state.previewOrientations[entry.path]
+        next.userRotation = rotation === undefined ? 0 : rotation
+        if (orientation !== undefined) {
+          next.thumbnailOrientation = orientation
+        }
+        nextStates[entry.path] = next
+      }
+      this.imageVisualStates = nextStates
     }).catch((error: Error): void => {
       console.warn('[UgreenImage] refresh file-list display metadata failed: ' + JSON.stringify(error))
     })
   }
 
   private fileListImageRotation(path: string): number {
-    const value = this.fileListImageRotations[path]
-    return value === undefined ? 0 : value
+    return this.imageVisualState(path).userRotation
   }
 
   private fileListImageBaseOrientation(entry: FileEntry): ImageRotateOrientation {
@@ -7519,7 +8202,7 @@ struct Index {
     // safe client-side rule for both cases. Older persisted inverse values
     // are deliberately ignored so a cache/database migration cannot rotate
     // the same thumbnail a second time.
-    return ImageRotateOrientation.AUTO
+    return this.imageVisualState(entry.path).thumbnailOrientation
   }
 
   private setFileListImageBaseOrientation(path: string,
@@ -7527,12 +8210,9 @@ struct Index {
     if (path.length === 0) {
       return
     }
-    const next: Record<string, ImageRotateOrientation> = {}
-    for (const key of Object.keys(this.fileListImageBaseOrientations)) {
-      next[key] = this.fileListImageBaseOrientations[key]
-    }
-    next[path] = orientation
-    this.fileListImageBaseOrientations = next
+    this.updateImageVisualState(path, (state: ImageVisualState): void => {
+      state.thumbnailOrientation = orientation
+    })
   }
 
   private persistPreviewOrientation(entry: FileEntry,
@@ -7610,6 +8290,43 @@ struct Index {
     }
   }
 
+  private resetViewerVisualSession(entries: FileEntry[],
+    persisted: ImageDisplayState): void {
+    const nextStates: Record<string, ImageVisualState> = {}
+    for (const key of Object.keys(this.imageVisualStates)) {
+      nextStates[key] = this.imageVisualStates[key]
+    }
+    for (const item of entries) {
+      const next = this.copyImageVisualState(this.imageVisualStates[item.path])
+      const rotation = persisted.rotations[item.path]
+      const orientation = persisted.previewOrientations[item.path]
+      next.userRotation = rotation === undefined ? 0 : rotation
+      if (orientation !== undefined) {
+        next.thumbnailOrientation = orientation
+      }
+      next.originalUri = ''
+      next.originalOrientation = ImageRotateOrientation.AUTO
+      next.physicalWidth = 0
+      next.physicalHeight = 0
+      next.displayWidth = 0
+      next.displayHeight = 0
+      // Image.onComplete content bounds are render-result dimensions. In a
+      // rotated or clipped WaterFlow card they are not source metadata and
+      // must not seed a new viewer session.
+      next.thumbnailDisplayWidth = 0
+      next.thumbnailDisplayHeight = 0
+      next.frameWidth = 0
+      next.frameHeight = 0
+      next.frameLocked = false
+      next.decodeState = 'idle'
+      next.visibleLayer = 'thumbnail'
+      next.progress = 0
+      next.progressKnown = false
+      nextStates[item.path] = next
+    }
+    this.imageVisualStates = nextStates
+  }
+
   private async openImageViewer(entry: FileEntry): Promise<void> {
     if (this.isBusy || this.viewerClosePending || entry.isDirectory) {
       return
@@ -7627,6 +8344,7 @@ struct Index {
       this.captureViewerReturnScrollPosition()
       const persistedState = await this.loadPersistedImageDisplayState(imageEntries)
       this.viewerGeneration += 1
+      const openingGeneration = this.viewerGeneration
       this.viewerLoadQueue = []
       this.viewerLoadRequests = {}
       this.viewerManualLoadPaths = {}
@@ -7644,69 +8362,88 @@ struct Index {
       this.viewerChromeIndex = initialIndex
       this.viewerImageEntry = entry
       this.viewerHeaderTitle = entry.name
-      this.viewerOriginalUris = {}
-      this.viewerImageSourceSizes = {}
-      this.viewerImageLayoutSizes = {}
-      this.viewerImageOrientations = {}
-      this.viewerManualRotations = persistedState.rotations
-      const baseOrientations: Record<string, ImageRotateOrientation> = {}
-      for (const imageEntry of imageEntries) {
-        const persistedOrientation = persistedState.previewOrientations[imageEntry.path]
-        const currentOrientation = this.fileListImageBaseOrientations[imageEntry.path]
-        if (persistedOrientation !== undefined) {
-          baseOrientations[imageEntry.path] = persistedOrientation
-        } else if (currentOrientation !== undefined) {
-          baseOrientations[imageEntry.path] = currentOrientation
-        }
-      }
-      this.fileListImageBaseOrientations = baseOrientations
+      this.resetViewerVisualSession(imageEntries, persistedState)
       // The original may have been released while its thumbnail remains.
       // Seed the shared layout aspect ratio from that thumbnail before the
       // viewer is mounted, including the persisted base-orientation swap.
-      await this.primeViewerPreviewGeometry(entry)
+      await this.primeViewerFrameWindow(imageEntries, initialIndex, 2)
       this.ensureViewerImageFrame(entry)
-      this.viewerDecodedImages = {}
-      this.viewerDownloadProgress = {}
-      this.viewerDownloadProgressKnown = {}
+      this.logViewerDiagnostic('open-frame-ready', entry.path)
       this.viewerProgressLastUpdateAt = {}
+      this.viewerRevealTokens = {}
+      this.viewerPendingBitmapReveals = {}
+      this.viewerPendingRotationPath = ''
+      this.viewerCloseRequested = false
+      this.viewerReturnReadyPath = entry.path
       this.viewerBottomBarWidthVp = 0
       this.showImageMoreMenu = false
       this.showImageDetails = false
       this.viewerLastNavigationDirection = 1
       this.resetImageTransform()
       this.viewerTransitionActive = false
-      this.setImageChromeVisible(true, false)
-      // First expose the source thumbnail with its transition id. Waiting one
-      // render turn is important: if source and target are mounted in the
-      // same state batch, ArkUI cannot capture the source geometry.
+      this.viewerSurfaceOpacity = 1
+      this.viewerFallbackEntryActive = false
+      this.setImageChromeVisible(false, false)
+      // The shared-element source and target must consume the same decoded
+      // raster. Decode the preview before binding the geometry id; if the
+      // local thumbnail is unavailable we intentionally use the ordinary
+      // no-geometry transition instead of inventing a frame.
+      await this.ensureViewerPreviewBitmap(entry)
+      // Commit the source-only frame first. The following hierarchy swap is
+      // the sole state change inside animateTo, so one Image leaves the file
+      // surface at exactly the moment its viewer counterpart is inserted.
       this.startViewerEntryTransition(entry)
+      this.logViewerDiagnostic(this.viewerEntryTransitionActive
+        ? 'entry-source-bound' : 'entry-fallback', entry.path)
       if (this.viewerEntryTransitionActive) {
-        await new Promise<void>((resolve: () => void) => {
-          setTimeout(resolve, 0)
+        await this.nextRenderFrame()
+        await new Promise<void>((resolve: () => void): void => {
+          this.getUIContext().animateTo({
+            duration: IMAGE_GEOMETRY_TRANSITION_DURATION,
+            curve: Curve.FastOutSlowIn,
+            onFinish: resolve
+          }, () => {
+            this.showImageViewer = true
+          })
         })
-      }
-      if (this.viewerEntryTransitionActive) {
-        // geometryTransition matches the source and target only when the
-        // hierarchy change is made inside the same explicit animation.
-        this.getUIContext().animateTo({
-          duration: IMAGE_GEOMETRY_TRANSITION_DURATION,
-          curve: Curve.FastOutSlowIn
-        }, () => {
-          this.showImageViewer = true
-        })
-        this.scheduleViewerEntryTransitionCleanup()
+        await this.nextRenderFrame()
+        this.clearViewerEntryTransition()
       } else {
-        // There is no rendered source to fly from. Do not wait for a network
-        // thumbnail just to manufacture a transition; open normally.
+        // Unknown thumbnail geometry deliberately uses a normal surface fade.
+        // It never guesses a square source or binds a shared-element id.
+        this.viewerSurfaceOpacity = 0
+        this.viewerFallbackEntryActive = true
         this.showImageViewer = true
+        await this.nextRenderFrame()
+        await new Promise<void>((resolve: () => void): void => {
+          this.getUIContext().animateTo({
+            duration: IMAGE_FALLBACK_TRANSITION_DURATION,
+            curve: Curve.EaseOut,
+            onFinish: resolve
+          }, () => {
+            this.viewerSurfaceOpacity = 1
+          })
+        })
+        await this.nextRenderFrame()
+        this.viewerFallbackEntryActive = false
       }
+      this.logViewerDiagnostic('entry-complete', entry.path)
+      if (!this.showImageViewer || openingGeneration !== this.viewerGeneration) {
+        return
+      }
+      if (this.viewerCloseRequested) {
+        this.viewerCloseRequested = false
+        this.postRenderFrame((): void => this.closeImageViewer())
+        return
+      }
+      this.setImageChromeVisible(true, false)
       this.enableImageViewerAutoRotation()
       // Mount the viewer and its ring before doing any local original work.
       // A cache hit has no HTTP byte progress, so it stays gray during local
       // EXIF/normalization work, reaches 95% when the Image source is bound,
       // and closes only from Image.onComplete.
       this.setViewerDownloadProgress(entry.path, 0, true, true)
-      await this.primeCachedViewerOriginal(entry, this.viewerGeneration)
+      await this.primeCachedViewerOriginal(entry, openingGeneration)
       if (!this.showImageViewer) {
         return
       }
@@ -7714,6 +8451,9 @@ struct Index {
       this.statusText = ''
     } catch (error) {
       this.clearViewerEntryTransition()
+      this.showImageViewer = false
+      this.viewerSurfaceOpacity = 1
+      this.viewerFallbackEntryActive = false
       this.reportError(error as Object, '图片预览失败')
       this.statusText = '图片预览失败'
     } finally {
@@ -7775,9 +8515,9 @@ struct Index {
       // land on a different image even when the offset itself is unchanged.
       const token = this.waterfallAnchorRestoreToken + 1
       this.waterfallAnchorRestoreToken = token
-      setTimeout((): void => {
+      this.postRenderFrame((): void => {
         this.restoreFileViewAnchor(anchor, token, 0)
-      }, 0)
+      })
       return
     }
 
@@ -7796,24 +8536,112 @@ struct Index {
           JSON.stringify(error))
       }
     }
-    setTimeout(restore, 0)
-    setTimeout(restore, 80)
+    this.postRenderFrame((): void => {
+      restore()
+      this.postRenderFrame(restore)
+    })
+  }
+
+  private viewerActiveLayer(entry: FileEntry): ViewerImageLayer {
+    const state = this.imageVisualState(entry.path)
+    return state.visibleLayer === 'original' && state.originalUri.length > 0 &&
+      state.decodeState === 'displayed' ? 'original' : 'thumbnail'
+  }
+
+  private scrollViewerReturnSourceIntoView(entry: FileEntry): boolean {
+    try {
+      if (this.showSearch) {
+        const searchIndex = this.searchResults.findIndex((item: FileEntry): boolean => {
+          return item.path === entry.path
+        })
+        if (searchIndex < 0) {
+          return false
+        }
+        this.searchResultScroller.scrollToIndex(searchIndex + 1, false, ScrollAlign.CENTER)
+        return true
+      }
+      if (this.screen !== 'files') {
+        return false
+      }
+      const items = this.fileViewMode === 'waterfall' ? this.waterfallEntries : this.entries
+      const index = items.findIndex((item: FileEntry): boolean => item.path === entry.path)
+      if (index < 0) {
+        return false
+      }
+      const childIndex = this.fileViewMode === 'list' ? index + 1 : index
+      const scroller = this.fileViewMode === 'waterfall'
+        ? this.waterfallScroller : this.fileListScroller
+      scroller.scrollToIndex(childIndex, false, ScrollAlign.CENTER)
+      return true
+    } catch (error) {
+      console.warn('[UgreenViewer] position return source failed: ' + JSON.stringify(error))
+      return false
+    }
+  }
+
+  private async prepareViewerReturnSource(entry: FileEntry): Promise<boolean> {
+    if (!this.scrollViewerReturnSourceIntoView(entry)) {
+      this.viewerReturnReadyPath = ''
+      return false
+    }
+    // A page reached by Swiper may not have been the opening source.  Decode
+    // its local preview before binding the return id so the target Image uses
+    // the same PixelMap as the viewer, never a URI-decoded substitute.
+    await this.ensureViewerPreviewBitmap(entry)
+    for (let frame = 0; frame < IMAGE_RETURN_MOUNT_FRAME_LIMIT; frame += 1) {
+      await this.nextRenderFrame()
+      if (!this.showImageViewer || this.viewerImageEntry === null ||
+        this.viewerImageEntry.path !== entry.path) {
+        return false
+      }
+      if (this.hasViewerTransitionSource(entry, true)) {
+        this.viewerReturnReadyPath = entry.path
+        return true
+      }
+    }
+    this.viewerReturnReadyPath = ''
+    return false
+  }
+
+  private releaseViewerVisualSession(entries: FileEntry[]): void {
+    const nextStates: Record<string, ImageVisualState> = {}
+    for (const key of Object.keys(this.imageVisualStates)) {
+      nextStates[key] = this.imageVisualStates[key]
+    }
+    for (const entry of entries) {
+      const next = this.copyImageVisualState(this.imageVisualStates[entry.path])
+      next.originalUri = ''
+      next.originalOrientation = ImageRotateOrientation.AUTO
+      next.physicalWidth = 0
+      next.physicalHeight = 0
+      next.displayWidth = 0
+      next.displayHeight = 0
+      next.frameLocked = false
+      next.frameWidth = next.thumbnailDisplayWidth
+      next.frameHeight = next.thumbnailDisplayHeight
+      next.decodeState = 'idle'
+      next.visibleLayer = 'thumbnail'
+      next.progress = 0
+      next.progressKnown = false
+      nextStates[entry.path] = next
+    }
+    this.imageVisualStates = nextStates
   }
 
   private finishCloseImageViewer(shouldRestoreSearch: boolean): void {
     if (!this.viewerClosePending) {
       return
     }
-    if (this.viewerCloseCleanupTimer !== 0) {
-      clearTimeout(this.viewerCloseCleanupTimer)
-      this.viewerCloseCleanupTimer = 0
-    }
-
-    // The shared-element window is over. Only now remove the viewer data and
-    // release its local URI state; clearing it earlier removes the target
-    // geometry before ArkUI can complete the reverse transition.
+    const closingImages = this.viewerImages.slice()
+    const returnedEntry = this.viewerImageEntry
     this.clearViewerEntryTransition()
+    this.releaseViewerVisualSession(closingImages)
+    this.releaseViewerSessionBitmaps(closingImages).catch((error: Error): void => {
+      console.warn('[UgreenBitmap] viewer release failed: ' + JSON.stringify(error))
+    })
     this.viewerClosePending = false
+    this.viewerCloseRequested = false
+    this.viewerReturnReadyPath = ''
     this.isBusy = false
     this.viewerImageEntry = null
     this.viewerHeaderTitle = ''
@@ -7823,48 +8651,69 @@ struct Index {
     this.showImageMoreMenu = false
     this.showImageDetails = false
     this.viewerLastNavigationDirection = 1
-    this.viewerOriginalUris = {}
-    this.viewerImageSourceSizes = {}
-    this.viewerImageLayoutSizes = {}
-    this.viewerImageOrientations = {}
-    this.viewerManualRotations = {}
-    this.viewerDecodedImages = {}
-    this.viewerDownloadProgress = {}
-    this.viewerDownloadProgressKnown = {}
     this.viewerProgressLastUpdateAt = {}
+    this.viewerRevealTokens = {}
+    this.viewerPendingBitmapReveals = {}
+    this.viewerPendingRotationPath = ''
     this.viewerBottomBarWidthVp = 0
     this.viewerTransitionActive = false
     this.imageChromeVisible = true
     this.imageChromeOpacity = 1
     this.imageTopChromeOffsetY = 0
     this.imageBottomChromeOffsetY = 0
+    this.viewerSurfaceOpacity = 1
+    this.viewerFallbackEntryActive = false
     this.resetImageTransform()
     if (shouldRestoreSearch) {
       this.restoreSearchSession()
     }
+    this.postRenderFrame((): void => {
+      if (returnedEntry !== null) {
+        this.loadEntryPreview(returnedEntry, 0)
+      }
+      this.schedulePreviewWarmup(this.previewGeneration)
+    })
   }
 
   private closeImageViewer(): void {
     if (this.viewerClosePending) {
       return
     }
+    if (this.viewerTransitionActive ||
+      (this.viewerEntryTransitionActive && this.viewerTransitionKind === 'entry')) {
+      this.viewerCloseRequested = true
+      this.setImageChromeVisible(false, false)
+      return
+    }
+    this.beginCloseImageViewer()
+  }
+
+  private async beginCloseImageViewer(): Promise<void> {
+    if (this.viewerClosePending || !this.showImageViewer || this.viewerImageEntry === null) {
+      return
+    }
     const shouldRestoreSearch = this.searchSession !== null && this.searchSession.returnMode === 'image'
-    const returningEntry = this.currentViewerEntry()
-    const canUseGeometryTransition = this.hasViewerTransitionSource(returningEntry)
-    // FileContent/SearchContent now remains mounted below the viewer. In the
-    // ordinary file-page path its scroller is already at the exact position
-    // the user left, so calling scrollTo during the close animation would
-    // itself create the downward jump that this transition is meant to avoid.
-    // Search restoration remains separate because it may intentionally change
-    // the search session after the viewer has closed.
+    const returningEntry = this.viewerImageEntry as FileEntry
     const keepFileSurfacePosition = this.screen === 'files' &&
       !this.showSearch && this.currentPath.length > 0
-
-    // Do not clear the shared id before the viewer is removed. The file
-    // surface is then added with the same id, so ArkUI can match the two
-    // image frames for the reverse flight.
-    this.startViewerExitTransition(returningEntry)
     this.viewerClosePending = true
+    this.isBusy = true
+    this.setImageChromeVisible(false, false)
+    const returnReady = await this.prepareViewerReturnSource(returningEntry)
+    if (!this.showImageViewer) {
+      return
+    }
+    this.logViewerDiagnostic(returnReady ? 'return-source-ready' : 'return-fallback',
+      returningEntry.path)
+    if (!this.showImageViewer || this.viewerImageEntry === null ||
+      this.viewerImageEntry.path !== returningEntry.path) {
+      return
+    }
+    const lockedLayer = this.viewerActiveLayer(returningEntry)
+    const canUseGeometryTransition = returnReady &&
+      this.startViewerExitTransition(returningEntry, lockedLayer)
+    this.logViewerDiagnostic(canUseGeometryTransition ? 'exit-source-bound' : 'exit-fallback',
+      returningEntry.path)
     this.restoreImageViewerOrientation()
     this.viewerGeneration += 1
     this.viewerLoadQueue = []
@@ -7875,32 +8724,46 @@ struct Index {
     this.viewerPrimaryPath = ''
     this.viewerPendingIndex = -1
     this.lastImageDoubleTapAt = 0
-    this.isBusy = true
 
     const closeGeneration = this.viewerGeneration
     if (canUseGeometryTransition) {
-      this.getUIContext().animateTo({
-        duration: IMAGE_GEOMETRY_TRANSITION_DURATION,
-        curve: Curve.FastOutSlowIn
-      }, () => {
-        this.showImageViewer = false
-        if (!keepFileSurfacePosition) {
-          this.restoreViewerReturnScrollPosition()
-        }
+      // First frame removes the inactive progressive layer. The second frame
+      // commits the id on the one visible Image before the hierarchy swap.
+      await this.nextRenderFrame()
+      this.viewerGeometryBound = true
+      await this.nextRenderFrame()
+      await new Promise<void>((resolve: () => void): void => {
+        this.getUIContext().animateTo({
+          duration: IMAGE_GEOMETRY_TRANSITION_DURATION,
+          curve: Curve.FastOutSlowIn,
+          onFinish: resolve
+        }, () => {
+          this.showImageViewer = false
+          if (!keepFileSurfacePosition) {
+            this.restoreViewerReturnScrollPosition()
+          }
+        })
       })
-      this.viewerCloseCleanupTimer = setTimeout((): void => {
-        if (closeGeneration !== this.viewerGeneration) {
-          return
-        }
-        this.finishCloseImageViewer(shouldRestoreSearch)
-      }, IMAGE_GEOMETRY_TRANSITION_SETTLE)
     } else {
-      // No rendered source exists. Do not delay a normal close for an
-      // animation that cannot be matched.
+      // An offscreen/unmounted source gets a single-image shrink and fade;
+      // it never flies to a stale rectangle from another Swiper page.
+      await new Promise<void>((resolve: () => void): void => {
+        this.getUIContext().animateTo({
+          duration: IMAGE_FALLBACK_TRANSITION_DURATION,
+          curve: Curve.EaseIn,
+          onFinish: resolve
+        }, () => {
+          this.imageDismissScale = Math.min(this.imageDismissScale, 0.94)
+          this.viewerSurfaceOpacity = 0
+        })
+      })
       this.showImageViewer = false
       if (!keepFileSurfacePosition) {
         this.restoreViewerReturnScrollPosition()
       }
+    }
+    await this.nextRenderFrame()
+    if (closeGeneration === this.viewerGeneration) {
       this.finishCloseImageViewer(shouldRestoreSearch)
     }
   }
@@ -8025,6 +8888,8 @@ struct Index {
     if (!this.imageDismissGestureEnabled(index)) {
       return
     }
+    this.imageDismissChromeWasVisible = this.imageChromeVisible
+    this.setImageChromeVisible(false, false)
     this.imageDismissDragging = true
     this.imageTouchMoved = true
   }
@@ -8045,7 +8910,13 @@ struct Index {
 
   private animateImageDismissBack(): void {
     this.getUIContext().animateTo({
-      curve: curves.interpolatingSpring(0, 1, 320, 30)
+      curve: curves.interpolatingSpring(0, 1, 320, 30),
+      onFinish: (): void => {
+        if (this.imageDismissChromeWasVisible) {
+          this.setImageChromeVisible(true, false)
+        }
+        this.flushDeferredViewerVisualCommits()
+      }
     }, () => {
       this.imageDismissOffsetY = 0
       this.imageDismissScale = 1
@@ -8230,6 +9101,13 @@ struct Index {
     this.ensureViewerImageFrame(this.viewerImages[index])
     this.resetImageTransform()
     this.prefetchViewerImages(index)
+    this.primeViewerFrameWindow(this.viewerImages, index, 2).catch((error: Error): void => {
+      console.warn('[UgreenViewer] prepare frame window failed: ' + JSON.stringify(error))
+    })
+    this.viewerReturnReadyPath = ''
+    this.prepareViewerReturnSource(this.viewerImages[index]).catch((error: Error): void => {
+      console.warn('[UgreenViewer] prepare swiped return source failed: ' + JSON.stringify(error))
+    })
   }
 
   private prefetchViewerImages(index: number): void {
@@ -8257,7 +9135,7 @@ struct Index {
       // path never starts a request when the file is not already local.
       this.loadViewerCachedOnly(entry, this.viewerGeneration)
     }
-    if (this.viewerOriginalUri(entry).length > 0 && this.viewerDecodedImages[entry.path] === true) {
+    if (this.viewerOriginalUri(entry).length > 0 && this.viewerImageDecoded(entry)) {
       this.startAdjacentViewerPrefetch(index, this.viewerGeneration)
     }
   }
@@ -8283,6 +9161,9 @@ struct Index {
     for (const adjacentIndex of adjacentIndexes) {
       const adjacent = this.viewerImages[adjacentIndex]
       this.loadEntryPreview(adjacent)
+      this.primeViewerPreviewGeometry(adjacent).then((): void => {
+        this.ensureViewerImageFrame(adjacent, false)
+      }).catch((): void => {})
       this.enqueueViewerOriginal(adjacent, false, false)
     }
   }
@@ -8332,76 +9213,41 @@ struct Index {
   }
 
   private trimViewerOriginalState(): void {
-    // Do not impose an arbitrary number-of-images limit here. These maps only
-    // retain file URIs, source dimensions and small progress values; decoded
-    // PixelMaps belong to ArkUI/ImageKit and are released by the component
-    // lifecycle. The actual original-file bytes are bounded by CacheManager's
-    // byte-based LRU cache. Keeping the session state prevents a return swipe
-    // from blanking the page and rebinding the same local file unnecessarily.
+    // Keep only the visible page and its immediate Swiper neighbours.  A
+    // PixelMap is a native raster, so retaining every image visited during a
+    // long swipe session would defeat the viewer memory budget.
     const keepPaths: Record<string, boolean> = {}
-    for (const item of this.viewerImages) {
-      keepPaths[item.path] = true
-    }
-
-    const nextUris: Record<string, string> = {}
-    for (const key of Object.keys(this.viewerOriginalUris)) {
-      if (keepPaths[key] === true) {
-        nextUris[key] = this.viewerOriginalUris[key]
+    const centers: number[] = [this.viewerImageIndex, this.viewerPendingIndex]
+    for (const center of centers) {
+      if (center < 0 || center >= this.viewerImages.length) {
+        continue
+      }
+      for (let index = Math.max(0, center - 2);
+        index <= Math.min(this.viewerImages.length - 1, center + 2); index += 1) {
+        keepPaths[this.viewerImages[index].path] = true
       }
     }
-    this.viewerOriginalUris = nextUris
-
-    const nextSourceSizes: Record<string, ThumbnailSize> = {}
-    const nextLayoutSizes: Record<string, ThumbnailSize> = {}
-    for (const key of Object.keys(this.viewerImageSourceSizes)) {
-      if (keepPaths[key] === true) {
-        nextSourceSizes[key] = this.viewerImageSourceSizes[key]
+    for (const key of Object.keys(this.viewerOriginalBitmaps)) {
+      if (keepPaths[key] === true || this.viewerActiveLoadPaths[key] === true) {
+        continue
       }
+      this.releaseViewerBitmap(this.viewerOriginalBitmaps, key).catch((): void => {})
+      this.updateImageVisualState(key, (state: ImageVisualState): void => {
+        state.originalUri = ''
+        state.originalOrientation = ImageRotateOrientation.AUTO
+        state.decodeState = 'idle'
+        state.visibleLayer = 'thumbnail'
+        state.progress = 0
+        state.progressKnown = false
+      })
     }
-    this.viewerImageSourceSizes = nextSourceSizes
-    for (const key of Object.keys(this.viewerImageLayoutSizes)) {
-      if (keepPaths[key] === true) {
-        nextLayoutSizes[key] = this.viewerImageLayoutSizes[key]
-      }
-    }
-    this.viewerImageLayoutSizes = nextLayoutSizes
 
-    const nextOrientations: Record<string, ImageRotateOrientation> = {}
-    for (const key of Object.keys(this.viewerImageOrientations)) {
-      if (keepPaths[key] === true) {
-        nextOrientations[key] = this.viewerImageOrientations[key]
-      }
-    }
-    this.viewerImageOrientations = nextOrientations
-
-    const nextDecoded: Record<string, boolean> = {}
-    for (const key of Object.keys(this.viewerDecodedImages)) {
-      if (keepPaths[key] === true) {
-        nextDecoded[key] = this.viewerDecodedImages[key]
-      }
-    }
-    this.viewerDecodedImages = nextDecoded
-
-    const nextProgress: Record<string, number> = {}
-    const nextProgressKnown: Record<string, boolean> = {}
     const nextProgressTimes: Record<string, number> = {}
-    for (const key of Object.keys(this.viewerDownloadProgress)) {
-      if (keepPaths[key] === true) {
-        nextProgress[key] = this.viewerDownloadProgress[key]
-      }
-    }
-    for (const key of Object.keys(this.viewerDownloadProgressKnown)) {
-      if (keepPaths[key] === true) {
-        nextProgressKnown[key] = this.viewerDownloadProgressKnown[key]
-      }
-    }
     for (const key of Object.keys(this.viewerProgressLastUpdateAt)) {
       if (keepPaths[key] === true) {
         nextProgressTimes[key] = this.viewerProgressLastUpdateAt[key]
       }
     }
-    this.viewerDownloadProgress = nextProgress
-    this.viewerDownloadProgressKnown = nextProgressKnown
     this.viewerProgressLastUpdateAt = nextProgressTimes
 
     this.viewerLoadQueue = this.viewerLoadQueue.filter((item: FileEntry): boolean => {
@@ -8445,23 +9291,13 @@ struct Index {
       if (existingPath.length === 0) {
         return
       }
-      const displayPath = await this.prepareViewerImagePath(entry, existingPath)
-      const sourceSize = await this.readViewerImageSourceSize(displayPath, entry.path)
-      if (!this.showImageViewer || generation !== this.viewerGeneration) {
+      this.setViewerDownloadProgress(entry.path, 95, true, true)
+      const record = await this.decodeViewerOriginalBitmap(entry, existingPath)
+      if (record === null || !this.showImageViewer || generation !== this.viewerGeneration) {
         return
       }
-      if (sourceSize !== null) {
-        this.setViewerImageSourceSize(entry.path, sourceSize)
-        this.setViewerImageLayoutSizeIfAbsent(entry.path, sourceSize)
-      }
-      if (displayPath !== existingPath) {
-        this.setViewerImageOrientation(entry.path, ImageRotateOrientation.UP)
-      } else {
-        this.setViewerImageOrientation(entry.path, this.viewerPreviewImageOrientation(entry))
-      }
-      this.setViewerDownloadProgress(entry.path, 95, true, true)
-      this.setViewerOriginalUri(entry.path, fileUri.getUriFromPath(displayPath))
-      await this.refreshEntryPreviewFromViewer(entry, displayPath)
+      this.applyDecodedBitmapGeometry(entry.path, record, true)
+      this.commitViewerBitmap(entry, existingPath, record)
     } catch (_) {
       // A missing/reclaimed cache entry is normal; the ring remains available.
     }
@@ -8478,24 +9314,12 @@ struct Index {
       if (existingPath.length === 0) {
         return
       }
-      const displayPath = await this.prepareViewerImagePath(entry, existingPath)
-      const sourceSize = await this.readViewerImageSourceSize(displayPath, entry.path)
-      if (generation !== this.viewerGeneration) {
+      const record = await this.decodeViewerOriginalBitmap(entry, existingPath)
+      if (record === null || generation !== this.viewerGeneration || !this.showImageViewer) {
         return
       }
-      if (sourceSize !== null) {
-        this.setViewerImageSourceSize(entry.path, sourceSize)
-        this.setViewerImageLayoutSizeIfAbsent(entry.path, sourceSize)
-      }
-      this.setViewerImageOrientation(entry.path,
-        displayPath !== existingPath ? ImageRotateOrientation.UP : this.viewerPreviewImageOrientation(entry))
-      this.setViewerDownloadProgress(entry.path, 95, true, true)
-      this.setViewerOriginalUri(entry.path, fileUri.getUriFromPath(displayPath))
-      // File rows still use a small, locally downsampled derivative. Binding
-      // the full original in a scrolling list would multiply decode memory.
-      this.refreshEntryPreviewFromViewer(entry, displayPath).catch((error: Error): void => {
-        console.warn('[UgreenPreview] cached-original preview refresh failed: ' + JSON.stringify(error))
-      })
+      this.applyDecodedBitmapGeometry(entry.path, record, true)
+      this.commitViewerBitmap(entry, existingPath, record)
     } catch (error) {
       // A reclaimed cache entry simply falls back to the normal preview and
       // download path; it must not make opening the viewer fail.
@@ -8504,8 +9328,26 @@ struct Index {
   }
 
   private async primeViewerPreviewGeometry(entry: FileEntry): Promise<void> {
-    await this.primeViewerPreviewGeometryAtPath(entry, this.previewLocalPaths[entry.path],
-      this.previewCanonicalPaths[entry.path] === true)
+    let localPath = this.previewLocalPaths[entry.path]
+    let canonical = this.previewCanonicalPaths[entry.path] === true
+    if (typeof localPath !== 'string' || localPath.length === 0 || !CacheManager.exists(localPath)) {
+      const waterfallPath = this.waterfallLocalPaths[entry.path]
+      if (typeof waterfallPath === 'string' && waterfallPath.length > 0) {
+        localPath = waterfallPath
+        canonical = false
+      }
+    }
+    await this.primeViewerPreviewGeometryAtPath(entry, localPath, canonical)
+  }
+
+  private async primeViewerFrameWindow(entries: FileEntry[], center: number,
+    radius: number): Promise<void> {
+    const start = Math.max(0, center - radius)
+    const end = Math.min(entries.length - 1, center + radius)
+    for (let index = start; index <= end; index += 1) {
+      await this.primeViewerPreviewGeometry(entries[index])
+      this.ensureViewerImageFrame(entries[index], false)
+    }
   }
 
   private async primeViewerPreviewGeometryAtPath(entry: FileEntry, localPath: string,
@@ -8513,15 +9355,28 @@ struct Index {
     if (typeof localPath !== 'string' || localPath.length === 0 || !CacheManager.exists(localPath)) {
       return
     }
-    const physicalSize = await this.readViewerImageSourceSize(localPath, entry.path)
-    if (physicalSize === null) {
+    if ((this.showImageViewer || this.viewerEntryTransitionActive || this.viewerClosePending) &&
+      localPath !== this.previewLocalPaths[entry.path]) {
       return
     }
-    // readViewerImageSourceSize already resolves EXIF axis swapping from the
-    // physical source. Do not apply the viewer orientation a second time here;
-    // doing so was the source of the preview/original ratio mismatch for 90°
-    // and 270° images.
-    this.setViewerImageLayoutSizeIfAbsent(entry.path, physicalSize)
+    const geometry = await this.readViewerImageGeometry(localPath, entry.path)
+    if (geometry === null) {
+      return
+    }
+    this.updateImageVisualState(entry.path, (state: ImageVisualState): void => {
+      state.physicalWidth = geometry.physicalWidth
+      state.physicalHeight = geometry.physicalHeight
+      state.displayWidth = geometry.displayWidth
+      state.displayHeight = geometry.displayHeight
+      if (!state.frameLocked) {
+        state.thumbnailDisplayWidth = geometry.displayWidth
+        state.thumbnailDisplayHeight = geometry.displayHeight
+        state.frameWidth = geometry.displayWidth
+        state.frameHeight = geometry.displayHeight
+      }
+      state.thumbnailOrientation = canonical
+        ? ImageRotateOrientation.UP : ImageRotateOrientation.AUTO
+    })
   }
 
   private previewOrientationSwapsAxes(orientation: ImageRotateOrientation): boolean {
@@ -8583,27 +9438,15 @@ struct Index {
       if (!this.showImageViewer || generation !== this.viewerGeneration) {
         return
       }
-      const displayPath = await this.prepareViewerImagePath(entry, localPath)
-      const sourceSize = await this.readViewerImageSourceSize(displayPath, entry.path)
-      if (!this.showImageViewer || generation !== this.viewerGeneration) {
-        return
-      }
-      if (sourceSize !== null) {
-        this.setViewerImageSourceSize(entry.path, sourceSize)
-        this.setViewerImageLayoutSizeIfAbsent(entry.path, sourceSize)
-      }
-      if (displayPath !== localPath) {
-        this.setViewerImageOrientation(entry.path, ImageRotateOrientation.UP)
-      } else {
-        this.setViewerImageOrientation(entry.path, this.viewerPreviewImageOrientation(entry))
-      }
       if (existingPath.length > 0) {
         this.setViewerDownloadProgress(entry.path, 95, true, true)
       }
-      this.setViewerOriginalUri(entry.path, fileUri.getUriFromPath(displayPath))
-      // Persist a small canonical preview derived from the EXIF-normalized
-      // display source. File rows can then apply only the user's manual turn.
-      await this.refreshEntryPreviewFromViewer(entry, displayPath)
+      const record = await this.decodeViewerOriginalBitmap(entry, localPath)
+      if (record === null || !this.showImageViewer || generation !== this.viewerGeneration) {
+        return
+      }
+      this.applyDecodedBitmapGeometry(entry.path, record, true)
+      this.commitViewerBitmap(entry, localPath, record)
     } catch (error) {
       if (error instanceof UgreenError && error.status === 499) {
         return
@@ -8633,114 +9476,8 @@ struct Index {
     }
   }
 
-  /**
-   * Reads the physical image dimensions before the Image component is built.
-   * The decoder target must use the same aspect ratio as the source; a fixed
-   * square sourceSize is not safe for portrait or panoramic images.
-   */
-  private async prepareViewerImagePath(entry: FileEntry, localPath: string): Promise<string> {
-    let source: image.ImageSource | null = null
-    let sourceFd: number = -1
-    let pixelMap: image.PixelMap | null = null
-    let packer: image.ImagePacker | null = null
-    try {
-      const sourceFile = fileIo.openSync(localPath, fileIo.OpenMode.READ_ONLY)
-      sourceFd = sourceFile.fd
-      source = image.createImageSource(sourceFd)
-      const info = source.getImageInfoSync()
-      const width = Math.max(1, Math.floor(info.size.width))
-      const height = Math.max(1, Math.floor(info.size.height))
-      let orientation = ''
-      try {
-        orientation = await source.getImageProperty(image.PropertyKey.ORIENTATION)
-      } catch (_) {
-        return localPath
-      }
-      const mapped = this.mapExifOrientation(orientation)
-      // Do not guess how the NAS thumbnail service handled EXIF. HarmonyOS
-      // recommends AUTO for an external image whose EXIF policy is unknown;
-      // it works whether the server retained the tag or already baked the
-      // direction into the thumbnail pixels. The canonical viewer copy below
-      // is explicitly transformed and rendered as UP.
-      this.setFileListImageBaseOrientation(entry.path, ImageRotateOrientation.AUTO)
-      this.persistPreviewOrientation(entry, ImageRotateOrientation.AUTO)
-      if (mapped === ImageRotateOrientation.AUTO || mapped === ImageRotateOrientation.UP) {
-        return localPath
-      }
-
-      const outputExtension = this.viewerPreservesAlpha(entry.name) ? 'png' : 'jpg'
-      const outputName = entry.name + '.viewer-orientation-v7.' + outputExtension
-      const outputKey = this.originalCacheKey(entry) + ':viewer-orientation-v7:' + orientation
-      const existingPath = CacheManager.findExisting(this.cacheDirectory, outputName, outputKey)
-      if (existingPath.length > 0) {
-        console.info('[UgreenImage] normalized-cache-hit path=' + entry.path)
-        return existingPath
-      }
-
-      // Decode the source pixels, apply the EXIF transform explicitly, and
-      // repack without relying on a stale orientation tag. The resulting
-      // display copy is canonical UP, so ArkUI never combines an external
-      // thumbnail correction with layout sizing.
-      pixelMap = await source.createPixelMap({
-        sampleSize: ThumbnailPolicy.sampleSize(width, height, 'viewerZoom'),
-        editable: true
-      })
-      await this.applyExifOrientationToPixelMap(pixelMap, mapped)
-      packer = image.createImagePacker()
-      const encoded = await packer.packToData(pixelMap, {
-        format: outputExtension === 'png' ? 'image/png' : 'image/jpeg',
-        quality: 92
-      })
-      const normalizedPath = await CacheManager.save(new Uint8Array(encoded),
-        this.cacheDirectory, outputName, this.cacheLimitBytes, outputKey)
-      const normalizedInfo = pixelMap.getImageInfoSync()
-      console.info('[UgreenImage] normalized path=' + entry.path + ' orientation=' + orientation +
-        ' size=' + normalizedInfo.size.width.toString() + 'x' + normalizedInfo.size.height.toString())
-      return normalizedPath
-    } catch (error) {
-      // A decoder-specific EXIF failure must not prevent the original from
-      // being viewed. ImageFit.Contain and the normal AUTO fallback remain in
-      // place for formats that cannot be rewritten by Image Kit.
-      console.warn('[UgreenImage] normalize failed path=' + entry.path + ': ' + JSON.stringify(error))
-      return localPath
-    } finally {
-      if (packer !== null) {
-        try {
-          await packer.release()
-        } catch (_) {
-          // The packed display copy is disposable.
-        }
-      }
-      if (pixelMap !== null) {
-        try {
-          await pixelMap.release()
-        } catch (_) {
-          // The decoder may have released it after a failed pack operation.
-        }
-      }
-      if (source !== null) {
-        try {
-          await source.release()
-        } catch (_) {
-          // Keep the original viewer path usable if cleanup races the decoder.
-        }
-      }
-      if (sourceFd >= 0) {
-        try {
-          fileIo.closeSync(sourceFd)
-        } catch (_) {
-          // The source may already own/close the descriptor.
-        }
-      }
-    }
-  }
-
-  private viewerPreservesAlpha(name: string): boolean {
-    const extension = this.fileExtension(name)
-    return extension === 'png' || extension === 'webp' || extension === 'gif'
-  }
-
-  private async readViewerImageSourceSize(localPath: string, entryPath: string = ''): Promise<ThumbnailSize | null> {
+  private async readViewerImageGeometry(localPath: string,
+    entryPath: string = ''): Promise<ViewerImageGeometry | null> {
     let source: image.ImageSource | null = null
     let sourceFd: number = -1
     try {
@@ -8767,10 +9504,13 @@ struct Index {
         ' size=' + width.toString() + 'x' + height.toString() +
         ' displaySize=' + displayWidth.toString() + 'x' + displayHeight.toString() +
         ' orientation=' + orientation)
-      // sourceSize is a decode target, but the viewer frame must use the
-      // post-EXIF display geometry. Otherwise a portrait image with a
-      // landscape pixel buffer gets a transiently wrong frame ratio.
-      return ThumbnailPolicy.targetSize(displayWidth, displayHeight, 'viewerZoom')
+      const geometry = new ViewerImageGeometry()
+      geometry.physicalWidth = width
+      geometry.physicalHeight = height
+      geometry.displayWidth = displayWidth
+      geometry.displayHeight = displayHeight
+      geometry.orientation = mapped
+      return geometry
     } catch (error) {
       console.warn('[UgreenImage] read source size failed: ' + JSON.stringify(error))
       return null
@@ -8792,42 +9532,6 @@ struct Index {
     }
   }
 
-  private setViewerImageSourceSize(path: string, size: ThumbnailSize): void {
-    if (path.length === 0 || !this.isViewerPathNearCurrent(path)) {
-      return
-    }
-    const next: Record<string, ThumbnailSize> = {}
-    for (const key of Object.keys(this.viewerImageSourceSizes)) {
-      next[key] = this.viewerImageSourceSizes[key]
-    }
-    next[path] = size
-    this.viewerImageSourceSizes = next
-  }
-
-  private setViewerImageLayoutSize(path: string, size: ThumbnailSize): void {
-    if (path.length === 0 || !this.isViewerPathNearCurrent(path)) {
-      return
-    }
-    const next: Record<string, ThumbnailSize> = {}
-    for (const key of Object.keys(this.viewerImageLayoutSizes)) {
-      next[key] = this.viewerImageLayoutSizes[key]
-    }
-    next[path] = size
-    this.viewerImageLayoutSizes = next
-  }
-
-  private setViewerImageLayoutSizeIfAbsent(path: string, size: ThumbnailSize): void {
-    if (path.length === 0 || this.viewerImageLayoutSizes[path] !== undefined) {
-      return
-    }
-    this.setViewerImageLayoutSize(path, size)
-  }
-
-  private viewerImageOrientation(entry: FileEntry): ImageRotateOrientation {
-    const value = this.viewerImageOrientations[entry.path]
-    return value === undefined ? ImageRotateOrientation.AUTO : value
-  }
-
   private viewerPreviewImageOrientation(entry: FileEntry): ImageRotateOrientation {
     // The file row and viewer preview must always consume one shared base
     // orientation. A cache release may replace the preview bytes, but it must
@@ -8838,7 +9542,7 @@ struct Index {
     if (this.previewCanonicalPaths[entry.path] === true) {
       return ImageRotateOrientation.UP
     }
-    return ImageRotateOrientation.AUTO
+    return this.imageVisualState(entry.path).thumbnailOrientation
   }
 
   /**
@@ -8874,88 +9578,60 @@ struct Index {
     return ImageRotateOrientation.AUTO
   }
 
-  private async applyExifOrientationToPixelMap(pixelMap: image.PixelMap,
-    orientation: ImageRotateOrientation): Promise<void> {
-    // Image Kit's PixelMap operations are explicit pixel transforms. Apply
-    // the EXIF operation in the order defined by ArkUI's orientation enum;
-    // the packed result is then physically upright and is rendered with UP.
-    if (orientation === ImageRotateOrientation.UP_MIRRORED) {
-      await pixelMap.flip(true, false)
-      return
-    }
-    if (orientation === ImageRotateOrientation.DOWN_MIRRORED) {
-      await pixelMap.flip(false, true)
-      return
-    }
-    if (orientation === ImageRotateOrientation.RIGHT_MIRRORED) {
-      await pixelMap.flip(true, false)
-      await pixelMap.rotate(90)
-      return
-    }
-    if (orientation === ImageRotateOrientation.LEFT_MIRRORED) {
-      await pixelMap.flip(true, false)
-      await pixelMap.rotate(270)
-      return
-    }
-    if (orientation === ImageRotateOrientation.RIGHT) {
-      await pixelMap.rotate(90)
-      return
-    }
-    if (orientation === ImageRotateOrientation.DOWN) {
-      await pixelMap.rotate(180)
-      return
-    }
-    if (orientation === ImageRotateOrientation.LEFT) {
-      await pixelMap.rotate(270)
-    }
+  private viewerVisualCommitBlocked(_path: string): boolean {
+    return this.viewerClosePending || this.viewerEntryTransitionActive ||
+      this.viewerTransitionActive || this.imageDismissDragging
   }
 
-  private setViewerImageOrientation(path: string, orientation: ImageRotateOrientation): void {
+  private commitViewerBitmap(entry: FileEntry, localPath: string,
+    record: ViewerBitmapRecord): void {
+    const path = entry.path
     if (path.length === 0 || !this.isViewerPathNearCurrent(path)) {
       return
     }
-    const next: Record<string, ImageRotateOrientation> = {}
-    for (const key of Object.keys(this.viewerImageOrientations)) {
-      next[key] = this.viewerImageOrientations[key]
+    this.applyDecodedBitmapGeometry(path, record, true)
+    this.updateImageVisualState(path, (state: ImageVisualState): void => {
+      state.originalUri = fileUri.getUriFromPath(localPath)
+      state.originalOrientation = ImageRotateOrientation.UP
+      state.decodeState = 'decoded'
+      state.visibleLayer = 'thumbnail'
+      state.progress = 95
+      state.progressKnown = true
+    })
+    this.setViewerDownloadProgress(path, 95, true, true)
+    this.viewerPendingBitmapReveals[path] = true
+    const token = (this.viewerRevealTokens[path] === undefined
+      ? 0 : this.viewerRevealTokens[path]) + 1
+    this.viewerRevealTokens[path] = token
+    this.logViewerDiagnostic('original-pixelmap-decoded', path)
+    if (!this.viewerVisualCommitBlocked(path)) {
+      this.scheduleViewerBitmapReveal(path, token)
     }
-    next[path] = orientation
-    this.viewerImageOrientations = next
   }
 
-  private viewerImageSourceSize(entry: FileEntry): ThumbnailSize | null {
-    const size = this.viewerImageSourceSizes[entry.path]
-    if (size !== undefined && size.width > 0 && size.height > 0) {
-      return size
-    }
-    return null
-  }
-
-  private viewerImageLayoutSize(entry: FileEntry): ThumbnailSize | null {
-    const size = this.viewerImageLayoutSizes[entry.path]
-    if (size !== undefined && size.width > 0 && size.height > 0) {
-      return size
-    }
-    return null
-  }
-
-  private setViewerOriginalUri(path: string, uri: string): void {
-    if (path.length === 0 || uri.length === 0 || !this.isViewerPathNearCurrent(path)) {
+  private commitViewerBitmapReveal(path: string, token: number): void {
+    if (this.viewerRevealTokens[path] !== token || !this.showImageViewer ||
+      this.viewerVisualCommitBlocked(path)) {
       return
     }
-    const nextUris: Record<string, string> = {}
-    for (const key of Object.keys(this.viewerOriginalUris)) {
-      nextUris[key] = this.viewerOriginalUris[key]
+    const record = this.viewerOriginalBitmaps[path]
+    if (record === undefined) {
+      return
     }
-    nextUris[path] = uri
-    this.viewerOriginalUris = nextUris
-
-    const nextDecoded: Record<string, boolean> = {}
-    for (const key of Object.keys(this.viewerDecodedImages)) {
-      nextDecoded[key] = this.viewerDecodedImages[key]
+    this.updateImageVisualState(path, (next: ImageVisualState): void => {
+      next.visibleLayer = 'original'
+      next.decodeState = 'displayed'
+      next.progress = 100
+      next.progressKnown = true
+    })
+    this.viewerPendingBitmapReveals[path] = false
+    this.logViewerDiagnostic('original-pixelmap-displayed', path)
+    if (path === this.viewerPrimaryPath) {
+      const primaryIndex = this.viewerImages.findIndex((item: FileEntry): boolean => item.path === path)
+      if (primaryIndex >= 0) {
+        this.startAdjacentViewerPrefetch(primaryIndex, this.viewerGeneration)
+      }
     }
-    nextDecoded[path] = false
-    this.viewerDecodedImages = nextDecoded
-    this.setViewerDownloadProgress(path, 95, true, true)
   }
 
   private isViewerPathNearCurrent(path: string): boolean {
@@ -8981,42 +9657,48 @@ struct Index {
     return false
   }
 
-  private markViewerImageDecoded(path: string): void {
-    if (!this.showImageViewer || this.viewerOriginalUris[path] === undefined ||
-      this.viewerDecodedImages[path] === true) {
-      return
-    }
-    const next: Record<string, boolean> = {}
-    for (const key of Object.keys(this.viewerDecodedImages)) {
-      next[key] = this.viewerDecodedImages[key]
-    }
-    next[path] = true
-    this.viewerDecodedImages = next
-    this.setViewerDownloadProgress(path, 100, true, true)
-    // Do not warm neighbors merely because their files are present locally.
-    // Start the adjacent decode window only after the currently selected
-    // Image has delivered onComplete, so the visible page always wins.
-    if (path === this.viewerPrimaryPath) {
-      const primaryIndex = this.viewerImages.findIndex((item: FileEntry): boolean => {
-        return item.path === path
-      })
-      if (primaryIndex >= 0) {
-        this.startAdjacentViewerPrefetch(primaryIndex, this.viewerGeneration)
-      }
-    }
+  private scheduleViewerBitmapReveal(path: string, token: number): void {
+    // Keep the preview in one submitted frame, then swap the source of the
+    // same Image node and close the progress ring from the official callback.
+    this.postRenderFrame((): void => this.commitViewerBitmapReveal(path, token))
   }
 
   private markViewerImageFailed(path: string): void {
-    if (!this.showImageViewer || this.viewerOriginalUris[path] === undefined) {
+    if (!this.showImageViewer || this.imageVisualState(path).originalUri.length === 0) {
       return
     }
-    const next: Record<string, boolean> = {}
-    for (const key of Object.keys(this.viewerDecodedImages)) {
-      next[key] = this.viewerDecodedImages[key]
-    }
-    next[path] = false
-    this.viewerDecodedImages = next
+    this.updateImageVisualState(path, (next: ImageVisualState): void => {
+      next.decodeState = 'failed'
+      next.visibleLayer = 'thumbnail'
+    })
     this.setViewerDownloadProgress(path, 0, false, true)
+  }
+
+  private flushDeferredViewerVisualCommits(): void {
+    if (!this.showImageViewer || this.viewerClosePending ||
+      this.viewerEntryTransitionActive || this.viewerTransitionActive ||
+      this.imageDismissDragging) {
+      return
+    }
+    for (const path of Object.keys(this.viewerPendingBitmapReveals)) {
+      if (this.viewerPendingBitmapReveals[path] !== true ||
+        this.viewerOriginalBitmaps[path] === undefined) {
+        continue
+      }
+      const token = (this.viewerRevealTokens[path] === undefined
+        ? 0 : this.viewerRevealTokens[path]) + 1
+      this.viewerRevealTokens[path] = token
+      this.scheduleViewerBitmapReveal(path, token)
+    }
+    if (this.viewerPendingRotationPath.length > 0) {
+      const rotationEntry = this.viewerImages.find((item: FileEntry): boolean => {
+        return item.path === this.viewerPendingRotationPath
+      })
+      this.viewerPendingRotationPath = ''
+      if (rotationEntry !== undefined) {
+        this.applyViewerRotation(rotationEntry)
+      }
+    }
   }
 
   private async saveViewerImage(entry: FileEntry): Promise<void> {
@@ -9041,37 +9723,30 @@ struct Index {
     if (!this.showImageViewer || this.isBusy) {
       return
     }
-    const current = this.viewerManualRotations[entry.path] === undefined
-      ? 0 : this.viewerManualRotations[entry.path]
-    const nextRotation = (current + 90) % 360
-    const next: Record<string, number> = {}
-    for (const key of Object.keys(this.viewerManualRotations)) {
-      next[key] = this.viewerManualRotations[key]
+    this.closeImageMoreMenu()
+    if (this.viewerVisualCommitBlocked(entry.path)) {
+      this.viewerPendingRotationPath = entry.path
+      return
     }
-    next[entry.path] = nextRotation
-    this.viewerManualRotations = next
+    this.applyViewerRotation(entry)
+  }
+
+  private applyViewerRotation(entry: FileEntry): void {
+    const current = this.imageVisualState(entry.path).userRotation
+    const nextRotation = (current + 90) % 360
+    this.updateImageVisualState(entry.path, (state: ImageVisualState): void => {
+      state.userRotation = nextRotation
+    })
 
     // The file page remains mounted below the viewer. Update its thumbnail
     // immediately and invalidate any older asynchronous database read.
     this.fileListRotationGeneration += 1
-    const nextFileListRotations: Record<string, number> = {}
-    for (const key of Object.keys(this.fileListImageRotations)) {
-      if (key !== entry.path) {
-        nextFileListRotations[key] = this.fileListImageRotations[key]
-      }
-    }
-    if (nextRotation !== 0) {
-      nextFileListRotations[entry.path] = nextRotation
-    }
-    this.fileListImageRotations = nextFileListRotations
     this.persistViewerRotation(entry, nextRotation)
-    this.closeImageMoreMenu()
     this.resetImageTransform()
   }
 
   private viewerManualRotation(path: string): number {
-    const value = this.viewerManualRotations[path]
-    return value === undefined ? 0 : value
+    return this.imageVisualState(path).userRotation
   }
 
   private viewerManualRotationFitScale(entry: FileEntry): number {
@@ -9079,14 +9754,16 @@ struct Index {
     if (angle === 0 || angle === 180) {
       return 1
     }
-    const size = this.viewerImageLayoutSize(entry)
-    if (size === null) {
+    const state = this.imageVisualState(entry.path)
+    if (state.frameWidth <= 0 || state.frameHeight <= 0) {
       return 1
     }
     const viewportWidth = Math.max(1, this.imageViewportWidthVp)
     const viewportHeight = Math.max(1, this.imageViewportHeightVp)
-    const unrotatedContain = Math.min(viewportWidth / size.width, viewportHeight / size.height)
-    const rotatedContain = Math.min(viewportWidth / size.height, viewportHeight / size.width)
+    const unrotatedContain = Math.min(viewportWidth / state.frameWidth,
+      viewportHeight / state.frameHeight)
+    const rotatedContain = Math.min(viewportWidth / state.frameHeight,
+      viewportHeight / state.frameWidth)
     if (unrotatedContain <= 0 || rotatedContain <= 0) {
       return 1
     }
@@ -9189,12 +9866,13 @@ struct Index {
       this.viewerImageIndex = boundedIndex
       this.viewerImageEntry = remainingImages[boundedIndex]
       this.viewerHeaderTitle = remainingImages[boundedIndex].name
-      this.viewerOriginalUris = this.filterViewerUris(remainingImages)
-      this.viewerImageSourceSizes = this.filterViewerSourceSizes(remainingImages)
-      this.viewerImageLayoutSizes = this.filterViewerLayoutSizes(remainingImages)
-      this.viewerImageOrientations = this.filterViewerOrientations(
-        remainingImages, this.viewerImageOrientations)
-      this.viewerDecodedImages = this.filterViewerDecodedImages(remainingImages)
+      const nextStates: Record<string, ImageVisualState> = {}
+      for (const key of Object.keys(this.imageVisualStates)) {
+        if (key !== entry.path) {
+          nextStates[key] = this.imageVisualStates[key]
+        }
+      }
+      this.imageVisualStates = nextStates
       this.viewerLoadQueue = this.viewerLoadQueue.filter((item: FileEntry) => item.path !== entry.path)
       this.viewerLoadRequests[entry.path] = false
       this.resetImageTransform()
@@ -9203,7 +9881,9 @@ struct Index {
       } else if (boundedIndex < deletedIndex) {
         this.viewerLastNavigationDirection = -1
       }
+      this.ensureViewerImageFrame(remainingImages[boundedIndex])
       this.prefetchViewerImages(boundedIndex)
+      this.prepareViewerReturnSource(remainingImages[boundedIndex]).catch((): void => {})
       this.statusText = '已移入回收站'
       this.showImmersiveToast('已移入云盘回收站')
     } catch (error) {
@@ -9212,61 +9892,6 @@ struct Index {
     } finally {
       this.isBusy = false
     }
-  }
-
-  private filterViewerUris(entries: FileEntry[]): Record<string, string> {
-    const next: Record<string, string> = {}
-    for (const item of entries) {
-      const uri = this.viewerOriginalUris[item.path]
-      if (typeof uri === 'string' && uri.length > 0) {
-        next[item.path] = uri
-      }
-    }
-    return next
-  }
-
-  private filterViewerDecodedImages(entries: FileEntry[]): Record<string, boolean> {
-    const next: Record<string, boolean> = {}
-    for (const item of entries) {
-      if (this.viewerDecodedImages[item.path] === true) {
-        next[item.path] = true
-      }
-    }
-    return next
-  }
-
-  private filterViewerSourceSizes(entries: FileEntry[]): Record<string, ThumbnailSize> {
-    const next: Record<string, ThumbnailSize> = {}
-    for (const item of entries) {
-      const size = this.viewerImageSourceSizes[item.path]
-      if (size !== undefined) {
-        next[item.path] = size
-      }
-    }
-    return next
-  }
-
-  private filterViewerLayoutSizes(entries: FileEntry[]): Record<string, ThumbnailSize> {
-    const next: Record<string, ThumbnailSize> = {}
-    for (const item of entries) {
-      const size = this.viewerImageLayoutSizes[item.path]
-      if (size !== undefined) {
-        next[item.path] = size
-      }
-    }
-    return next
-  }
-
-  private filterViewerOrientations(entries: FileEntry[],
-    source: Record<string, ImageRotateOrientation>): Record<string, ImageRotateOrientation> {
-    const next: Record<string, ImageRotateOrientation> = {}
-    for (const item of entries) {
-      const orientation = source[item.path]
-      if (orientation !== undefined) {
-        next[item.path] = orientation
-      }
-    }
-    return next
   }
 
   private async openAudioPlayer(entry: FileEntry): Promise<void> {
@@ -10133,10 +10758,9 @@ struct Index {
   }
 
   private previewUri(entry: FileEntry): string {
-    const uri = this.previewUris[entry.path]
-    const signature = this.previewUriSignatures[entry.path]
-    return typeof uri === 'string' && uri.length > 0 && signature === this.previewSignature(entry)
-      ? uri : ''
+    const state = this.imageVisualState(entry.path)
+    return state.thumbnailUri.length > 0 &&
+      state.thumbnailSignature === this.previewSignature(entry) ? state.thumbnailUri : ''
   }
 
   private setPreviewUri(entry: FileEntry, uri: string, localPath: string = '',
@@ -10145,20 +10769,26 @@ struct Index {
     if (path.length === 0 || uri.length === 0) {
       return
     }
+    // Viewer-time derivatives are already persisted by the cache manager.
+    // Keep the mounted file surface byte-for-byte stable until the return
+    // transition has finished; the next normal preview warmup may adopt them.
+    if (this.showImageViewer || this.viewerEntryTransitionActive || this.viewerClosePending) {
+      return
+    }
     const order: string[] = this.previewUriOrder.filter((key: string): boolean => key !== path)
     order.push(path)
+    const evictedPaths: string[] = []
     while (order.length > 96) {
-      order.shift()
+      const evicted = order.shift()
+      if (evicted !== undefined) {
+        evictedPaths.push(evicted)
+      }
     }
-    const next: Record<string, string> = {}
-    const nextSignatures: Record<string, string> = {}
     const nextLocalPaths: Record<string, string> = {}
     const nextCanonicalPaths: Record<string, boolean> = {}
     const signature = this.previewSignature(entry)
     for (const key of order) {
       if (key === path) {
-        next[key] = uri
-        nextSignatures[key] = signature
         if (localPath.length > 0) {
           nextLocalPaths[key] = localPath
         }
@@ -10166,27 +10796,36 @@ struct Index {
           nextCanonicalPaths[key] = true
         }
       } else {
-        const existing = this.previewUris[key]
-        const existingSignature = this.previewUriSignatures[key]
         const existingLocalPath = this.previewLocalPaths[key]
-        if (typeof existing === 'string' && existing.length > 0 &&
-          typeof existingSignature === 'string' && existingSignature.length > 0) {
-          next[key] = existing
-          nextSignatures[key] = existingSignature
-          if (typeof existingLocalPath === 'string' && existingLocalPath.length > 0) {
-            nextLocalPaths[key] = existingLocalPath
-          }
-          if (this.previewCanonicalPaths[key] === true) {
-            nextCanonicalPaths[key] = true
-          }
+        if (typeof existingLocalPath === 'string' && existingLocalPath.length > 0) {
+          nextLocalPaths[key] = existingLocalPath
+        }
+        if (this.previewCanonicalPaths[key] === true) {
+          nextCanonicalPaths[key] = true
         }
       }
     }
     this.previewUriOrder = order
-    this.previewUris = next
-    this.previewUriSignatures = nextSignatures
     this.previewLocalPaths = nextLocalPaths
     this.previewCanonicalPaths = nextCanonicalPaths
+    this.updateImageVisualState(path, (state: ImageVisualState): void => {
+      if (state.thumbnailUri !== uri || state.thumbnailSignature !== signature) {
+        state.thumbnailDecodedUri = ''
+      }
+      state.thumbnailUri = uri
+      state.thumbnailSignature = signature
+      state.thumbnailOrientation = canonical
+        ? ImageRotateOrientation.UP : ImageRotateOrientation.AUTO
+    })
+    for (const evictedPath of evictedPaths) {
+      this.updateImageVisualState(evictedPath, (state: ImageVisualState): void => {
+        state.thumbnailUri = ''
+        state.thumbnailSignature = ''
+        if (state.thumbnailVisibleRatio <= 0) {
+          state.transitionThumbnailUri = ''
+        }
+      })
+    }
   }
 
   private replaceEntries(nextEntries: FileEntry[], appendWaterfall: boolean = false): void {
