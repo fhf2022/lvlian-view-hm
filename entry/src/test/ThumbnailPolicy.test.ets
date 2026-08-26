@@ -26,5 +26,20 @@ export default function thumbnailPolicyTest() {
       expect(size.height).assertEqual(810)
       expect(ThumbnailPolicy.needsDownsample(4000, 3000, 'viewerZoom')).assertTrue()
     })
+
+    it('keeps a screen-width tall original at its native resolution', 0, () => {
+      const size = ThumbnailPolicy.targetSize(1080, 7460, 'viewerZoom')
+      expect(size.width).assertEqual(1080)
+      expect(size.height).assertEqual(7460)
+      expect(ThumbnailPolicy.needsDownsample(1080, 7460, 'viewerZoom')).assertFalse()
+    })
+
+    it('bounds oversized originals by total decoded pixels', 0, () => {
+      const size = ThumbnailPolicy.targetSize(6000, 4000, 'viewerZoom')
+      expect(size.width < 6000).assertTrue()
+      expect(size.height < 4000).assertTrue()
+      expect(size.width * size.height <= ThumbnailPolicy.VIEWER_ZOOM_MAX_PIXELS).assertTrue()
+      expect(ThumbnailPolicy.needsDownsample(6000, 4000, 'viewerZoom')).assertTrue()
+    })
   })
 }

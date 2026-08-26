@@ -1,6 +1,7 @@
 import { fileIo } from '@kit.CoreFileKit'
 import { image } from '@kit.ImageKit'
 import { ThumbnailPolicy, ThumbnailProfile, ThumbnailSize } from './ThumbnailPolicy'
+import { ImageTransformPolicy } from './ImageTransformPolicy'
 
 /**
  * The viewer keeps decoded pixels separate from the URI cache.  URIs are a
@@ -12,6 +13,8 @@ export interface ViewerBitmapRecord {
   pixelMap: image.PixelMap
   physicalWidth: number
   physicalHeight: number
+  exifDisplayWidth: number
+  exifDisplayHeight: number
   displayWidth: number
   displayHeight: number
   decodeWidth: number
@@ -20,17 +23,23 @@ export interface ViewerBitmapRecord {
   exifRotation: number
   mirrorHorizontal: boolean
   mirrorVertical: boolean
+  userRotation: number
+  transformKey: string
 }
 
 export interface ViewerBitmapMetadata {
   physicalWidth: number
   physicalHeight: number
+  exifDisplayWidth: number
+  exifDisplayHeight: number
   displayWidth: number
   displayHeight: number
   exifValue: string
   exifRotation: number
   mirrorHorizontal: boolean
   mirrorVertical: boolean
+  userRotation: number
+  transformKey: string
 }
 
 interface ExifTransform {
@@ -46,7 +55,7 @@ interface ExifTransform {
  * formats that do not support a DMA-backed decode.
  */
 export class ViewerBitmapStore {
-  async readMetadata(path: string): Promise<ViewerBitmapMetadata | null> {
+  async readMetadata(path: string, userRotation: number = 0): Promise<ViewerBitmapMetadata | null> {
     let source: image.ImageSource | null = null
     let sourceFd: number = -1
     try {
@@ -59,15 +68,23 @@ export class ViewerBitmapStore {
       const exifValue = await this.readExif(source)
       const transform = this.transformFor(exifValue)
       const swapsAxes = transform.rotation === 90 || transform.rotation === 270
+      const normalizedUserRotation = ImageTransformPolicy.normalizedRotation(userRotation)
+      const exifDisplayWidth = swapsAxes ? physicalHeight : physicalWidth
+      const exifDisplayHeight = swapsAxes ? physicalWidth : physicalHeight
+      const userSwapsAxes = ImageTransformPolicy.swapsAxes(normalizedUserRotation)
       return {
         physicalWidth: physicalWidth,
         physicalHeight: physicalHeight,
-        displayWidth: swapsAxes ? physicalHeight : physicalWidth,
-        displayHeight: swapsAxes ? physicalWidth : physicalHeight,
+        exifDisplayWidth: exifDisplayWidth,
+        exifDisplayHeight: exifDisplayHeight,
+        displayWidth: userSwapsAxes ? exifDisplayHeight : exifDisplayWidth,
+        displayHeight: userSwapsAxes ? exifDisplayWidth : exifDisplayHeight,
         exifValue: exifValue,
         exifRotation: transform.rotation,
         mirrorHorizontal: transform.mirrorHorizontal,
-        mirrorVertical: transform.mirrorVertical
+        mirrorVertical: transform.mirrorVertical,
+        userRotation: normalizedUserRotation,
+        transformKey: this.transformKey(path, exifValue, normalizedUserRotation)
       }
     } catch (error) {
       console.warn('[UgreenBitmap] metadata failed: ' + path + ': ' + JSON.stringify(error))
@@ -88,7 +105,7 @@ export class ViewerBitmapStore {
     }
   }
 
-  async decode(path: string, profile: ThumbnailProfile,
+  async decode(path: string, profile: ThumbnailProfile, userRotation: number = 0,
     desiredSize?: ThumbnailSize): Promise<ViewerBitmapRecord | null> {
     let source: image.ImageSource | null = null
     let sourceFd: number = -1
@@ -104,17 +121,28 @@ export class ViewerBitmapStore {
       const physicalHeight = Math.max(1, Math.floor(info.size.height))
       const exifValue = await this.readExif(source)
       const transform = this.transformFor(exifValue)
-      const displayWidth = transform.rotation === 90 || transform.rotation === 270
+      const normalizedUserRotation = ImageTransformPolicy.normalizedRotation(userRotation)
+      const exifDisplayWidth = transform.rotation === 90 || transform.rotation === 270
         ? physicalHeight : physicalWidth
-      const displayHeight = transform.rotation === 90 || transform.rotation === 270
+      const exifDisplayHeight = transform.rotation === 90 || transform.rotation === 270
         ? physicalWidth : physicalHeight
-      const target = desiredSize === undefined
+      const userSwapsAxes = ImageTransformPolicy.swapsAxes(normalizedUserRotation)
+      const displayWidth = userSwapsAxes ? exifDisplayHeight : exifDisplayWidth
+      const displayHeight = userSwapsAxes ? exifDisplayWidth : exifDisplayHeight
+      const finalTarget = desiredSize === undefined
         ? ThumbnailPolicy.targetSize(displayWidth, displayHeight, profile)
         : this.fitSize(displayWidth, displayHeight, desiredSize)
+      // The user's quarter-turn is applied to the EXIF-normalized PixelMap
+      // below. Request the pre-user-rotation axes here so the resulting
+      // raster has exactly finalTarget's dimensions after that operation.
+      const decodeTarget: ThumbnailSize = {
+        width: userSwapsAxes ? finalTarget.height : finalTarget.width,
+        height: userSwapsAxes ? finalTarget.width : finalTarget.height
+      }
       const options: image.DecodingOptions = {
-        desiredSize: { width: target.width, height: target.height },
+        desiredSize: { width: decodeTarget.width, height: decodeTarget.height },
         rotate: transform.rotation,
-        editable: transform.mirrorHorizontal || transform.mirrorVertical
+        editable: transform.mirrorHorizontal || transform.mirrorVertical || normalizedUserRotation !== 0
       }
       try {
         pixelMap = await source.createPixelMapUsingAllocator(options, image.AllocatorType.DMA)
@@ -132,6 +160,12 @@ export class ViewerBitmapStore {
       if (transform.mirrorHorizontal || transform.mirrorVertical) {
         await pixelMap.flip(transform.mirrorHorizontal, transform.mirrorVertical)
       }
+      // Persisted rotation is a visual edit performed after the source EXIF
+      // transform. Baking it into the PixelMap makes layout and rendering use
+      // the same final axes; ArkUI's post-layout .rotate() is not involved.
+      if (normalizedUserRotation !== 0) {
+        await pixelMap.rotate(normalizedUserRotation)
+      }
       const decodedInfo = pixelMap.getImageInfoSync()
       const decodedWidth = Math.max(1, Math.floor(decodedInfo.size.width))
       const decodedHeight = Math.max(1, Math.floor(decodedInfo.size.height))
@@ -140,6 +174,8 @@ export class ViewerBitmapStore {
         pixelMap: pixelMap,
         physicalWidth: physicalWidth,
         physicalHeight: physicalHeight,
+        exifDisplayWidth: exifDisplayWidth,
+        exifDisplayHeight: exifDisplayHeight,
         displayWidth: displayWidth,
         displayHeight: displayHeight,
         decodeWidth: decodedWidth,
@@ -147,13 +183,16 @@ export class ViewerBitmapStore {
         exifValue: exifValue,
         exifRotation: transform.rotation,
         mirrorHorizontal: transform.mirrorHorizontal,
-        mirrorVertical: transform.mirrorVertical
+        mirrorVertical: transform.mirrorVertical,
+        userRotation: normalizedUserRotation,
+        transformKey: this.transformKey(path, exifValue, normalizedUserRotation)
       }
       console.info('[UgreenBitmap] decoded path=' + path + ' allocator=' + allocator +
         ' physical=' + physicalWidth.toString() + 'x' + physicalHeight.toString() +
+        ' exifDisplay=' + exifDisplayWidth.toString() + 'x' + exifDisplayHeight.toString() +
         ' display=' + displayWidth.toString() + 'x' + displayHeight.toString() +
         ' raster=' + decodedWidth.toString() + 'x' + decodedHeight.toString() +
-        ' exif=' + exifValue)
+        ' exif=' + exifValue + ' userRotation=' + normalizedUserRotation.toString())
       ownsPixelMap = false
       return record
     } catch (error) {
@@ -209,6 +248,11 @@ export class ViewerBitmapStore {
       width: Math.max(1, Math.round(sourceWidth * scale)),
       height: Math.max(1, Math.round(sourceHeight * scale))
     }
+  }
+
+  private transformKey(path: string, exifValue: string, userRotation: number): string {
+    return path + '|exif=' + exifValue.trim().toLowerCase() +
+      '|user=' + ImageTransformPolicy.normalizedRotation(userRotation).toString()
   }
 
   private transformFor(value: string): ExifTransform {

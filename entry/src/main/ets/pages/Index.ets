@@ -11,7 +11,7 @@ import { DownloadQueueManager } from '../download/DownloadQueueManager'
 import { UserFileManager } from '../download/UserFileManager'
 import { AudioPlaybackManager } from '../media/AudioPlaybackManager'
 import { MediaPreviewManager } from '../media/MediaPreviewManager'
-import { ImageRotationStore } from '../media/ImageRotationStore'
+import { ImageRotationRecord, ImageRotationStore } from '../media/ImageRotationStore'
 import { RemoteSearchScope, UgreenRemoteRepository } from '../repository/UgreenRemoteRepository'
 import { BinaryDownloadProgress, BinaryProgressListener } from '../core/network/HttpTransport'
 import { UgreenError, readableUgreenError } from '../ugreen/UgreenErrors'
@@ -105,8 +105,11 @@ class ImageVisualState {
   thumbnailOrientation: ImageRotateOrientation = ImageRotateOrientation.AUTO
   originalOrientation: ImageRotateOrientation = ImageRotateOrientation.AUTO
   userRotation: number = 0
+  rotationResolved: boolean = false
   physicalWidth: number = 0
   physicalHeight: number = 0
+  exifDisplayWidth: number = 0
+  exifDisplayHeight: number = 0
   displayWidth: number = 0
   displayHeight: number = 0
   thumbnailDisplayWidth: number = 0
@@ -134,6 +137,8 @@ class ImageVisualState {
 class ViewerImageGeometry {
   physicalWidth: number = 0
   physicalHeight: number = 0
+  exifDisplayWidth: number = 0
+  exifDisplayHeight: number = 0
   displayWidth: number = 0
   displayHeight: number = 0
   orientation: ImageRotateOrientation = ImageRotateOrientation.AUTO
@@ -378,6 +383,9 @@ struct Index {
   private viewerPreviewBitmaps: Record<string, ViewerBitmapRecord> = {}
   private viewerPreviewBitmapAliases: Record<string, boolean> = {}
   private viewerOriginalBitmaps: Record<string, ViewerBitmapRecord> = {}
+  private viewerOriginalLocalPaths: Record<string, string> = {}
+  private fileThumbnailBitmaps: Record<string, ViewerBitmapRecord> = {}
+  private fileThumbnailDecodeKeys: Record<string, string> = {}
   private waterfallBitmaps: Record<string, ViewerBitmapRecord> = {}
   private imageRotationStore: ImageRotationStore = new ImageRotationStore()
   // Keep the already rendered parent pages so system/back navigation does not
@@ -1462,11 +1470,6 @@ struct Index {
             .objectFit(ImageFit.Cover)
             .borderRadius(6)
             .geometryTransition(this.fileImageTransitionId(entry, surface))
-            .rotate({ angle: this.fileListImageRotation(entry.path) })
-            .scale({
-              x: this.fileThumbnailRotationFitScale(entry, surface),
-              y: this.fileThumbnailRotationFitScale(entry, surface)
-            })
             .syncLoad(this.fileImageShouldSyncLoad(entry))
             .onComplete((event?: ViewerImageCompleteEvent): void =>
               this.recordThumbnailComplete(entry, this.previewUri(entry), index, surface, event))
@@ -1971,11 +1974,6 @@ struct Index {
                       .objectFit(ImageFit.Cover)
                       .borderRadius(10)
                       .geometryTransition(this.fileImageTransitionId(entry, 'grid'))
-                      .rotate({ angle: this.fileListImageRotation(entry.path) })
-                      .scale({
-                        x: this.fileThumbnailRotationFitScale(entry, 'grid'),
-                        y: this.fileThumbnailRotationFitScale(entry, 'grid')
-                      })
                       .syncLoad(this.fileImageShouldSyncLoad(entry))
                       .onComplete((event?: ViewerImageCompleteEvent): void =>
                         this.recordThumbnailComplete(entry, this.previewUri(entry), index,
@@ -2078,11 +2076,6 @@ struct Index {
                       .orientation(this.fileImageSourceOrientation(entry, 'waterfall'))
                       .objectFit(ImageFit.Contain)
                       .geometryTransition(this.fileImageTransitionId(entry, 'waterfall'))
-                      .rotate({ angle: this.fileListImageRotation(entry.path) })
-                      .scale({
-                        x: this.fileThumbnailRotationFitScale(entry, 'waterfall'),
-                        y: this.fileThumbnailRotationFitScale(entry, 'waterfall')
-                      })
                       .syncLoad(this.fileImageShouldSyncLoad(entry))
                       .onComplete((event?: ViewerImageCompleteEvent): void => {
                         this.recordThumbnailComplete(entry, this.waterfallUri(entry), index,
@@ -4039,8 +4032,11 @@ struct Index {
     next.thumbnailOrientation = source.thumbnailOrientation
     next.originalOrientation = source.originalOrientation
     next.userRotation = source.userRotation
+    next.rotationResolved = source.rotationResolved
     next.physicalWidth = source.physicalWidth
     next.physicalHeight = source.physicalHeight
+    next.exifDisplayWidth = source.exifDisplayWidth
+    next.exifDisplayHeight = source.exifDisplayHeight
     next.displayWidth = source.displayWidth
     next.displayHeight = source.displayHeight
     next.thumbnailDisplayWidth = source.thumbnailDisplayWidth
@@ -4131,6 +4127,13 @@ struct Index {
   }
 
   private fileImageSource(entry: FileEntry, surface: ThumbnailSurfaceKind): image.PixelMap | string {
+    // The maps contain native resources and intentionally are not @State.
+    // Reading the epoch makes every file-surface Image react to an atomic map
+    // replacement without copying PixelMaps through observable state.
+    const epoch = this.viewerBitmapEpoch
+    if (epoch < 0) {
+      return ''
+    }
     if (this.viewerEntryTransitionActive && this.viewerEntryTransitionPath === entry.path) {
       const transitionBitmap = this.viewerTransitionKind === 'exit' &&
         this.viewerTransitionLayer === 'original'
@@ -4145,6 +4148,15 @@ struct Index {
         return waterfallBitmap.pixelMap
       }
     }
+    if (this.isImage(entry)) {
+      const thumbnailBitmap = this.fileThumbnailBitmaps[entry.path]
+      if (thumbnailBitmap !== undefined) {
+        return thumbnailBitmap.pixelMap
+      }
+      // Image URIs are transport/cache inputs only. Persisted rotation must be
+      // baked by Image Kit before ArkUI is allowed to render the thumbnail.
+      return ''
+    }
     if (surface === 'waterfall') {
       return this.waterfallUri(entry)
     }
@@ -4152,6 +4164,9 @@ struct Index {
   }
 
   private fileImageSourceAvailable(entry: FileEntry, surface: ThumbnailSurfaceKind): boolean {
+    if (this.isImage(entry) && !this.imageVisualState(entry.path).rotationResolved) {
+      return false
+    }
     const source = this.fileImageSource(entry, surface)
     return typeof source === 'string' ? source.length > 0 : true
   }
@@ -4173,11 +4188,20 @@ struct Index {
 
   private async ensureViewerPreviewBitmap(entry: FileEntry): Promise<ViewerBitmapRecord | null> {
     const existing = this.viewerPreviewBitmaps[entry.path]
-    if (existing !== undefined) {
+    const rotation = this.imageVisualState(entry.path).userRotation
+    if (existing !== undefined && existing.userRotation === rotation) {
       return existing
     }
+    if (existing !== undefined) {
+      const alias = this.viewerPreviewBitmapAliases[entry.path] === true
+      this.removeViewerBitmap(this.viewerPreviewBitmaps, entry.path)
+      this.viewerPreviewBitmapAliases[entry.path] = false
+      if (!alias) {
+        await this.viewerBitmapStore.release(existing)
+      }
+    }
     const waterfallBitmap = this.waterfallBitmaps[entry.path]
-    if (waterfallBitmap !== undefined) {
+    if (waterfallBitmap !== undefined && waterfallBitmap.userRotation === rotation) {
       const next: Record<string, ViewerBitmapRecord> = {}
       for (const key of Object.keys(this.viewerPreviewBitmaps)) {
         next[key] = this.viewerPreviewBitmaps[key]
@@ -4196,8 +4220,12 @@ struct Index {
     if (typeof localPath !== 'string' || localPath.length === 0 || !CacheManager.exists(localPath)) {
       return null
     }
-    const record = await this.viewerBitmapStore.decode(localPath, 'viewerPreview')
+    const record = await this.viewerBitmapStore.decode(localPath, 'viewerPreview', rotation)
     if (record === null) {
+      return null
+    }
+    if (this.imageVisualState(entry.path).userRotation !== rotation) {
+      await this.viewerBitmapStore.release(record)
       return null
     }
     const raced = this.viewerPreviewBitmaps[entry.path]
@@ -4212,6 +4240,8 @@ struct Index {
         state.physicalWidth = record.physicalWidth
         state.physicalHeight = record.physicalHeight
       }
+      state.exifDisplayWidth = record.exifDisplayWidth
+      state.exifDisplayHeight = record.exifDisplayHeight
       if (state.displayWidth <= 0 || state.displayHeight <= 0) {
         state.displayWidth = record.displayWidth
         state.displayHeight = record.displayHeight
@@ -4231,11 +4261,20 @@ struct Index {
   private async decodeViewerOriginalBitmap(entry: FileEntry,
     localPath: string): Promise<ViewerBitmapRecord | null> {
     const existing = this.viewerOriginalBitmaps[entry.path]
-    if (existing !== undefined) {
+    const rotation = this.imageVisualState(entry.path).userRotation
+    if (existing !== undefined && existing.userRotation === rotation) {
       return existing
     }
-    const record = await this.viewerBitmapStore.decode(localPath, 'viewerZoom')
+    if (existing !== undefined) {
+      this.removeViewerBitmap(this.viewerOriginalBitmaps, entry.path)
+      await this.viewerBitmapStore.release(existing)
+    }
+    const record = await this.viewerBitmapStore.decode(localPath, 'viewerZoom', rotation)
     if (record === null) {
+      return null
+    }
+    if (this.imageVisualState(entry.path).userRotation !== rotation) {
+      await this.viewerBitmapStore.release(record)
       return null
     }
     const raced = this.viewerOriginalBitmaps[entry.path]
@@ -4255,6 +4294,8 @@ struct Index {
       }
       state.physicalWidth = record.physicalWidth
       state.physicalHeight = record.physicalHeight
+      state.exifDisplayWidth = record.exifDisplayWidth
+      state.exifDisplayHeight = record.exifDisplayHeight
       state.displayWidth = record.displayWidth
       state.displayHeight = record.displayHeight
       if (!state.frameLocked) {
@@ -4285,6 +4326,94 @@ struct Index {
       this.waterfallBitmaps = next
     }
     this.bumpViewerBitmapEpoch()
+  }
+
+  private async installFileThumbnailBitmap(entry: FileEntry,
+    localPath: string): Promise<ViewerBitmapRecord | null> {
+    if (!this.isImage(entry) || !this.imageVisualState(entry.path).rotationResolved ||
+      localPath.length === 0 || !CacheManager.exists(localPath)) {
+      return null
+    }
+    const rotation = this.imageVisualState(entry.path).userRotation
+    const requestKey = localPath + '|' + this.previewSignature(entry) +
+      '|rotation=' + rotation.toString()
+    const existing = this.fileThumbnailBitmaps[entry.path]
+    if (existing !== undefined && existing.path === localPath && existing.userRotation === rotation &&
+      this.fileThumbnailDecodeKeys[entry.path] === requestKey) {
+      return existing
+    }
+    this.fileThumbnailDecodeKeys[entry.path] = requestKey
+    const record = await this.viewerBitmapStore.decode(localPath, 'list', rotation)
+    if (record === null) {
+      return null
+    }
+    if (this.fileThumbnailDecodeKeys[entry.path] !== requestKey ||
+      this.imageVisualState(entry.path).userRotation !== rotation) {
+      await this.viewerBitmapStore.release(record)
+      return null
+    }
+    const previous = this.fileThumbnailBitmaps[entry.path]
+    const next: Record<string, ViewerBitmapRecord> = {}
+    for (const key of Object.keys(this.fileThumbnailBitmaps)) {
+      if (key !== entry.path) {
+        next[key] = this.fileThumbnailBitmaps[key]
+      }
+    }
+    next[entry.path] = record
+    this.fileThumbnailBitmaps = next
+    this.bumpViewerBitmapEpoch()
+    this.updateImageVisualState(entry.path, (state: ImageVisualState): void => {
+      state.physicalWidth = record.physicalWidth
+      state.physicalHeight = record.physicalHeight
+      state.exifDisplayWidth = record.exifDisplayWidth
+      state.exifDisplayHeight = record.exifDisplayHeight
+      state.displayWidth = record.displayWidth
+      state.displayHeight = record.displayHeight
+      state.thumbnailDisplayWidth = record.displayWidth
+      state.thumbnailDisplayHeight = record.displayHeight
+      if (!state.frameLocked) {
+        state.frameWidth = record.displayWidth
+        state.frameHeight = record.displayHeight
+      }
+    })
+    if (previous !== undefined && previous !== record) {
+      this.postRenderFrame((): void => {
+        this.viewerBitmapStore.release(previous).catch((): void => {})
+      })
+    }
+    return record
+  }
+
+  private async publishImagePreview(entry: FileEntry, localPath: string,
+    canonical: boolean, generation: number): Promise<void> {
+    if (generation !== this.previewGeneration || localPath.length === 0) {
+      return
+    }
+    await this.primeViewerPreviewGeometryAtPath(entry, localPath, canonical)
+    const record = await this.installFileThumbnailBitmap(entry, localPath)
+    if (record === null || generation !== this.previewGeneration) {
+      return
+    }
+    this.setPreviewUri(entry, fileUri.getUriFromPath(localPath), localPath, canonical)
+  }
+
+  private releaseFileThumbnailBitmap(path: string): void {
+    const record = this.fileThumbnailBitmaps[path]
+    if (record === undefined) {
+      return
+    }
+    const next: Record<string, ViewerBitmapRecord> = {}
+    for (const key of Object.keys(this.fileThumbnailBitmaps)) {
+      if (key !== path) {
+        next[key] = this.fileThumbnailBitmaps[key]
+      }
+    }
+    this.fileThumbnailBitmaps = next
+    this.fileThumbnailDecodeKeys[path] = ''
+    this.bumpViewerBitmapEpoch()
+    this.postRenderFrame((): void => {
+      this.viewerBitmapStore.release(record).catch((): void => {})
+    })
   }
 
   private removeViewerBitmap(target: Record<string, ViewerBitmapRecord>, path: string): ViewerBitmapRecord | null {
@@ -4322,6 +4451,7 @@ struct Index {
     const originals = this.viewerOriginalBitmaps
     this.viewerPreviewBitmaps = {}
     this.viewerOriginalBitmaps = {}
+    this.viewerOriginalLocalPaths = {}
     const previewAliases = this.viewerPreviewBitmapAliases
     this.viewerPreviewBitmapAliases = {}
     this.bumpViewerBitmapEpoch()
@@ -4367,6 +4497,7 @@ struct Index {
       state.thumbnailDisplayHeight.toString() +
       ' frame=' + state.frameWidth.toString() + 'x' + state.frameHeight.toString() +
       ' physical=' + state.physicalWidth.toString() + 'x' + state.physicalHeight.toString() +
+      ' exifDisplay=' + state.exifDisplayWidth.toString() + 'x' + state.exifDisplayHeight.toString() +
       ' display=' + state.displayWidth.toString() + 'x' + state.displayHeight.toString() +
       ' rotation=' + state.userRotation.toString() +
       ' decode=' + state.decodeState +
@@ -4422,8 +4553,7 @@ struct Index {
   }
 
   private viewerPageVisualScale(entry: FileEntry, index: number): number {
-    return this.viewerPageScale(index) * this.viewerPageDismissScale(index) *
-      this.viewerManualRotationFitScale(entry)
+    return this.viewerPageScale(index) * this.viewerPageDismissScale(index)
   }
 
   /**
@@ -4713,30 +4843,6 @@ struct Index {
     return viewerEntry !== null && viewerEntry.path === entry.path && this.isImage(entry)
   }
 
-  private fileThumbnailRotationFitScale(entry: FileEntry,
-    surface: ThumbnailSurfaceKind): number {
-    const angle = ((this.fileListImageRotation(entry.path) % 360) + 360) % 360
-    if (angle !== 90 && angle !== 270) {
-      return 1
-    }
-    const state = this.imageVisualState(entry.path)
-    let width = state.thumbnailSurface === surface ? state.thumbnailWidth : 0
-    let height = state.thumbnailSurface === surface ? state.thumbnailHeight : 0
-    if (width <= 0 || height <= 0) {
-      if (surface === 'list' || surface === 'search') {
-        width = 40
-        height = 34
-      } else if (surface === 'waterfall') {
-        width = this.waterfallColumnWidthVp > 0 ? this.waterfallColumnWidthVp : 160
-        height = width / this.waterfallAspectRatio(entry)
-      } else {
-        width = Math.max(1, (this.pageWidthVp - 28) / 2 - 12)
-        height = 82
-      }
-    }
-    return Math.min(width / height, height / width)
-  }
-
   private fileImageShouldSyncLoad(entry: FileEntry): boolean {
     return this.viewerEntryTransitionActive &&
       this.viewerEntryTransitionPath === entry.path && this.isImage(entry)
@@ -4888,7 +4994,8 @@ struct Index {
       .duration(180)
       .curve(Curve.FastOutSlowIn)
       .effectMode(EdgeEffect.Spring)
-      .disableSwipe(this.imageScale > 1.001)
+      .disableSwipe(this.imageScale > 1.001 || this.viewerTransitionActive ||
+        this.viewerEntryTransitionActive || this.isBusy)
       .width('100%')
       .height('100%')
       .onAreaChange((_, area) => {
@@ -4985,7 +5092,6 @@ struct Index {
       .orientation(this.viewerImageSourceOrientation(entry))
       .objectFit(ImageFit.Contain)
       .geometryTransition(this.viewerImageTransitionId(entry, this.viewerTransitionLayer))
-      .rotate({ angle: this.viewerManualRotation(entry.path) })
       .syncLoad(this.viewerImageShouldSyncLoad(entry, this.viewerTransitionLayer))
       .onComplete((event?: ViewerImageCompleteEvent): void => {
         const original = this.viewerBitmap(entry, true)
@@ -5968,6 +6074,7 @@ struct Index {
       return false
     }
     this.searchResults = cached.results.slice()
+    this.refreshFileListImageRotations(this.searchResults)
     this.searchLoading = false
     this.searchScrollOffset = Math.max(0, cached.scrollOffset)
     this.errorText = ''
@@ -6068,6 +6175,7 @@ struct Index {
     this.searchQuery = session.query
     this.searchScope = session.scope
     this.searchResults = session.results.slice()
+    this.refreshFileListImageRotations(this.searchResults)
     this.searchLoading = session.loading
     this.searchHistoryExpanded = session.historyExpanded
     this.searchScrollOffset = Math.max(0, session.scrollOffset)
@@ -6388,9 +6496,9 @@ struct Index {
 
   private waterfallAspectRatio(entry: FileEntry): number {
     const value = this.waterfallAspectRatios[entry.path]
-    // A persisted user rotation is a visual transform, not new source
-    // metadata. Keep masonry measurement stable and fit the rotated Image
-    // inside this immutable card instead of changing row heights.
+    // This cache contains the final Image Kit raster ratio after EXIF and the
+    // persisted user rotation. WaterFlow must measure the same axes that the
+    // Image node renders.
     if (typeof value === 'number' && value > 0) {
       return value
     }
@@ -6568,10 +6676,15 @@ struct Index {
   private async decodeWaterfallBitmap(entry: FileEntry, localPath: string,
     generation: number): Promise<void> {
     try {
-      const record = await this.viewerBitmapStore.decode(localPath, 'viewerPreview',
+      const rotation = this.imageVisualState(entry.path).userRotation
+      const record = await this.viewerBitmapStore.decode(localPath, 'viewerPreview', rotation,
         this.waterfallSourceSize(entry))
       if (record === null || generation !== this.waterfallGeneration ||
-        this.fileViewMode !== 'waterfall' || this.waterfallVisiblePaths[entry.path] !== true) {
+        this.fileViewMode !== 'waterfall' || this.waterfallVisiblePaths[entry.path] !== true ||
+        this.imageVisualState(entry.path).userRotation !== rotation) {
+        if (record !== null) {
+          await this.viewerBitmapStore.release(record)
+        }
         return
       }
       this.installViewerBitmap(this.waterfallBitmaps, entry.path, record)
@@ -6751,6 +6864,7 @@ struct Index {
         })
       if (generation === this.searchGeneration && this.showSearch) {
         this.searchResults = results
+        this.refreshFileListImageRotations(this.searchResults)
         this.cacheSearchResults(normalized, searchScope, results, false, this.searchScrollOffset)
       }
     } catch (error) {
@@ -6780,6 +6894,7 @@ struct Index {
       }
     }
     this.searchResults = next
+    this.refreshFileListImageRotations(next)
     this.cacheSearchResults(this.searchQuery, this.searchScope, next, this.searchLoading, this.searchScrollOffset)
   }
 
@@ -8127,8 +8242,15 @@ struct Index {
     }
     try {
       await this.ensureImageRotationState()
-      const parent = this.parentPath(entries[0].path)
-      const records = await this.imageRotationStore.readDirectory(scope, parent)
+      const parents: Record<string, boolean> = {}
+      for (const entry of entries) {
+        parents[this.parentPath(entry.path)] = true
+      }
+      const records: ImageRotationRecord[] = []
+      for (const parent of Object.keys(parents)) {
+        const directoryRecords = await this.imageRotationStore.readDirectory(scope, parent)
+        records.push(...directoryRecords)
+      }
       const entriesByPath: Map<string, FileEntry> = new Map<string, FileEntry>()
       for (const entry of entries) {
         entriesByPath.set(entry.path, entry)
@@ -8165,6 +8287,19 @@ struct Index {
       return
     }
     const snapshot = entries.slice()
+    const pendingStates: Record<string, ImageVisualState> = {}
+    for (const key of Object.keys(this.imageVisualStates)) {
+      pendingStates[key] = this.imageVisualStates[key]
+    }
+    for (const entry of snapshot) {
+      if (!this.isImage(entry)) {
+        continue
+      }
+      const pending = this.copyImageVisualState(this.imageVisualStates[entry.path])
+      pending.rotationResolved = false
+      pendingStates[entry.path] = pending
+    }
+    this.imageVisualStates = pendingStates
     this.loadPersistedImageDisplayState(snapshot).then((state: ImageDisplayState): void => {
       if (generation !== this.fileListRotationGeneration) {
         return
@@ -8178,19 +8313,35 @@ struct Index {
         const rotation = state.rotations[entry.path]
         const orientation = state.previewOrientations[entry.path]
         next.userRotation = rotation === undefined ? 0 : rotation
-        if (orientation !== undefined) {
-          next.thumbnailOrientation = orientation
-        }
+        next.rotationResolved = true
+        next.thumbnailOrientation = orientation === undefined
+          ? (this.previewCanonicalPaths[entry.path] === true
+            ? ImageRotateOrientation.UP : ImageRotateOrientation.AUTO) : orientation
         nextStates[entry.path] = next
       }
       this.imageVisualStates = nextStates
+      for (const entry of snapshot) {
+        if (!this.isImage(entry)) {
+          continue
+        }
+        const rotation = this.imageVisualState(entry.path).userRotation
+        const thumbnail = this.fileThumbnailBitmaps[entry.path]
+        if (thumbnail !== undefined && thumbnail.userRotation !== rotation) {
+          this.releaseFileThumbnailBitmap(entry.path)
+        }
+        const waterfall = this.waterfallBitmaps[entry.path]
+        if (waterfall !== undefined && waterfall.userRotation !== rotation) {
+          this.releaseViewerBitmap(this.waterfallBitmaps, entry.path).catch((): void => {})
+          this.waterfallDecodedPaths[entry.path] = false
+        }
+        this.loadEntryPreview(entry)
+        if (this.fileViewMode === 'waterfall' && this.waterfallVisiblePaths[entry.path] === true) {
+          this.enqueueWaterfallDecode(entry)
+        }
+      }
     }).catch((error: Error): void => {
       console.warn('[UgreenImage] refresh file-list display metadata failed: ' + JSON.stringify(error))
     })
-  }
-
-  private fileListImageRotation(path: string): number {
-    return this.imageVisualState(path).userRotation
   }
 
   private fileListImageBaseOrientation(entry: FileEntry): ImageRotateOrientation {
@@ -8301,6 +8452,7 @@ struct Index {
       const rotation = persisted.rotations[item.path]
       const orientation = persisted.previewOrientations[item.path]
       next.userRotation = rotation === undefined ? 0 : rotation
+      next.rotationResolved = true
       if (orientation !== undefined) {
         next.thumbnailOrientation = orientation
       }
@@ -8308,6 +8460,8 @@ struct Index {
       next.originalOrientation = ImageRotateOrientation.AUTO
       next.physicalWidth = 0
       next.physicalHeight = 0
+      next.exifDisplayWidth = 0
+      next.exifDisplayHeight = 0
       next.displayWidth = 0
       next.displayHeight = 0
       // Image.onComplete content bounds are render-result dimensions. In a
@@ -8614,6 +8768,8 @@ struct Index {
       next.originalOrientation = ImageRotateOrientation.AUTO
       next.physicalWidth = 0
       next.physicalHeight = 0
+      next.exifDisplayWidth = 0
+      next.exifDisplayHeight = 0
       next.displayWidth = 0
       next.displayHeight = 0
       next.frameLocked = false
@@ -9366,6 +9522,8 @@ struct Index {
     this.updateImageVisualState(entry.path, (state: ImageVisualState): void => {
       state.physicalWidth = geometry.physicalWidth
       state.physicalHeight = geometry.physicalHeight
+      state.exifDisplayWidth = geometry.exifDisplayWidth
+      state.exifDisplayHeight = geometry.exifDisplayHeight
       state.displayWidth = geometry.displayWidth
       state.displayHeight = geometry.displayHeight
       if (!state.frameLocked) {
@@ -9498,15 +9656,22 @@ struct Index {
         // source with ImageRotateOrientation.AUTO when the image is rendered.
       }
       const mapped = this.mapExifOrientation(orientation)
-      const displayWidth = this.previewOrientationSwapsAxes(mapped) ? height : width
-      const displayHeight = this.previewOrientationSwapsAxes(mapped) ? width : height
+      const exifDisplayWidth = this.previewOrientationSwapsAxes(mapped) ? height : width
+      const exifDisplayHeight = this.previewOrientationSwapsAxes(mapped) ? width : height
+      const userRotation = ((this.imageVisualState(entryPath).userRotation % 360) + 360) % 360
+      const userSwapsAxes = userRotation === 90 || userRotation === 270
+      const displayWidth = userSwapsAxes ? exifDisplayHeight : exifDisplayWidth
+      const displayHeight = userSwapsAxes ? exifDisplayWidth : exifDisplayHeight
       console.info('[UgreenImage] source-metadata path=' + localPath +
         ' size=' + width.toString() + 'x' + height.toString() +
+        ' exifDisplaySize=' + exifDisplayWidth.toString() + 'x' + exifDisplayHeight.toString() +
         ' displaySize=' + displayWidth.toString() + 'x' + displayHeight.toString() +
-        ' orientation=' + orientation)
+        ' orientation=' + orientation + ' userRotation=' + userRotation.toString())
       const geometry = new ViewerImageGeometry()
       geometry.physicalWidth = width
       geometry.physicalHeight = height
+      geometry.exifDisplayWidth = exifDisplayWidth
+      geometry.exifDisplayHeight = exifDisplayHeight
       geometry.displayWidth = displayWidth
       geometry.displayHeight = displayHeight
       geometry.orientation = mapped
@@ -9589,6 +9754,14 @@ struct Index {
     if (path.length === 0 || !this.isViewerPathNearCurrent(path)) {
       return
     }
+    if (record.userRotation !== this.imageVisualState(path).userRotation) {
+      if (this.viewerOriginalBitmaps[path] === record) {
+        this.removeViewerBitmap(this.viewerOriginalBitmaps, path)
+      }
+      this.viewerBitmapStore.release(record).catch((): void => {})
+      return
+    }
+    this.viewerOriginalLocalPaths[path] = localPath
     this.applyDecodedBitmapGeometry(path, record, true)
     this.updateImageVisualState(path, (state: ImageVisualState): void => {
       state.originalUri = fileUri.getUriFromPath(localPath)
@@ -9731,43 +9904,152 @@ struct Index {
     this.applyViewerRotation(entry)
   }
 
-  private applyViewerRotation(entry: FileEntry): void {
+  private async applyViewerRotation(entry: FileEntry): Promise<void> {
     const current = this.imageVisualState(entry.path).userRotation
     const nextRotation = (current + 90) % 360
-    this.updateImageVisualState(entry.path, (state: ImageVisualState): void => {
-      state.userRotation = nextRotation
+    const path = entry.path
+    const state = this.imageVisualState(path)
+    let previewPath = this.previewLocalPaths[path]
+    if (typeof previewPath !== 'string' || previewPath.length === 0 ||
+      !CacheManager.exists(previewPath)) {
+      previewPath = this.waterfallLocalPaths[path]
+    }
+    const originalPath = this.viewerOriginalLocalPaths[path]
+    if ((typeof previewPath !== 'string' || previewPath.length === 0 ||
+      !CacheManager.exists(previewPath)) && typeof originalPath === 'string' &&
+      originalPath.length > 0 && CacheManager.exists(originalPath)) {
+      previewPath = originalPath
+    }
+    if (typeof previewPath !== 'string' || previewPath.length === 0 ||
+      !CacheManager.exists(previewPath)) {
+      this.showImmersiveToast('图片旋转失败：预览缓存不可用')
+      return
+    }
+
+    this.viewerTransitionActive = true
+    this.isBusy = true
+    // Publish the requested angle immediately, but keep the old PixelMaps and
+    // frame visible. This invalidates every in-flight decode made for the old
+    // transform without exposing a partially rotated visual state.
+    this.updateImageVisualState(path, (pending: ImageVisualState): void => {
+      pending.userRotation = nextRotation
     })
-
-    // The file page remains mounted below the viewer. Update its thumbnail
-    // immediately and invalidate any older asynchronous database read.
-    this.fileListRotationGeneration += 1
-    this.persistViewerRotation(entry, nextRotation)
-    this.resetImageTransform()
-  }
-
-  private viewerManualRotation(path: string): number {
-    return this.imageVisualState(path).userRotation
-  }
-
-  private viewerManualRotationFitScale(entry: FileEntry): number {
-    const angle = this.viewerManualRotation(entry.path) % 360
-    if (angle === 0 || angle === 180) {
-      return 1
+    const oldPreview = this.viewerPreviewBitmaps[path]
+    const oldPreviewAlias = this.viewerPreviewBitmapAliases[path] === true
+    const oldOriginal = this.viewerOriginalBitmaps[path]
+    const oldFile = this.fileThumbnailBitmaps[path]
+    const oldWaterfall = this.waterfallBitmaps[path]
+    let nextPreview: ViewerBitmapRecord | null = null
+    let nextOriginal: ViewerBitmapRecord | null = null
+    let nextFile: ViewerBitmapRecord | null = null
+    let nextWaterfall: ViewerBitmapRecord | null = null
+    let committed = false
+    try {
+      nextPreview = await this.viewerBitmapStore.decode(previewPath, 'viewerPreview', nextRotation)
+      nextFile = await this.viewerBitmapStore.decode(previewPath, 'list', nextRotation)
+      if (typeof originalPath === 'string' && originalPath.length > 0 &&
+        CacheManager.exists(originalPath)) {
+        nextOriginal = await this.viewerBitmapStore.decode(originalPath, 'viewerZoom', nextRotation)
+      }
+      const waterfallPath = this.waterfallLocalPaths[path]
+      if (typeof waterfallPath === 'string' && waterfallPath.length > 0 &&
+        CacheManager.exists(waterfallPath)) {
+        nextWaterfall = await this.viewerBitmapStore.decode(waterfallPath,
+          'viewerPreview', nextRotation)
+      }
+      const visibleRecord = state.visibleLayer === 'original' ? nextOriginal : nextPreview
+      if (visibleRecord === null || nextPreview === null || nextFile === null ||
+        (oldOriginal !== undefined && nextOriginal === null)) {
+        throw new Error('rotated PixelMap decode did not produce the active visual layer')
+      }
+      if (!this.showImageViewer || this.viewerImageEntry === null ||
+        this.viewerImageEntry.path !== path || this.viewerClosePending) {
+        return
+      }
+      await this.nextRenderFrame()
+      this.installViewerBitmap(this.viewerPreviewBitmaps, path, nextPreview)
+      this.viewerPreviewBitmapAliases[path] = false
+      if (nextOriginal !== null) {
+        this.installViewerBitmap(this.viewerOriginalBitmaps, path, nextOriginal)
+      } else if (oldOriginal !== undefined) {
+        this.removeViewerBitmap(this.viewerOriginalBitmaps, path)
+      }
+      const nextFileMaps: Record<string, ViewerBitmapRecord> = {}
+      for (const key of Object.keys(this.fileThumbnailBitmaps)) {
+        if (key !== path) {
+          nextFileMaps[key] = this.fileThumbnailBitmaps[key]
+        }
+      }
+      nextFileMaps[path] = nextFile
+      this.fileThumbnailBitmaps = nextFileMaps
+      this.fileThumbnailDecodeKeys[path] = previewPath + '|' + this.previewSignature(entry) +
+        '|rotation=' + nextRotation.toString()
+      if (nextWaterfall !== null) {
+        this.installViewerBitmap(this.waterfallBitmaps, path, nextWaterfall)
+        this.waterfallDecodedPaths[path] = true
+        this.setWaterfallAspectRatio(path, nextWaterfall.displayWidth,
+          nextWaterfall.displayHeight)
+      } else {
+        if (oldWaterfall !== undefined) {
+          this.removeViewerBitmap(this.waterfallBitmaps, path)
+          this.waterfallDecodedPaths[path] = false
+        }
+        this.setWaterfallAspectRatio(path, visibleRecord.displayWidth, visibleRecord.displayHeight)
+      }
+      this.updateImageVisualState(path, (next: ImageVisualState): void => {
+        next.userRotation = nextRotation
+        next.rotationResolved = true
+        next.physicalWidth = visibleRecord.physicalWidth
+        next.physicalHeight = visibleRecord.physicalHeight
+        next.exifDisplayWidth = visibleRecord.exifDisplayWidth
+        next.exifDisplayHeight = visibleRecord.exifDisplayHeight
+        next.displayWidth = visibleRecord.displayWidth
+        next.displayHeight = visibleRecord.displayHeight
+        next.thumbnailDisplayWidth = nextFile!.displayWidth
+        next.thumbnailDisplayHeight = nextFile!.displayHeight
+        next.frameWidth = visibleRecord.displayWidth
+        next.frameHeight = visibleRecord.displayHeight
+        next.frameLocked = true
+      })
+      this.fileListRotationGeneration += 1
+      this.bumpViewerBitmapEpoch()
+      this.resetImageTransform()
+      this.persistViewerRotation(entry, nextRotation)
+      committed = true
+      await this.nextRenderFrame()
+      if (oldPreview !== undefined && !oldPreviewAlias && oldPreview !== nextPreview) {
+        await this.viewerBitmapStore.release(oldPreview)
+      }
+      if (oldOriginal !== undefined && oldOriginal !== nextOriginal) {
+        await this.viewerBitmapStore.release(oldOriginal)
+      }
+      if (oldFile !== undefined && oldFile !== nextFile) {
+        await this.viewerBitmapStore.release(oldFile)
+      }
+      if (oldWaterfall !== undefined && oldWaterfall !== nextWaterfall) {
+        await this.viewerBitmapStore.release(oldWaterfall)
+      }
+    } catch (error) {
+      console.warn('[UgreenImage] rotate PixelMap failed: ' + JSON.stringify(error))
+      this.showImmersiveToast('图片旋转失败')
+    } finally {
+      if (!committed) {
+        this.updateImageVisualState(path, (rollback: ImageVisualState): void => {
+          rollback.userRotation = current
+        })
+        await this.viewerBitmapStore.release(nextPreview)
+        await this.viewerBitmapStore.release(nextOriginal)
+        await this.viewerBitmapStore.release(nextFile)
+        await this.viewerBitmapStore.release(nextWaterfall)
+      }
+      this.viewerTransitionActive = false
+      this.isBusy = false
+      this.flushDeferredViewerVisualCommits()
+      if (this.viewerCloseRequested && this.showImageViewer) {
+        this.viewerCloseRequested = false
+        this.postRenderFrame((): void => this.closeImageViewer())
+      }
     }
-    const state = this.imageVisualState(entry.path)
-    if (state.frameWidth <= 0 || state.frameHeight <= 0) {
-      return 1
-    }
-    const viewportWidth = Math.max(1, this.imageViewportWidthVp)
-    const viewportHeight = Math.max(1, this.imageViewportHeightVp)
-    const unrotatedContain = Math.min(viewportWidth / state.frameWidth,
-      viewportHeight / state.frameHeight)
-    const rotatedContain = Math.min(viewportWidth / state.frameHeight,
-      viewportHeight / state.frameWidth)
-    if (unrotatedContain <= 0 || rotatedContain <= 0) {
-      return 1
-    }
-    return rotatedContain / unrotatedContain
   }
 
   private openImageDetails(entry: FileEntry): void {
@@ -10818,6 +11100,7 @@ struct Index {
         ? ImageRotateOrientation.UP : ImageRotateOrientation.AUTO
     })
     for (const evictedPath of evictedPaths) {
+      this.releaseFileThumbnailBitmap(evictedPath)
       this.updateImageVisualState(evictedPath, (state: ImageVisualState): void => {
         state.thumbnailUri = ''
         state.thumbnailSignature = ''
@@ -11050,8 +11333,16 @@ struct Index {
       const canonicalPath = this.mediaPreviewManager.cachedImagePreview(entry,
         this.thumbnailDirectory)
       if (canonicalPath.length > 0) {
-        this.primeViewerPreviewGeometryAtPath(entry, canonicalPath, true).catch((): void => {})
-        this.setPreviewUri(entry, fileUri.getUriFromPath(canonicalPath), canonicalPath, true)
+        this.publishImagePreview(entry, canonicalPath, true, this.previewGeneration)
+          .catch((): void => {})
+        return
+      }
+      const retainedPath = this.previewLocalPaths[entry.path]
+      if (typeof retainedPath === 'string' && retainedPath.length > 0 &&
+        CacheManager.exists(retainedPath)) {
+        this.publishImagePreview(entry, retainedPath,
+          this.previewCanonicalPaths[entry.path] === true, this.previewGeneration)
+          .catch((): void => {})
         return
       }
     }
@@ -11085,8 +11376,7 @@ struct Index {
         const canonicalPath = this.mediaPreviewManager.cachedImagePreview(entry,
           this.thumbnailDirectory)
         if (canonicalPath.length > 0) {
-          await this.primeViewerPreviewGeometryAtPath(entry, canonicalPath, true)
-          this.setPreviewUri(entry, fileUri.getUriFromPath(canonicalPath), canonicalPath, true)
+          await this.publishImagePreview(entry, canonicalPath, true, generation)
           return
         }
       }
@@ -11107,8 +11397,7 @@ struct Index {
         return
       }
       if (thumbnailPath.length > 0) {
-        await this.primeViewerPreviewGeometryAtPath(entry, thumbnailPath)
-        this.setPreviewUri(entry, fileUri.getUriFromPath(thumbnailPath), thumbnailPath)
+        await this.publishImagePreview(entry, thumbnailPath, false, generation)
         return
       }
 

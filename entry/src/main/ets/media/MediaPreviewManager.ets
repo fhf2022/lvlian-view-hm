@@ -3,7 +3,7 @@ import { image } from '@kit.ImageKit'
 import { media } from '@kit.MediaKit'
 import { CacheManager } from '../download/CacheManager'
 import { FileEntry } from '../model/FileEntry'
-import { ThumbnailPolicy } from './ThumbnailPolicy'
+import { ViewerBitmapRecord, ViewerBitmapStore } from './ViewerBitmapStore'
 
 type PreviewKind = 'image' | 'video' | 'audio' | ''
 
@@ -51,23 +51,19 @@ export class MediaPreviewManager {
       return existingPath
     }
 
-    let source: image.ImageSource | null = null
-    let pixelMap: image.PixelMap | null = null
+    const bitmapStore = new ViewerBitmapStore()
+    let bitmapRecord: ViewerBitmapRecord | null = null
     let packer: image.ImagePacker | null = null
-    let sourceFd: number = -1
     try {
-      const sourceFile = fileIo.openSync(localPath, fileIo.OpenMode.READ_ONLY)
-      sourceFd = sourceFile.fd
-      source = image.createImageSource(sourceFd)
-      const sourceInfo = source.getImageInfoSync()
-      const sourceWidth = Math.max(1, Math.floor(sourceInfo.size.width))
-      const sourceHeight = Math.max(1, Math.floor(sourceInfo.size.height))
-      pixelMap = await source.createPixelMap({
-        sampleSize: ThumbnailPolicy.sampleSize(sourceWidth, sourceHeight, 'list'),
-        editable: false
-      })
+      // Generate a canonical EXIF-normalized derivative. Persisted user
+      // rotation remains outside the disk bytes and is baked only when this
+      // derivative is decoded for a concrete visual state.
+      bitmapRecord = await bitmapStore.decode(localPath, 'list', 0)
+      if (bitmapRecord === null) {
+        return ''
+      }
       packer = image.createImagePacker()
-      const encoded = await packer.packToData(pixelMap, {
+      const encoded = await packer.packToData(bitmapRecord.pixelMap, {
         format: preservesAlpha ? 'image/png' : 'image/jpeg',
         quality: 78
       })
@@ -85,27 +81,7 @@ export class MediaPreviewManager {
           // The preview is disposable; release failures must not break browse.
         }
       }
-      if (pixelMap !== null) {
-        try {
-          await pixelMap.release()
-        } catch (_) {
-          // Keep a failed decode isolated from the directory page.
-        }
-      }
-      if (source !== null) {
-        try {
-          await source.release()
-        } catch (_) {
-          // Metadata/preview cleanup must not break the directory page.
-        }
-      }
-      if (sourceFd >= 0) {
-        try {
-          fileIo.closeSync(sourceFd)
-        } catch (_) {
-          // The decoder may already have closed the descriptor.
-        }
-      }
+      await bitmapStore.release(bitmapRecord)
     }
   }
 
@@ -211,7 +187,7 @@ export class MediaPreviewManager {
   }
 
   private imagePreviewCacheKey(entry: FileEntry): string {
-    return entry.path + ':media-preview:image-v4-canonical:' + entry.modifiedTime.toString() + ':' +
+    return entry.path + ':media-preview:image-v5-imagekit-canonical:' + entry.modifiedTime.toString() + ':' +
       entry.size.toString()
   }
 }
