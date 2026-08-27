@@ -291,11 +291,9 @@ struct Index {
   @State viewerHeaderTitle: string = ''
   @State viewerImages: FileEntry[] = []
   @State viewerImageIndex: number = 0
-  // The Swiper index is committed at animation end, while the title and
-  // bottom actions must follow the page that is entering during the swipe.
-  // Keep that chrome binding explicit so a progress ring cannot reuse the
-  // previous page's entry while the two Swiper indices briefly coexist.
-  @State viewerChromeIndex: number = 0
+  // More/details keep an explicit snapshot of the committed image. The
+  // overlay must never silently switch to another file underneath the user.
+  @State viewerOverlayEntry: FileEntry | null = null
   @State showImageMoreMenu: boolean = false
   @State showImageDetails: boolean = false
   @State viewerLastNavigationDirection: number = 1
@@ -1213,8 +1211,8 @@ struct Index {
       if (this.destinationFolderDialog) {
         this.DestinationFolderOverlay()
       }
-      if (this.showImageViewer && this.currentViewerEntry() !== null) {
-        this.ImageViewer(this.currentViewerEntry() as FileEntry)
+      if (this.showImageViewer && this.committedViewerEntry() !== null) {
+        this.ImageViewer()
       }
       if (this.showAudioPlayer && this.audioEntry !== null) {
         this.AudioPlayerOverlay(this.audioEntry as FileEntry)
@@ -4490,7 +4488,8 @@ struct Index {
       ' stage=' + stage +
       ' path=' + resolvedPath +
       ' index=' + this.viewerImageIndex.toString() +
-      ' chrome=' + this.viewerChromeIndex.toString() +
+      ' committed=' + (this.committedViewerEntry() === null
+        ? '' : (this.committedViewerEntry() as FileEntry).path) +
       ' pending=' + this.viewerPendingIndex.toString() +
       ' surface=' + state.thumbnailSurface +
       ' thumb=' + state.thumbnailDisplayWidth.toString() + 'x' +
@@ -4638,12 +4637,45 @@ struct Index {
     return this.viewerImageDecoded(this.viewerImageEntry as FileEntry)
   }
 
-  private viewerProgress(entry: FileEntry): number {
-    return this.imageVisualState(entry.path).progress
+  private committedViewerPath(): string {
+    const entry = this.committedViewerEntry()
+    return entry === null ? '' : entry.path
   }
 
-  private viewerProgressKnown(entry: FileEntry): boolean {
-    return this.imageVisualState(entry.path).progressKnown
+  private viewerProgress(): number {
+    return this.imageVisualState(this.committedViewerPath()).progress
+  }
+
+  private viewerProgressIdentity(): string {
+    return 'viewer_progress_' + this.committedViewerPath().replace(/[^A-Za-z0-9_]/g, '_')
+  }
+
+  private markViewerOriginalLoading(path: string, value: number = 0,
+    known: boolean = false): void {
+    if (!this.showImageViewer || path.length === 0 || !this.isViewerPathNearCurrent(path)) {
+      return
+    }
+    this.updateImageVisualState(path, (next: ImageVisualState): void => {
+      if (next.decodeState !== 'decoded' && next.decodeState !== 'displayed') {
+        next.decodeState = 'loading'
+        next.progress = Math.min(95, Math.max(0, value))
+        next.progressKnown = known
+      }
+    })
+    this.viewerProgressLastUpdateAt[path] = Date.now()
+  }
+
+  private finishViewerOriginalLoading(path: string, failed: boolean): void {
+    if (!this.showImageViewer || path.length === 0 || !this.isViewerPathNearCurrent(path)) {
+      return
+    }
+    this.updateImageVisualState(path, (next: ImageVisualState): void => {
+      if (next.decodeState === 'loading') {
+        next.decodeState = failed ? 'failed' : 'idle'
+        next.progress = 0
+        next.progressKnown = false
+      }
+    })
   }
 
   private updateViewerDownloadProgress(path: string, progress: BinaryDownloadProgress): void {
@@ -4683,6 +4715,11 @@ struct Index {
       return
     }
     this.updateImageVisualState(path, (next: ImageVisualState): void => {
+      if (next.decodeState !== 'decoded' && next.decodeState !== 'displayed' &&
+        next.decodeState !== 'failed' &&
+        this.viewerLoadRequests[path] === true) {
+        next.decodeState = 'loading'
+      }
       next.progress = nextValue
       next.progressKnown = known
     })
@@ -4940,32 +4977,19 @@ struct Index {
   }
 
   /**
-   * Swiper owns the displayed child. Do not use the entry captured when the
-   * viewer builder was first created for overlays or actions after a swipe.
+   * The committed index is the only source for title, actions and progress.
+   * viewerPendingIndex is intentionally excluded: a drag or spring-back must
+   * leave all chrome bound to the page that is still stable on screen.
    */
-  private currentViewerEntry(): FileEntry | null {
-    // The chrome index is updated at animation start, so the title, actions,
-    // and progress ring follow the image being entered without waiting for
-    // Swiper's committed index at animation end.
-    if (this.viewerChromeIndex >= 0 && this.viewerChromeIndex < this.viewerImages.length) {
-      return this.viewerImages[this.viewerChromeIndex]
-    }
-    if (this.viewerImageEntry !== null) {
-      return this.viewerImageEntry
-    }
+  private committedViewerEntry(): FileEntry | null {
     if (this.viewerImageIndex >= 0 && this.viewerImageIndex < this.viewerImages.length) {
       return this.viewerImages[this.viewerImageIndex]
     }
     return this.viewerImageEntry
   }
 
-  private viewerDisplayEntry(fallback: FileEntry): FileEntry {
-    const current = this.currentViewerEntry()
-    return current === null ? fallback : current
-  }
-
   @Builder
-  ImageViewer(entry: FileEntry): void {
+  ImageViewer(): void {
     Stack() {
       // Keep the file surface mounted underneath the viewer. During a
       // downward pull this is the only layer that fades, so the unchanged
@@ -4995,7 +5019,8 @@ struct Index {
       .curve(Curve.FastOutSlowIn)
       .effectMode(EdgeEffect.Spring)
       .disableSwipe(this.imageScale > 1.001 || this.viewerTransitionActive ||
-        this.viewerEntryTransitionActive || this.isBusy)
+        this.viewerEntryTransitionActive || this.isBusy || this.showImageMoreMenu ||
+        this.showImageDetails || this.showRenameDialog)
       .width('100%')
       .height('100%')
       .onAreaChange((_, area) => {
@@ -5010,12 +5035,9 @@ struct Index {
         if (index !== targetIndex) {
           this.viewerTransitionActive = true
           this.viewerPendingIndex = targetIndex
-          // During motion only the title/progress chrome follows the target.
-          // The committed image, hidden file-page source and load window are
-          // changed together from onAnimationEnd.
+          // Keep title, actions and progress on the committed page. The
+          // pending index is only a transition/preload hint until end.
           if (targetIndex >= 0 && targetIndex < this.viewerImages.length) {
-            this.viewerChromeIndex = targetIndex
-            this.viewerHeaderTitle = this.viewerImages[targetIndex].name
             this.logViewerDiagnostic('swiper-start', this.viewerImages[targetIndex].path)
           }
         }
@@ -5024,9 +5046,12 @@ struct Index {
       // externally bound index stable during that animation and commit the
       // new page only from the documented animation-end callback.
       .onAnimationEnd((index: number) => {
+        // Commit every externally visible binding before unlocking the
+        // transition. There is no frame in which actions are enabled for the
+        // old entry while the new page is considered stable.
+        this.onViewerImageChanged(index)
         this.viewerPendingIndex = -1
         this.viewerTransitionActive = false
-        this.onViewerImageChanged(index)
         this.logViewerDiagnostic('swiper-end')
         this.flushDeferredViewerVisualCommits()
         if (this.viewerCloseRequested) {
@@ -5036,7 +5061,7 @@ struct Index {
       })
 
       Column() {
-        this.ImageViewerTopOverlay(this.viewerDisplayEntry(entry))
+        this.ImageViewerTopOverlay()
         Blank()
           .layoutWeight(1)
           .hitTestBehavior(HitTestMode.None)
@@ -5051,7 +5076,7 @@ struct Index {
         Blank()
           .layoutWeight(1)
           .hitTestBehavior(HitTestMode.None)
-        this.ImageViewerBottomBar(this.viewerDisplayEntry(entry))
+        this.ImageViewerBottomBar()
       }
       .width('100%')
       .height('100%')
@@ -5059,11 +5084,11 @@ struct Index {
       .translate({ x: 0, y: this.imageBottomChromeOffsetY, z: 0 })
       .hitTestBehavior(HitTestMode.None)
 
-      if (this.showImageMoreMenu) {
-        this.ImageViewerMoreOverlay(this.viewerDisplayEntry(entry))
+      if (this.showImageMoreMenu && this.viewerOverlayEntry !== null) {
+        this.ImageViewerMoreOverlay()
       }
-      if (this.showImageDetails) {
-        this.ImageViewerDetailsOverlay(this.viewerDisplayEntry(entry))
+      if (this.showImageDetails && this.viewerOverlayEntry !== null) {
+        this.ImageViewerDetailsOverlay()
       }
       if (this.showRenameDialog && this.renameEntry !== null) {
         this.RenameOverlay()
@@ -5228,7 +5253,7 @@ struct Index {
   }
 
   @Builder
-  ImageViewerTopOverlay(entry: FileEntry): void {
+  ImageViewerTopOverlay(): void {
     Stack() {
       Row()
         .width('100%')
@@ -5255,7 +5280,7 @@ struct Index {
 
       Row() {
         this.OfficialBackButton(() => this.closeImageViewer())
-        Text(this.viewerHeaderTitle.length > 0 ? this.viewerHeaderTitle : entry.name)
+        Text(this.viewerHeaderTitle)
           .fontSize(17)
           .fontWeight(FontWeight.Bold)
           .fontColor($r('app.color.text_primary'))
@@ -5276,26 +5301,27 @@ struct Index {
   }
 
   @Builder
-  ImageViewerBottomBar(entry: FileEntry): void {
+  ImageViewerBottomBar(): void {
     Row() {
       this.ImageViewerActionItem($r('sys.symbol.square_and_arrow_down'), '保存',
-        () => this.saveViewerImage(entry))
+        () => this.saveCommittedViewerImage())
       this.ImageViewerActionItem($r('sys.symbol.share'), '分享',
-        () => this.shareViewerImage(entry))
+        () => this.shareCommittedViewerImage())
       Stack() {
-        Progress({ value: this.viewerProgress(entry), total: 100, type: ProgressType.Ring })
+        Progress({ value: this.viewerProgress(), total: 100, type: ProgressType.Ring })
           .width(27)
           .height(27)
-          // Key the progress component by file identity so ArkUI does not
-          // retain the previous image's internal ring value after a swipe.
-          .id('viewer_progress_' + entry.path.replace(/[^A-Za-z0-9_]/g, '_'))
+          // This identity and all values come from the committed index. They
+          // switch together only after Swiper reports animation end.
+          .id(this.viewerProgressIdentity())
           .backgroundColor('#AAB3C1')
           .color('#2E6BFF')
           .style({
             strokeWidth: 3,
-            // LOADING is the indeterminate rotating animation. Keep this
-            // ring determinate: blue arc is received, gray arc is remaining.
             enableSmoothEffect: false,
+            // This ring always represents actual byte/decode/display
+            // progress. Unknown-length work remains static instead of using
+            // the unrelated infinite LOADING animation.
             status: ProgressStatus.PROGRESSING
           })
       }
@@ -5303,9 +5329,9 @@ struct Index {
       .height('100%')
       .hitTestBehavior(HitTestMode.Default)
       .monopolizeEvents(true)
-      .onClick(() => this.loadCurrentViewerOriginalManually(entry))
+      .onClick(() => this.loadCommittedViewerOriginalManually())
       this.ImageViewerActionItem($r('sys.symbol.trash'), '删除',
-        () => this.deleteViewerImage(entry))
+        () => this.deleteCommittedViewerImage())
       this.ImageViewerActionItem($r('sys.symbol.ellipsis_circle'), '更多',
         () => this.openImageMoreMenu())
     }
@@ -5352,7 +5378,7 @@ struct Index {
   }
 
   @Builder
-  ImageViewerMoreOverlay(entry: FileEntry): void {
+  ImageViewerMoreOverlay(): void {
     Stack() {
       Column()
         .width('100%')
@@ -5360,13 +5386,13 @@ struct Index {
         .onClick(() => this.closeImageMoreMenu())
       Column() {
         this.ImageViewerMoreRow($r('sys.symbol.arrow_2_circlepath'), '旋转',
-          () => this.rotateViewerImage(entry), true)
+          () => this.rotateViewerOverlayImage(), true)
         this.ImageViewerMoreRow($r('sys.symbol.rectangle_and_arrowshape_turn_up_right'), '其他应用打开',
-          () => this.openWithOtherApp(entry), true)
+          () => this.openViewerOverlayWithOtherApp(), true)
         this.ImageViewerMoreRow($r('sys.symbol.rectangle_on_rectangle'), '重命名',
-          () => this.openRenameFromViewer(entry), true)
+          () => this.openRenameFromViewerOverlay(), true)
         this.ImageViewerMoreRow($r('sys.symbol.doc'), '详情',
-          () => this.openImageDetails(entry), false)
+          () => this.openImageDetails(), false)
       }
       .width('88%')
       .padding({ left: 10, right: 10, top: 8, bottom: 8 })
@@ -5467,7 +5493,7 @@ struct Index {
   }
 
   @Builder
-  ImageViewerDetailsOverlay(entry: FileEntry): void {
+  ImageViewerDetailsOverlay(): void {
     Column() {
       Blank()
         .layoutWeight(1)
@@ -5486,11 +5512,14 @@ struct Index {
         }
         .width('100%')
 
-        this.ImageDetailsLine('文件名', entry.name)
-        this.ImageDetailsLine('路径', this.entryDisplayPath(entry))
-        this.ImageDetailsLine('大小', this.formatSize(entry.size))
-        this.ImageDetailsLine('修改时间', this.formatTime(entry.modifiedTime))
-        this.ImageDetailsLine('文件类型', this.fileType(entry).length > 0 ? this.fileType(entry) : '图片')
+        this.ImageDetailsLine('文件名', (this.viewerOverlayEntry as FileEntry).name)
+        this.ImageDetailsLine('路径', this.entryDisplayPath(this.viewerOverlayEntry as FileEntry))
+        this.ImageDetailsLine('大小', this.formatSize((this.viewerOverlayEntry as FileEntry).size))
+        this.ImageDetailsLine('修改时间',
+          this.formatTime((this.viewerOverlayEntry as FileEntry).modifiedTime))
+        this.ImageDetailsLine('文件类型',
+          this.fileType(this.viewerOverlayEntry as FileEntry).length > 0
+            ? this.fileType(this.viewerOverlayEntry as FileEntry) : '图片')
       }
       .width('90%')
       .padding({ left: 20, right: 20, top: 18, bottom: 20 })
@@ -8513,7 +8542,6 @@ struct Index {
       this.viewerMaxConcurrentLoads = 1
       this.replaceViewerImages(imageEntries)
       this.viewerImageIndex = initialIndex
-      this.viewerChromeIndex = initialIndex
       this.viewerImageEntry = entry
       this.viewerHeaderTitle = entry.name
       this.resetViewerVisualSession(imageEntries, persistedState)
@@ -8532,6 +8560,7 @@ struct Index {
       this.viewerBottomBarWidthVp = 0
       this.showImageMoreMenu = false
       this.showImageDetails = false
+      this.viewerOverlayEntry = null
       this.viewerLastNavigationDirection = 1
       this.resetImageTransform()
       this.viewerTransitionActive = false
@@ -8803,9 +8832,9 @@ struct Index {
     this.viewerHeaderTitle = ''
     this.replaceViewerImages([])
     this.viewerImageIndex = 0
-    this.viewerChromeIndex = 0
     this.showImageMoreMenu = false
     this.showImageDetails = false
+    this.viewerOverlayEntry = null
     this.viewerLastNavigationDirection = 1
     this.viewerProgressLastUpdateAt = {}
     this.viewerRevealTokens = {}
@@ -9250,7 +9279,6 @@ struct Index {
       // The image previously viewed is on the right; after deletion prefer left.
       this.viewerLastNavigationDirection = -1
     }
-    this.viewerChromeIndex = index
     this.viewerImageIndex = index
     this.viewerImageEntry = this.viewerImages[index]
     this.viewerHeaderTitle = this.viewerImages[index].name
@@ -9338,6 +9366,7 @@ struct Index {
         retained.push(item)
       } else {
         this.viewerLoadRequests[item.path] = false
+        this.finishViewerOriginalLoading(item.path, false)
       }
     }
     this.viewerLoadQueue = retained
@@ -9358,12 +9387,14 @@ struct Index {
         // This task is no longer the visible target. Its request flag is
         // cleared below so a later swipe can enqueue it again.
         this.viewerLoadRequests[item.path] = false
+        this.finishViewerOriginalLoading(item.path, false)
       }
     }
     this.viewerLoadQueue = nextQueue
     for (const key of Object.keys(this.viewerLoadRequests)) {
       if (key !== targetPath && this.viewerActiveLoadPaths[key] !== true) {
         this.viewerLoadRequests[key] = false
+        this.finishViewerOriginalLoading(key, false)
       }
     }
   }
@@ -9407,7 +9438,12 @@ struct Index {
     this.viewerProgressLastUpdateAt = nextProgressTimes
 
     this.viewerLoadQueue = this.viewerLoadQueue.filter((item: FileEntry): boolean => {
-      return keepPaths[item.path] === true
+      const keep = keepPaths[item.path] === true
+      if (!keep) {
+        this.viewerLoadRequests[item.path] = false
+        this.finishViewerOriginalLoading(item.path, false)
+      }
+      return keep
     })
 
     // A queued request can be removed by the adjacent-page window. Its old
@@ -9422,7 +9458,7 @@ struct Index {
     this.viewerLoadRequests = nextLoadRequests
   }
 
-  private async loadCurrentViewerOriginalManually(entry: FileEntry): Promise<void> {
+  private async loadViewerOriginalManually(entry: FileEntry): Promise<void> {
     if (!this.showImageViewer || entry.isDirectory || this.isBusy ||
       this.viewerOriginalUri(entry).length > 0 || this.viewerLoadRequests[entry.path] === true) {
       return
@@ -9447,14 +9483,16 @@ struct Index {
       if (existingPath.length === 0) {
         return
       }
-      this.setViewerDownloadProgress(entry.path, 95, true, true)
+      this.markViewerOriginalLoading(entry.path)
       const record = await this.decodeViewerOriginalBitmap(entry, existingPath)
       if (record === null || !this.showImageViewer || generation !== this.viewerGeneration) {
+        this.finishViewerOriginalLoading(entry.path, false)
         return
       }
       this.applyDecodedBitmapGeometry(entry.path, record, true)
       this.commitViewerBitmap(entry, existingPath, record)
     } catch (_) {
+      this.finishViewerOriginalLoading(entry.path, false)
       // A missing/reclaimed cache entry is normal; the ring remains available.
     }
   }
@@ -9470,13 +9508,16 @@ struct Index {
       if (existingPath.length === 0) {
         return
       }
+      this.markViewerOriginalLoading(entry.path)
       const record = await this.decodeViewerOriginalBitmap(entry, existingPath)
       if (record === null || generation !== this.viewerGeneration || !this.showImageViewer) {
+        this.finishViewerOriginalLoading(entry.path, false)
         return
       }
       this.applyDecodedBitmapGeometry(entry.path, record, true)
       this.commitViewerBitmap(entry, existingPath, record)
     } catch (error) {
+      this.finishViewerOriginalLoading(entry.path, false)
       // A reclaimed cache entry simply falls back to the normal preview and
       // download path; it must not make opening the viewer fail.
       console.warn('[UgreenImage] cached-original fast path failed: ' + JSON.stringify(error))
@@ -9550,6 +9591,7 @@ struct Index {
     }
     this.viewerLoadRequests[entry.path] = true
     this.viewerManualLoadPaths[entry.path] = manual
+    this.markViewerOriginalLoading(entry.path)
     if (priority) {
       this.viewerLoadQueue.unshift(entry)
     } else {
@@ -9570,6 +9612,8 @@ struct Index {
   }
 
   private async loadViewerOriginal(entry: FileEntry, generation: number): Promise<void> {
+    let completed = false
+    let failed = false
     try {
       const manual = this.viewerManualLoadPaths[entry.path] === true
       await this.ensureCacheState()
@@ -9605,9 +9649,14 @@ struct Index {
       }
       this.applyDecodedBitmapGeometry(entry.path, record, true)
       this.commitViewerBitmap(entry, localPath, record)
+      completed = true
     } catch (error) {
       if (error instanceof UgreenError && error.status === 499) {
         return
+      }
+      failed = true
+      if (this.showImageViewer && generation === this.viewerGeneration) {
+        this.finishViewerOriginalLoading(entry.path, true)
       }
       if (this.showImageViewer && generation === this.viewerGeneration &&
         this.viewerImageEntry !== null &&
@@ -9625,6 +9674,9 @@ struct Index {
       }
     } finally {
       if (generation === this.viewerGeneration) {
+        if (!completed && !failed) {
+          this.finishViewerOriginalLoading(entry.path, false)
+        }
         this.viewerActiveLoads = Math.max(0, this.viewerActiveLoads - 1)
         this.viewerLoadRequests[entry.path] = false
         this.viewerActiveLoadPaths[entry.path] = false
@@ -9874,6 +9926,45 @@ struct Index {
     }
   }
 
+  private committedViewerActionEntry(action: string): FileEntry | null {
+    if (!this.showImageViewer || this.viewerClosePending) {
+      return null
+    }
+    const entry = this.committedViewerEntry()
+    if (entry !== null) {
+      this.logViewerDiagnostic('action-' + action, entry.path)
+    }
+    return entry
+  }
+
+  private async saveCommittedViewerImage(): Promise<void> {
+    const entry = this.committedViewerActionEntry('save')
+    if (entry !== null) {
+      await this.saveViewerImage(entry)
+    }
+  }
+
+  private async shareCommittedViewerImage(): Promise<void> {
+    const entry = this.committedViewerActionEntry('share')
+    if (entry !== null) {
+      await this.shareViewerImage(entry)
+    }
+  }
+
+  private async deleteCommittedViewerImage(): Promise<void> {
+    const entry = this.committedViewerActionEntry('delete')
+    if (entry !== null) {
+      await this.deleteViewerImage(entry)
+    }
+  }
+
+  private async loadCommittedViewerOriginalManually(): Promise<void> {
+    const entry = this.committedViewerActionEntry('load-original')
+    if (entry !== null) {
+      await this.loadViewerOriginalManually(entry)
+    }
+  }
+
   private async saveViewerImage(entry: FileEntry): Promise<void> {
     this.closeImageMoreMenu()
     this.closeImageDetails()
@@ -9884,12 +9975,45 @@ struct Index {
     if (!this.showImageViewer || this.isBusy) {
       return
     }
+    const entry = this.committedViewerActionEntry('more')
+    if (entry === null) {
+      return
+    }
+    this.viewerOverlayEntry = entry
     this.showImageDetails = false
     this.showImageMoreMenu = true
   }
 
   private closeImageMoreMenu(): void {
     this.showImageMoreMenu = false
+    this.viewerOverlayEntry = null
+  }
+
+  private rotateViewerOverlayImage(): void {
+    const entry = this.viewerOverlayEntry
+    if (entry !== null) {
+      this.rotateViewerImage(entry)
+    }
+  }
+
+  private openViewerOverlayWithOtherApp(): void {
+    const entry = this.viewerOverlayEntry
+    if (entry === null) {
+      return
+    }
+    this.closeImageMoreMenu()
+    this.openWithOtherApp(entry)
+  }
+
+  private openRenameFromViewerOverlay(): void {
+    const entry = this.viewerOverlayEntry
+    if (entry === null || !this.showImageViewer || this.isBusy) {
+      return
+    }
+    this.showImageMoreMenu = false
+    this.showImageDetails = false
+    this.viewerOverlayEntry = null
+    this.openRename(entry)
   }
 
   private rotateViewerImage(entry: FileEntry): void {
@@ -10052,8 +10176,8 @@ struct Index {
     }
   }
 
-  private openImageDetails(entry: FileEntry): void {
-    if (!this.showImageViewer || this.isBusy) {
+  private openImageDetails(): void {
+    if (!this.showImageViewer || this.isBusy || this.viewerOverlayEntry === null) {
       return
     }
     this.showImageMoreMenu = false
@@ -10062,15 +10186,7 @@ struct Index {
 
   private closeImageDetails(): void {
     this.showImageDetails = false
-  }
-
-  private openRenameFromViewer(entry: FileEntry): void {
-    if (!this.showImageViewer || this.isBusy) {
-      return
-    }
-    this.showImageMoreMenu = false
-    this.showImageDetails = false
-    this.openRename(entry)
+    this.viewerOverlayEntry = null
   }
 
   private async shareViewerImage(entry: FileEntry): Promise<void> {
@@ -10107,6 +10223,13 @@ struct Index {
     if (this.isBusy || !this.showImageViewer) {
       return
     }
+    const deletedIndex = this.viewerImages.findIndex((item: FileEntry): boolean => {
+      return item.path === entry.path
+    })
+    if (deletedIndex < 0) {
+      return
+    }
+    const preferredDirection = this.viewerLastNavigationDirection >= 0 ? 1 : -1
     this.closeImageMoreMenu()
     this.closeImageDetails()
     const response = await promptAction.showDialog({
@@ -10122,8 +10245,6 @@ struct Index {
       return
     }
 
-    const deletedIndex = this.viewerImageIndex
-    const preferredDirection = this.viewerLastNavigationDirection >= 0 ? 1 : -1
     this.isBusy = true
     this.errorText = ''
     this.statusText = '正在移入云盘回收站…'
@@ -10144,10 +10265,10 @@ struct Index {
         : (deletedIndex > 0 ? deletedIndex - 1 : 0)
       const boundedIndex = Math.min(remainingImages.length - 1, Math.max(0, targetIndex))
       this.replaceViewerImages(remainingImages)
-      this.viewerChromeIndex = boundedIndex
       this.viewerImageIndex = boundedIndex
       this.viewerImageEntry = remainingImages[boundedIndex]
       this.viewerHeaderTitle = remainingImages[boundedIndex].name
+      this.viewerOverlayEntry = null
       const nextStates: Record<string, ImageVisualState> = {}
       for (const key of Object.keys(this.imageVisualStates)) {
         if (key !== entry.path) {
