@@ -168,6 +168,14 @@ export class DownloadQueueManager {
     task.destinationRoot = normalizedRoot
     task.relativePath = normalizedRelative
     task.manualMobileResume = this.isMeteredNetwork()
+    // Keep the queue record tied to the same remote version used by the
+    // video/cache resolver. Older callers may not supply validators.
+    if (this.repository !== null) {
+      const signature = this.repository.signatureForFile(entry)
+      task.sourceKey = signature.key()
+      task.sourceEtag = signature.etag
+      task.sourceChecksum = signature.checksum
+    }
     this.tasks.push(task)
     this.requestPersist()
     this.notify()
@@ -259,6 +267,9 @@ export class DownloadQueueManager {
         task.systemTaskId = ''
         task.errorMessage = typeof source.errorMessage === 'string' ? source.errorMessage : ''
         task.manualMobileResume = source.manualMobileResume === true
+        task.sourceKey = typeof source.sourceKey === 'string' ? source.sourceKey : ''
+        task.sourceEtag = typeof source.sourceEtag === 'string' ? source.sourceEtag : ''
+        task.sourceChecksum = typeof source.sourceChecksum === 'string' ? source.sourceChecksum : ''
         if (task.status === 'downloading') {
           task.status = 'queued'
         }
@@ -408,6 +419,12 @@ export class DownloadQueueManager {
       const descriptor = await this.repository.downloadDescriptor(record.remotePath)
       if (descriptor.size > 0) {
         record.size = descriptor.size
+      }
+      if (descriptor.etag.length > 0) {
+        record.sourceEtag = descriptor.etag
+      }
+      if (descriptor.checksum.length > 0) {
+        record.sourceChecksum = descriptor.checksum
       }
       if (descriptor.fileName.length > 0 && record.name.length === 0) {
         record.name = descriptor.fileName
@@ -689,6 +706,9 @@ export class DownloadQueueManager {
     result.systemTaskId = source.systemTaskId
     result.errorMessage = source.errorMessage
     result.manualMobileResume = source.manualMobileResume
+    result.sourceKey = source.sourceKey
+    result.sourceEtag = source.sourceEtag
+    result.sourceChecksum = source.sourceChecksum
     return result
   }
 

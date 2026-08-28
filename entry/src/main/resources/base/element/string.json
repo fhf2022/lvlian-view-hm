@@ -15,6 +15,10 @@
     {
       "name": "download_permission_reason",
       "value": "用于将下载完成的文件保存到系统 Download/UGREENlink 文件夹"
+    },
+    {
+      "name": "background_playback_reason",
+      "value": "用于视频播放时在后台持续播放"
     }
   ]
 }

@@ -32,6 +32,48 @@ export class UgreenEndpoints {
       '&size_type=1&type=0'
   }
 
+  /**
+   * The official UGOS media viewer uses this authenticated source for video
+   * playback.  It supports byte ranges without first minting a download-file
+   * token; that token route is reserved for explicit durable downloads.
+   */
+  mediaPlayer(path: string, size: number = 0, modifiedTime: number = 0,
+    createdTime: number = 0, intranetShareId: number = 0): string {
+    const query = [
+      'path=' + encodeURIComponent(path),
+      'mtime=' + Math.max(0, Math.floor(modifiedTime)).toString(),
+      'ctime=' + Math.max(0, Math.floor(createdTime)).toString(),
+      'file_size=' + Math.max(0, Math.floor(size)).toString(),
+      'intranet_share_id=' + Math.max(0, Math.floor(intranetShareId)).toString()
+    ]
+    return this.baseUrl + '/ugreen/v1/filemgr/mediaPlayer?' + query.join('&')
+  }
+
+  /** The same server-side HLS preparation endpoints used by the web viewer. */
+  streamTranscodeInfo(): string {
+    return this.baseUrl + '/ugreen/v2/stream/transcode/web/info'
+  }
+
+  streamTranscodePlay(): string {
+    return this.baseUrl + '/ugreen/v2/stream/transcode/web/play'
+  }
+
+  streamTranscodeM3u8(m3u8File: string, taskId: string, timestamp: number,
+    sourceType: number = 1): string {
+    const query = [
+      'm3u8_file=' + encodeURIComponent(m3u8File),
+      'task_id=' + encodeURIComponent(taskId),
+      'timestamp=' + Math.max(0, Math.floor(timestamp)).toString(),
+      'src_type=' + Math.max(-1, Math.floor(sourceType)).toString()
+    ]
+    return this.baseUrl + '/ugreen/v2/stream/transcode/web/m3u8?' + query.join('&')
+  }
+
+  streamTranscodeClose(): string {
+    // This is the endpoint used by web-video-player's sendBeacon cleanup.
+    return this.baseUrl + '/ugreen/v2/stream/transcode/web/close'
+  }
+
   detectPermissions(): string {
     return this.baseUrl + '/ugreen/v1/filemgr/detectionPermissions'
   }
@@ -44,6 +86,10 @@ export class UgreenEndpoints {
     query.push('intranet_share_id=0')
     query.push('coding=true')
     return this.baseUrl + '/ugreen/v2/filemgr/getDownloadToken?' + query.join('&')
+  }
+
+  downloadFile(token: string): string {
+    return this.baseUrl + '/ugreen/v2/filemgr/downloadFile?token=' + encodeURIComponent(token)
   }
 
   downloadLink(path: string): string {

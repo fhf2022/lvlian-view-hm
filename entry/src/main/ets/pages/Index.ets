@@ -1,15 +1,25 @@
-import { promptAction, uiMaterial, curves, window, LengthMetrics, FrameCallback } from '@kit.ArkUI'
+import { promptAction, uiMaterial, curves, window, LengthMetrics, FrameCallback, PiPWindow } from '@kit.ArkUI'
 import { systemShare, harmonyShare } from '@kit.ShareKit'
 import { Context, Want, common, wantConstant } from '@kit.AbilityKit'
 import { Environment, fileIo, fileUri } from '@kit.CoreFileKit'
 import { preferences, uniformTypeDescriptor as utd } from '@kit.ArkData'
 import { image } from '@kit.ImageKit'
+import { media } from '@kit.MediaKit'
+import { AVCastPicker, AVCastPickerState, avSession } from '@kit.AVSessionKit'
 import { hilog } from '@kit.PerformanceAnalysisKit'
 import { DownloadTaskRecord, FileEntry } from '../model/FileEntry'
 import { CacheManager } from '../download/CacheManager'
 import { DownloadQueueManager } from '../download/DownloadQueueManager'
 import { UserFileManager } from '../download/UserFileManager'
 import { AudioPlaybackManager } from '../media/AudioPlaybackManager'
+import { VideoPlaybackManager } from '../media/VideoPlaybackManager'
+import {
+  VideoCastPlaybackSnapshot,
+  VideoMediaPlaybackSnapshot,
+  VideoMediaSessionManager
+} from '../media/VideoMediaSessionManager'
+import { VideoBackgroundTaskManager } from '../media/VideoBackgroundTaskManager'
+import { VideoSourceHandle, VideoTransferManager, VideoTransferState } from '../media/VideoTransferManager'
 import { MediaPreviewManager } from '../media/MediaPreviewManager'
 import { ImageRotationRecord, ImageRotationStore } from '../media/ImageRotationStore'
 import { RemoteSearchScope, UgreenRemoteRepository } from '../repository/UgreenRemoteRepository'
@@ -28,7 +38,7 @@ type BottomTab = 'home' | 'shared' | 'downloads' | 'settings'
 type PageTransitionDirection = 'push' | 'pop'
 type FileViewMode = 'list' | 'grid' | 'waterfall'
 type FileSortKey = 'name' | 'type' | 'time' | 'size'
-type SearchReturnMode = 'none' | 'directory' | 'image' | 'audio' | 'download'
+type SearchReturnMode = 'none' | 'directory' | 'image' | 'audio' | 'video' | 'download'
 type FileAction = 'share' | 'openWith' | 'quickView' | 'multiSelect' | 'download' |
   'saveGallery' | 'releaseCache' | 'rename' | 'details' | 'delete' | 'copy' | 'move'
 type DestinationOperation = 'copy' | 'move'
@@ -210,6 +220,31 @@ interface DirectoryViewState {
   anchor: FileViewAnchor | null
 }
 
+// The file surface underneath a video is kept as the PiP restore destination.
+// A user may browse other tabs/directories while PiP is active; restoring must
+// therefore put the player back over the directory that launched it, rather
+// than whatever page happened to be visible when the system restore button was
+// pressed.
+interface VideoPipOrigin {
+  screen: RemoteScreen
+  selectedBottomTab: BottomTab
+  rootKind: RootKind
+  currentPath: string
+  currentRootType: number
+  entries: FileEntry[]
+  navigationStack: string[]
+  navigationEntryStack: FileEntry[][]
+  navigationRootTypeStack: number[]
+  navigationViewStateStack: DirectoryViewState[]
+  navigationPageIndexStack: number[]
+  navigationPageHasMoreStack: boolean[]
+  currentPageIndex: number
+  currentPageHasMore: boolean
+  viewState: DirectoryViewState
+  topTitle: string
+  topTitleOpacity: number
+}
+
 interface GestureTransferSelection {
   entries: FileEntry[]
   skippedCount: number
@@ -286,6 +321,7 @@ struct Index {
   @State showRenameDialog: boolean = false
   @State showStorageSettings: boolean = false
   @State showNetworkSettings: boolean = false
+  @State showPlaybackSettings: boolean = false
   @State showImageViewer: boolean = false
   @State viewerImageEntry: FileEntry | null = null
   @State viewerHeaderTitle: string = ''
@@ -335,6 +371,34 @@ struct Index {
   @State audioPlaying: boolean = false
   @State audioCurrentMs: number = 0
   @State audioDurationMs: number = 0
+  // Playback preferences are kept separate from cache/network settings so
+  // each settings page has one responsibility.
+  @State backgroundVideoPlayback: boolean = true
+  @State backgroundAudioPlayback: boolean = true
+  @State videoBackgroundAutoPip: boolean = false
+  @State autoPlayOnOpen: boolean = true
+  @State showVideoPlayer: boolean = false
+  @State videoEntry: FileEntry | null = null
+  @State videoSourceKey: string = ''
+  @State videoLocalPath: string = ''
+  @State videoDurationMs: number = 0
+  @State videoCurrentMs: number = 0
+  @State videoPlaying: boolean = false
+  @State videoMuted: boolean = false
+  @State videoPrepared: boolean = false
+  @State videoFirstFrame: boolean = false
+  @State videoSurfaceReady: boolean = false
+  @State videoOrientationChanging: boolean = false
+  @State videoLandscape: boolean = false
+  @State videoControlPending: boolean = false
+  @State videoWidthPx: number = 0
+  @State videoHeightPx: number = 0
+  @State videoBufferingPercent: number = 0
+  @State videoPipActive: boolean = false
+  @State videoPipBackgrounded: boolean = false
+  @State videoPipCreating: boolean = false
+  @State videoCasting: boolean = false
+  @State videoTransferStates: Record<string, VideoTransferState> = {}
   @State previewCanonicalPaths: Record<string, boolean> = {}
   @State waterfallOriginalUris: Record<string, string> = {}
   // PixelMap source changes are committed on a render frame.  The epoch is
@@ -372,10 +436,76 @@ struct Index {
   @StorageProp('statusBarHeightPx') statusBarHeightPx: number = 0
   @StorageProp('navigationBarHeightPx') navigationBarHeightPx: number = 0
   @StorageProp('isDarkTheme') isDarkTheme: boolean = false
+  @StorageProp('abilityInBackground') @Watch('onAbilityBackgroundChanged')
+  abilityInBackground: boolean = false
   private repository: UgreenRemoteRepository = new UgreenRemoteRepository()
   private networkPolicy: NetworkPolicy = NetworkPolicy.shared()
   private downloadQueue: DownloadQueueManager = new DownloadQueueManager()
   private audioManager: AudioPlaybackManager = new AudioPlaybackManager()
+  private videoPlaybackManager: VideoPlaybackManager = new VideoPlaybackManager()
+  private videoMediaSession: VideoMediaSessionManager = new VideoMediaSessionManager()
+  private videoBackgroundTask: VideoBackgroundTaskManager = new VideoBackgroundTaskManager()
+  private videoTransferManager: VideoTransferManager = new VideoTransferManager()
+  private videoSurfaceController: XComponentController = new XComponentController()
+  private videoSourceHandle: VideoSourceHandle | null = null
+  private videoOpenToken: number = 0
+  private videoPositionPersistAt: number = 0
+  private videoWasPlayingBeforeHide: boolean = false
+  private playbackBackgroundActive: boolean = false
+  // XComponent surface dimensions are physical pixels. Keep the last layout
+  // area in vp so a window rotation can recompute a centered, aspect-preserved
+  // surface without stretching the decoded video frame.
+  private videoViewportWidthVp: number = 0
+  private videoViewportHeightVp: number = 0
+  private videoSurfaceWidthPx: number = 0
+  private videoSurfaceHeightPx: number = 0
+  private videoPipController: PiPWindow.PiPController | null = null
+  private videoPipOrigin: VideoPipOrigin | null = null
+  private videoPipHideOnStart: boolean = false
+  // startPiP/stopPiP resolve asynchronously and the platform can deliver the
+  // state callback on a later turn. Keep explicit in-flight guards so a fast
+  // second tap cannot issue a second command against the same controller.
+  private videoPipStarting: boolean = false
+  private videoPipStopping: boolean = false
+  private videoPipRestorePending: boolean = false
+  private videoPipRestoreScheduled: boolean = false
+  private videoPipRestoring: boolean = false
+  private videoPipStateChange = (state: PiPWindow.PiPState, reason: string): void => {
+    this.handleVideoPipStateChange(state, reason)
+  }
+  private videoPipControlEvent = (event: PiPWindow.PiPActionEventType,
+    status?: number): void => {
+    this.handleVideoPipControlEvent(event, status)
+  }
+  private videoCastPreparing: boolean = false
+  private videoWasPlayingBeforeCast: boolean = false
+  private videoPlayerWindow: window.Window | null = null
+  private videoPlayerPreviousOrientation: window.Orientation | null = null
+  private videoOrientationToken: number = 0
+  // System-bar changes are asynchronous. Serialize them so a sensor callback
+  // cannot finish after a close/portrait request and hide the bars again.
+  private videoSystemBarsLandscape: boolean | null = null
+  private videoSystemBarsQueue: Promise<void> = Promise.resolve()
+  private videoSystemBarsToken: number = 0
+  private videoWindowSizeChange = (size: window.Size): void => {
+    if (!this.showVideoPlayer || size.width <= 0 || size.height <= 0) {
+      return
+    }
+    // Window.Size is reported in physical pixels. The XComponent area callback
+    // remains the source of the exact vp dimensions used by the surface, but
+    // this event lets the controls switch orientation as soon as the window
+    // has committed a sensor rotation.
+    this.videoLandscape = size.width > size.height
+    const win = this.videoPlayerWindow
+    if (win !== null) {
+      this.setVideoSystemBars(win, this.videoLandscape).catch((error: Error): void => {
+        console.warn('[UgreenVideo] sync system bars after window rotation failed: ' +
+          JSON.stringify(error))
+      })
+    }
+    this.updateVideoSurfaceRect()
+  }
+  private videoMediaSessionPositionAt: number = 0
   private mediaPreviewManager: MediaPreviewManager = new MediaPreviewManager()
   private viewerBitmapStore: ViewerBitmapStore = new ViewerBitmapStore()
   private viewerPreviewBitmaps: Record<string, ViewerBitmapRecord> = {}
@@ -499,6 +629,7 @@ struct Index {
   }
   private cachePreferences: preferences.Preferences | null = null
   private networkPreferences: preferences.Preferences | null = null
+  private playbackPreferences: preferences.Preferences | null = null
   private loginPreferences: preferences.Preferences | null = null
   private searchPreferences: preferences.Preferences | null = null
   private cacheDirectory: string = ''
@@ -508,8 +639,10 @@ struct Index {
   private networkStatePromise: Promise<void> | null = null
   private loginStatePromise: Promise<void> | null = null
   private searchStatePromise: Promise<void> | null = null
+  private playbackStatePromise: Promise<void> | null = null
   private imageRotationStatePromise: Promise<void> | null = null
   private downloadStatePromise: Promise<void> | null = null
+  private videoStatePromise: Promise<void> | null = null
   private searchTimer: number = 0
   private searchGeneration: number = 0
   private errorDialogShowing: boolean = false
@@ -525,6 +658,13 @@ struct Index {
   private downloadStateListener = (tasks: DownloadTaskRecord[], speed: number): void => {
     this.downloadTasks = tasks
     this.downloadSpeedBytesPerSecond = speed
+  }
+  private videoTransferStateListener = (states: VideoTransferState[]): void => {
+    const next: Record<string, VideoTransferState> = {}
+    for (const state of states) {
+      next[state.sourceKey] = state
+    }
+    this.videoTransferStates = next
   }
   private gestureShareRegistered: boolean = false
   private gestureShareRegistering: boolean = false
@@ -545,6 +685,8 @@ struct Index {
     this.ensureCacheState()
     this.ensureNetworkState()
     this.ensureDownloadState()
+    this.ensurePlaybackState()
+    this.ensureVideoState()
     this.loginStatePromise = this.loadLoginPreferences()
     this.searchStatePromise = this.loadSearchPreferences()
     this.ensureImageRotationState()
@@ -552,7 +694,89 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    this.closeVideoPlayer()
     this.disableGestureShare()
+  }
+
+  onPageHide(): void {
+    this.handlePlaybackBackgroundState(true)
+    this.updateVideoMediaSession(true)
+  }
+
+  onPageShow(): void {
+    this.handlePlaybackBackgroundState(false)
+    this.scheduleVideoPipRestore()
+    if (this.showVideoPlayer) {
+      // Refresh the system card when the page is visible again without issuing
+      // a duplicate play command.
+      this.updateVideoMediaSession(true)
+    }
+  }
+
+  onAbilityBackgroundChanged(): void {
+    this.handlePlaybackBackgroundState(this.abilityInBackground)
+    if (!this.abilityInBackground) {
+      this.scheduleVideoPipRestore()
+    }
+  }
+
+  private scheduleVideoPipRestore(): void {
+    if (!this.videoPipRestorePending || this.abilityInBackground ||
+      this.videoPipRestoreScheduled) {
+      return
+    }
+    this.videoPipRestoreScheduled = true
+    this.postRenderFrame((): void => {
+      this.videoPipRestoreScheduled = false
+      if (!this.videoPipRestorePending || this.abilityInBackground ||
+        !this.showVideoPlayer) {
+        return
+      }
+      this.videoPipRestorePending = false
+      this.videoPipRestoring = false
+      this.restoreVideoPipOrigin()
+      this.videoPipBackgrounded = false
+      this.updateBottomBarVisibility(true)
+      this.updateVideoMediaSession(true)
+    })
+  }
+
+  private handlePlaybackBackgroundState(isBackground: boolean): void {
+    if (this.playbackBackgroundActive === isBackground) {
+      return
+    }
+    this.playbackBackgroundActive = isBackground
+    if (!isBackground) {
+      this.videoWasPlayingBeforeHide = false
+      return
+    }
+
+    this.videoWasPlayingBeforeHide = this.showVideoPlayer && this.videoPlaying
+    // Explicit PiP is already a background playback mode. Do not let the
+    // page-hide callback immediately pause the same player while the system
+    // is transferring its surface into the PiP window.
+    if (this.showVideoPlayer && this.videoPlaying && !this.backgroundVideoPlayback &&
+      !this.videoPipActive && !this.videoPipBackgrounded) {
+      // A forced background pause is still routed through the same local/cast
+      // control path as the system media-session pause command.
+      this.pauseVideoFromMediaSession(true)
+    } else if (this.showVideoPlayer && this.videoWasPlayingBeforeHide &&
+      this.backgroundVideoPlayback && this.videoBackgroundAutoPip && !this.videoCasting &&
+      !this.videoPipActive && !this.videoPipBackgrounded) {
+      this.toggleVideoPip().catch((error: Object): void => {
+        console.warn('[UgreenVideo] automatic background PiP failed: ' + JSON.stringify(error))
+      })
+    }
+
+    if (this.showAudioPlayer && this.audioPlaying && !this.backgroundAudioPlayback) {
+      this.audioManager.pause().then((): void => {
+        if (this.playbackBackgroundActive) {
+          this.audioPlaying = false
+        }
+      }).catch((error: Object): void => {
+        console.warn('[UgreenAudio] background pause failed: ' + JSON.stringify(error))
+      })
+    }
   }
 
   /**
@@ -643,8 +867,16 @@ struct Index {
         skippedCount += 1
         continue
       }
-      const cachedPath = CacheManager.findExisting(this.cacheDirectory, entry.name,
+      let cachedPath = CacheManager.findExisting(this.cacheDirectory, entry.name,
         this.originalCacheKey(entry))
+      if (this.isVideo(entry)) {
+        try {
+          await this.refreshVideoManager()
+          cachedPath = await this.videoTransferManager.resolveLocal(entry)
+        } catch (_) {
+          cachedPath = ''
+        }
+      }
       if (cachedPath.length > 0 || this.networkClass === 'unmetered') {
         allowed.push(entry)
         continue
@@ -830,6 +1062,17 @@ struct Index {
     return this.getUIContext().px2vp(this.statusBarHeightPx)
   }
 
+  // The video surface is already laid out edge-to-edge. Once landscape video
+  // hides the status bar, retaining the portrait avoid-area inset would leave
+  // a visible empty strip above the controls while the window is rotating.
+  private videoTopInset(): number {
+    return this.videoLandscape ? 0 : this.topSafeInset()
+  }
+
+  private videoBottomInset(): number {
+    return this.videoLandscape ? 0 : this.bottomSafeInset()
+  }
+
   // All file view modes share the same content origin below the common
   // TopFileOverlay. Keeping this in one helper prevents WaterFlow from
   // drifting away from the list/grid header geometry.
@@ -863,7 +1106,7 @@ struct Index {
       return true
     }
     if (this.screen === 'settings') {
-      return !this.showStorageSettings && !this.showNetworkSettings
+      return !this.showStorageSettings && !this.showPlaybackSettings && !this.showNetworkSettings
     }
     if (this.screen !== 'files') {
       return false
@@ -885,7 +1128,11 @@ struct Index {
       !this.showRenameDialog &&
       !this.showImageViewer && !this.viewerEntryTransitionActive &&
       !this.viewerFallbackEntryActive &&
-      !this.showAudioPlayer && !this.selectionMode
+      !this.showAudioPlayer && !this.videoPlaybackUiVisible() && !this.selectionMode
+  }
+
+  private videoPlaybackUiVisible(): boolean {
+    return this.showVideoPlayer && !this.videoPipBackgrounded
   }
 
   private updateBottomBarVisibility(animated: boolean = true): void {
@@ -1045,6 +1292,10 @@ struct Index {
       this.closeAudioPlayer()
       return true
     }
+    if (this.videoPlaybackUiVisible()) {
+      this.closeVideoPlayer()
+      return true
+    }
     if (this.showRenameDialog) {
       this.closeRename()
       return true
@@ -1072,6 +1323,10 @@ struct Index {
     if (this.screen === 'settings') {
       if (this.showStorageSettings) {
         this.closeStorageSettings()
+        return true
+      }
+      if (this.showPlaybackSettings) {
+        this.closePlaybackSettings()
         return true
       }
       if (this.showNetworkSettings) {
@@ -1141,7 +1396,7 @@ struct Index {
         !this.showImageViewer &&
         !this.viewerEntryTransitionActive &&
         !this.viewerFallbackEntryActive &&
-        !this.showAudioPlayer && !this.selectionMode) {
+        !this.showAudioPlayer && !this.videoPlaybackUiVisible() && !this.selectionMode) {
         Stack({ alignContent: Alignment.Bottom }) {
           this.FloatingBottomBar()
         }
@@ -1158,7 +1413,7 @@ struct Index {
       if (this.screen === 'files' && this.selectionMode &&
         !this.showDestinationPicker && !this.showRenameDialog &&
         !this.showImageViewer && !this.viewerEntryTransitionActive &&
-        !this.viewerFallbackEntryActive && !this.showAudioPlayer) {
+        !this.viewerFallbackEntryActive && !this.showAudioPlayer && !this.videoPlaybackUiVisible()) {
         Stack({ alignContent: Alignment.Bottom }) {
           this.SelectionBottomBar()
         }
@@ -1184,7 +1439,8 @@ struct Index {
 
       if ((this.screen === 'files' || this.screen === 'downloads' || this.screen === 'settings') &&
         !this.showDestinationPicker && !this.showImageViewer &&
-        !this.viewerEntryTransitionActive && !this.viewerFallbackEntryActive) {
+        !this.viewerEntryTransitionActive && !this.viewerFallbackEntryActive &&
+        !this.showAudioPlayer && !this.videoPlaybackUiVisible()) {
         Stack({ alignContent: Alignment.TopStart }) {
           this.TopFileOverlay()
         }
@@ -1216,6 +1472,9 @@ struct Index {
       }
       if (this.showAudioPlayer && this.audioEntry !== null) {
         this.AudioPlayerOverlay(this.audioEntry as FileEntry)
+      }
+      if (this.showVideoPlayer && this.videoEntry !== null) {
+        this.VideoPlayerOverlay(this.videoEntry as FileEntry)
       }
     }
     .width('100%')
@@ -1263,6 +1522,8 @@ struct Index {
           .onClick(() => {
             if (this.showStorageSettings) {
               this.closeStorageSettings()
+            } else if (this.showPlaybackSettings) {
+              this.closePlaybackSettings()
             } else if (this.showNetworkSettings) {
               this.closeNetworkSettings()
             } else {
@@ -1499,6 +1760,60 @@ struct Index {
   }
 
   @Builder
+  VideoTransferIndicator(entry: FileEntry): void {
+    if (!this.isVideo(entry)) {
+      Blank()
+        .width(0)
+        .height(0)
+    } else {
+      if (this.videoStateForEntry(entry).status === 'failed') {
+        SymbolGlyph($r('sys.symbol.exclamationmark_triangle'))
+          .fontSize(18)
+          .fontColor([$r('app.color.icon_muted')])
+          .margin({ left: 8, right: 4 })
+      } else if (this.videoStateForEntry(entry).status === 'completed') {
+        SymbolGlyph($r('sys.symbol.checkmark_circle'))
+          .fontSize(20)
+          .fontColor(['#2E6BFF'])
+          .margin({ left: 8, right: 4 })
+      } else if (this.videoStateForEntry(entry).status !== 'idle') {
+        // Network playback is buffered inside AVPlayer rather than written to
+        // our durable cache.  Until a native CACHED_DURATION value is
+        // available, a zero-byte Progress ring would render as a permanently
+        // grey circle; use the same active indicator as the file manager for
+        // this indeterminate phase.
+        if (this.videoTransferIsIndeterminate(entry)) {
+          // A gateway that omits Content-Range cannot provide a truthful
+          // percentage yet.  Keep that state visibly active instead of
+          // rendering a permanently grey zero-value Progress ring.
+          LoadingProgress()
+            .width(25)
+            .height(25)
+            .color('#2E6BFF')
+            .margin({ left: 8, right: 4 })
+        } else {
+          Progress({ value: this.videoStateForEntry(entry).progress(), total: 100, type: ProgressType.Ring })
+            .width(25)
+            .height(25)
+            .backgroundColor('#AAB3C1')
+            .color('#2E6BFF')
+            .style({
+              strokeWidth: 3,
+              enableSmoothEffect: false,
+              status: ProgressStatus.PROGRESSING
+            })
+            .margin({ left: 8, right: 4 })
+        }
+      }
+    }
+  }
+
+  private videoTransferIsIndeterminate(entry: FileEntry): boolean {
+    const state = this.videoStateForEntry(entry)
+    return state.totalBytes <= 0 || (state.status === 'streaming' && state.receivedBytes <= 0)
+  }
+
+  @Builder
   SelectionCheckbox(entry: FileEntry): void {
     Checkbox()
       .select(this.isSelected(entry))
@@ -1668,6 +1983,7 @@ struct Index {
                 .alignItems(HorizontalAlign.Start)
                 .layoutWeight(1)
                 .margin({ left: 10 })
+                this.VideoTransferIndicator(entry)
                 if (entry.isDirectory) {
                   SymbolGlyph($r('sys.symbol.chevron_forward'))
                     .fontSize(18)
@@ -1752,6 +2068,7 @@ struct Index {
                 }
                 .alignItems(HorizontalAlign.Start)
                 .layoutWeight(1)
+                this.VideoTransferIndicator(entry)
                 if (this.selectionMode) {
                   this.SelectionCheckbox(entry)
                 } else if (entry.isDirectory) {
@@ -2011,6 +2328,7 @@ struct Index {
             }
             .width('100%')
             .padding({ left: 6, right: 6, top: 8, bottom: 8 })
+            this.VideoTransferIndicator(entry)
             if (this.selectionMode) {
               Row() {
                 this.SelectionCheckbox(entry)
@@ -2058,7 +2376,7 @@ struct Index {
     }) {
       LazyForEach(this.waterfallDataSource, (entry: FileEntry, index: number) => {
         FlowItem() {
-          Stack() {
+          Stack({ alignContent: Alignment.TopEnd }) {
             if (this.shouldReplaceViewerTransitionSource(entry)) {
               Blank()
                 .width('100%')
@@ -2096,6 +2414,7 @@ struct Index {
               .width('100%')
               .height('100%')
             }
+            this.VideoTransferIndicator(entry)
           }
           .width('100%')
           .aspectRatio(this.waterfallAspectRatio(entry))
@@ -2284,10 +2603,13 @@ struct Index {
             // The symbol and action change inside the node; the container is
             // never removed and recreated.
             this.FileHeaderLeadingControl()
-          } else if ((this.screen === 'settings' && (this.showStorageSettings || this.showNetworkSettings))) {
+          } else if ((this.screen === 'settings' &&
+            (this.showStorageSettings || this.showPlaybackSettings || this.showNetworkSettings))) {
             this.OfficialBackButton(() => {
               if (this.showStorageSettings) {
                 this.closeStorageSettings()
+              } else if (this.showPlaybackSettings) {
+                this.closePlaybackSettings()
               } else if (this.showNetworkSettings) {
                 this.closeNetworkSettings()
               } else {
@@ -2303,9 +2625,10 @@ struct Index {
 
           Text(this.selectionMode ? this.selectionTitle() :
             (this.screen === 'settings' && this.showStorageSettings ? '缓存与存储' :
+            (this.screen === 'settings' && this.showPlaybackSettings ? '播放与控制' :
             (this.screen === 'settings' && this.showNetworkSettings ? '网络与流量' :
             (this.screen === 'settings' ? '设置' :
-              (this.screen === 'downloads' ? '下载' : this.topTitle)))))
+              (this.screen === 'downloads' ? '下载' : this.topTitle))))))
             .fontSize(this.selectionMode ? 22 : 17)
             .fontWeight(FontWeight.Bold)
             .fontColor($r('app.color.text_primary'))
@@ -2438,6 +2761,8 @@ struct Index {
   SettingsContent(): void {
     if (this.showStorageSettings) {
       this.StorageSettingsContent()
+    } else if (this.showPlaybackSettings) {
+      this.PlaybackSettingsContent()
     } else if (this.showNetworkSettings) {
       this.NetworkSettingsContent()
     } else {
@@ -2479,6 +2804,43 @@ struct Index {
           .borderRadius(18)
           .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true))
           .onClick(() => this.openStorageSettings())
+
+          Column() {
+            Row() {
+              Stack() {
+                SymbolGlyph($r('sys.symbol.play'))
+                  .fontSize(22)
+                  .fontColor(['#2E6BFF'])
+              }
+              .width(42)
+              .height(42)
+              .borderRadius(14)
+              .backgroundColor('#EAF1FF')
+
+              Column({ space: 4 }) {
+                Text('播放与控制')
+                  .fontSize(16)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('app.color.text_primary'))
+                Text('管理自动播放、后台播放和视频小窗')
+                  .fontSize(12)
+                  .fontColor($r('app.color.text_tertiary'))
+              }
+              .alignItems(HorizontalAlign.Start)
+              .layoutWeight(1)
+              .margin({ left: 12 })
+
+              SymbolGlyph($r('sys.symbol.chevron_forward'))
+                .fontSize(18)
+                .fontColor([$r('app.color.icon_muted')])
+            }
+            .width('100%')
+            .padding(16)
+          }
+          .width('100%')
+          .borderRadius(18)
+          .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true))
+          .onClick(() => this.openPlaybackSettings())
 
           Column() {
             Row() {
@@ -2625,6 +2987,128 @@ struct Index {
       .alignItems(HorizontalAlign.Start)
       .justifyContent(FlexAlign.Start)
       .padding({ left: 20, right: 20, top: this.topSafeInset() + 99, bottom: this.bottomSafeInset() + 112 })
+    }
+    .width('100%')
+    .height('100%')
+    .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
+    .scrollBar(BarState.Auto)
+  }
+
+  @Builder
+  PlaybackSettingsContent(): void {
+    Scroll() {
+      Column({ space: 16 }) {
+        Column() {
+          Text('播放与控制')
+            .fontSize(28)
+            .fontWeight(FontWeight.Bold)
+            .fontColor($r('app.color.text_primary'))
+          Text('设置进入播放器和切换到后台时的播放行为。')
+            .fontSize(14)
+            .fontColor($r('app.color.text_tertiary'))
+            .lineHeight(22)
+            .margin({ top: 8 })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .width('100%')
+
+        Column({ space: 12 }) {
+          Row() {
+            Column({ space: 4 }) {
+              Text('进入后自动播放')
+                .fontSize(15)
+                .fontColor($r('app.color.text_primary'))
+              Text('打开视频或音频后立即开始播放；关闭后先停在暂停状态')
+                .fontSize(12)
+                .fontColor($r('app.color.text_tertiary'))
+                .maxLines(2)
+            }
+            .alignItems(HorizontalAlign.Start)
+            .layoutWeight(1)
+            Toggle({ type: ToggleType.Switch, isOn: this.autoPlayOnOpen })
+              .selectedColor('#2E6BFF')
+              .enabled(!this.isBusy)
+              .onChange((value: boolean) => this.setAutoPlayOnOpen(value))
+          }
+          .width('100%')
+
+          Row() {
+            Column({ space: 4 }) {
+              Text('视频后台播放')
+                .fontSize(15)
+                .fontColor($r('app.color.text_primary'))
+              Text('切换到其他应用后继续播放视频；关闭后进入后台自动暂停')
+                .fontSize(12)
+                .fontColor($r('app.color.text_tertiary'))
+                .maxLines(2)
+            }
+            .alignItems(HorizontalAlign.Start)
+            .layoutWeight(1)
+            Toggle({ type: ToggleType.Switch, isOn: this.backgroundVideoPlayback })
+              .selectedColor('#2E6BFF')
+              .enabled(!this.isBusy)
+              .onChange((value: boolean) => this.setBackgroundVideoPlayback(value))
+          }
+          .width('100%')
+
+          Row() {
+            Column({ space: 4 }) {
+              Text('音频后台播放')
+                .fontSize(15)
+                .fontColor($r('app.color.text_primary'))
+              Text('切换到其他应用后继续播放音频；关闭后进入后台自动暂停')
+                .fontSize(12)
+                .fontColor($r('app.color.text_tertiary'))
+                .maxLines(2)
+            }
+            .alignItems(HorizontalAlign.Start)
+            .layoutWeight(1)
+            Toggle({ type: ToggleType.Switch, isOn: this.backgroundAudioPlayback })
+              .selectedColor('#2E6BFF')
+              .enabled(!this.isBusy)
+              .onChange((value: boolean) => this.setBackgroundAudioPlayback(value))
+          }
+          .width('100%')
+
+          Row() {
+            Column({ space: 4 }) {
+              Text('视频后台自动进入小窗')
+                .fontSize(15)
+                .fontColor($r('app.color.text_primary'))
+              Text(this.backgroundVideoPlayback
+                ? '播放中的视频进入后台时自动切换到小窗'
+                : '请先开启视频后台播放')
+                .fontSize(12)
+                .fontColor($r('app.color.text_tertiary'))
+                .maxLines(2)
+            }
+            .alignItems(HorizontalAlign.Start)
+            .layoutWeight(1)
+            Toggle({ type: ToggleType.Switch, isOn: this.videoBackgroundAutoPip })
+              .selectedColor('#2E6BFF')
+              .enabled(!this.isBusy && this.backgroundVideoPlayback)
+              .onChange((value: boolean) => this.setVideoBackgroundAutoPip(value))
+          }
+          .width('100%')
+        }
+        .width('100%')
+        .padding(16)
+        .borderRadius(14)
+        .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true))
+
+        if (this.statusText.length > 0) {
+          Text(this.statusText)
+            .fontSize(13)
+            .fontColor($r('app.color.text_secondary'))
+            .width('100%')
+            .lineHeight(20)
+        }
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Start)
+      .justifyContent(FlexAlign.Start)
+      .padding({ left: 20, right: 20, top: this.topSafeInset() + 99,
+        bottom: this.bottomSafeInset() + 112 })
     }
     .width('100%')
     .height('100%')
@@ -4395,6 +4879,25 @@ struct Index {
     this.setPreviewUri(entry, fileUri.getUriFromPath(localPath), localPath, canonical)
   }
 
+  /**
+   * Images need the Image Kit decode/rotation pipeline before their URI can
+   * be exposed. Video and audio thumbnails are already raster previews from
+   * the server, so publishing the URI directly avoids sending them through
+   * the image-only rotation store while still allowing the file row and the
+   * video poster to render the same cached asset.
+   */
+  private async publishThumbnailPreview(entry: FileEntry, localPath: string,
+    canonical: boolean, generation: number): Promise<void> {
+    if (this.isImage(entry)) {
+      await this.publishImagePreview(entry, localPath, canonical, generation)
+      return
+    }
+    if (generation !== this.previewGeneration || localPath.length === 0) {
+      return
+    }
+    this.setPreviewUri(entry, fileUri.getUriFromPath(localPath), localPath, canonical)
+  }
+
   private releaseFileThumbnailBitmap(path: string): void {
     const record = this.fileThumbnailBitmaps[path]
     if (record === undefined) {
@@ -4461,9 +4964,9 @@ struct Index {
       const original = originals[entry.path]
       if (original !== undefined) {
         await this.viewerBitmapStore.release(original)
-      }
-    }
-  }
+              }
+            }
+          }
 
   private viewerThumbnailUri(entry: FileEntry): string {
     const state = this.imageVisualState(entry.path)
@@ -5065,8 +5568,8 @@ struct Index {
         Blank()
           .layoutWeight(1)
           .hitTestBehavior(HitTestMode.None)
-      }
-      .width('100%')
+          }
+          .width('100%')
       .height('100%')
       .opacity(this.imageChromeOpacity)
       .translate({ x: 0, y: this.imageTopChromeOffsetY, z: 0 })
@@ -5661,6 +6164,258 @@ struct Index {
     .backgroundColor('#101828')
   }
 
+  @Builder
+  VideoPlayerOverlay(entry: FileEntry): void {
+    // Stack defaults to centered child alignment.  The media/control layers
+    // occupy the whole window, but the compact header does not; explicitly
+    // pin the overlay stack to the top-left so the header cannot be centered
+    // in the video viewport.
+    Stack({ alignContent: Alignment.TopStart }) {
+      // The media surface owns the complete window. The player scale mode
+      // supplies the aspect-preserving letterbox; the UI never resizes the
+      // surface to the source video's raw width/height.
+      Stack({ alignContent: Alignment.Center }) {
+        XComponent({
+          id: 'ugreen-video-surface',
+          type: XComponentType.SURFACE,
+          controller: this.videoSurfaceController
+        })
+          .width('100%')
+          .height('100%')
+          .backgroundColor(Color.Black)
+          .opacity(this.videoFirstFrame ? 1 : 0)
+          .onLoad(() => this.handleVideoSurfaceLoad())
+
+        if (!this.videoFirstFrame) {
+          if (this.previewUri(entry).length > 0) {
+            Image(this.previewUri(entry))
+              .width('100%')
+              .height('100%')
+              .objectFit(ImageFit.Contain)
+          } else {
+            SymbolGlyph($r('sys.symbol.play'))
+              .fontSize(72)
+              .fontColor([$r('app.color.icon_muted')])
+          }
+          if (!this.videoPrepared || this.videoBufferingPercent < 100) {
+            LoadingProgress()
+              .width(32)
+              .height(32)
+              .color('#2E6BFF')
+          }
+        }
+
+        // XComponent can consume touch events itself.  A transparent sibling
+        // with an official ArkUI TapGesture keeps double-tap recognition
+        // reliable while HitTestMode.Transparent lets the surface continue
+        // receiving its normal input.
+        Column()
+          .width('100%')
+          .height('100%')
+          .backgroundColor(Color.Transparent)
+          .hitTestBehavior(HitTestMode.Transparent)
+          .gesture(
+            TapGesture({ count: 2, distanceThreshold: 8 })
+              .onAction(() => this.handleVideoDoubleTap())
+          )
+      }
+        .width('100%')
+        .height('100%')
+        .backgroundColor(Color.Black)
+        .onAreaChange((_, area) => {
+          if (typeof area.width === 'number' && typeof area.height === 'number' &&
+            area.width > 0 && area.height > 0) {
+            this.handleVideoViewportArea(area.width, area.height)
+          }
+        })
+
+      if (!this.videoPipBackgrounded) {
+        // Official video-player layout: the controls are a transparent overlay
+        // on the video, not a second card below it. Keep every control in one
+        // horizontal row, with the Slider taking the remaining width.
+        Stack({ alignContent: Alignment.Bottom }) {
+        Column()
+          .width('100%')
+          .height(112)
+          .linearGradient({
+            direction: GradientDirection.Bottom,
+            colors: [['#00000000', 0.0], ['#B8000000', 1.0]]
+          })
+          .hitTestBehavior(HitTestMode.None)
+
+        Column({ space: 4 }) {
+          Row({ space: 4 }) {
+            // Keep playback controls at the leading edge, as in the official
+            // video controller.  A previous-video action is intentionally not
+            // exposed; only the next item is available when the window is
+            // landscape.
+            Button() {
+              SymbolGlyph(this.videoPlaying
+                ? $r('sys.symbol.pause') : $r('sys.symbol.play'))
+                .fontSize(24)
+                .fontColor([Color.White])
+            }
+              .type(ButtonType.Normal)
+              .width(40)
+              .height(40)
+              .backgroundColor(Color.Transparent)
+              .enabled(this.videoPrepared && !this.isBusy && !this.videoControlPending)
+              .onClick(() => this.toggleVideo())
+
+            if (this.videoLandscape) {
+              Button() {
+                SymbolGlyph($r('sys.symbol.chevron_forward'))
+                  .fontSize(20)
+                  .fontColor([Color.White])
+              }
+                .type(ButtonType.Normal)
+                .width(36)
+                .height(40)
+                .backgroundColor(Color.Transparent)
+                .enabled(this.videoSibling(1) !== null && !this.isBusy)
+                .onClick(() => this.switchVideo(1))
+            }
+
+            Text(this.formatPlaybackTime(this.videoCurrentMs))
+              .fontSize(11)
+              .fontColor(Color.White)
+              .width(40)
+            // Keep the native AVPlayer buffer visible behind the playback
+            // thumb, following the official network-video example.  The
+            // buffering callback reports an estimated duration ahead of the
+            // playhead, which VideoPlaybackManager converts to this absolute
+            // timeline percentage.
+            Stack({ alignContent: Alignment.Center }) {
+              Slider({
+                value: this.videoBufferedTimelineMs(),
+                min: 0,
+                max: Math.max(1, this.videoDurationMs),
+                direction: Axis.Horizontal,
+                // Keep the buffer and seek layers on the same track geometry.
+                // SliderStyle.NONE removes the thumb's layout inset, so a
+                // stacked NONE/OutSet pair leaves a visible extra segment at
+                // the leading edge.
+                style: SliderStyle.OutSet
+              })
+                .trackColor('#55FFFFFF')
+                .selectedColor('#66FFFFFF')
+                .blockColor(Color.Transparent)
+                .blockBorderColor(Color.Transparent)
+                .trackThickness(4)
+                .enabled(false)
+
+              Slider({
+                value: Math.min(this.videoCurrentMs, Math.max(1, this.videoDurationMs)),
+                min: 0,
+                max: Math.max(1, this.videoDurationMs),
+                direction: Axis.Horizontal,
+                style: SliderStyle.OutSet
+              })
+                .trackColor(Color.Transparent)
+                .selectedColor('#2E6BFF')
+                .trackThickness(4)
+                .enabled(this.videoDurationMs > 0)
+                .onChange((value: number) => this.seekVideo(value))
+            }
+              .layoutWeight(1)
+              Text(this.formatPlaybackTime(this.videoDurationMs))
+              .fontSize(11)
+              .fontColor(Color.White)
+              .width(40)
+              .textAlign(TextAlign.End)
+
+            Button() {
+              SymbolGlyph($r('sys.symbol.rotate_left'))
+                .fontSize(22)
+                .fontColor([Color.White])
+            }
+              .type(ButtonType.Normal)
+              .width(40)
+              .height(40)
+              .backgroundColor(Color.Transparent)
+              .enabled(!this.isBusy && !this.videoOrientationChanging)
+              .onClick(() => this.rotateVideoInterface())
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
+
+          if (this.videoTransferError(entry).length > 0) {
+            Text(this.videoStatusText(entry))
+              .fontSize(12)
+              .fontColor('#FFFF8A8A')
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
+        }
+          .width('100%')
+          .padding({ left: 12, right: 12, top: 16, bottom: this.videoBottomInset() + 8 })
+        }
+          .width('100%')
+          .height('100%')
+          .zIndex(2)
+          // The parent is only a visual overlay. Let empty areas fall through
+          // to the media gesture while its button/slider children still handle
+          // their own touches.
+          .hitTestBehavior(HitTestMode.None)
+
+        // Keep the same back affordance as the file and image pages, but float
+        // it over the video instead of allocating a separate header band.
+        Row() {
+        this.OfficialBackButton(() => this.closeVideoPlayer())
+        Text(entry.name)
+          .fontSize(17)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(Color.White)
+          .layoutWeight(1)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        Button() {
+          // Keep the supplied PiP artwork as a hand-drawn vector asset.  The
+          // SVG has no raster background, so it stays crisp at every density.
+          Image($r('app.media.video_pip_icon'))
+            .width(24)
+            .height(24)
+            .objectFit(ImageFit.Contain)
+        }
+          .type(ButtonType.Normal)
+          .width(40)
+          .height(40)
+          .backgroundColor(Color.Transparent)
+          .enabled(this.videoSurfaceReady && this.videoPrepared &&
+            !this.videoPipCreating && !this.isBusy)
+          .onClick(() => this.toggleVideoPip())
+        // Keep the official AVCastPicker (including its stateful vector
+        // glyph) and shrink only its visual box to match the PiP symbol.  The
+        // surrounding Stack preserves a 40vp touch target in the header.
+        Stack({ alignContent: Alignment.Center }) {
+          AVCastPicker({
+            sessionType: 'video',
+            normalColor: Color.White,
+            activeColor: '#2E6BFF',
+            onStateChange: (state: AVCastPickerState): void => this.handleVideoCastPickerState(state)
+          })
+            .width(24)
+            .height(24)
+            .backgroundColor(Color.Transparent)
+        }
+          .width(40)
+          .height(40)
+        }
+          .width('100%')
+          .height(this.videoTopInset() + 76)
+          .padding({ left: 12, right: 12, top: this.videoTopInset() + 8, bottom: 28 })
+          .zIndex(3)
+      }
+    }
+    // Keep the original XComponent mounted while PiP is active so the system
+    // controller keeps its surface. Shrinking only this host reveals the file
+    // page underneath without creating a second video node or stopping AVPlayer.
+    .width(this.videoPipBackgrounded ? 1 : '100%')
+    .height(this.videoPipBackgrounded ? 1 : '100%')
+    .backgroundColor(this.videoPipBackgrounded ? Color.Transparent : Color.Black)
+    .hitTestBehavior(this.videoPipBackgrounded ? HitTestMode.None : HitTestMode.Default)
+  }
+
   private immersiveMaterial(style: uiMaterial.ImmersiveStyle, interactive: boolean = true,
     materialColor: string = ''): uiMaterial.Material {
     const options: uiMaterial.ImmersiveOptions = {
@@ -5770,11 +6525,25 @@ struct Index {
     return this.networkStatePromise
   }
 
+  private ensurePlaybackState(): Promise<void> {
+    if (this.playbackStatePromise === null) {
+      this.playbackStatePromise = this.loadPlaybackState()
+    }
+    return this.playbackStatePromise
+  }
+
   private ensureDownloadState(): Promise<void> {
     if (this.downloadStatePromise === null) {
       this.downloadStatePromise = this.loadDownloadState()
     }
     return this.downloadStatePromise
+  }
+
+  private ensureVideoState(): Promise<void> {
+    if (this.videoStatePromise === null) {
+      this.videoStatePromise = this.loadVideoState()
+    }
+    return this.videoStatePromise
   }
 
   private async loadDownloadState(): Promise<void> {
@@ -5815,6 +6584,37 @@ struct Index {
     await this.networkPolicy.initialize()
     this.networkClass = this.networkPolicy.current()
     this.repository.setMeteredBackgroundRefreshAllowed(this.meteredBackgroundRefresh)
+  }
+
+  private async loadPlaybackState(): Promise<void> {
+    try {
+      const context = getContext(this) as Context
+      this.playbackPreferences = await preferences.getPreferences(context, 'ugreen-playback-settings')
+      const storedVideoBackground = await this.playbackPreferences.get(
+        'background_video_playback', true)
+      const storedAudioBackground = await this.playbackPreferences.get(
+        'background_audio_playback', true)
+      const storedVideoPip = await this.playbackPreferences.get(
+        'video_background_auto_pip', false)
+      const storedAutoPlay = await this.playbackPreferences.get(
+        'auto_play_on_open', true)
+      if (typeof storedVideoBackground === 'boolean') {
+        this.backgroundVideoPlayback = storedVideoBackground
+      }
+      if (typeof storedAudioBackground === 'boolean') {
+        this.backgroundAudioPlayback = storedAudioBackground
+      }
+      if (typeof storedVideoPip === 'boolean') {
+        this.videoBackgroundAutoPip = storedVideoPip
+      }
+      if (typeof storedAutoPlay === 'boolean') {
+        this.autoPlayOnOpen = storedAutoPlay
+      }
+    } catch (error) {
+      // Playback defaults preserve the behavior from before this settings
+      // page existed, so an unavailable preference store is non-fatal.
+      console.warn('[UgreenPlayback] load preferences failed: ' + JSON.stringify(error))
+    }
   }
 
   private async persistNetworkPreferences(): Promise<void> {
@@ -6148,7 +6948,8 @@ struct Index {
     this.captureSearchSession()
     const mode: SearchReturnMode = entry.isDirectory
       ? 'directory'
-      : (this.isImage(entry) ? 'image' : (this.isAudio(entry) ? 'audio' : 'download'))
+      : (this.isImage(entry) ? 'image' :
+        (this.isAudio(entry) ? 'audio' : (this.isVideo(entry) ? 'video' : 'download')))
     this.searchSession.returnMode = mode
     this.searchSession.targetParentPath = targetParent
     this.searchSession.targetNavigationDepth = this.navigationStack.length
@@ -6992,7 +7793,8 @@ struct Index {
       await this.openEntry(entry)
       if (returnMode === 'download' ||
         (returnMode === 'image' && !this.showImageViewer) ||
-        (returnMode === 'audio' && !this.showAudioPlayer)) {
+        (returnMode === 'audio' && !this.showAudioPlayer) ||
+        (returnMode === 'video' && !this.showVideoPlayer)) {
         this.restoreSearchSession()
       }
       return
@@ -7028,7 +7830,8 @@ struct Index {
         await this.openEntry(located)
         if (returnMode === 'download' ||
           (returnMode === 'image' && !this.showImageViewer) ||
-          (returnMode === 'audio' && !this.showAudioPlayer)) {
+          (returnMode === 'audio' && !this.showAudioPlayer) ||
+          (returnMode === 'video' && !this.showVideoPlayer)) {
           this.restoreSearchSession()
         }
       } else {
@@ -7071,6 +7874,7 @@ struct Index {
     this.clearSearchIfPresent()
     this.showStorageSettings = false
     this.showNetworkSettings = false
+    this.showPlaybackSettings = false
     this.errorText = ''
     this.selectedBottomTab = 'settings'
     this.screen = 'settings'
@@ -7084,9 +7888,23 @@ struct Index {
     }
     this.showStorageSettings = true
     this.showNetworkSettings = false
+    this.showPlaybackSettings = false
     this.ensureCacheState()
     this.errorText = ''
     this.updateTopTitle('缓存与存储', true)
+    this.updateBottomBarVisibility(true)
+  }
+
+  private openPlaybackSettings(): void {
+    if (this.isBusy || this.screen !== 'settings') {
+      return
+    }
+    this.showStorageSettings = false
+    this.showPlaybackSettings = true
+    this.showNetworkSettings = false
+    this.ensurePlaybackState()
+    this.errorText = ''
+    this.updateTopTitle('播放与控制', true)
     this.updateBottomBarVisibility(true)
   }
 
@@ -7094,6 +7912,19 @@ struct Index {
     if (this.screen !== 'settings' || !this.showStorageSettings) {
       return
     }
+    this.showStorageSettings = false
+    this.showNetworkSettings = false
+    this.showPlaybackSettings = false
+    this.errorText = ''
+    this.updateTopTitle('设置', true)
+    this.updateBottomBarVisibility(true)
+  }
+
+  private closePlaybackSettings(): void {
+    if (this.screen !== 'settings' || !this.showPlaybackSettings) {
+      return
+    }
+    this.showPlaybackSettings = false
     this.showStorageSettings = false
     this.showNetworkSettings = false
     this.errorText = ''
@@ -7107,6 +7938,7 @@ struct Index {
     }
     this.showStorageSettings = false
     this.showNetworkSettings = true
+    this.showPlaybackSettings = false
     this.ensureNetworkState()
     this.errorText = ''
     this.updateTopTitle('网络与流量', true)
@@ -7119,6 +7951,7 @@ struct Index {
     }
     this.showNetworkSettings = false
     this.showStorageSettings = false
+    this.showPlaybackSettings = false
     this.errorText = ''
     this.updateTopTitle('设置', true)
     this.updateBottomBarVisibility(true)
@@ -7138,6 +7971,7 @@ struct Index {
     this.clearSearchIfPresent()
     this.closeActionMenu()
     this.showStorageSettings = false
+    this.showPlaybackSettings = false
     this.showNetworkSettings = false
     this.selectedBottomTab = 'home'
     this.screen = 'files'
@@ -7154,6 +7988,7 @@ struct Index {
     this.clearSearchIfPresent()
     this.closeActionMenu()
     this.showStorageSettings = false
+    this.showPlaybackSettings = false
     this.showNetworkSettings = false
     this.selectedBottomTab = 'shared'
     this.screen = 'files'
@@ -7171,6 +8006,7 @@ struct Index {
     this.clearSearchIfPresent()
     this.closeActionMenu()
     this.showStorageSettings = false
+    this.showPlaybackSettings = false
     this.showNetworkSettings = false
     this.selectionMode = false
     this.selectedPaths = []
@@ -7198,6 +8034,10 @@ struct Index {
       }
       await CacheManager.enforceLimit(this.cacheDirectory, value)
       await this.repository.enforceThumbnailCacheLimit(this.thumbnailCacheLimitBytes)
+      await this.ensureVideoState()
+      const videoContext = getContext(this) as Context
+      await this.videoTransferManager.initialize(videoContext, this.repository,
+        this.cacheDirectory, value)
       await this.refreshCacheUsage()
       this.statusText = '缓存上限已设置为 ' + this.formatStorageSize(value)
     } catch (error) {
@@ -7274,6 +8114,7 @@ struct Index {
         return
       }
       await this.loadRoot()
+      await this.refreshVideoManager()
       await this.ensureDownloadState()
       await this.downloadQueue.setReady(true)
       this.screen = 'files'
@@ -7300,6 +8141,7 @@ struct Index {
     try {
       const result = await this.repository.verifyOtp(this.otpCode, this.trustDevice)
       await this.loadRoot()
+      await this.refreshVideoManager()
       await this.ensureDownloadState()
       await this.downloadQueue.setReady(true)
       this.screen = 'files'
@@ -7495,6 +8337,10 @@ struct Index {
       }
       if (this.isAudio(entry)) {
         await this.openAudioPlayer(entry)
+        return
+      }
+      if (this.isVideo(entry)) {
+        await this.openVideoPlayer(entry)
         return
       }
       await this.downloadEntry(entry)
@@ -7704,7 +8550,8 @@ struct Index {
   private showActionMenu(entry: FileEntry, event: GestureEvent): void {
     if (this.screen !== 'files' || this.showSearch || this.selectionMode ||
       this.showDestinationPicker || this.showRenameDialog || this.showCreateFolderDialog ||
-      this.showImageViewer || this.showAudioPlayer || this.showPageTransition) {
+      this.showImageViewer || this.showAudioPlayer || this.videoPlaybackUiVisible() ||
+      this.showPageTransition) {
       return
     }
 
@@ -7821,10 +8668,24 @@ struct Index {
   }
 
   private actionHasLocalCache(entry: FileEntry): boolean {
-    if (entry.isDirectory || this.cacheDirectory.length === 0) {
+    if (entry.isDirectory) {
+      return false
+    }
+    if (this.isVideo(entry)) {
+      const state = this.videoTransferManager.stateFor(entry)
+      return state.durablePath.length === 0 && state.localPath.length > 0 &&
+        CacheManager.exists(state.localPath)
+    }
+    if (this.cacheDirectory.length === 0) {
       return false
     }
     return CacheManager.findExisting(this.cacheDirectory, entry.name, this.originalCacheKey(entry)).length > 0
+  }
+
+  private videoStateForEntry(entry: FileEntry): VideoTransferState {
+    const sourceKey = this.repository.signatureForFile(entry).key()
+    const state = this.videoTransferStates[sourceKey]
+    return state === undefined ? this.videoTransferManager.stateFor(entry) : state
   }
 
   private async downloadEntryFromMenu(entry: FileEntry): Promise<void> {
@@ -7858,7 +8719,15 @@ struct Index {
   private async enqueueRemoteTree(entry: FileEntry, destinationRoot: string,
     relativePath: string): Promise<number> {
     if (!entry.isDirectory) {
-      await this.downloadQueue.enqueue(entry, destinationRoot, relativePath)
+      if (this.isVideo(entry)) {
+        // Video transfers use the MediaKit range/cache coordinator so an
+        // earlier stream is promoted instead of starting a second full-file
+        // download. The route remains the same UGREENlink directory.
+        await this.refreshVideoManager()
+        await this.videoTransferManager.requestDownload(entry, destinationRoot, relativePath)
+      } else {
+        await this.downloadQueue.enqueue(entry, destinationRoot, relativePath)
+      }
       return 1
     }
     this.ensureLocalDirectory(destinationRoot + '/' + this.safeLocalPath(relativePath))
@@ -7899,6 +8768,21 @@ struct Index {
       return
     }
     this.closeActionMenu()
+    if (this.isVideo(entry)) {
+      this.isBusy = true
+      try {
+        await this.refreshVideoManager()
+        await this.videoTransferManager.clearCache(entry)
+        await this.refreshCacheUsage()
+        this.statusText = '已释放缓存'
+        this.showImmersiveToast('已释放缓存')
+      } catch (error) {
+        this.reportError(error as Object, '释放缓存失败')
+      } finally {
+        this.isBusy = false
+      }
+      return
+    }
     await this.ensureCacheState()
     const path = CacheManager.findExisting(this.cacheDirectory, entry.name, this.originalCacheKey(entry))
     if (path.length === 0) {
@@ -9926,6 +10810,87 @@ struct Index {
     }
   }
 
+  private async persistPlaybackPreferences(): Promise<void> {
+    try {
+      if (this.playbackPreferences === null) {
+        await this.ensurePlaybackState()
+      }
+      if (this.playbackPreferences === null) {
+        return
+      }
+      await this.playbackPreferences.put('background_video_playback', this.backgroundVideoPlayback)
+      await this.playbackPreferences.put('background_audio_playback', this.backgroundAudioPlayback)
+      await this.playbackPreferences.put('video_background_auto_pip', this.videoBackgroundAutoPip)
+      await this.playbackPreferences.put('auto_play_on_open', this.autoPlayOnOpen)
+      await this.playbackPreferences.flush()
+    } catch (error) {
+      console.warn('[UgreenPlayback] save preferences failed: ' + JSON.stringify(error))
+    }
+  }
+
+  private async setBackgroundVideoPlayback(value: boolean): Promise<void> {
+    this.backgroundVideoPlayback = value
+    if (!value && this.videoBackgroundAutoPip) {
+      // Automatic PiP is a form of video background playback. Do not leave a
+      // visually contradictory enabled switch after the parent option is off.
+      this.videoBackgroundAutoPip = false
+    }
+    if (!value && this.showVideoPlayer && this.videoPlaying) {
+      this.pauseVideoFromMediaSession(true)
+    }
+    await this.persistPlaybackPreferences()
+  }
+
+  private async setBackgroundAudioPlayback(value: boolean): Promise<void> {
+    this.backgroundAudioPlayback = value
+    if (!value && this.showAudioPlayer && this.audioPlaying) {
+      this.audioManager.pause().then((): void => {
+        this.audioPlaying = false
+      }).catch((error: Object): void => {
+        console.warn('[UgreenAudio] setting background playback failed: ' +
+          JSON.stringify(error))
+      })
+    }
+    await this.persistPlaybackPreferences()
+  }
+
+  private async setVideoBackgroundAutoPip(value: boolean): Promise<void> {
+    if (value && !this.backgroundVideoPlayback) {
+      this.showImmersiveToast('请先开启视频后台播放')
+      this.videoBackgroundAutoPip = false
+      return
+    }
+    this.videoBackgroundAutoPip = value
+    await this.persistPlaybackPreferences()
+  }
+
+  private async setAutoPlayOnOpen(value: boolean): Promise<void> {
+    this.autoPlayOnOpen = value
+    await this.persistPlaybackPreferences()
+  }
+
+  private async loadVideoState(): Promise<void> {
+    try {
+      await this.ensureCacheState()
+      const context = getContext(this) as Context
+      // Register before initialization so restored cache/download records are
+      // reflected in the file rows during the first render.
+      this.videoTransferManager.onChange(this.videoTransferStateListener)
+      await this.videoTransferManager.initialize(context, this.repository,
+        this.cacheDirectory, this.cacheLimitBytes)
+    } catch (error) {
+      console.warn('[UgreenVideo] initialize failed: ' + JSON.stringify(error))
+    }
+  }
+
+  private async refreshVideoManager(): Promise<void> {
+    await this.ensureVideoState()
+    await this.ensureCacheState()
+    const context = getContext(this) as Context
+    await this.videoTransferManager.initialize(context, this.repository,
+      this.cacheDirectory, this.cacheLimitBytes)
+  }
+
   private committedViewerActionEntry(action: string): FileEntry | null {
     if (!this.showImageViewer || this.viewerClosePending) {
       return null
@@ -10305,6 +11270,7 @@ struct Index {
     if (!await this.confirmMeteredDownload(entry)) {
       return
     }
+    await this.ensurePlaybackState()
     this.isBusy = true
     this.errorText = ''
     this.statusText = '正在准备音频…'
@@ -10337,8 +11303,12 @@ struct Index {
           this.audioPlaying = false
         }
       )
-      await this.audioManager.play()
-      this.statusText = '正在播放：' + entry.name
+      if (this.autoPlayOnOpen) {
+        await this.audioManager.play()
+        this.statusText = '正在播放：' + entry.name
+      } else {
+        this.statusText = '已准备：' + entry.name
+      }
     } catch (error) {
       await this.audioManager.release()
       this.showAudioPlayer = false
@@ -10350,6 +11320,1416 @@ struct Index {
     } finally {
       this.isBusy = false
     }
+  }
+
+  /**
+   * Opens one AVPlayer surface for a video.  The transfer manager owns the
+   * source selection, cache/download hand-off, and the playback manager owns
+   * the MediaKit player and its native network buffer; the page only
+   * coordinates their lifetime and renders a poster until the first real
+   * video frame arrives.
+   */
+  private async openVideoPlayer(entry: FileEntry): Promise<void> {
+    if (this.isBusy || entry.isDirectory) {
+      return
+    }
+    if (this.videoPipBackgrounded) {
+      await this.stopVideoPipForReplacement()
+    }
+    this.closeActionMenu()
+    this.closeImageMoreMenu()
+    this.closeImageDetails()
+    if (!await this.confirmMeteredDownload(entry)) {
+      return
+    }
+    await this.ensurePlaybackState()
+
+    const token = this.videoOpenToken + 1
+    this.videoOpenToken = token
+    this.isBusy = true
+    this.errorText = ''
+    this.statusText = '正在准备视频…'
+    try {
+      await this.refreshVideoManager()
+      if (token !== this.videoOpenToken) {
+        return
+      }
+      await this.videoPlaybackManager.release()
+      const previousEntry = this.videoEntry
+      if (previousEntry !== null && previousEntry.path !== entry.path) {
+        await this.videoTransferManager.releaseSource(previousEntry)
+      }
+      const handle = await this.videoTransferManager.openSource(entry)
+      if (token !== this.videoOpenToken) {
+        await this.videoTransferManager.releaseSource(entry)
+        return
+      }
+      const position = await this.videoTransferManager.playbackPosition(entry)
+      this.videoSourceHandle = handle
+      this.videoSourceKey = handle.sourceKey
+      this.videoLocalPath = handle.localPath
+      this.videoEntry = entry
+      this.videoDurationMs = 0
+      this.videoCurrentMs = position
+      this.videoPlaying = false
+      this.videoMuted = false
+      this.videoPrepared = false
+      this.videoLandscape = this.pageWidthVp > this.pageHeightVp
+      this.videoControlPending = false
+      this.videoCasting = false
+      this.videoCastPreparing = false
+      this.videoWasPlayingBeforeCast = false
+      this.videoFirstFrame = false
+      this.videoSurfaceReady = false
+      this.videoWidthPx = 0
+      this.videoHeightPx = 0
+      this.videoBufferingPercent = 0
+      this.videoPositionPersistAt = 0
+      this.videoMediaSessionPositionAt = 0
+      this.videoSurfaceWidthPx = 0
+      this.videoSurfaceHeightPx = 0
+      this.videoViewportWidthVp = this.pageWidthVp
+      this.videoViewportHeightVp = this.pageHeightVp
+
+      await this.videoPlaybackManager.open(handle, position, {
+        onTime: (timeMs: number): void => {
+          if (token !== this.videoOpenToken || this.videoEntry === null ||
+            this.videoEntry.path !== entry.path) {
+            return
+          }
+          this.videoCurrentMs = Math.max(0, timeMs)
+          const now = Date.now()
+          if (now - this.videoPositionPersistAt >= 500) {
+            this.videoPositionPersistAt = now
+            this.videoTransferManager.savePlaybackPosition(entry, this.videoCurrentMs)
+              .catch((): void => {})
+          }
+          this.updateVideoMediaSession()
+        },
+        onDuration: (durationMs: number): void => {
+          if (token === this.videoOpenToken && this.videoEntry !== null &&
+            this.videoEntry.path === entry.path) {
+            this.videoDurationMs = Math.max(0, durationMs)
+            this.updateVideoMediaSession(true)
+          }
+        },
+        onState: (state: media.AVPlayerState): void => {
+          if (token !== this.videoOpenToken || this.videoEntry === null ||
+            this.videoEntry.path !== entry.path) {
+            return
+          }
+          this.videoPlaying = state === 'playing'
+          this.syncVideoBackgroundTask()
+          this.updateVideoPipControlStatus()
+          if (state === 'prepared' || state === 'playing' || state === 'paused' ||
+            state === 'completed') {
+            this.videoPrepared = true
+          }
+          if (state === 'completed') {
+            this.videoCurrentMs = this.videoDurationMs
+            this.syncVideoBackgroundTask()
+            this.videoTransferManager.savePlaybackPosition(entry, this.videoCurrentMs)
+              .catch((): void => {})
+          }
+          if (state === 'error') {
+            this.videoPrepared = false
+            this.videoPlaying = false
+            this.syncVideoBackgroundTask()
+            this.statusText = '视频播放错误'
+          }
+          this.updateVideoMediaSession(true)
+        },
+        onBuffering: (percent: number): void => {
+          if (token === this.videoOpenToken && this.videoEntry !== null &&
+            this.videoEntry.path === entry.path) {
+            this.videoBufferingPercent = Math.max(0, Math.min(100, percent))
+            this.updateVideoMediaSession()
+          }
+        },
+        onSize: (width: number, height: number): void => {
+          if (token === this.videoOpenToken && this.videoEntry !== null &&
+            this.videoEntry.path === entry.path) {
+            this.videoWidthPx = width
+            this.videoHeightPx = height
+            this.updateVideoSurfaceRect()
+            if (this.videoPipController !== null && width > 0 && height > 0) {
+              try {
+                this.videoPipController.updateContentSize(width, height)
+              } catch (error) {
+                console.warn('[UgreenVideo] update PiP content size failed: ' +
+                  JSON.stringify(error))
+              }
+            }
+            this.updateVideoMediaSession(true)
+          }
+        },
+        onFirstFrame: (): void => {
+          if (token === this.videoOpenToken && this.videoEntry !== null &&
+            this.videoEntry.path === entry.path) {
+            this.videoPrepared = true
+            this.videoFirstFrame = true
+            this.syncVideoBackgroundTask()
+            this.updateVideoPipControlStatus()
+            this.updateVideoMediaSession(true)
+          }
+        },
+        onError: (error: Object): void => {
+          if (token !== this.videoOpenToken || this.videoEntry === null ||
+            this.videoEntry.path !== entry.path) {
+            return
+          }
+          this.videoPrepared = false
+          this.videoPlaying = false
+          this.syncVideoBackgroundTask()
+          this.statusText = '视频播放错误'
+          this.updateVideoMediaSession(true)
+          this.reportError(error, '视频播放失败')
+        }
+      }, this.autoPlayOnOpen)
+      if (token !== this.videoOpenToken) {
+        return
+      }
+      this.showVideoPlayer = true
+      this.enableVideoPlayerAutoRotation()
+      this.startVideoMediaSession(entry)
+      this.syncVideoBackgroundTask()
+      this.statusText = '正在准备视频…'
+    } catch (error) {
+      if (token === this.videoOpenToken) {
+        await this.videoPlaybackManager.release()
+        this.videoSourceHandle = null
+        this.videoSourceKey = ''
+        this.videoLocalPath = ''
+        this.videoEntry = null
+        this.showVideoPlayer = false
+        this.videoPrepared = false
+        this.videoFirstFrame = false
+        this.videoPlaying = false
+        this.videoCasting = false
+        this.videoCastPreparing = false
+        this.destroyVideoPipController()
+        this.syncVideoBackgroundTask()
+        this.videoMediaSession.close().catch((): void => {})
+        this.reportError(error as Object, '视频播放失败')
+        this.statusText = '视频播放失败'
+      }
+    } finally {
+      if (token === this.videoOpenToken) {
+        this.isBusy = false
+      }
+    }
+  }
+
+  private videoMediaSessionSnapshot(): VideoMediaPlaybackSnapshot {
+    return {
+      playing: this.videoPlaying,
+      prepared: this.videoPrepared,
+      completed: this.videoDurationMs > 0 && this.videoCurrentMs >= this.videoDurationMs,
+      bufferingPercent: this.videoBufferingPercent,
+      positionMs: this.videoCurrentMs,
+      durationMs: this.videoDurationMs,
+      muted: this.videoMuted,
+      videoWidthPx: this.videoWidthPx,
+      videoHeightPx: this.videoHeightPx
+    }
+  }
+
+  private updateVideoMediaSession(force: boolean = false): void {
+    if (!this.showVideoPlayer || this.videoEntry === null) {
+      return
+    }
+    const now = Date.now()
+    if (!force && now - this.videoMediaSessionPositionAt < 250) {
+      return
+    }
+    this.videoMediaSessionPositionAt = now
+    this.videoMediaSession.update(this.videoMediaSessionSnapshot())
+  }
+
+  private startVideoMediaSession(entry: FileEntry): void {
+    const context = getContext(this) as Context
+    const nextEntry = this.videoSibling(1)
+    this.videoMediaSession.open(context, entry, nextEntry,
+      this.videoMediaSessionSnapshot(), {
+        onPlay: (): void => {
+          this.playVideoFromMediaSession()
+        },
+        onPause: (): void => {
+          this.pauseVideoFromMediaSession()
+        },
+        onStop: (): void => {
+          this.stopVideoFromMediaSession()
+        },
+        onNext: (): void => {
+          this.switchVideo(1).catch((error: Error): void => {
+            console.warn('[UgreenAVSession] next video failed: ' + JSON.stringify(error))
+          })
+        },
+        onSeek: (timeMs: number): void => {
+          this.seekVideo(timeMs)
+        },
+        onCastConnected: (): void => {
+          this.handleVideoCastConnected().catch((error: Object): void => {
+            console.warn('[UgreenVideo] cast connection handling failed: ' +
+              JSON.stringify(error))
+          })
+        },
+        onCastDisconnected: (): void => {
+          this.handleVideoCastDisconnected()
+        },
+        onCastPlayback: (snapshot: VideoCastPlaybackSnapshot): void => {
+          this.handleVideoCastPlayback(snapshot)
+        }
+      }).catch((error: Error): void => {
+        // The in-app player remains usable when the device does not expose an
+        // AVSession service (for example, on an older preview image).
+        console.warn('[UgreenAVSession] start bridge failed: ' + JSON.stringify(error))
+      })
+  }
+
+  private playVideoFromMediaSession(): void {
+    if (!this.showVideoPlayer || this.videoEntry === null || this.isBusy ||
+      !this.videoPrepared || this.videoControlPending) {
+      return
+    }
+    if (this.videoCasting) {
+      this.videoControlPending = true
+      this.videoMediaSession.sendCastControl({ command: 'play' }).then((): void => {
+        this.videoPlaying = true
+        this.syncVideoBackgroundTask()
+        this.updateVideoPipControlStatus()
+        this.updateVideoMediaSession(true)
+      }).catch((error: Error): void => {
+        console.warn('[UgreenAVSession] remote play command failed: ' + JSON.stringify(error))
+      }).finally((): void => {
+        this.videoControlPending = false
+      })
+      return
+    }
+    if (this.videoPlaybackManager.state() === 'playing') {
+      this.videoPlaying = true
+      this.syncVideoBackgroundTask()
+      this.updateVideoMediaSession(true)
+      return
+    }
+    this.videoControlPending = true
+    this.videoPlaybackManager.play().then((): void => {
+      if (this.showVideoPlayer) {
+        this.videoPlaying = true
+        this.syncVideoBackgroundTask()
+        this.updateVideoPipControlStatus()
+        this.updateVideoMediaSession(true)
+      }
+    }).catch((error: Error): void => {
+      console.warn('[UgreenAVSession] play command could not be applied: ' +
+        JSON.stringify(error))
+    }).finally((): void => {
+      this.videoControlPending = false
+    })
+  }
+
+  private pauseVideoFromMediaSession(force: boolean = false): void {
+    if (!this.showVideoPlayer || this.videoEntry === null || (!force && this.isBusy) ||
+      this.videoControlPending) {
+      return
+    }
+    if (this.videoCasting) {
+      this.videoControlPending = true
+      this.videoMediaSession.sendCastControl({ command: 'pause' }).then((): void => {
+        this.videoPlaying = false
+        this.syncVideoBackgroundTask()
+        this.updateVideoPipControlStatus()
+        this.updateVideoMediaSession(true)
+      }).catch((error: Error): void => {
+        console.warn('[UgreenAVSession] remote pause command failed: ' + JSON.stringify(error))
+      }).finally((): void => {
+        this.videoControlPending = false
+      })
+      return
+    }
+    if (this.videoPlaybackManager.state() !== 'playing') {
+      this.videoPlaying = false
+      this.syncVideoBackgroundTask()
+      this.updateVideoMediaSession(true)
+      return
+    }
+    this.videoControlPending = true
+    this.videoPlaybackManager.pause().then((): void => {
+      if (this.showVideoPlayer) {
+        this.videoPlaying = false
+        this.syncVideoBackgroundTask()
+        this.updateVideoPipControlStatus()
+        this.updateVideoMediaSession(true)
+      }
+    }).catch((error: Error): void => {
+      console.warn('[UgreenAVSession] pause command could not be applied: ' +
+        JSON.stringify(error))
+    }).finally((): void => {
+      this.videoControlPending = false
+    })
+  }
+
+  private stopVideoFromMediaSession(): void {
+    if (!this.showVideoPlayer || this.videoEntry === null || this.isBusy ||
+      this.videoControlPending) {
+      return
+    }
+    if (this.videoCasting) {
+      this.videoControlPending = true
+      this.videoMediaSession.sendCastControl({ command: 'stop' }).then((): void => {
+        this.videoCurrentMs = 0
+        this.videoPlaying = false
+        this.syncVideoBackgroundTask()
+        this.updateVideoPipControlStatus()
+        this.updateVideoMediaSession(true)
+      }).catch((error: Error): void => {
+        console.warn('[UgreenAVSession] remote stop command failed: ' + JSON.stringify(error))
+      }).finally((): void => {
+        this.videoControlPending = false
+      })
+      return
+    }
+    this.videoControlPending = true
+    this.videoPlaybackManager.pause().then((): void => {
+      this.videoPlaybackManager.seek(0)
+      this.videoCurrentMs = 0
+      this.videoPlaying = false
+      this.syncVideoBackgroundTask()
+      this.updateVideoPipControlStatus()
+      this.updateVideoMediaSession(true)
+    }).catch((error: Error): void => {
+      console.warn('[UgreenAVSession] stop command could not be applied: ' +
+        JSON.stringify(error))
+    }).finally((): void => {
+      this.videoControlPending = false
+    })
+  }
+
+  private handleVideoViewportArea(widthVp: number, heightVp: number): void {
+    this.videoViewportWidthVp = widthVp
+    this.videoViewportHeightVp = heightVp
+    this.videoLandscape = widthVp > heightVp
+    this.updateVideoSurfaceRect()
+  }
+
+  /**
+   * Calculate the largest centered rectangle that can contain the decoded
+   * video in the current window.  The AVPlayer scale mode is also configured
+   * to SCALED_ASPECT, but sizing the Surface itself is important on rotation:
+   * it prevents a previously portrait Surface buffer from being reused as a
+   * stretched landscape target during the window transition.
+   */
+  private updateVideoSurfaceRect(): void {
+    if (!this.videoSurfaceReady || !this.showVideoPlayer) {
+      return
+    }
+    const viewportWidthVp = this.videoViewportWidthVp > 0
+      ? this.videoViewportWidthVp : this.pageWidthVp
+    const viewportHeightVp = this.videoViewportHeightVp > 0
+      ? this.videoViewportHeightVp : this.pageHeightVp
+    if (viewportWidthVp <= 0 || viewportHeightVp <= 0) {
+      return
+    }
+
+    let surfaceWidthVp = viewportWidthVp
+    let surfaceHeightVp = viewportHeightVp
+    if (this.videoWidthPx > 0 && this.videoHeightPx > 0) {
+      const videoAspect = this.videoWidthPx / this.videoHeightPx
+      const viewportAspect = viewportWidthVp / viewportHeightVp
+      if (viewportAspect > videoAspect) {
+        surfaceHeightVp = viewportHeightVp
+        surfaceWidthVp = surfaceHeightVp * videoAspect
+      } else {
+        surfaceWidthVp = viewportWidthVp
+        surfaceHeightVp = surfaceWidthVp / videoAspect
+      }
+    }
+
+    const surfaceWidthPx = Math.max(1, Math.round(this.getUIContext().vp2px(surfaceWidthVp)))
+    const surfaceHeightPx = Math.max(1, Math.round(this.getUIContext().vp2px(surfaceHeightVp)))
+    if (surfaceWidthPx === this.videoSurfaceWidthPx &&
+      surfaceHeightPx === this.videoSurfaceHeightPx) {
+      return
+    }
+    this.videoSurfaceWidthPx = surfaceWidthPx
+    this.videoSurfaceHeightPx = surfaceHeightPx
+    try {
+      // Omitting offsetX/offsetY centers the rectangle in the XComponent,
+      // exactly as described by the XComponent SurfaceRect contract.
+      this.videoSurfaceController.setXComponentSurfaceRect({
+        surfaceWidth: surfaceWidthPx,
+        surfaceHeight: surfaceHeightPx
+      })
+      console.info('[UgreenVideo] surface rect=' + surfaceWidthPx + 'x' + surfaceHeightPx +
+        ' viewport=' + Math.round(viewportWidthVp) + 'x' + Math.round(viewportHeightVp) +
+        ' video=' + this.videoWidthPx + 'x' + this.videoHeightPx)
+    } catch (error) {
+      console.warn('[UgreenVideo] set surface rect failed: ' + JSON.stringify(error))
+    }
+  }
+
+  private handleVideoSurfaceLoad(): void {
+    if (!this.showVideoPlayer || this.videoEntry === null || this.videoSourceHandle === null) {
+      return
+    }
+    const token = this.videoOpenToken
+    const surfaceId = this.videoSurfaceController.getXComponentSurfaceId()
+    if (surfaceId.length === 0) {
+      this.statusText = '视频画面初始化失败'
+      return
+    }
+    this.videoSurfaceReady = true
+    try {
+      // Let the Surface follow the window orientation. Without this explicit
+      // setting a Surface created in portrait can retain its old rotation
+      // matrix after the window becomes landscape.
+      this.videoSurfaceController.setXComponentSurfaceRotation({ lock: false })
+    } catch (error) {
+      console.warn('[UgreenVideo] unlock surface rotation failed: ' + JSON.stringify(error))
+    }
+    this.updateVideoSurfaceRect()
+    this.videoPlaybackManager.attachSurface(surfaceId, this.videoCurrentMs).catch((error: Object): void => {
+      if (token !== this.videoOpenToken || !this.showVideoPlayer) {
+        return
+      }
+      this.videoPrepared = false
+      this.videoPlaying = false
+      this.statusText = '视频画面初始化失败'
+      this.reportError(error, '视频播放失败')
+    })
+  }
+
+  private closeVideoPlayer(): void {
+    const closingEntry = this.videoEntry
+    const closingPosition = this.videoCurrentMs
+    const shouldRestoreSearch = this.searchSession !== null && this.searchSession.returnMode === 'video'
+    const context = getContext(this) as Context
+    this.videoPipBackgrounded = false
+    this.videoPipOrigin = null
+    this.videoPipHideOnStart = false
+    this.videoPipStarting = false
+    this.videoPipStopping = false
+    this.videoPipRestorePending = false
+    this.videoPipRestoreScheduled = false
+    this.videoPipRestoring = false
+    this.destroyVideoPipController()
+    this.videoCastPreparing = false
+    this.videoCasting = false
+    this.videoWasPlayingBeforeCast = false
+    this.videoBackgroundTask.release(context).catch((error: Object): void => {
+      console.warn('[UgreenVideo] release background task failed: ' + JSON.stringify(error))
+    })
+    this.restoreVideoPlayerOrientation()
+    this.videoOpenToken += 1
+    if (closingEntry !== null) {
+      this.videoTransferManager.savePlaybackPosition(closingEntry, closingPosition)
+        .catch((): void => {})
+      this.videoTransferManager.releaseSource(closingEntry).catch((): void => {})
+    }
+    this.showVideoPlayer = false
+    this.videoEntry = null
+    this.videoSourceKey = ''
+    this.videoLocalPath = ''
+    this.videoDurationMs = 0
+    this.videoCurrentMs = 0
+    this.videoPlaying = false
+    this.videoPrepared = false
+    this.videoLandscape = false
+    this.videoControlPending = false
+    this.videoFirstFrame = false
+    this.videoSurfaceReady = false
+    this.videoOrientationChanging = false
+    this.videoWidthPx = 0
+    this.videoHeightPx = 0
+    this.videoBufferingPercent = 0
+    this.videoSurfaceWidthPx = 0
+    this.videoSurfaceHeightPx = 0
+    this.videoViewportWidthVp = 0
+    this.videoViewportHeightVp = 0
+    this.videoMediaSessionPositionAt = 0
+    this.videoSourceHandle = null
+    this.videoPlaybackManager.release().catch((): void => {})
+    this.videoMediaSession.close().catch((error: Error): void => {
+      console.warn('[UgreenAVSession] close bridge failed: ' + JSON.stringify(error))
+    })
+    if (shouldRestoreSearch) {
+      this.restoreSearchSession()
+    }
+  }
+
+  private videoNavigationEntries(): FileEntry[] {
+    const source = this.showSearch ? this.searchResults : this.entries
+    return source.filter((candidate: FileEntry): boolean =>
+      !candidate.isDirectory && this.isVideo(candidate))
+  }
+
+  private videoSibling(delta: number): FileEntry | null {
+    if (this.videoEntry === null || delta === 0) {
+      return null
+    }
+    const candidates = this.videoNavigationEntries()
+    const currentIndex = candidates.findIndex((candidate: FileEntry): boolean =>
+      candidate.path === (this.videoEntry as FileEntry).path)
+    if (currentIndex < 0) {
+      return null
+    }
+    const targetIndex = currentIndex + (delta < 0 ? -1 : 1)
+    return targetIndex >= 0 && targetIndex < candidates.length
+      ? candidates[targetIndex] : null
+  }
+
+  private async switchVideo(delta: number): Promise<void> {
+    if (this.isBusy || this.videoEntry === null) {
+      return
+    }
+    const target = this.videoSibling(delta)
+    if (target === null) {
+      return
+    }
+    const previous = this.videoEntry
+    await this.openVideoPlayer(target)
+    if (this.videoEntry === null || this.videoEntry.path !== target.path ||
+      previous.path === target.path) {
+      return
+    }
+    // The XComponent is deliberately kept mounted while changing the source,
+    // so its onLoad callback does not fire a second time. Rebind the new
+    // AVPlayer to that already-real surface explicitly.
+    this.handleVideoSurfaceLoad()
+    await this.videoTransferManager.releaseSource(previous)
+  }
+
+  private videoWindowIsLandscape(win: window.Window): boolean {
+    try {
+      const preferred = win.getPreferredOrientation()
+      if (preferred === window.Orientation.LANDSCAPE ||
+        preferred === window.Orientation.LANDSCAPE_INVERTED ||
+        preferred === window.Orientation.USER_ROTATION_LANDSCAPE ||
+        preferred === window.Orientation.USER_ROTATION_LANDSCAPE_INVERTED) {
+        return true
+      }
+      if (preferred === window.Orientation.PORTRAIT ||
+        preferred === window.Orientation.PORTRAIT_INVERTED ||
+        preferred === window.Orientation.USER_ROTATION_PORTRAIT ||
+        preferred === window.Orientation.USER_ROTATION_PORTRAIT_INVERTED) {
+        return false
+      }
+    } catch (error) {
+      console.warn('[UgreenVideo] read preferred orientation failed: ' + JSON.stringify(error))
+    }
+    try {
+      const rect = win.getWindowProperties().windowRect
+      if (rect.width > 0 && rect.height > 0) {
+        return rect.width > rect.height
+      }
+    } catch (error) {
+      console.warn('[UgreenVideo] read window size failed: ' + JSON.stringify(error))
+    }
+    return this.pageWidthVp > this.pageHeightVp
+  }
+
+  /**
+   * Apply the official system-bar visibility APIs used by immersive media
+   * windows. `setSpecificSystemBarEnabled` is preferred because it makes the
+   * status-bar decision explicit; the older list API remains a device/API
+   * fallback so the player still becomes immersive on builds that do not
+   * expose the per-bar call at runtime.
+   */
+  private async applyVideoSystemBarVisibility(win: window.Window,
+    landscape: boolean): Promise<void> {
+    const enabled = !landscape
+    let statusUpdated = false
+    let navigationUpdated = false
+    try {
+      await win.setSpecificSystemBarEnabled('status', enabled, false)
+      statusUpdated = true
+    } catch (error) {
+      console.warn('[UgreenVideo] set status bar visibility failed: ' + JSON.stringify(error))
+    }
+    try {
+      await win.setSpecificSystemBarEnabled('navigation', enabled, false)
+      navigationUpdated = true
+    } catch (error) {
+      console.warn('[UgreenVideo] set navigation bar visibility failed: ' +
+        JSON.stringify(error))
+    }
+    if (statusUpdated && navigationUpdated) {
+      return
+    }
+    try {
+      await win.setWindowSystemBarEnable(enabled ? ['status', 'navigation'] : [])
+    } catch (error) {
+      console.warn('[UgreenVideo] set system bar visibility fallback failed: ' +
+        JSON.stringify(error))
+    }
+  }
+
+  /**
+   * Window callbacks are synchronous while system-bar APIs return Promises.
+   * Keep requests in one chain and invalidate stale requests when a newer
+   * orientation or close operation is issued.
+   */
+  private setVideoSystemBars(win: window.Window, landscape: boolean,
+    allowWhenClosed: boolean = false): Promise<void> {
+    if (!allowWhenClosed && (!this.showVideoPlayer || this.videoPlayerWindow !== win)) {
+      return Promise.resolve()
+    }
+    if (!allowWhenClosed && this.videoSystemBarsLandscape === landscape) {
+      return this.videoSystemBarsQueue
+    }
+    this.videoSystemBarsLandscape = landscape
+    const token = this.videoSystemBarsToken + 1
+    this.videoSystemBarsToken = token
+    const operation = this.videoSystemBarsQueue
+      .catch((): void => {})
+      .then(async (): Promise<void> => {
+        if (token !== this.videoSystemBarsToken) {
+          return
+        }
+        if (!allowWhenClosed && (!this.showVideoPlayer || this.videoPlayerWindow !== win)) {
+          return
+        }
+        await this.applyVideoSystemBarVisibility(win, landscape)
+      })
+    this.videoSystemBarsQueue = operation.catch((error: Object): void => {
+      console.warn('[UgreenVideo] system bar update failed: ' + JSON.stringify(error))
+    })
+    return operation
+  }
+
+  /**
+   * Match the image viewer's orientation policy: the video window follows the
+   * device sensor only when the system's automatic-rotation switch permits
+   * it. The callback is kept on the same Window instance so the surface and
+   * the one-line controller react to the committed window size, not to a
+   * guessed timer frame.
+   */
+  private enableVideoPlayerAutoRotation(): void {
+    const token = this.videoOrientationToken + 1
+    this.videoOrientationToken = token
+    const context = getContext(this) as common.UIAbilityContext
+    window.getLastWindow(context).then((win: window.Window): void => {
+      if (token !== this.videoOrientationToken || !this.showVideoPlayer) {
+        return
+      }
+      try {
+        if (this.videoPlayerWindow !== win) {
+          this.videoPlayerWindow = win
+        }
+        if (this.videoPlayerPreviousOrientation === null) {
+          this.videoPlayerPreviousOrientation = win.getPreferredOrientation()
+          win.on('windowSizeChange', this.videoWindowSizeChange)
+        }
+        // If the window is already landscape, no size-change callback is
+        // guaranteed to be emitted by the platform. Inspect the committed
+        // window rectangle once so the status bar is hidden on first frame.
+        try {
+          const rect = win.getWindowProperties().windowRect
+          if (rect.width > 0 && rect.height > 0) {
+            this.videoLandscape = rect.width > rect.height
+          }
+        } catch (error) {
+          console.warn('[UgreenVideo] read initial video window size failed: ' +
+            JSON.stringify(error))
+        }
+        this.setVideoSystemBars(win, this.videoLandscape).catch((error: Error): void => {
+          console.warn('[UgreenVideo] set initial video system bars failed: ' +
+            JSON.stringify(error))
+        })
+        // AUTO_ROTATION_RESTRICTED is the official mode that obeys the
+        // system auto-rotation lock. It is deliberately different from the
+        // unrestricted mode used only by the explicit rotate button below.
+        win.setPreferredOrientation(window.Orientation.AUTO_ROTATION_RESTRICTED)
+          .catch((error: Error): void => {
+            console.warn('[UgreenVideo] enable auto rotation failed: ' +
+              JSON.stringify(error))
+          })
+      } catch (error) {
+        console.warn('[UgreenVideo] prepare auto rotation failed: ' + JSON.stringify(error))
+      }
+    }).catch((error: Error): void => {
+      console.warn('[UgreenVideo] get video window failed: ' + JSON.stringify(error))
+    })
+  }
+
+  /**
+   * Keep the rotation behavior aligned with the official video-show sample:
+   * the window (rather than the video pixels) changes orientation, landscape
+   * multi-window is enabled for the landscape presentation, and system bars
+   * are hidden only while that presentation is active.
+   */
+  private async applyVideoWindowOrientation(win: window.Window, landscape: boolean): Promise<void> {
+    // Update the overlay immediately, then let windowSizeChange confirm the
+    // committed dimensions. This removes the portrait status-bar inset during
+    // the orientation animation instead of one frame after it completes.
+    this.videoLandscape = landscape
+    if (landscape) {
+      try {
+        await win.enableLandscapeMultiWindow()
+      } catch (error) {
+        // Some phone/window modes do not support this switch. The orientation
+        // change is still useful, so continue with the remaining operations.
+        console.warn('[UgreenVideo] enable landscape multi-window failed: ' +
+          JSON.stringify(error))
+      }
+      await this.setVideoSystemBars(win, true)
+      await win.setPreferredOrientation(window.Orientation.USER_ROTATION_LANDSCAPE)
+      return
+    }
+
+    try {
+      await win.disableLandscapeMultiWindow()
+    } catch (error) {
+      console.warn('[UgreenVideo] disable landscape multi-window failed: ' +
+        JSON.stringify(error))
+    }
+    await this.setVideoSystemBars(win, false)
+    await win.setPreferredOrientation(window.Orientation.USER_ROTATION_PORTRAIT)
+  }
+
+  private rotateVideoInterface(): void {
+    if (this.isBusy || this.videoEntry === null || this.videoOrientationChanging) {
+      return
+    }
+    const token = this.videoOrientationToken + 1
+    this.videoOrientationToken = token
+    this.videoOrientationChanging = true
+    const context = getContext(this) as common.UIAbilityContext
+    window.getLastWindow(context)
+      .then((win: window.Window): Promise<void> => {
+        if (token !== this.videoOrientationToken || !this.showVideoPlayer ||
+          this.videoEntry === null) {
+          return Promise.resolve()
+        }
+        if (this.videoPlayerWindow === null) {
+          this.videoPlayerWindow = win
+          try {
+            this.videoPlayerPreviousOrientation = win.getPreferredOrientation()
+            win.on('windowSizeChange', this.videoWindowSizeChange)
+          } catch (error) {
+            console.warn('[UgreenVideo] save preferred orientation failed: ' +
+              JSON.stringify(error))
+          }
+        }
+        const targetLandscape = !this.videoWindowIsLandscape(win)
+        console.info('[UgreenVideo] rotate interface to ' +
+          (targetLandscape ? 'landscape' : 'portrait'))
+        return this.applyVideoWindowOrientation(win, targetLandscape)
+      })
+      .catch((error: Error): void => {
+        if (token === this.videoOrientationToken && this.showVideoPlayer) {
+          this.statusText = '切换视频方向失败'
+          console.warn('[UgreenVideo] rotate interface failed: ' + JSON.stringify(error))
+        }
+      })
+      .then((): void => {
+        if (token === this.videoOrientationToken) {
+          this.videoOrientationChanging = false
+        }
+      })
+  }
+
+  private restoreVideoPlayerOrientation(): void {
+    this.videoOrientationToken += 1
+    this.videoOrientationChanging = false
+    this.videoSystemBarsLandscape = null
+    this.videoSystemBarsToken += 1
+    const win = this.videoPlayerWindow
+    const previous = this.videoPlayerPreviousOrientation
+    this.videoPlayerWindow = null
+    this.videoPlayerPreviousOrientation = null
+    if (win === null) {
+      return
+    }
+    try {
+      win.off('windowSizeChange', this.videoWindowSizeChange)
+    } catch (error) {
+      console.warn('[UgreenVideo] release window size listener failed: ' +
+        JSON.stringify(error))
+    }
+    this.restoreVideoWindowState(win, previous).catch((error: Error): void => {
+      console.warn('[UgreenVideo] restore video window state failed: ' + JSON.stringify(error))
+    })
+  }
+
+  private async restoreVideoWindowState(win: window.Window,
+    previous: window.Orientation | null): Promise<void> {
+    try {
+      await win.disableLandscapeMultiWindow()
+    } catch (error) {
+      console.warn('[UgreenVideo] restore landscape multi-window failed: ' +
+        JSON.stringify(error))
+    }
+    await this.setVideoSystemBars(win, false, true)
+    if (previous === null) {
+      return
+    }
+    try {
+      await win.setPreferredOrientation(previous)
+    } catch (error) {
+      console.warn('[UgreenVideo] restore orientation failed: ' + JSON.stringify(error))
+    }
+  }
+
+  /**
+   * Handles the double-tap gesture on the media surface. The gesture itself
+   * is the official ArkUI TapGesture; playback is routed through the same
+   * control path as the bottom-bar button so local playback and remote
+   * casting stay in sync.
+   */
+  private async handleVideoDoubleTap(): Promise<void> {
+    if (this.isBusy || !this.videoPrepared || this.videoEntry === null ||
+      this.videoControlPending) {
+      return
+    }
+    await this.toggleVideo()
+  }
+
+  private async toggleVideo(): Promise<void> {
+    if (this.isBusy || !this.videoPrepared || this.videoEntry === null ||
+      this.videoControlPending) {
+      return
+    }
+    if (this.videoCasting) {
+      const shouldPause = this.videoPlaying
+      this.videoControlPending = true
+      try {
+        await this.videoMediaSession.sendCastControl({
+          command: shouldPause ? 'pause' : 'play'
+        })
+        this.videoPlaying = !shouldPause
+        this.syncVideoBackgroundTask()
+        this.updateVideoPipControlStatus()
+        this.updateVideoMediaSession(true)
+      } catch (error) {
+        this.reportError(error as Object, '视频操作失败')
+        this.statusText = '投播操作失败'
+      } finally {
+        this.videoControlPending = false
+      }
+      return
+    }
+    const playerState = this.videoPlaybackManager.state()
+    // Read the MediaKit state at the point of the click instead of trusting a
+    // possibly one-frame-old @State value. This is important when the player
+    // sends `playing` just before the controller is rendered.
+    const shouldPause = playerState === 'playing' ||
+      (playerState === null && this.videoPlaying)
+    this.videoControlPending = true
+    try {
+      if (shouldPause) {
+        await this.videoPlaybackManager.pause()
+        this.videoPlaying = false
+      } else {
+        await this.videoPlaybackManager.play()
+        this.videoPlaying = true
+      }
+      this.syncVideoBackgroundTask()
+      this.updateVideoPipControlStatus()
+      this.updateVideoMediaSession(true)
+    } catch (error) {
+      this.reportError(error as Object, '视频操作失败')
+      this.statusText = '视频操作失败'
+    } finally {
+      this.videoControlPending = false
+    }
+  }
+
+  private toggleVideoMute(): void {
+    if (!this.videoPrepared) {
+      return
+    }
+    this.videoMuted = !this.videoMuted
+    if (this.videoCasting) {
+      this.videoMediaSession.sendCastControl({ command: 'toggleMute' })
+        .catch((error: Error): void => {
+          console.warn('[UgreenAVSession] remote mute command failed: ' + JSON.stringify(error))
+        })
+      this.updateVideoMediaSession(true)
+      return
+    }
+    this.videoPlaybackManager.setMuted(this.videoMuted)
+  }
+
+  private seekVideo(value: number): void {
+    if (!this.videoPrepared || this.videoDurationMs <= 0) {
+      return
+    }
+    const timeMs = Math.min(this.videoDurationMs, Math.max(0, Math.floor(value)))
+    this.videoCurrentMs = timeMs
+    if (this.videoCasting) {
+      this.videoMediaSession.sendCastControl({ command: 'seek', parameter: timeMs })
+        .catch((error: Error): void => {
+          console.warn('[UgreenAVSession] remote seek command failed: ' + JSON.stringify(error))
+        })
+    } else {
+      this.videoPlaybackManager.seek(timeMs)
+    }
+    if (this.videoEntry !== null) {
+      this.videoTransferManager.savePlaybackPosition(this.videoEntry, timeMs)
+        .catch((): void => {})
+    }
+  }
+
+  private async downloadVideoFromPlayer(entry: FileEntry): Promise<void> {
+    if (this.isBusy || entry.isDirectory) {
+      return
+    }
+    this.isBusy = true
+    this.errorText = ''
+    this.statusText = '正在下载视频…'
+    try {
+      await this.refreshVideoManager()
+      await this.videoTransferManager.requestDownload(entry)
+      this.statusText = '视频已下载到 UGREENlink'
+      this.showImmersiveToast('视频已下载到 UGREENlink：' + entry.name)
+    } catch (error) {
+      this.reportError(error as Object, '视频下载失败')
+      this.statusText = '视频下载失败'
+    } finally {
+      this.isBusy = false
+    }
+  }
+
+  private videoTransferError(entry: FileEntry): string {
+    return this.videoStateForEntry(entry).errorMessage
+  }
+
+  private videoStatusText(entry: FileEntry): string {
+    const error = this.videoTransferError(entry)
+    if (error.length > 0) {
+      return '传输失败：' + error
+    }
+    const state = this.videoStateForEntry(entry)
+    if (state.status === 'downloading' || state.status === 'queued') {
+      const received = this.formatSize(state.receivedBytes)
+      const total = state.totalBytes > 0 ? ' / ' + this.formatSize(state.totalBytes) : ''
+      return received + total + ' · 下载中'
+    }
+    if (state.status === 'streaming') {
+      if (state.totalBytes > 0) {
+        return this.formatSize(state.receivedBytes) + ' / ' + this.formatSize(state.totalBytes) + ' · 边下边播'
+      }
+      return '正在缓冲视频…'
+    }
+    if (state.status === 'partial') {
+      if (state.totalBytes > 0) {
+        return this.formatSize(state.receivedBytes) + ' / ' + this.formatSize(state.totalBytes) + ' · 已缓存部分'
+      }
+      return '已缓存部分'
+    }
+    if (state.status === 'completed') {
+      return state.durablePath.length > 0 ? '已下载到 UGREENlink' : '已缓存，可离线播放'
+    }
+    if (this.videoPrepared) {
+      return this.videoPlaying ? '正在播放' : '已暂停'
+    }
+    return '正在准备视频…'
+  }
+
+  private syncVideoBackgroundTask(): void {
+    if (!this.showVideoPlayer || this.videoEntry === null) {
+      return
+    }
+    const context = getContext(this) as Context
+    // A remote cast is an AUDIO_PLAYBACK workload too.  Keep the continuous
+    // task while the sink is playing even though the local AVPlayer is paused.
+    this.videoBackgroundTask.setPlaying(context, this.videoPlaying || this.videoCasting)
+  }
+
+  private handleVideoCastPickerState(state: AVCastPickerState): void {
+    console.info('[UgreenVideo] AVCastPicker state=' + state.toString())
+  }
+
+  private async toggleVideoPip(): Promise<void> {
+    if (this.isBusy || !this.showVideoPlayer || !this.videoSurfaceReady ||
+      this.videoPipCreating || this.videoPipStarting || this.videoPipStopping) {
+      return
+    }
+    if (this.videoPipActive && this.videoPipController !== null) {
+      this.videoPipStopping = true
+      try {
+        await this.videoPipController.stopPiP()
+      } catch (error) {
+        console.warn('[UgreenVideo] stop PiP failed: ' + JSON.stringify(error))
+      } finally {
+        this.videoPipStopping = false
+      }
+      return
+    }
+    if (!PiPWindow.isPiPEnabled()) {
+      this.statusText = '当前设备不支持小窗播放'
+      this.showImmersiveToast('当前设备不支持小窗播放')
+      return
+    }
+    this.captureVideoPipOrigin()
+    this.videoPipHideOnStart = true
+    this.videoPipStarting = true
+    try {
+      const controller = await this.createVideoPipController()
+      await controller.startPiP()
+      this.enterVideoPipBackground()
+      this.statusText = '已进入小窗播放'
+    } catch (error) {
+      this.videoPipHideOnStart = false
+      this.videoPipOrigin = null
+      this.videoPipActive = false
+      this.videoPipBackgrounded = false
+      this.videoPipRestorePending = false
+      this.videoPipRestoring = false
+      this.updateBottomBarVisibility(true)
+      // A failed start can leave a controller in an unusable state on some
+      // platform releases. Drop it so the next explicit tap creates a fresh
+      // controller instead of retrying the rejected instance.
+      this.destroyVideoPipController()
+      this.statusText = '小窗播放启动失败'
+      console.warn('[UgreenVideo] start PiP failed: ' + JSON.stringify(error))
+    } finally {
+      this.videoPipStarting = false
+    }
+  }
+
+  private captureVideoPipOrigin(): void {
+    if (this.videoPipOrigin !== null || !this.showVideoPlayer) {
+      return
+    }
+    this.videoPipOrigin = {
+      screen: this.screen,
+      selectedBottomTab: this.selectedBottomTab,
+      rootKind: this.rootKind,
+      currentPath: this.currentPath,
+      currentRootType: this.currentRootType,
+      entries: this.entries.slice(),
+      navigationStack: this.navigationStack.slice(),
+      navigationEntryStack: this.cloneNavigationEntryStack(this.navigationEntryStack),
+      navigationRootTypeStack: this.navigationRootTypeStack.slice(),
+      navigationViewStateStack: this.cloneNavigationViewStateStack(this.navigationViewStateStack),
+      navigationPageIndexStack: this.navigationPageIndexStack.slice(),
+      navigationPageHasMoreStack: this.navigationPageHasMoreStack.slice(),
+      currentPageIndex: this.currentPageIndex,
+      currentPageHasMore: this.currentPageHasMore,
+      viewState: this.cloneDirectoryViewState(this.captureDirectoryViewState()),
+      topTitle: this.topTitle,
+      topTitleOpacity: this.topTitleOpacity
+    }
+  }
+
+  private enterVideoPipBackground(): void {
+    if (!this.showVideoPlayer || this.videoPipBackgrounded) {
+      return
+    }
+    this.videoPipHideOnStart = false
+    this.videoPipBackgrounded = true
+    // The player remains alive and the original XComponent stays mounted in a
+    // 1x1 host. Only the surrounding controls are removed, revealing the file
+    // page that launched the video underneath the system PiP window.
+    this.updateBottomBarVisibility(true)
+  }
+
+  private async stopVideoPipForReplacement(): Promise<void> {
+    if (!this.videoPipBackgrounded) {
+      return
+    }
+    this.videoPipBackgrounded = false
+    this.videoPipOrigin = null
+    this.videoPipHideOnStart = false
+    this.videoPipStarting = false
+    this.videoPipStopping = true
+    this.videoPipRestorePending = false
+    this.videoPipRestoreScheduled = false
+    this.videoPipRestoring = false
+    const controller = this.videoPipController
+    if (controller !== null) {
+      try {
+        await controller.stopPiP()
+      } catch (error) {
+        console.warn('[UgreenVideo] stop PiP before replacement failed: ' +
+          JSON.stringify(error))
+      }
+    }
+    this.destroyVideoPipController()
+    this.videoPipStopping = false
+  }
+
+  private restoreVideoPipOrigin(): void {
+    const origin = this.videoPipOrigin
+    this.videoPipOrigin = null
+    if (origin === null) {
+      return
+    }
+    this.navigationRequestId += 1
+    this.isNavigating = false
+    this.cancelFileTransition()
+    this.closeActionMenu()
+    this.showDestinationPicker = false
+    this.showRenameDialog = false
+    this.showCreateFolderDialog = false
+    this.destinationFolderDialog = false
+    this.selectionMode = false
+    this.selectedPaths = []
+    this.selectedEntryCount = 0
+    this.screen = origin.screen
+    this.selectedBottomTab = origin.selectedBottomTab
+    this.rootKind = origin.rootKind
+    this.currentPath = origin.currentPath
+    this.currentRootType = origin.currentRootType
+    this.navigationStack = origin.navigationStack.slice()
+    this.navigationEntryStack = this.cloneNavigationEntryStack(origin.navigationEntryStack)
+    this.navigationRootTypeStack = origin.navigationRootTypeStack.slice()
+    this.navigationViewStateStack = this.cloneNavigationViewStateStack(origin.navigationViewStateStack)
+    this.navigationPageIndexStack = origin.navigationPageIndexStack.slice()
+    this.navigationPageHasMoreStack = origin.navigationPageHasMoreStack.slice()
+    this.currentPageIndex = origin.currentPageIndex
+    this.currentPageHasMore = origin.currentPageHasMore
+    this.fileViewMode = origin.viewState.mode
+    this.showSearch = false
+    // A search result is resolved to its real parent directory before the
+    // video is opened. Once PiP restoration has put that directory back under
+    // the player, Back must close the player to this directory instead of
+    // replaying the suspended search result return route.
+    if (this.searchSession !== null && this.searchSession.returnMode === 'video') {
+      this.searchSession.returnMode = 'none'
+      this.searchSession.targetParentPath = ''
+      this.searchSession.targetNavigationDepth = this.navigationStack.length
+    }
+    this.replaceEntries(origin.entries.slice())
+    this.resetPreviewState(false)
+    this.restoreDirectoryViewState(origin.viewState)
+    this.updateTopTitle(origin.topTitle, false)
+    this.topTitleOpacity = origin.topTitleOpacity
+    this.errorText = ''
+  }
+
+  private async createVideoPipController(): Promise<PiPWindow.PiPController> {
+    if (this.videoPipController !== null) {
+      return this.videoPipController
+    }
+    if (this.videoPipCreating) {
+      throw new Error('小窗控制器正在创建')
+    }
+    this.videoPipCreating = true
+    try {
+      const width = this.videoWidthPx > 0 ? this.videoWidthPx : 16
+      const height = this.videoHeightPx > 0 ? this.videoHeightPx : 9
+      const config: PiPWindow.PiPConfiguration = {
+        context: getContext(this) as Context,
+        componentController: this.videoSurfaceController,
+        templateType: PiPWindow.PiPTemplateType.VIDEO_PLAY,
+        contentWidth: width,
+        contentHeight: height,
+        // The system video template owns the play/pause/close/restore UI;
+        // expose only the optional previous/next group supported by the
+        // official XComponent PiP sample.
+        controlGroups: [PiPWindow.VideoPlayControlGroup.VIDEO_PREVIOUS_NEXT]
+      }
+      const controller = await PiPWindow.create(config)
+      this.videoPipController = controller
+      controller.on('stateChange', this.videoPipStateChange)
+      controller.on('controlPanelActionEvent', this.videoPipControlEvent)
+      // PiP is entered by the explicit top-bar button.  Background audio
+      // playback remains enabled independently of automatic PiP.
+      controller.setAutoStartEnabled(false)
+      return controller
+    } finally {
+      this.videoPipCreating = false
+    }
+  }
+
+  private handleVideoPipStateChange(state: PiPWindow.PiPState, reason: string): void {
+    console.info('[UgreenVideo] PiP state=' + state.toString() + ' reason=' + reason)
+    switch (state) {
+      case PiPWindow.PiPState.STARTED:
+        this.videoPipActive = true
+        if (this.videoPipHideOnStart) {
+          this.enterVideoPipBackground()
+        }
+        this.updateVideoPipControlStatus()
+        break
+      case PiPWindow.PiPState.STOPPED:
+        this.videoPipActive = false
+        this.videoPipStopping = false
+        if (this.videoPipRestorePending || this.videoPipRestoring) {
+          // ABOUT_TO_RESTORE is followed by STOPPED on some releases. The
+          // restore callback owns the page transition; STOPPED must not tear
+          // down the player or clear the origin snapshot before that frame.
+          break
+        }
+        if (this.videoPipBackgrounded) {
+          // Closing or dragging away the system PiP also closes the retained
+          // player. The file directory is already visible underneath.
+          this.videoPipBackgrounded = false
+          this.videoPipOrigin = null
+          this.closeVideoPlayer()
+        }
+        break
+      case PiPWindow.PiPState.ABOUT_TO_RESTORE:
+        this.videoPipActive = false
+        this.videoPipRestoring = true
+        this.videoPipRestorePending = true
+        this.scheduleVideoPipRestore()
+        break
+      case PiPWindow.PiPState.ERROR:
+        this.videoPipActive = false
+        this.videoPipHideOnStart = false
+        this.videoPipStarting = false
+        this.videoPipStopping = false
+        this.videoPipRestorePending = false
+        this.videoPipRestoring = false
+        this.videoPipOrigin = null
+        this.videoPipBackgrounded = false
+        this.statusText = '小窗播放不可用'
+        this.updateBottomBarVisibility(true)
+        break
+      default:
+        break
+    }
+  }
+
+  private handleVideoPipControlEvent(event: PiPWindow.PiPActionEventType,
+    status?: number): void {
+    switch (event) {
+      case 'playbackStateChanged':
+        if (status === 0) {
+          this.pauseVideoFromMediaSession()
+        } else if (status === 1) {
+          this.playVideoFromMediaSession()
+        }
+        break
+      case 'nextVideo':
+        this.switchVideo(1).catch((error: Error): void => {
+          console.warn('[UgreenVideo] PiP next video failed: ' + JSON.stringify(error))
+        })
+        break
+      case 'previousVideo':
+        this.switchVideo(-1).catch((error: Error): void => {
+          console.warn('[UgreenVideo] PiP previous video failed: ' + JSON.stringify(error))
+        })
+        break
+      default:
+        break
+    }
+  }
+
+  private updateVideoPipControlStatus(): void {
+    const controller = this.videoPipController
+    if (controller === null || !this.videoPipActive) {
+      return
+    }
+    try {
+      controller.updatePiPControlStatus(PiPWindow.PiPControlType.VIDEO_PLAY_PAUSE,
+        this.videoPlaying ? PiPWindow.PiPControlStatus.PLAY : PiPWindow.PiPControlStatus.PAUSE)
+    } catch (error) {
+      // The VIDEO_PLAY template may not expose this optional control on some
+      // device releases; playback itself remains valid.
+      console.warn('[UgreenVideo] update PiP control status failed: ' + JSON.stringify(error))
+    }
+  }
+
+  private destroyVideoPipController(): void {
+    const controller = this.videoPipController
+    this.videoPipController = null
+    this.videoPipActive = false
+    this.videoPipCreating = false
+    this.videoPipStarting = false
+    this.videoPipStopping = false
+    if (controller === null) {
+      return
+    }
+    try {
+      controller.setAutoStartEnabled(false)
+      controller.off('stateChange')
+      controller.off('controlPanelActionEvent')
+    } catch (error) {
+      console.warn('[UgreenVideo] destroy PiP controller failed: ' + JSON.stringify(error))
+    }
+    controller.stopPiP().catch((): void => {})
+  }
+
+  private async handleVideoCastConnected(): Promise<void> {
+    if (!this.showVideoPlayer || this.videoEntry === null ||
+      this.videoCastPreparing || !this.videoMediaSession.isCasting()) {
+      return
+    }
+    const entry = this.videoEntry
+    const token = this.videoOpenToken
+    this.videoCastPreparing = true
+    this.videoWasPlayingBeforeCast = this.videoPlaying
+    this.videoCasting = true
+    this.syncVideoBackgroundTask()
+    try {
+      if (this.videoPlaybackManager.state() === 'playing') {
+        await this.videoPlaybackManager.pause()
+      }
+      this.videoPlaying = false
+      this.updateVideoMediaSession(true)
+      const descriptor = await this.videoTransferManager.castDescriptor(entry)
+      if (token !== this.videoOpenToken || !this.showVideoPlayer ||
+        !this.videoMediaSession.isCasting()) {
+        return
+      }
+      await this.videoMediaSession.startCasting(descriptor.url, this.videoCurrentMs,
+        this.videoDurationMs)
+      this.videoPlaying = true
+      this.updateVideoPipControlStatus()
+      this.updateVideoMediaSession(true)
+      this.statusText = '正在投播'
+    } catch (error) {
+      this.videoCasting = false
+      this.syncVideoBackgroundTask()
+      this.statusText = '投播失败，已恢复本地播放'
+      console.warn('[UgreenVideo] cast start failed: ' + JSON.stringify(error))
+      if (this.videoWasPlayingBeforeCast && this.showVideoPlayer &&
+        this.videoEntry !== null) {
+        this.videoPlaybackManager.play().then((): void => {
+          this.videoPlaying = true
+          this.syncVideoBackgroundTask()
+          this.updateVideoMediaSession(true)
+        }).catch((): void => {})
+      }
+    } finally {
+      this.videoCastPreparing = false
+    }
+  }
+
+  private handleVideoCastDisconnected(): void {
+    // `videoWasPlayingBeforeCast` is only the fallback used when preparing a
+    // cast fails. Once the remote sink has started, the live `videoPlaying`
+    // value reflects the user's last remote pause/play action and must win
+    // when the route is disconnected.
+    const shouldResume = this.videoPlaying
+    this.videoCasting = false
+    this.videoWasPlayingBeforeCast = false
+    this.syncVideoBackgroundTask()
+    if (!shouldResume || !this.showVideoPlayer || this.videoEntry === null) {
+      this.videoPlaying = false
+      this.updateVideoMediaSession(true)
+      return
+    }
+    this.videoPlaybackManager.seek(this.videoCurrentMs)
+    this.videoPlaybackManager.play().then((): void => {
+      if (!this.showVideoPlayer) {
+        return
+      }
+      this.videoPlaying = true
+      this.syncVideoBackgroundTask()
+      this.updateVideoMediaSession(true)
+    }).catch((error: Error): void => {
+      console.warn('[UgreenVideo] resume local video after cast failed: ' + JSON.stringify(error))
+    })
+  }
+
+  private handleVideoCastPlayback(snapshot: VideoCastPlaybackSnapshot): void {
+    if (!this.videoCasting || this.videoEntry === null) {
+      return
+    }
+    this.videoPlaying = snapshot.playing
+    if (snapshot.durationMs > 0) {
+      this.videoDurationMs = snapshot.durationMs
+    }
+    this.videoCurrentMs = Math.max(0, snapshot.positionMs)
+    this.syncVideoBackgroundTask()
+    this.updateVideoPipControlStatus()
+    this.updateVideoMediaSession(true)
   }
 
   private closeAudioPlayer(): void {
@@ -10419,6 +12799,10 @@ struct Index {
       await this.openAudioPlayer(entry)
       return
     }
+    if (this.isVideo(entry)) {
+      await this.openVideoPlayer(entry)
+      return
+    }
     await this.openCachedEntry(entry, false)
   }
 
@@ -10464,6 +12848,27 @@ struct Index {
 
   private async ensureCachedFile(entry: FileEntry,
     onProgress?: BinaryProgressListener, shouldContinue?: () => boolean): Promise<string> {
+    if (this.isVideo(entry)) {
+      await this.refreshVideoManager()
+      const videoLocal = await this.videoTransferManager.resolveLocal(entry)
+      if (videoLocal.length > 0) {
+        if (onProgress !== undefined) {
+          onProgress({ receiveSize: 1, totalSize: 1 })
+        }
+        return videoLocal
+      }
+      // Explicit actions such as Save/Share/Open-with are allowed to promote
+      // the resumable stream into the user Download/UGREENlink directory.
+      await this.videoTransferManager.requestDownload(entry)
+      const downloaded = await this.videoTransferManager.resolveLocal(entry)
+      if (downloaded.length === 0) {
+        throw new Error('视频下载未生成本地文件')
+      }
+      if (onProgress !== undefined) {
+        onProgress({ receiveSize: 1, totalSize: 1 })
+      }
+      return downloaded
+    }
     await this.ensureCacheState()
     const cacheKey = this.originalCacheKey(entry)
     const existingPath = CacheManager.findExisting(this.cacheDirectory, entry.name, cacheKey)
@@ -10483,6 +12888,17 @@ struct Index {
 
   private async confirmMeteredDownload(entry: FileEntry): Promise<boolean> {
     await this.ensureNetworkState()
+    if (this.isVideo(entry)) {
+      await this.refreshVideoManager()
+      try {
+        if ((await this.videoTransferManager.resolveLocal(entry)).length > 0) {
+          return true
+        }
+      } catch (_) {
+        // Initialization/network metadata errors are reported by the action
+        // that actually needs the video; keep the existing prompt path here.
+      }
+    }
     if (this.networkClass === 'offline') {
       return false
     }
@@ -10518,6 +12934,25 @@ struct Index {
     }
     this.closeActionMenu()
     this.errorText = ''
+    if (this.isVideo(entry)) {
+      if (!await this.confirmMeteredDownload(entry)) {
+        return
+      }
+      this.isBusy = true
+      this.statusText = '正在下载视频…'
+      try {
+        await this.refreshVideoManager()
+        await this.videoTransferManager.requestDownload(entry)
+        this.statusText = '视频已下载到 UGREENlink'
+        this.showImmersiveToast('视频已下载到 UGREENlink：' + entry.name)
+      } catch (error) {
+        this.reportError(error as Object, '视频下载失败')
+        this.statusText = '视频下载失败'
+      } finally {
+        this.isBusy = false
+      }
+      return
+    }
     try {
       await this.ensureDownloadState()
       await this.downloadQueue.enqueue(entry)
@@ -10691,19 +13126,37 @@ struct Index {
 
   private async confirmMeteredSelection(entries: FileEntry[]): Promise<boolean> {
     await this.ensureNetworkState()
-    if (this.networkClass === 'offline') {
-      return false
-    }
     if (!this.networkPolicy.isMetered()) {
       return true
     }
     await this.ensureCacheState()
-    const requiresDownload = entries.some((entry: FileEntry): boolean => {
-      return CacheManager.findExisting(this.cacheDirectory, entry.name,
-        this.originalCacheKey(entry)).length === 0
-    })
+    let requiresDownload = false
+    for (const entry of entries) {
+      if (entry.isDirectory) {
+        requiresDownload = true
+        break
+      }
+      if (this.isVideo(entry)) {
+        try {
+          await this.refreshVideoManager()
+          if ((await this.videoTransferManager.resolveLocal(entry)).length > 0) {
+            continue
+          }
+        } catch (_) {
+          // Treat an unavailable local index as a download requirement.
+        }
+      } else if (CacheManager.findExisting(this.cacheDirectory, entry.name,
+        this.originalCacheKey(entry)).length > 0) {
+        continue
+      }
+      requiresDownload = true
+      break
+    }
     if (!requiresDownload) {
       return true
+    }
+    if (this.networkClass === 'offline') {
+      return false
     }
     const response = await promptAction.showDialog({
       title: '使用移动网络分享？',
@@ -10808,11 +13261,15 @@ struct Index {
     this.statusText = '正在加入下载队列…'
     try {
       await this.ensureDownloadState()
+      await this.refreshVideoManager()
       const destinationRoot = this.userDownloadDirectory() + '/UGREENlink'
       let count = 0
       for (const entry of entries) {
         if (entry.isDirectory) {
           count += await this.enqueueRemoteTree(entry, destinationRoot, entry.name)
+        } else if (this.isVideo(entry)) {
+          await this.videoTransferManager.requestDownload(entry)
+          count += 1
         } else {
           await this.downloadQueue.enqueue(entry)
           count += 1
@@ -10839,11 +13296,16 @@ struct Index {
     this.closeSelectionMoreMenu()
     this.isBusy = true
     try {
+      await this.refreshVideoManager()
       for (const entry of entries) {
-        const path = CacheManager.findExisting(this.cacheDirectory, entry.name,
-          this.originalCacheKey(entry))
-        if (path.length > 0) {
-          await CacheManager.remove(path)
+        if (this.isVideo(entry)) {
+          await this.videoTransferManager.clearCache(entry)
+        } else {
+          const path = CacheManager.findExisting(this.cacheDirectory, entry.name,
+            this.originalCacheKey(entry))
+          if (path.length > 0) {
+            await CacheManager.remove(path)
+          }
         }
       }
       await this.refreshCacheUsage()
@@ -11518,7 +13980,7 @@ struct Index {
         return
       }
       if (thumbnailPath.length > 0) {
-        await this.publishImagePreview(entry, thumbnailPath, false, generation)
+          await this.publishThumbnailPreview(entry, thumbnailPath, false, generation)
         return
       }
 
@@ -11642,16 +14104,29 @@ struct Index {
   }
 
   private isImage(entry: FileEntry): boolean {
+    const mime = entry.mimeType.trim().toLowerCase()
+    if (mime.startsWith('image/')) {
+      return true
+    }
     const extension = this.fileExtension(entry.name)
     return ['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'heif', 'bmp', 'tif', 'tiff'].indexOf(extension) >= 0
   }
 
   private isVideo(entry: FileEntry): boolean {
+    const mime = entry.mimeType.trim().toLowerCase()
+    if (mime.startsWith('video/')) {
+      return true
+    }
     const extension = this.fileExtension(entry.name)
-    return ['mp4', 'mov', 'm4v', 'avi', 'mkv', 'webm', '3gp', 'ts'].indexOf(extension) >= 0
+    return ['mp4', 'mov', 'm4v', 'avi', 'mkv', 'webm', '3gp', 'ts', 'mpeg', 'mpg',
+      'm2ts', 'mts', 'wmv', 'flv', 'f4v', 'rmvb', 'asf'].indexOf(extension) >= 0
   }
 
   private isAudio(entry: FileEntry): boolean {
+    const mime = entry.mimeType.trim().toLowerCase()
+    if (mime.startsWith('audio/')) {
+      return true
+    }
     const extension = this.fileExtension(entry.name)
     return ['mp3', 'wav', 'm4a', 'flac', 'aac', 'ogg', 'amr'].indexOf(extension) >= 0
   }
@@ -11766,6 +14241,8 @@ struct Index {
     this.clearSearchIfPresent()
     this.closeImageViewer()
     this.closeAudioPlayer()
+    this.closeVideoPlayer()
+    await this.videoTransferManager.flush()
     await this.ensureDownloadState()
     await this.downloadQueue.setReady(false)
     this.repository.logout()
@@ -11773,6 +14250,7 @@ struct Index {
     this.isNavigating = false
     this.screen = 'login'
     this.showStorageSettings = false
+    this.showPlaybackSettings = false
     this.showNetworkSettings = false
     this.silentAutoLogin = false
     this.baseUrl = ''
@@ -11945,5 +14423,17 @@ struct Index {
     const minutes = Math.floor(totalSeconds / 60)
     const seconds = totalSeconds % 60
     return minutes.toString().padStart(2, '0') + ':' + seconds.toString().padStart(2, '0')
+  }
+
+  private videoBufferedTimelineMs(): number {
+    if (this.videoDurationMs <= 0) {
+      return 0
+    }
+    const estimated = this.videoDurationMs *
+      Math.max(0, Math.min(100, this.videoBufferingPercent)) / 100
+    // A BUFFERING_START callback is allowed to report zero while the decoder
+    // is still consuming the last known window. Never draw the buffer behind
+    // the playhead, which would make the progress bar visibly jump backwards.
+    return Math.min(this.videoDurationMs, Math.max(this.videoCurrentMs, estimated))
   }
 }

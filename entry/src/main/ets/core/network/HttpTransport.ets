@@ -18,6 +18,14 @@ export interface StreamDownloadResult {
   resumed: boolean
 }
 
+export interface BinaryRangeResult {
+  responseCode: number
+  start: number
+  totalSize: number
+  bytes: Uint8Array
+  headers: Record<string, string>
+}
+
 export class HttpTransport {
   async requestJson(url: string, method: http.RequestMethod, body?: JsonObject,
     headers: Record<string, string> = {}): Promise<HttpResult<JsonObject>> {
@@ -96,6 +104,148 @@ export class HttpTransport {
         request.off('dataReceiveProgress', progressCallback)
       }
       request.destroy()
+    }
+  }
+
+  /**
+   * Fetches one bounded byte range. The video MediaSource loader uses this
+   * instead of assembling the whole movie in memory. A non-zero range must be
+   * answered with HTTP 206; accepting a 200 response there would duplicate
+   * the file at the requested offset and corrupt the sparse .part file.
+   */
+  async requestBinaryRange(url: string, start: number, length: number,
+    headers: Record<string, string> = {}): Promise<BinaryRangeResult> {
+    const safeStart = Math.max(0, Math.floor(start))
+    const safeLength = Math.max(1, Math.floor(length))
+    const request = http.createHttp()
+    const requestHeaders: Record<string, string> = {}
+    for (const key of Object.keys(headers)) {
+      requestHeaders[key] = headers[key]
+    }
+    requestHeaders['Range'] = 'bytes=' + safeStart.toString() + '-' +
+      (safeStart + safeLength - 1).toString()
+    let responseCode = 0
+    let responseHeaders: Record<string, string> = {}
+    let receivedBytes = 0
+    const chunks: Uint8Array[] = []
+    let dataResolve: (() => void) | null = null
+    let dataReject: ((error: Object) => void) | null = null
+    let streamFinished = false
+    const dataFinished = new Promise<void>((resolve, reject) => {
+      dataResolve = resolve
+      dataReject = reject
+    })
+    const failStream = (error: Object): void => {
+      if (streamFinished) {
+        return
+      }
+      streamFinished = true
+      if (dataReject !== null) {
+        dataReject(error)
+        dataReject = null
+      }
+      try {
+        request.destroy()
+      } catch (_) {
+        // The request may already be at dataEnd.
+      }
+    }
+    const headersCallback = (raw: Object): void => {
+      responseHeaders = this.toHeaders(raw)
+      const advertisedLength = this.numberHeader(responseHeaders, 'content-length')
+      if (advertisedLength > safeLength) {
+        failStream(new UgreenError(UgreenErrorKind.NETWORK,
+          '服务器返回了超出请求范围的视频数据', 0))
+      }
+    }
+    const dataCallback = (chunk: ArrayBuffer): void => {
+      if (streamFinished) {
+        return
+      }
+      const bytes = new Uint8Array(chunk)
+      if (receivedBytes + bytes.byteLength > safeLength) {
+        failStream(new UgreenError(UgreenErrorKind.NETWORK,
+          '服务器返回了超出请求范围的视频数据', responseCode))
+        return
+      }
+      if (bytes.byteLength > 0) {
+        chunks.push(bytes)
+        receivedBytes += bytes.byteLength
+      }
+    }
+    const endCallback = (): void => {
+      if (streamFinished) {
+        return
+      }
+      streamFinished = true
+      if (dataResolve !== null) {
+        dataResolve()
+        dataResolve = null
+      }
+    }
+    request.once('headersReceive', headersCallback)
+    request.on('dataReceive', dataCallback)
+    request.on('dataEnd', endCallback)
+    try {
+      responseCode = await request.requestInStream(url, {
+        method: http.RequestMethod.GET,
+        header: requestHeaders,
+        connectTimeout: 30000,
+        readTimeout: 120000,
+        usingCache: false
+      })
+      await dataFinished
+      const status = Number(responseCode)
+      if (status < 200 || status >= 300) {
+        throw new UgreenError(UgreenErrorKind.NETWORK,
+          '视频分段请求失败（HTTP ' + status.toString() + '）', status)
+      }
+      const contentRange = this.headerValue(responseHeaders, 'content-range')
+      const responseStart = status === 206 ? this.rangeStart(contentRange) : 0
+      if (safeStart > 0 && status !== 206) {
+        throw new UgreenError(UgreenErrorKind.NETWORK,
+          '服务器不支持视频 Range 播放', status)
+      }
+      if (status === 206 && responseStart !== safeStart) {
+        throw new UgreenError(UgreenErrorKind.NETWORK,
+          '服务器返回了错误的视频分段范围', status)
+      }
+      const bytes = new Uint8Array(receivedBytes)
+      let copyOffset = 0
+      for (const chunk of chunks) {
+        bytes.set(chunk, copyOffset)
+        copyOffset += chunk.byteLength
+      }
+      if (bytes.byteLength <= 0) {
+        throw new UgreenError(UgreenErrorKind.NETWORK, '视频分段为空', status)
+      }
+      const totalFromRange = this.rangeTotal(contentRange)
+      const contentLength = this.numberHeader(responseHeaders, 'content-length')
+      // A 206 response without the complete Content-Range total is still
+      // usable for streaming, but it is not safe to promote as a complete
+      // durable file. Returning zero keeps the transfer manager from
+      // mistaking the first chunk for the whole movie.
+      const totalSize = totalFromRange > 0
+        ? totalFromRange : (status === 206 ? 0 :
+          (contentLength > 0 ? contentLength : bytes.byteLength))
+      return {
+        responseCode: status,
+        start: responseStart,
+        totalSize: totalSize,
+        bytes: bytes,
+        headers: responseHeaders
+      }
+    } catch (error) {
+      if (error instanceof UgreenError) {
+        throw error
+      }
+      console.warn('[UgreenHTTP] range request failed: ' + url + ' :: ' + String(error))
+      throw new UgreenError(UgreenErrorKind.NETWORK, '视频分段下载失败，请检查网络连接')
+    } finally {
+      request.destroy()
+      request.off('dataReceive', dataCallback)
+      request.off('dataEnd', endCallback)
+      request.off('headersReceive', headersCallback)
     }
   }
 

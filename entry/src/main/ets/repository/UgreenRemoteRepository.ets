@@ -4,6 +4,7 @@ import { CacheManager } from '../download/CacheManager'
 import { BinaryProgressListener, HttpTransport } from '../core/network/HttpTransport'
 import { UgreenDirectoryPage, UgreenRemoteClient } from '../ugreen/UgreenRemoteClient'
 import { DownloadDescriptor, FileEntry, RootDirectory, LoginResult } from '../model/FileEntry'
+import { RemoteFileSignature } from '../media/MediaLocalStore'
 import { ThumbnailNormalizer } from '../media/ThumbnailNormalizer'
 import { ThumbnailProfile } from '../media/ThumbnailPolicy'
 import { ThumbnailCacheStore } from '../media/ThumbnailCacheStore'
@@ -90,6 +91,16 @@ export class UgreenRemoteRepository {
   cacheKeyForFile(entry: FileEntry): string {
     return 'original-v3:' + this.cacheScopeHash() + ':' + entry.path + ':' +
       entry.size.toString() + ':' + entry.modifiedTime.toString()
+  }
+
+  /**
+   * Stable identity shared by video streaming, disposable originals and the
+   * durable Download route. Optional validators are included when the NAS
+   * exposes them, while older endpoints continue to use size/mtime.
+   */
+  signatureForFile(entry: FileEntry): RemoteFileSignature {
+    return new RemoteFileSignature(this.cacheScopeHash(), entry.path, entry.size,
+      entry.modifiedTime, entry.etag, entry.checksum)
   }
 
   async resolve(linkId: string): Promise<string> {
@@ -520,11 +531,35 @@ export class UgreenRemoteRepository {
     return await this.client.withReconnect(() => this.client.download(path))
   }
 
+  /** Authenticated mediaPlayer source for AVPlayer Range streaming. */
+  async mediaPlayerDescriptor(entry: FileEntry): Promise<DownloadDescriptor> {
+    return await this.client.mediaPlayerDescriptor(entry)
+  }
+
+  /**
+   * Prepare the server-side HLS source used by the web video viewer.  Older
+   * NAS firmware may reject this when its transcode worker is unavailable;
+   * callers should fall back to mediaPlayerDescriptor in that case.
+   */
+  async streamDescriptor(entry: FileEntry): Promise<DownloadDescriptor> {
+    return await this.client.streamDescriptor(entry)
+  }
+
+  async closeStreamTask(taskId: string, sourceType: number = 1): Promise<void> {
+    await this.client.closeStreamTask(taskId, sourceType)
+  }
+
   private async downloadOnce(entry: FileEntry, filesDirectory: string, maxBytes: number,
     onProgress?: BinaryProgressListener, shouldContinue?: () => boolean): Promise<string> {
     const descriptor = await this.client.download(entry.path)
     if (descriptor.size <= 0 && entry.size > 0) {
       descriptor.size = entry.size
+    }
+    if (descriptor.etag.length === 0) {
+      descriptor.etag = entry.etag
+    }
+    if (descriptor.checksum.length === 0) {
+      descriptor.checksum = entry.checksum
     }
     return await this.downloadManager.download(descriptor, filesDirectory, maxBytes,
       this.cacheKeyForFile(entry), onProgress, shouldContinue)

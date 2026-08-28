@@ -493,11 +493,15 @@ export class DirectoryMetadataStore {
         entry.isDirectory = this.booleanValue(raw['isDirectory'])
         entry.size = this.numberValue(raw['size'])
         entry.modifiedTime = this.numberValue(raw['modifiedTime'])
+        entry.createdTime = this.numberValue(raw['createdTime'])
         entry.childCount = this.numberValue(raw['childCount'], -1)
         entry.rootType = this.numberValue(raw['rootType'])
+        entry.intranetShareId = this.numberValue(raw['intranetShareId'])
         entry.thumbnailUrl = this.stringValue(raw['thumbnailUrl'])
         entry.coverUrl = this.stringValue(raw['coverUrl'])
         entry.mimeType = this.stringValue(raw['mimeType'])
+        entry.etag = this.stringValue(raw['etag'])
+        entry.checksum = this.stringValue(raw['checksum'])
         entries.push(entry)
       }
       return entries

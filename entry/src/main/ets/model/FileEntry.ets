@@ -4,11 +4,20 @@ export class FileEntry {
   isDirectory: boolean = false
   size: number = 0
   modifiedTime: number = 0
+  // UGOS mediaPlayer URLs also carry the creation time.  Older list
+  // responses may omit it, so zero remains a valid fallback.
+  createdTime: number = 0
   childCount: number = -1
   rootType: number = 0
+  // Shared-folder media sources use this value when the gateway exposes it.
+  intranetShareId: number = 0
   thumbnailUrl: string = ''
   coverUrl: string = ''
   mimeType: string = ''
+  // Optional server supplied validators. Older UGOS endpoints do not return
+  // these fields, so callers must still be able to fall back to size/mtime.
+  etag: string = ''
+  checksum: string = ''
 }
 
 export class RootDirectory {
@@ -31,13 +40,28 @@ export class DownloadDescriptor {
   fileName: string = ''
   size: number = 0
   headers: Record<string, string> = {}
+  etag: string = ''
+  checksum: string = ''
+  // A descriptor may also represent the short-lived stream URL returned by
+  // UGOS's web video pipeline.  Keeping these fields on the descriptor lets
+  // the playback path carry the same metadata without changing the durable
+  // download contract (which still replaces it with a normal file URL).
+  streamType: string = 'file'
+  streamTaskId: string = ''
+  streamFile: string = ''
+  durationMs: number = 0
+  width: number = 0
+  height: number = 0
+  bitrate: number = 0
 
   constructor(url: string = '', fileName: string = '', size: number = 0,
-    headers: Record<string, string> = {}) {
+    headers: Record<string, string> = {}, etag: string = '', checksum: string = '') {
     this.url = url
     this.fileName = fileName
     this.size = size
     this.headers = headers
+    this.etag = etag
+    this.checksum = checksum
   }
 }
 
@@ -69,4 +93,8 @@ export class DownloadTaskRecord {
   systemTaskId: string = ''
   errorMessage: string = ''
   manualMobileResume: boolean = false
+  // Stable identity shared by video streaming and the durable download queue.
+  sourceKey: string = ''
+  sourceEtag: string = ''
+  sourceChecksum: string = ''
 }

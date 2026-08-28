@@ -1,4 +1,5 @@
 import { http } from '@kit.NetworkKit'
+import { util } from '@kit.ArkTS'
 import { FileEntry, RootDirectory, LoginResult, DownloadDescriptor } from '../model/FileEntry'
 import { UgreenSession } from '../model/Session'
 import { SessionStore } from '../core/session/SessionStore'
@@ -266,10 +267,12 @@ export class UgreenRemoteClient {
       const remotePath = this.firstString(raw, ['path', 'full_path', 'file_path', 'filepath'])
       entry.path = this.normalizePath(remotePath.length > 0 ? remotePath : this.joinPath(requestPath, entry.name))
       entry.isDirectory = this.isDirectory(raw)
-      entry.size = this.numberValue(raw['size'])
-      entry.modifiedTime = this.numberValue(raw['mtime'])
+      entry.size = this.firstNumber(raw, ['size', 'file_size', 'fileSize', 'bytes', 'length'])
+      entry.modifiedTime = this.firstNumber(raw, ['mtime', 'modified_time', 'modifiedTime', 'last_modified'])
+      entry.createdTime = this.firstNumber(raw, ['ctime', 'create_time', 'created_time', 'created_at'])
       entry.childCount = this.directoryChildCount(raw)
       entry.rootType = effectiveRootType
+      entry.intranetShareId = this.firstNumber(raw, ['intranet_share_id', 'intranetShareId'])
       entry.thumbnailUrl = this.remotePreviewUrl(urls, raw, [
         'thumbnail_url', 'thumbnailUrl', 'thumb_url', 'thumbUrl', 'thumbnail', 'thumb',
         'preview_url', 'previewUrl', 'preview', 'poster_url', 'posterUrl', 'poster',
@@ -280,6 +283,10 @@ export class UgreenRemoteClient {
         'artwork_url', 'artworkUrl', 'artwork', 'album_cover', 'albumCover', 'song_cover', 'songCover'
       ])
       entry.mimeType = this.firstString(raw, ['mime_type', 'mimetype', 'content_type', 'type_name'])
+      entry.etag = this.firstString(raw, ['etag', 'e_tag', 'entity_tag', 'entityTag'])
+      entry.checksum = this.firstString(raw, [
+        'checksum', 'hash', 'md5', 'sha256', 'content_hash', 'contentHash'
+      ])
       result.push(entry)
     }
     this.sortEntries(result)
@@ -304,6 +311,152 @@ export class UgreenRemoteClient {
 
   async download(path: string): Promise<DownloadDescriptor> {
     return await this.withReconnect(() => this.downloadOnce(path))
+  }
+
+  /**
+   * Returns the same authenticated mediaPlayer source used by the official
+   * UGOS viewer.  Unlike download(), this deliberately does not mint a
+   * download-file token: AVPlayer needs a seekable Range source while the
+   * user is only viewing the remote movie.
+   */
+  async mediaPlayerDescriptor(entry: FileEntry): Promise<DownloadDescriptor> {
+    return await this.withReconnect(() => this.mediaPlayerDescriptorOnce(entry))
+  }
+
+  private async mediaPlayerDescriptorOnce(entry: FileEntry): Promise<DownloadDescriptor> {
+    const urls = this.requireEndpoints()
+    const headers = await this.authHeaders()
+    headers['referer'] = urls.baseUrl + '/filemgr/?_filemgr=a58981e8'
+    const createdTime = entry.createdTime > 0 ? entry.createdTime : entry.modifiedTime
+    const url = urls.mediaPlayer(entry.path, entry.size, entry.modifiedTime,
+      createdTime, entry.intranetShareId)
+    return new DownloadDescriptor(url, entry.name, entry.size, headers,
+      entry.etag, entry.checksum)
+  }
+
+  /**
+   * Prepare the server-side HLS source used by the UGOS web video viewer.
+   *
+   * The web client first asks for media information, then creates one HLS
+   * playlist for the selected quality/audio track.  The playlist and its
+   * segments are consumed directly by AVPlayer, so the application never
+   * needs to assemble a sparse MP4 while the decoder is already reading it.
+   * A caller can fall back to mediaPlayerDescriptor() when an older NAS has
+   * no transcode worker available.
+   */
+  async streamDescriptor(entry: FileEntry): Promise<DownloadDescriptor> {
+    return await this.withReconnect(() => this.streamDescriptorOnce(entry))
+  }
+
+  /** Stop one server-side HLS producer when the viewer is closed. */
+  async closeStreamTask(taskId: string, sourceType: number = 1): Promise<void> {
+    const cleanTaskId = taskId.trim()
+    if (cleanTaskId.length === 0) {
+      return
+    }
+    await this.withReconnect(() => this.closeStreamTaskOnce(cleanTaskId, sourceType))
+  }
+
+  private async closeStreamTaskOnce(taskId: string, sourceType: number): Promise<void> {
+    const urls = this.requireEndpoints()
+    const sourceHeaders = await this.authHeaders()
+    sourceHeaders['referer'] = urls.baseUrl + '/filemgr/?_filemgr=a58981e8'
+    const headers = this.withHeaders(sourceHeaders, 'content-type', 'application/json')
+    const body: JsonObject = {}
+    body['task_id'] = taskId
+    body['timestamp'] = Date.now().toString()
+    body['src_type'] = Math.max(-1, Math.floor(sourceType))
+    await this.transport.requestJson(urls.streamTranscodeClose(), http.RequestMethod.POST, body, headers)
+  }
+
+  private async streamDescriptorOnce(entry: FileEntry): Promise<DownloadDescriptor> {
+    const urls = this.requireEndpoints()
+    const sourceHeaders = await this.authHeaders()
+    sourceHeaders['referer'] = urls.baseUrl + '/filemgr/?_filemgr=a58981e8'
+    const headers = this.withHeaders(sourceHeaders, 'content-type', 'application/json')
+    const timestamp = Date.now()
+    const taskId = this.newStreamTaskId(timestamp)
+    let descriptorReady = false
+    try {
+      const common: JsonObject = {}
+      common['task_id'] = taskId
+      common['timestamp'] = timestamp.toString()
+      common['src_type'] = 1
+      const infoBody: JsonObject = {}
+      for (const key of Object.keys(common)) {
+        infoBody[key] = common[key]
+      }
+      infoBody['video_path'] = entry.path
+      // Local NAS paths use the NAS transcode service.  The web client only
+      // enables this flag for cloud/net-disk direct links.
+      infoBody['is_net_disk_direct'] = false
+      const infoResponse = await this.transport.requestJson(urls.streamTranscodeInfo(),
+        http.RequestMethod.POST, infoBody, headers)
+      const info = this.successData(infoResponse.body, '获取视频流信息失败')
+      const transcodeable = info['transcodeable']
+      if (!(transcodeable instanceof Array) || transcodeable.length === 0) {
+        throw new UgreenError(UgreenErrorKind.UNKNOWN, '视频没有可用的流媒体清晰度')
+      }
+
+      const firstQuality = transcodeable[0] as JsonObject
+      const quality = this.firstString(firstQuality, ['resolution', 'value'])
+      const redirLink = this.stringValue(info['redir_link'])
+      const videoName = this.queryValue(redirLink, 'video_name')
+      if (quality.length === 0 || videoName.length === 0) {
+        throw new UgreenError(UgreenErrorKind.API_CHANGED, '视频流信息缺少播放地址')
+      }
+      const audios = info['audios']
+      let audioIndex = -1
+      if (audios instanceof Array && audios.length > 0) {
+        const firstAudio = audios[0] as JsonObject
+        audioIndex = this.firstNumber(firstAudio, ['id', 'index'])
+        if (audioIndex <= 0) {
+          audioIndex = -1
+        }
+      }
+      const m3u8File = videoName + '_' + quality + '.m3u8'
+      const playBody: JsonObject = {}
+      for (const key of Object.keys(common)) {
+        playBody[key] = common[key]
+      }
+      playBody['m3u8_file'] = m3u8File
+      playBody['regen'] = 1
+      playBody['subtitle_index'] = -1
+      playBody['audio_index'] = audioIndex
+      // HarmonyOS devices decode HEVC in AVPlayer, but requesting the H.264
+      // rendition keeps the fallback compatible with older device codecs.  The
+      // browser chooses this flag from MediaSource support; native playback has
+      // no reason to force a codec the device may not expose.
+      playBody['prefer_h265'] = false
+      const playResponse = await this.transport.requestJson(urls.streamTranscodePlay(),
+        http.RequestMethod.POST, playBody, headers)
+      const play = this.successData(playResponse.body, '创建视频流失败')
+      const streamUrl = urls.streamTranscodeM3u8(m3u8File, taskId, Date.now(), 1)
+      const descriptor = new DownloadDescriptor(streamUrl, entry.name, entry.size, sourceHeaders,
+        entry.etag, entry.checksum)
+      descriptor.streamType = 'hls'
+      descriptor.streamTaskId = taskId
+      descriptor.streamFile = m3u8File
+      descriptor.durationMs = this.firstNumber(info, ['duration', 'duration_ms'])
+      descriptor.width = this.firstNumber(info, ['width'])
+      descriptor.height = this.firstNumber(info, ['height'])
+      descriptor.bitrate = this.firstNumber(play, ['bitrate_bps', 'bitrate'])
+      descriptorReady = true
+      console.info('[UgreenVideo] HLS stream prepared path=' + entry.path +
+        ' quality=' + quality + ' duration=' + descriptor.durationMs.toString())
+      return descriptor
+    } finally {
+      if (!descriptorReady) {
+        // The web client sends a close beacon when preparation fails as well.
+        // Do the same before falling back to mediaPlayer so a failed 9404 or
+        // malformed response does not leave a producer running on the NAS.
+        try {
+          await this.closeStreamTaskOnce(taskId, 1)
+        } catch (error) {
+          console.warn('[UgreenVideo] close failed HLS preparation task: ' + String(error))
+        }
+      }
+    }
   }
 
   private async downloadOnce(path: string): Promise<DownloadDescriptor> {
@@ -337,16 +490,28 @@ export class UgreenRemoteClient {
       throw error as Error
     }
     const tokenData = this.successData(tokenResponse.body, '获取下载令牌失败')
+    // Current UGOS returns data.dl_token and expects a second
+    // v2/filemgr/downloadFile?token=... request.  A few older firmware
+    // versions returned a ready-to-use dl_url, so keep that form compatible.
     const downloadPath = this.stringValue(tokenData['dl_url'])
-    if (downloadPath.length === 0) {
-      throw new UgreenError(UgreenErrorKind.API_CHANGED, '下载接口没有返回文件地址')
+    const downloadToken = this.firstString(tokenData,
+      ['dl_token', 'download_token', 'downloadToken', 'token'])
+    const downloadUrl = downloadPath.length > 0 ? urls.downloadLink(downloadPath) :
+      (downloadToken.length > 0 ? urls.downloadFile(downloadToken) : '')
+    if (downloadUrl.length === 0) {
+      throw new UgreenError(UgreenErrorKind.API_CHANGED, '下载接口没有返回文件地址或令牌')
     }
-    return new DownloadDescriptor(
-      urls.downloadLink(downloadPath),
+    const descriptor = new DownloadDescriptor(
+      downloadUrl,
       this.fileName(path),
-      this.numberValue(tokenData['size']),
-      sessionHeaders
+      this.firstNumber(tokenData, ['size', 'file_size', 'fileSize', 'bytes', 'length']),
+      sessionHeaders,
+      this.firstString(tokenData, ['etag', 'e_tag', 'entity_tag', 'entityTag']),
+      this.firstString(tokenData, [
+        'checksum', 'hash', 'md5', 'sha256', 'content_hash', 'contentHash'
+      ])
     )
+    return descriptor
   }
 
   async thumbnail(entry: FileEntry): Promise<DownloadDescriptor> {
@@ -588,6 +753,66 @@ export class UgreenRemoteClient {
     }
     if (typeof value === 'string') {
       return Number(value)
+    }
+    return 0
+  }
+
+  private newStreamTaskId(timestamp: number): string {
+    // Mirror the web player's task identity exactly: a UUID between the PC
+    // prefix and the millisecond timestamp.  The transcode service uses this
+    // value to associate info/play/m3u8 requests with one producer session.
+    return 'PC&' + util.generateRandomUUID() + '&' + timestamp.toString()
+  }
+
+  private queryValue(url: string, key: string): string {
+    const question = url.indexOf('?')
+    if (question < 0) {
+      return ''
+    }
+    const query = url.substring(question + 1).split('&')
+    for (const item of query) {
+      const equals = item.indexOf('=')
+      if (equals <= 0) {
+        continue
+      }
+      const name = decodeURIComponent(item.substring(0, equals))
+      if (name !== key) {
+        continue
+      }
+      try {
+        return decodeURIComponent(item.substring(equals + 1))
+      } catch (_) {
+        return item.substring(equals + 1)
+      }
+    }
+    return ''
+  }
+
+  private firstNumber(raw: JsonObject, keys: string[]): number {
+    for (const key of keys) {
+      const rawValue = raw[key]
+      if (rawValue !== undefined && rawValue !== null &&
+        !(typeof rawValue === 'string' && rawValue.trim().length === 0)) {
+        const value = this.numberValue(rawValue)
+        if (value > 0 && Number.isFinite(value)) {
+          return Math.floor(value)
+        }
+      }
+    }
+    // Some firmware puts file metadata under a nested info object. Keep the
+    // fallback narrow so generic counts do not accidentally become file size.
+    for (const containerName of ['metadata', 'meta', 'file_info', 'fileInfo', 'media', 'extra']) {
+      const container = this.asRecord(raw[containerName])
+      for (const key of keys) {
+        const rawValue = container[key]
+        if (rawValue !== undefined && rawValue !== null &&
+          !(typeof rawValue === 'string' && rawValue.trim().length === 0)) {
+          const value = this.numberValue(rawValue)
+          if (value > 0 && Number.isFinite(value)) {
+            return Math.floor(value)
+          }
+        }
+      }
     }
     return 0
   }

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="35" height="36" viewBox="0 0 35 36">
+  <g fill="none" stroke="#FFFFFF" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+    <!-- The large surface is intentionally open where the PiP surface overlaps. -->
+    <path d="M13 28H5c-2.2 0-4-1.8-4-4V11c0-2.2 1.8-4 4-4h18c2.2 0 4 1.8 4 4v5"/>
+    <!-- Diagonal move-to-window arrow from the reference artwork. -->
+    <path d="M8.5 12.5 14 18m0-5v5H9"/>
+    <!-- Foreground floating video surface. -->
+    <rect x="16" y="19" width="12" height="9" rx="2.5"/>
+  </g>
+</svg>
