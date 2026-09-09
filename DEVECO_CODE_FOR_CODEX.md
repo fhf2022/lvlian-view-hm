@@ -14,7 +14,7 @@ Agent 可调用的工具。调用链是：`deveco run` 启动 Agent → 选定 p
 ```powershell
 $deveco = "D:\MyFilePath\NodeJS\node_global\deveco.cmd"
 & $deveco run --agent debug --model westlake/deepseek --format json `
-  --dir "D:\code\harmony\ugreenlink-remote" `
+  --dir "D:\code\harmony\lvlian view\ugreenlink-remote" `
   "请调用 arkts_knowledge_search 查询华为官方 HarmonyOS 文档：<问题或文档 URL>。只返回官方文档标题、链接和与问题直接相关的结论，不要修改工程文件。"
 ```
 

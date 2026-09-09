@@ -22,3 +22,6 @@
 /tmp-*
 /current_*
 /screenshot_*
+
+# Local screenshots, layouts, design references, and validation logs
+/references/
