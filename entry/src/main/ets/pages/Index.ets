@@ -66,6 +66,7 @@ const FLOATING_BAR_HEIGHT_VP: number = 56
 const FLOATING_BAR_MIN_GAP_VP: number = 8
 const FLOATING_BAR_MAX_GAP_VP: number = 16
 const FLOATING_BAR_CONTENT_EXTRA_VP: number = 32
+const FILE_TOOL_HEIGHT_VP: number = 40
 
 interface ViewerReturnScrollOffset {
   xOffset: number
@@ -1442,7 +1443,7 @@ struct Index {
         !this.viewerEntryTransitionActive && !this.viewerFallbackEntryActive &&
         !this.showAudioPlayer && !this.videoPlaybackUiVisible()) {
         Stack({ alignContent: Alignment.TopStart }) {
-          this.TopFileOverlay()
+          this.NativeFileHeader()
         }
         .width('100%')
         .height('100%')
@@ -1450,22 +1451,10 @@ struct Index {
         .hitTestBehavior(HitTestMode.None)
       }
 
-      if (this.contextMenuVisible && this.contextMenuEntry !== null) {
-        this.ActionMenuOverlay(this.contextMenuEntry as FileEntry)
-      }
+      this.ActionMenuOverlay()
 
       if (this.showDestinationPicker) {
         this.DestinationPickerOverlay()
-      }
-      if (this.showRenameDialog && this.renameEntry !== null && !this.showImageViewer &&
-        !this.showDestinationPicker) {
-        this.RenameOverlay()
-      }
-      if (this.showCreateFolderDialog && !this.showImageViewer && !this.showDestinationPicker) {
-        this.CreateFolderOverlay()
-      }
-      if (this.destinationFolderDialog) {
-        this.DestinationFolderOverlay()
       }
       if (this.showImageViewer && this.committedViewerEntry() !== null) {
         this.ImageViewer()
@@ -1476,6 +1465,11 @@ struct Index {
       if (this.showVideoPlayer && this.videoEntry !== null) {
         this.VideoPlayerOverlay(this.videoEntry as FileEntry)
       }
+      // Keep native sheet anchors mounted for both opening and dismissal.
+      this.RenameOverlay()
+      this.CreateFolderOverlay()
+      this.DestinationFolderOverlay()
+      this.ImageViewerDetailsOverlay()
     }
     .width('100%')
     .height('100%')
@@ -2547,6 +2541,25 @@ struct Index {
   }
 
   @Builder
+  NativeFileHeader(): void {
+    Navigation() {}
+      .mode(NavigationMode.Stack)
+      .hideBackButton(true)
+      .hideToolBar(true)
+      .title({ builder: this.TopFileOverlay, height: this.topSafeInset() + 94 }, {
+        barStyle: BarStyle.STACK,
+        paddingStart: LengthMetrics.vp(0),
+        paddingEnd: LengthMetrics.vp(0),
+        backgroundColor: Color.Transparent
+      })
+      .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
+      .width('100%')
+      .height(this.topSafeInset() + 94)
+      .backgroundColor(Color.Transparent)
+      .hitTestBehavior(HitTestMode.Transparent)
+  }
+
+  @Builder
   TopFileOverlay(): void {
     Stack({ alignContent: Alignment.TopStart }) {
       Row()
@@ -3235,6 +3248,28 @@ struct Index {
 
   @Builder
   FloatingBottomBar(): void {
+    Tabs({ barPosition: BarPosition.End }) {
+      TabContent() {}.tabBar(this.HomeBarContent)
+    }
+    .vertical(false)
+    .scrollable(false)
+    .barOverlap(true)
+    .barHeight(FLOATING_BAR_HEIGHT_VP)
+    .barWidth(Math.min(328, this.effectivePageWidth() - 32))
+    .barFloatingStyle({
+      barBottomMargin: 40,
+      maskColor: Color.Transparent,
+      systemMaterial: this.bottomCapsuleMaterial
+    })
+    .width('100%')
+    .height(FLOATING_BAR_HEIGHT_VP + 80)
+    .margin({ bottom: this.floatingBarBottomMargin() - 40 })
+    .clip(false)
+    .hitTestBehavior(HitTestMode.Default)
+  }
+
+  @Builder
+  HomeBarContent(): void {
     Row() {
       this.BottomNavItem($r('sys.symbol.house'), '主页', 'home', () => this.openHome())
       this.BottomNavItem($r('sys.symbol.folder'), '共享', 'shared', () => this.openShared())
@@ -3242,12 +3277,10 @@ struct Index {
         () => this.openDownloads())
       this.BottomNavItem($r('sys.symbol.gearshape'), '设置', 'settings', () => this.openSettings())
     }
-    .width('auto')
+    .width('100%')
     .height(FLOATING_BAR_HEIGHT_VP)
     .padding({ left: 8, right: 8, top: 0, bottom: 0 })
-    .margin({ left: 12, right: 12, bottom: this.floatingBarBottomMargin() })
     .borderRadius(FLOATING_BAR_HEIGHT_VP / 2)
-    .systemMaterial(this.bottomCapsuleMaterial)
     // The capsule is above the scrolling page. Keep a drag that starts here
     // inside the capsule instead of letting the underlying List receive it.
     // Default keeps both this capsule and its nav-item children in the hit
@@ -3257,6 +3290,24 @@ struct Index {
 
   @Builder
   FileToolsBottomBar(): void {
+    Tabs({ barPosition: BarPosition.End }) {
+      TabContent() {}.tabBar(this.FileToolsBarContent)
+    }
+    .vertical(false)
+    .scrollable(false)
+    .barOverlap(true)
+    .barHeight(FILE_TOOL_HEIGHT_VP + 80, true)
+    .barBackgroundColor(Color.Transparent)
+    .barBackgroundBlurStyle(BlurStyle.NONE)
+    .width('100%')
+    .height(FILE_TOOL_HEIGHT_VP + 80)
+    .margin({ bottom: this.floatingBarBottomMargin() - 40 })
+    .clip(false)
+    .hitTestBehavior(HitTestMode.Default)
+  }
+
+  @Builder
+  FileToolsBarContent(): void {
     Row() {
       this.FileToolCircleButton($r('sys.symbol.folder_badge_plus'), () => this.openCreateFolder())
 
@@ -3265,17 +3316,17 @@ struct Index {
           Text(this.fileSortTitle())
             .fontSize(15)
             .fontColor($r('app.color.text_primary'))
-          SymbolGlyph($r('sys.symbol.chevron_down'))
-            .fontSize(15)
+          SymbolGlyph($r('sys.symbol.arrowtriangle_down_fill'))
+            .fontSize(10)
             .fontColor([$r('app.color.icon_primary')])
             .rotate({ angle: this.showFileSortMenu ? 180 : 0 })
         }
         .justifyContent(FlexAlign.Center)
       }
       .type(ButtonType.Normal)
-      .width(166)
-      .height(FLOATING_BAR_HEIGHT_VP)
-      .borderRadius(FLOATING_BAR_HEIGHT_VP / 2)
+      .width(140)
+      .height(FILE_TOOL_HEIGHT_VP)
+      .borderRadius(FILE_TOOL_HEIGHT_VP / 2)
       .backgroundColor(Color.Transparent)
       .systemMaterial(this.bottomCapsuleMaterial)
       .hitTestBehavior(HitTestMode.Default)
@@ -3284,7 +3335,6 @@ struct Index {
       .bindPopup(this.showFileSortMenu, {
         builder: this.FileSortPopup,
         placement: Placement.Top,
-        popupColor: Color.Transparent,
         maskColor: Color.Transparent,
         enableArrow: false,
         autoCancel: true,
@@ -3292,7 +3342,7 @@ struct Index {
         // not provide a HarmonyOS 7-only sort-popup animation name; keep the
         // popup on ArkUI's supported transition path instead of faking one.
         transition: this.fileSortPopupTransition(),
-        systemMaterial: this.bottomCapsuleMaterial,
+        systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
         onStateChange: (state: PopupStateChange): void => {
           if (!state.isVisible) {
             this.showFileSortMenu = false
@@ -3303,14 +3353,33 @@ struct Index {
       this.FileToolCircleButton(this.fileViewModeIcon(), () => this.toggleFileViewMode())
     }
     .width('100%')
-    .padding({ left: 12, right: 12 })
-    .margin({ bottom: this.floatingBarBottomMargin() })
+    .height(FILE_TOOL_HEIGHT_VP + 80)
+    .padding({ left: 16, right: 16 })
     .justifyContent(FlexAlign.SpaceBetween)
     .hitTestBehavior(HitTestMode.Default)
   }
 
   @Builder
   SelectionBottomBar(): void {
+    Tabs({ barPosition: BarPosition.End }) {
+      TabContent() {}.tabBar(this.SelectionBarContent)
+    }
+    .vertical(false)
+    .scrollable(false)
+    .barOverlap(true)
+    .barHeight(FLOATING_BAR_HEIGHT_VP)
+    .barWidth(Math.min(360, this.effectivePageWidth() - 40))
+    .barFloatingStyle({ barBottomMargin: 40, maskColor: Color.Transparent,
+      systemMaterial: this.bottomCapsuleMaterial })
+    .width('100%')
+    .height(FLOATING_BAR_HEIGHT_VP + 80)
+    .margin({ bottom: this.floatingBarBottomMargin() - 40 })
+    .clip(false)
+    .hitTestBehavior(HitTestMode.Default)
+  }
+
+  @Builder
+  SelectionBarContent(): void {
     Row() {
       this.SelectionActionButton($r('sys.symbol.share'), '分享',
         () => this.shareSelectedEntries())
@@ -3321,12 +3390,10 @@ struct Index {
       this.SelectionMoreButton()
     }
     .id('selection_bottom_bar_' + this.selectedEntryCount.toString())
-    .width('calc(100% - 40vp)')
+    .width('100%')
     .height(FLOATING_BAR_HEIGHT_VP)
     .padding({ left: 4, right: 4, top: 0, bottom: 0 })
-    .margin({ left: 20, right: 20, bottom: this.floatingBarBottomMargin() })
     .borderRadius(FLOATING_BAR_HEIGHT_VP / 2)
-    .systemMaterial(this.bottomCapsuleMaterial)
     .hitTestBehavior(HitTestMode.Default)
   }
 
@@ -3385,12 +3452,11 @@ struct Index {
     .bindPopup(this.showSelectionMoreMenu, {
       builder: this.SelectionMorePopup,
       placement: Placement.Top,
-      popupColor: Color.Transparent,
       maskColor: Color.Transparent,
       enableArrow: false,
       autoCancel: true,
       transition: this.fileSortPopupTransition(),
-      systemMaterial: this.bottomCapsuleMaterial,
+      systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
       onStateChange: (state: PopupStateChange): void => {
         if (!state.isVisible) {
           this.showSelectionMoreMenu = false
@@ -3443,7 +3509,6 @@ struct Index {
     .width(228)
     .padding({ left: 10, right: 10, top: 8, bottom: 8 })
     .borderRadius(22)
-    .systemMaterial(this.bottomCapsuleMaterial)
     .hitTestBehavior(HitTestMode.Default)
   }
 
@@ -3474,13 +3539,13 @@ struct Index {
   FileToolCircleButton(icon: Resource, action: () => void): void {
     Button() {
       SymbolGlyph(icon)
-        .fontSize(24)
+        .fontSize(22)
         .fontColor([$r('app.color.icon_primary')])
     }
     .type(ButtonType.Normal)
-    .width(FLOATING_BAR_HEIGHT_VP)
-    .height(FLOATING_BAR_HEIGHT_VP)
-    .borderRadius(FLOATING_BAR_HEIGHT_VP / 2)
+    .width(FILE_TOOL_HEIGHT_VP)
+    .height(FILE_TOOL_HEIGHT_VP)
+    .borderRadius(FILE_TOOL_HEIGHT_VP / 2)
     .backgroundColor(Color.Transparent)
     .systemMaterial(this.bottomCapsuleMaterial)
     .hitTestBehavior(HitTestMode.Default)
@@ -3499,7 +3564,6 @@ struct Index {
     .width(226)
     .padding({ left: 12, right: 12, top: 8, bottom: 8 })
     .borderRadius(24)
-    .systemMaterial(this.bottomCapsuleMaterial)
     .hitTestBehavior(HitTestMode.Default)
   }
 
@@ -3765,64 +3829,38 @@ struct Index {
   }
 
   @Builder
-  ActionMenuOverlay(entry: FileEntry): void {
-    Stack({ alignContent: Alignment.TopStart }) {
-      Column()
-        .width('100%')
-        .height('100%')
-        .backgroundColor(this.isDarkTheme ? '#42000000' : '#26000000')
-        .backgroundBlurStyle(BlurStyle.Thick, {
-          colorMode: ThemeColorMode.SYSTEM,
-          adaptiveColor: AdaptiveColor.DEFAULT
-        })
-        .transition(TransitionEffect.opacity(0).animation({
-          duration: 180,
-          curve: Curve.EaseOut
-        }))
-        .hitTestBehavior(HitTestMode.None)
-        .transition(TransitionEffect.opacity(0).animation({
-          duration: 160,
-          curve: Curve.EaseOut
-        }))
+  ActionMenuOverlay(): void {
+    Column() {}
+      .width(1)
+      .height(1)
+      .position({ x: 20, y: this.contextMenuEntry !== null
+        ? this.actionMenuTop(this.contextMenuEntry as FileEntry) : this.topSafeInset() + 94 })
+      .hitTestBehavior(HitTestMode.None)
+      .bindPopup(this.contextMenuVisible, {
+        builder: this.NativeActionMenuContent,
+        placement: Placement.BottomRight,
+        enableArrow: false,
+        autoCancel: true,
+        maskColor: '#26000000',
+        systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
+        onStateChange: (state: PopupStateChange) => {
+          if (!state.isVisible && this.contextMenuVisible) {
+            this.closeActionMenu()
+          }
+        }
+      })
+  }
 
-      // Use a real clickable node for the transparent mask. A transparent
-      // layout container can be skipped by hit testing on some API 26 builds;
-      // Button + Block is the documented self-hit-test path and also prevents
-      // the tap from falling through to the List.
-      Button() {
-        Row()
-          .width(1)
-          .height(1)
+  @Builder
+  NativeActionMenuContent(): void {
+    Column({ space: 8 }) {
+      if (this.contextMenuEntry !== null) {
+        this.ActionContextPreview(this.contextMenuEntry as FileEntry)
+        this.ActionContextMenu(this.contextMenuEntry as FileEntry)
       }
-      .type(ButtonType.Normal)
-      .width('100%')
-      .height('100%')
-      .padding(0)
-      .borderRadius(0)
-      .backgroundColor(Color.Transparent)
-      .stateEffect(false)
-      .hitTestBehavior(HitTestMode.Block)
-      .onClick(() => this.closeActionMenu())
-
-      Column({ space: 8 }) {
-        this.ActionContextPreview(entry)
-        this.ActionContextMenu(entry)
-      }
-      .alignItems(HorizontalAlign.Start)
-      .position({ x: 20, y: this.actionMenuTop(entry) })
-      .transition(this.actionMenuSurfaceTransition())
-      .hitTestBehavior(HitTestMode.Default)
-      .monopolizeEvents(true)
-      // The preview card is wider than the action list. The uncovered strip
-      // on the right belongs to this wrapper, so it must dismiss the menu.
-      .onClick(() => this.closeActionMenu())
     }
-    .width('100%')
-    .height('100%')
-    .hitTestBehavior(HitTestMode.Default)
-    // The root surface owns the empty area to the right and below the menu.
-    // It must close the long-press state instead of consuming that tap.
-    .onClick(() => this.closeActionMenu())
+    .alignItems(HorizontalAlign.Start)
+    .padding(8)
   }
 
   /**
@@ -3895,7 +3933,6 @@ struct Index {
     .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
     .borderRadius(22)
     .clip(true)
-    .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, true))
   }
 
   @Builder
@@ -4330,176 +4367,208 @@ struct Index {
 
   @Builder
   DestinationFolderOverlay(): void {
-    Column() {
-      Column({ space: 14 }) {
-        Text('新建文件夹')
-          .fontSize(20)
-          .fontWeight(FontWeight.Bold)
-          .fontColor($r('app.color.text_primary'))
-          .width('100%')
-        Column({ space: 2 }) {
-          TextInput({ placeholder: '输入文件夹名称', text: this.destinationFolderText })
-            .height(40)
-            .fontSize(16)
-            .fontColor($r('app.color.text_primary'))
-            .backgroundColor(Color.Transparent)
-            .border({ width: 0, color: Color.Transparent, radius: 0 })
-            .padding({ left: 14, right: 14 })
-            .onChange((value: string) => this.destinationFolderText = value)
-          Divider()
-            .width('100%')
-            .strokeWidth(0.5)
-            .color($r('app.color.divider'))
-            .margin({ left: 14, right: 14 })
+    Column() {}
+      .width(0)
+      .height(0)
+      .bindSheet($$this.destinationFolderDialog, this.DestinationFolderOverlayContent, {
+        preferType: SheetType.CENTER,
+        height: SheetSize.FIT_CONTENT,
+        width: '84%',
+        dragBar: false,
+        showClose: false,
+        systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
+        onWillDismiss: () => {
+          if (!this.destinationLoading) {
+            this.closeDestinationFolderDialog()
+          }
         }
-        Row({ space: 8 }) {
-          Button('取消')
-            .layoutWeight(1)
-            .height(42)
-            .fontSize(15)
-            .fontColor($r('app.color.text_secondary'))
-            .backgroundColor(Color.Transparent)
-            .stateEffect(false)
-            .onClick(() => this.closeDestinationFolderDialog())
-          Button(this.destinationLoading ? '处理中…' : '确定')
-            .layoutWeight(1)
-            .height(42)
-            .fontSize(15)
-            .fontColor('#2E6BFF')
-            .backgroundColor(Color.Transparent)
-            .stateEffect(false)
-            .enabled(!this.destinationLoading)
-            .onClick(() => this.confirmDestinationFolder())
-        }
+      })
+  }
+
+  @Builder
+  DestinationFolderOverlayContent(): void {
+    Column({ space: 14 }) {
+      Text('新建文件夹')
+        .fontSize(20)
+        .fontWeight(FontWeight.Bold)
+        .fontColor($r('app.color.text_primary'))
         .width('100%')
+      Column({ space: 2 }) {
+        TextInput({ placeholder: '输入文件夹名称', text: this.destinationFolderText })
+          .height(40)
+          .fontSize(16)
+          .fontColor($r('app.color.text_primary'))
+          .backgroundColor(Color.Transparent)
+          .border({ width: 0, color: Color.Transparent, radius: 0 })
+          .padding({ left: 14, right: 14 })
+          .onChange((value: string) => this.destinationFolderText = value)
+        Divider()
+          .width('100%')
+          .strokeWidth(0.5)
+          .color($r('app.color.divider'))
+          .margin({ left: 14, right: 14 })
       }
-      .width('84%')
-      .padding({ left: 18, right: 18, top: 18, bottom: 12 })
-      .borderRadius(24)
-      .backgroundColor(Color.Transparent)
-      .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN))
-      .transition(this.createFolderDialogTransition())
-      .onClick(() => {})
+      Row({ space: 8 }) {
+        Button('取消')
+          .layoutWeight(1)
+          .height(42)
+          .fontSize(15)
+          .fontColor($r('app.color.text_secondary'))
+          .backgroundColor(Color.Transparent)
+          .stateEffect(false)
+          .onClick(() => this.closeDestinationFolderDialog())
+        Button(this.destinationLoading ? '处理中…' : '确定')
+          .layoutWeight(1)
+          .height(42)
+          .fontSize(15)
+          .fontColor('#2E6BFF')
+          .backgroundColor(Color.Transparent)
+          .stateEffect(false)
+          .enabled(!this.destinationLoading)
+          .onClick(() => this.confirmDestinationFolder())
+      }
+      .width('100%')
     }
     .width('100%')
-    .height('100%')
-    .justifyContent(FlexAlign.Center)
-    .backgroundColor('#55000000')
-    .hitTestBehavior(HitTestMode.Default)
+    .padding({ left: 18, right: 18, top: 18, bottom: 12 })
+    .borderRadius(24)
+    .backgroundColor(Color.Transparent)
+    .onClick(() => {})
   }
 
   @Builder
   RenameOverlay(): void {
-    Column() {
-      Column({ space: 16 }) {
-        Text('重命名')
-          .fontSize(20)
-          .fontWeight(FontWeight.Bold)
-          .fontColor($r('app.color.text_primary'))
-          .width('100%')
-        TextInput({ placeholder: '输入新名称', text: this.renameText })
-          .height(50)
-          .fontSize(16)
-          .fontColor($r('app.color.text_primary'))
-          .backgroundColor(Color.Transparent)
-          .borderRadius(12)
-          .padding({ left: 14, right: 14 })
-          .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true))
-          .onChange((value: string) => this.renameText = value)
-        Row({ space: 10 }) {
-          Button('取消')
-            .layoutWeight(1)
-            .height(46)
-            .fontSize(15)
-            .fontColor($r('app.color.text_secondary'))
-            .backgroundColor(Color.Transparent)
-            .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN))
-            .onClick(() => this.closeRename())
-          Button(this.isBusy ? '处理中…' : '确定')
-            .layoutWeight(1)
-            .height(46)
-            .fontSize(15)
-            .fontColor(Color.White)
-            .backgroundColor(Color.Transparent)
-            .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true, '#552E6BFF'))
-            .enabled(!this.isBusy)
-            .onClick(() => this.confirmRename())
+    Column() {}
+      .width(0)
+      .height(0)
+      .bindSheet($$this.showRenameDialog, this.RenameOverlayContent, {
+        preferType: SheetType.CENTER,
+        height: SheetSize.FIT_CONTENT,
+        width: '88%',
+        dragBar: false,
+        showClose: false,
+        systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
+        onWillDismiss: () => {
+          if (!this.isBusy) {
+            this.closeRename()
+          }
         }
+      })
+  }
+
+  @Builder
+  RenameOverlayContent(): void {
+    Column({ space: 16 }) {
+      Text('重命名')
+        .fontSize(20)
+        .fontWeight(FontWeight.Bold)
+        .fontColor($r('app.color.text_primary'))
         .width('100%')
+      TextInput({ placeholder: '输入新名称', text: this.renameText })
+        .height(50)
+        .fontSize(16)
+        .fontColor($r('app.color.text_primary'))
+        .backgroundColor(Color.Transparent)
+        .borderRadius(12)
+        .padding({ left: 14, right: 14 })
+        .onChange((value: string) => this.renameText = value)
+      Row({ space: 10 }) {
+        Button('取消')
+          .layoutWeight(1)
+          .height(46)
+          .fontSize(15)
+          .fontColor($r('app.color.text_secondary'))
+          .backgroundColor(Color.Transparent)
+          .onClick(() => this.closeRename())
+        Button(this.isBusy ? '处理中…' : '确定')
+          .layoutWeight(1)
+          .height(46)
+          .fontSize(15)
+          .fontColor('#2E6BFF')
+          .backgroundColor(Color.Transparent)
+          .enabled(!this.isBusy)
+          .onClick(() => this.confirmRename())
       }
-      .width('88%')
-      .borderRadius(20)
-      .padding(20)
-      .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THICK, false))
-      .onClick(() => {})
+      .width('100%')
     }
     .width('100%')
-    .height('100%')
-    .justifyContent(FlexAlign.Center)
-    .backgroundColor('#66000000')
+    .borderRadius(20)
+    .padding(20)
+    .onClick(() => {})
   }
 
   @Builder
   CreateFolderOverlay(): void {
-    Column() {
-      Column({ space: 14 }) {
-        Text('新建文件夹')
-          .fontSize(20)
-          .fontWeight(FontWeight.Bold)
-          .fontColor($r('app.color.text_primary'))
-          .width('100%')
-        Column({ space: 2 }) {
-          TextInput({ placeholder: '输入文件夹名称', text: this.newFolderText })
-            .height(40)
-            .fontSize(16)
-            .fontColor($r('app.color.text_primary'))
-            // Keep the input as the transparent text area above the divider.
-            // An explicit background/border becomes an unintended rectangular
-            // frame in dark mode and does not match the reference dialog.
-            .backgroundColor(Color.Transparent)
-            .border({ width: 0, color: Color.Transparent, radius: 0 })
-            .padding({ left: 14, right: 14 })
-            .onChange((value: string) => this.newFolderText = value)
-          Divider()
-            .width('100%')
-            .strokeWidth(0.5)
-            .color($r('app.color.divider'))
-            .margin({ left: 14, right: 14 })
+    Column() {}
+      .width(0)
+      .height(0)
+      .bindSheet($$this.showCreateFolderDialog, this.CreateFolderOverlayContent, {
+        preferType: SheetType.CENTER,
+        height: SheetSize.FIT_CONTENT,
+        width: '84%',
+        dragBar: false,
+        showClose: false,
+        systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
+        onWillDismiss: () => {
+          if (!this.isBusy) {
+            this.closeCreateFolder()
+          }
         }
-        Row({ space: 8 }) {
-          Button('取消')
-            .layoutWeight(1)
-            .height(42)
-            .fontSize(15)
-            .fontColor($r('app.color.text_secondary'))
-            .backgroundColor(Color.Transparent)
-            .stateEffect(false)
-            .onClick(() => this.closeCreateFolder())
-          Button(this.isBusy ? '处理中…' : '确定')
-            .layoutWeight(1)
-            .height(42)
-            .fontSize(15)
-            .fontColor('#2E6BFF')
-            .backgroundColor(Color.Transparent)
-            .stateEffect(false)
-            .enabled(!this.isBusy)
-            .onClick(() => this.confirmCreateFolder())
-        }
+      })
+  }
+
+  @Builder
+  CreateFolderOverlayContent(): void {
+    Column({ space: 14 }) {
+      Text('新建文件夹')
+        .fontSize(20)
+        .fontWeight(FontWeight.Bold)
+        .fontColor($r('app.color.text_primary'))
         .width('100%')
+      Column({ space: 2 }) {
+        TextInput({ placeholder: '输入文件夹名称', text: this.newFolderText })
+          .height(40)
+          .fontSize(16)
+          .fontColor($r('app.color.text_primary'))
+          // Keep the input as the transparent text area above the divider.
+          // An explicit background/border becomes an unintended rectangular
+          // frame in dark mode and does not match the reference dialog.
+          .backgroundColor(Color.Transparent)
+          .border({ width: 0, color: Color.Transparent, radius: 0 })
+          .padding({ left: 14, right: 14 })
+          .onChange((value: string) => this.newFolderText = value)
+        Divider()
+          .width('100%')
+          .strokeWidth(0.5)
+          .color($r('app.color.divider'))
+          .margin({ left: 14, right: 14 })
       }
-      .width('84%')
-      .padding({ left: 18, right: 18, top: 18, bottom: 12 })
-      .borderRadius(24)
-      .backgroundColor(Color.Transparent)
-      .systemMaterial(this.bottomCapsuleMaterial)
-      .transition(this.createFolderDialogTransition())
-      .onClick(() => {})
+      Row({ space: 8 }) {
+        Button('取消')
+          .layoutWeight(1)
+          .height(42)
+          .fontSize(15)
+          .fontColor($r('app.color.text_secondary'))
+          .backgroundColor(Color.Transparent)
+          .stateEffect(false)
+          .onClick(() => this.closeCreateFolder())
+        Button(this.isBusy ? '处理中…' : '确定')
+          .layoutWeight(1)
+          .height(42)
+          .fontSize(15)
+          .fontColor('#2E6BFF')
+          .backgroundColor(Color.Transparent)
+          .stateEffect(false)
+          .enabled(!this.isBusy)
+          .onClick(() => this.confirmCreateFolder())
+      }
+      .width('100%')
     }
     .width('100%')
-    .height('100%')
-    .justifyContent(FlexAlign.Center)
+    .padding({ left: 18, right: 18, top: 18, bottom: 12 })
+    .borderRadius(24)
     .backgroundColor(Color.Transparent)
-    .hitTestBehavior(HitTestMode.Default)
+    .onClick(() => {})
   }
 
   private copyImageVisualState(source?: ImageVisualState): ImageVisualState {
@@ -5587,15 +5656,6 @@ struct Index {
       .translate({ x: 0, y: this.imageBottomChromeOffsetY, z: 0 })
       .hitTestBehavior(HitTestMode.None)
 
-      if (this.showImageMoreMenu && this.viewerOverlayEntry !== null) {
-        this.ImageViewerMoreOverlay()
-      }
-      if (this.showImageDetails && this.viewerOverlayEntry !== null) {
-        this.ImageViewerDetailsOverlay()
-      }
-      if (this.showRenameDialog && this.renameEntry !== null) {
-        this.RenameOverlay()
-      }
     }
     .width('100%')
     .height('100%')
@@ -5805,6 +5865,26 @@ struct Index {
 
   @Builder
   ImageViewerBottomBar(): void {
+    Tabs({ barPosition: BarPosition.End }) {
+      TabContent() {}.tabBar(this.ImageViewerBarContent)
+    }
+    .vertical(false)
+    .scrollable(false)
+    .barOverlap(true)
+    .barHeight(FLOATING_BAR_HEIGHT_VP)
+    .barWidth(this.viewerBottomBarWidthVp > 0 ? this.viewerBottomBarWidthVp :
+      Math.min(360, this.effectivePageWidth() - 32))
+    .barFloatingStyle({ barBottomMargin: 40, maskColor: Color.Transparent,
+      systemMaterial: this.bottomCapsuleMaterial })
+    .width('100%')
+    .height(FLOATING_BAR_HEIGHT_VP + 80)
+    .margin({ bottom: this.floatingBarBottomMargin() - 40 })
+    .clip(false)
+    .hitTestBehavior(HitTestMode.Default)
+  }
+
+  @Builder
+  ImageViewerBarContent(): void {
     Row() {
       this.ImageViewerActionItem($r('sys.symbol.square_and_arrow_down'), '保存',
         () => this.saveCommittedViewerImage())
@@ -5835,15 +5915,12 @@ struct Index {
       .onClick(() => this.loadCommittedViewerOriginalManually())
       this.ImageViewerActionItem($r('sys.symbol.trash'), '删除',
         () => this.deleteCommittedViewerImage())
-      this.ImageViewerActionItem($r('sys.symbol.ellipsis_circle'), '更多',
-        () => this.openImageMoreMenu())
+      this.ImageViewerMoreButton()
     }
-    .width(this.viewerBottomBarWidthVp > 0 ? this.viewerBottomBarWidthVp : '92%')
+    .width('100%')
     .height(FLOATING_BAR_HEIGHT_VP)
     .padding({ left: 8, right: 8, top: 0, bottom: 0 })
-    .margin({ left: 12, right: 12, bottom: this.floatingBarBottomMargin() })
     .borderRadius(FLOATING_BAR_HEIGHT_VP / 2)
-    .systemMaterial(this.bottomCapsuleMaterial)
     .onAreaChange((_, area) => {
       if (this.viewerBottomBarWidthVp <= 0 &&
         typeof area.width === 'number' && area.width > 0) {
@@ -5881,37 +5958,41 @@ struct Index {
   }
 
   @Builder
-  ImageViewerMoreOverlay(): void {
-    Stack() {
-      Column()
-        .width('100%')
-        .height('100%')
-        .onClick(() => this.closeImageMoreMenu())
-      Column() {
-        this.ImageViewerMoreRow($r('sys.symbol.arrow_2_circlepath'), '旋转',
-          () => this.rotateViewerOverlayImage(), true)
-        this.ImageViewerMoreRow($r('sys.symbol.rectangle_and_arrowshape_turn_up_right'), '其他应用打开',
-          () => this.openViewerOverlayWithOtherApp(), true)
-        this.ImageViewerMoreRow($r('sys.symbol.rectangle_on_rectangle'), '重命名',
-          () => this.openRenameFromViewerOverlay(), true)
-        this.ImageViewerMoreRow($r('sys.symbol.doc'), '详情',
-          () => this.openImageDetails(), false)
-      }
-      .width('88%')
-      .padding({ left: 10, right: 10, top: 8, bottom: 8 })
-      .borderRadius(22)
-      .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false))
-      // The menu is attached to the bottom action capsule, so it grows from
-      // its lower edge instead of appearing at the center of the page.
-      .transition(this.imageMoreMenuTransition())
-      .onClick(() => {})
-      .margin({ bottom: this.floatingBarBottomMargin() + FLOATING_BAR_HEIGHT_VP + 8 })
+  ImageViewerMoreButton(): void {
+    Row() {
+      this.ImageViewerActionItem($r('sys.symbol.ellipsis_circle'), '更多',
+        () => this.openImageMoreMenu())
     }
-    .width('100%')
+    .layoutWeight(1)
     .height('100%')
-    .alignContent(Alignment.Bottom)
-    .backgroundColor('#22000000')
-    .transition(this.imageMoreOverlayTransition())
+    .bindPopup(this.showImageMoreMenu, {
+      builder: this.ImageViewerMoreContent,
+      placement: Placement.Top,
+      enableArrow: false,
+      autoCancel: true,
+      systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
+      onStateChange: (state: PopupStateChange) => {
+        if (!state.isVisible && this.showImageMoreMenu) {
+          this.closeImageMoreMenu()
+        }
+      }
+    })
+  }
+
+  @Builder
+  ImageViewerMoreContent(): void {
+    Column() {
+      this.ImageViewerMoreRow($r('sys.symbol.arrow_2_circlepath'), '旋转',
+        () => this.rotateViewerOverlayImage(), true)
+      this.ImageViewerMoreRow($r('sys.symbol.rectangle_and_arrowshape_turn_up_right'), '其他应用打开',
+        () => this.openViewerOverlayWithOtherApp(), true)
+      this.ImageViewerMoreRow($r('sys.symbol.rectangle_on_rectangle'), '重命名',
+        () => this.openRenameFromViewerOverlay(), true)
+      this.ImageViewerMoreRow($r('sys.symbol.doc'), '详情',
+        () => this.openImageDetails(), false)
+    }
+    .width(Math.min(340, this.effectivePageWidth() - 40))
+    .padding({ left: 10, right: 10, top: 8, bottom: 8 })
   }
 
   /**
@@ -5997,43 +6078,49 @@ struct Index {
 
   @Builder
   ImageViewerDetailsOverlay(): void {
-    Column() {
-      Blank()
-        .layoutWeight(1)
-        .onClick(() => this.closeImageDetails())
-      Column({ space: 12 }) {
-        Row() {
-          Text('详情')
-            .fontSize(20)
-            .fontWeight(FontWeight.Bold)
-            .fontColor($r('app.color.text_primary'))
-            .layoutWeight(1)
-          Text('×')
-            .fontSize(28)
-            .fontColor($r('app.color.text_tertiary'))
-            .onClick(() => this.closeImageDetails())
-        }
-        .width('100%')
+    Column() {}
+      .width(0)
+      .height(0)
+      .bindSheet($$this.showImageDetails, this.ImageViewerDetailsContent, {
+        height: SheetSize.FIT_CONTENT,
+        dragBar: false,
+        showClose: false,
+        systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
+        onWillDismiss: () => this.closeImageDetails()
+      })
+  }
 
-        this.ImageDetailsLine('文件名', (this.viewerOverlayEntry as FileEntry).name)
-        this.ImageDetailsLine('路径', this.entryDisplayPath(this.viewerOverlayEntry as FileEntry))
-        this.ImageDetailsLine('大小', this.formatSize((this.viewerOverlayEntry as FileEntry).size))
-        this.ImageDetailsLine('修改时间',
-          this.formatTime((this.viewerOverlayEntry as FileEntry).modifiedTime))
-        this.ImageDetailsLine('文件类型',
-          this.fileType(this.viewerOverlayEntry as FileEntry).length > 0
-            ? this.fileType(this.viewerOverlayEntry as FileEntry) : '图片')
+  @Builder
+  ImageViewerDetailsContent(): void {
+    if (this.viewerOverlayEntry !== null) {
+    Column({ space: 12 }) {
+      Row() {
+        Text('详情')
+          .fontSize(20)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+          .layoutWeight(1)
+        Text('×')
+          .fontSize(28)
+          .fontColor($r('app.color.text_tertiary'))
+          .onClick(() => this.closeImageDetails())
       }
-      .width('90%')
-      .padding({ left: 20, right: 20, top: 18, bottom: 20 })
-      .borderRadius(22)
-      .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false))
-      .onClick(() => {})
-      .margin({ bottom: this.bottomSafeInset() + 24 })
+      .width('100%')
+
+      this.ImageDetailsLine('文件名', (this.viewerOverlayEntry as FileEntry).name)
+      this.ImageDetailsLine('路径', this.entryDisplayPath(this.viewerOverlayEntry as FileEntry))
+      this.ImageDetailsLine('大小', this.formatSize((this.viewerOverlayEntry as FileEntry).size))
+      this.ImageDetailsLine('修改时间',
+        this.formatTime((this.viewerOverlayEntry as FileEntry).modifiedTime))
+      this.ImageDetailsLine('文件类型',
+        this.fileType(this.viewerOverlayEntry as FileEntry).length > 0
+          ? this.fileType(this.viewerOverlayEntry as FileEntry) : '图片')
     }
     .width('100%')
-    .height('100%')
-    .backgroundColor('#22000000')
+    .padding({ left: 20, right: 20, top: 18, bottom: 20 })
+    .borderRadius(22)
+    .onClick(() => {})
+    }
   }
 
   @Builder
