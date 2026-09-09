@@ -303,8 +303,7 @@ struct Index {
   @State downloadSpeedBytesPerSecond: number = 0
   @State contextMenuVisible: boolean = false
   @State contextMenuEntry: FileEntry | null = null
-  @State contextMenuAnchorX: number = 0
-  @State contextMenuAnchorY: number = 0
+  @State contextMenuSourceY: number = 0
   @State showDestinationPicker: boolean = false
   @State destinationOperation: DestinationOperation = 'copy'
   @State destinationPath: string = ''
@@ -535,7 +534,6 @@ struct Index {
   private destinationTreeRequestToken: number = 0
   private destinationPickerCloseToken: number = 0
   private pendingContextAction: (() => void) | null = null
-  private contextMenuAnimationToken: number = 0
   private fileEntryDataSource: FileEntryDataSource = new FileEntryDataSource()
   private waterfallDataSource: FileEntryDataSource = new FileEntryDataSource()
   private viewerImageDataSource: FileEntryDataSource = new FileEntryDataSource()
@@ -1155,7 +1153,7 @@ struct Index {
 
   private shouldShowFileToolsBar(): boolean {
     return this.screen === 'files' && !this.showSearch &&
-      !this.shouldShowBottomBar() && !this.contextMenuVisible &&
+      !this.shouldShowBottomBar() && this.contextMenuEntry === null &&
       !this.showRenameDialog &&
       !this.showImageViewer && !this.viewerEntryTransitionActive &&
       !this.viewerFallbackEntryActive &&
@@ -1331,7 +1329,7 @@ struct Index {
       this.closeRename()
       return true
     }
-    if (this.contextMenuVisible) {
+    if (this.contextMenuEntry !== null) {
       this.closeActionMenu()
       return true
     }
@@ -1422,7 +1420,7 @@ struct Index {
       })
 
       if ((this.screen === 'files' || this.screen === 'downloads' || this.screen === 'settings') &&
-        !this.contextMenuVisible && !this.showRenameDialog &&
+        this.contextMenuEntry === null && !this.showRenameDialog &&
         !this.showDestinationPicker &&
         !this.showImageViewer &&
         !this.viewerEntryTransitionActive &&
@@ -3766,12 +3764,61 @@ struct Index {
 
   /**
    * Native ContextMenu preview.  The preview and the action list are two
-   * separate builders on purpose: HarmonyOS can then run the same long-press
-   * morph/scale animation as Files instead of animating a full-screen custom
-   * overlay from a guessed top offset.
+   * separate builders so ArkUI owns their preview movement and dismissal.
    */
   @Builder
   ActionContextPreview(entry: FileEntry): void {
+    Navigation() {}
+      .mode(NavigationMode.Stack)
+      .hideBackButton(true)
+      .hideToolBar(true)
+      .title({ builder: this.ActionContextPreviewCard.bind(this, entry), height: 58 }, {
+        barStyle: BarStyle.STACK,
+        paddingStart: LengthMetrics.vp(0),
+        paddingEnd: LengthMetrics.vp(0),
+        backgroundColor: Color.Transparent
+      })
+      .width(Math.min(324, this.effectivePageWidth() - 52))
+      .height(58)
+      .backgroundColor(Color.Transparent)
+      .clip(false)
+  }
+
+  @Builder
+  ActionMenuOverlay(): void {
+    Column() {}
+      .width(Math.min(324, this.effectivePageWidth() - 52))
+      .height(58)
+      .position({ x: 26, y: this.contextMenuSourceY })
+      .hitTestBehavior(HitTestMode.None)
+      .bindContextMenu(this.contextMenuVisible, this.NativeActionMenuContent, {
+        preview: this.NativeActionMenuPreview,
+        previewAnimationOptions: { scale: [1, 1] },
+        placement: Placement.BottomLeft,
+        borderRadius: 22,
+        transition: this.actionMenuSurfaceTransition(),
+        systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
+        onWillDisappear: () => { this.contextMenuVisible = false },
+        onDidDisappear: () => this.finishActionMenuDismiss()
+      })
+  }
+
+  @Builder
+  NativeActionMenuPreview(): void {
+    if (this.contextMenuEntry !== null) {
+      this.ActionContextPreview(this.contextMenuEntry as FileEntry)
+    }
+  }
+
+  @Builder
+  NativeActionMenuContent(): void {
+    if (this.contextMenuEntry !== null) {
+      this.ActionContextMenu(this.contextMenuEntry as FileEntry)
+    }
+  }
+
+  @Builder
+  ActionContextPreviewCard(entry: FileEntry): void {
     Row() {
       this.FileLeadingVisual(entry)
       Column({ space: 2 }) {
@@ -3792,118 +3839,90 @@ struct Index {
       .layoutWeight(1)
       .margin({ left: 10 })
     }
-    .width(304)
+    .width('100%')
     .height(58)
     .padding({ left: 12, right: 12 })
     .borderRadius(20)
-    .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true))
-  }
-
-  @Builder
-  ActionMenuOverlay(): void {
-    Column() {}
-      .width(1)
-      .height(1)
-      .position({ x: 20, y: this.contextMenuEntry !== null
-        ? this.actionMenuTop(this.contextMenuEntry as FileEntry) : this.topSafeInset() + 94 })
-      .hitTestBehavior(HitTestMode.None)
-      .bindPopup(this.contextMenuVisible, {
-        builder: this.NativeActionMenuContent,
-        placement: Placement.BottomRight,
-        enableArrow: false,
-        autoCancel: true,
-        maskColor: '#26000000',
-        systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
-        onStateChange: (state: PopupStateChange) => {
-          if (!state.isVisible && this.contextMenuVisible) {
-            this.closeActionMenu()
-          }
-        }
-      })
-  }
-
-  @Builder
-  NativeActionMenuContent(): void {
-    Column({ space: 8 }) {
-      if (this.contextMenuEntry !== null) {
-        this.ActionContextPreview(this.contextMenuEntry as FileEntry)
-        this.ActionContextMenu(this.contextMenuEntry as FileEntry)
-      }
-    }
-    .alignItems(HorizontalAlign.Start)
-    .padding(8)
+    .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, false))
   }
 
   /**
    * Native ContextMenu content.  Widths and section rhythm follow the Files
-   * reference: a compact menu (about 212vp) below a wider selected-item card,
+   * reference: a compact menu (224vp) below a wider selected-item card,
    * with quick actions in the first group and destructive actions at the end.
    */
   @Builder
   ActionContextMenu(entry: FileEntry): void {
-    Scroll() {
-      Column() {
-        Row() {
-          if (entry.isDirectory) {
-            this.ActionQuickButton($r('sys.symbol.doc'), '复制',
-              () => this.beginDestinationPicker('copy', entry))
-            this.ActionQuickButton($r('sys.symbol.folder'), '移动',
-              () => this.beginDestinationPicker('move', entry))
-          } else {
-            if (this.actionSupportsShare(entry)) {
-              this.ActionQuickButton($r('sys.symbol.share'), '分享',
-                () => this.shareViewerImage(entry))
+    Menu() {
+      MenuItem() {
+        Scroll() {
+          Column() {
+            Row() {
+              if (entry.isDirectory) {
+                this.ActionQuickButton($r('sys.symbol.doc'), '复制',
+                  () => this.beginDestinationPicker('copy', entry))
+                this.ActionQuickButton($r('sys.symbol.folder'), '移动',
+                  () => this.beginDestinationPicker('move', entry))
+              } else {
+                if (this.actionSupportsShare(entry)) {
+                  this.ActionQuickButton($r('sys.symbol.share'), '分享',
+                    () => this.shareViewerImage(entry))
+                }
+                this.ActionQuickButton($r('sys.symbol.doc'), '复制',
+                  () => this.beginDestinationPicker('copy', entry))
+                this.ActionQuickButton($r('sys.symbol.folder'), '移动',
+                  () => this.beginDestinationPicker('move', entry))
+              }
             }
-            this.ActionQuickButton($r('sys.symbol.doc'), '复制',
-              () => this.beginDestinationPicker('copy', entry))
-            this.ActionQuickButton($r('sys.symbol.folder'), '移动',
-              () => this.beginDestinationPicker('move', entry))
+            .width('100%')
+            .height(58)
+
+            this.ActionSectionGap()
+
+            if (!entry.isDirectory && this.actionSupportsOpenWith(entry)) {
+              this.ActionMenuRow($r('sys.symbol.square_and_arrow_down'), '其他应用打开',
+                () => this.openWithOtherApp(entry), false, true)
+              this.ActionSectionGap()
+            }
+
+            if (!entry.isDirectory && this.actionSupportsQuickView(entry)) {
+              this.ActionMenuRow($r('sys.symbol.play'), '快速查看',
+                () => this.quickView(entry), false, false)
+            }
+            this.ActionMenuRow($r('sys.symbol.list_bullet_square'), '多选',
+              () => this.enterSelection(entry), false, false)
+            this.ActionMenuRow($r('sys.symbol.square_and_arrow_down'), '下载',
+              () => this.downloadEntryFromMenu(entry), false, false)
+            if (!entry.isDirectory && this.isMedia(entry)) {
+              this.ActionMenuRow($r('sys.symbol.doc'), '保存图库',
+                () => this.saveToGallery(entry), false, !this.actionHasLocalCache(entry))
+            }
+            if (!entry.isDirectory && this.actionHasLocalCache(entry)) {
+              this.ActionMenuRow($r('sys.symbol.arrow_down'), '释放缓存',
+                () => this.releaseCache(entry), false, false)
+            }
+            this.ActionMenuRow($r('sys.symbol.doc_text'), '重命名',
+              () => this.openRename(entry), false, true)
+
+            this.ActionSectionGap()
+
+            this.ActionMenuRow($r('sys.symbol.doc'), '详情',
+              () => this.showEntryDetails(entry), false, false)
+            this.ActionMenuRow($r('sys.symbol.trash'), '删除',
+              () => this.deleteEntry(entry), true, true)
           }
+          .width('100%')
         }
-        .width('100%')
-        .height(58)
-
-        this.ActionSectionGap()
-
-        if (!entry.isDirectory && this.actionSupportsOpenWith(entry)) {
-          this.ActionMenuRow($r('sys.symbol.square_and_arrow_down'), '其他应用打开',
-            () => this.openWithOtherApp(entry), false, true)
-          this.ActionSectionGap()
-        }
-
-        if (!entry.isDirectory && this.actionSupportsQuickView(entry)) {
-          this.ActionMenuRow($r('sys.symbol.play'), '快速查看',
-            () => this.quickView(entry), false, false)
-        }
-        this.ActionMenuRow($r('sys.symbol.list_bullet_square'), '多选',
-          () => this.enterSelection(entry), false, false)
-        this.ActionMenuRow($r('sys.symbol.square_and_arrow_down'), '下载',
-          () => this.downloadEntryFromMenu(entry), false, false)
-        if (!entry.isDirectory && this.isMedia(entry)) {
-          this.ActionMenuRow($r('sys.symbol.doc'), '保存图库',
-            () => this.saveToGallery(entry), false, !this.actionHasLocalCache(entry))
-        }
-        if (!entry.isDirectory && this.actionHasLocalCache(entry)) {
-          this.ActionMenuRow($r('sys.symbol.arrow_down'), '释放缓存',
-            () => this.releaseCache(entry), false, false)
-        }
-        this.ActionMenuRow($r('sys.symbol.doc_text'), '重命名',
-          () => this.openRename(entry), false, true)
-
-        this.ActionSectionGap()
-
-        this.ActionMenuRow($r('sys.symbol.doc'), '详情',
-          () => this.showEntryDetails(entry), false, false)
-        this.ActionMenuRow($r('sys.symbol.trash'), '删除',
-          () => this.deleteEntry(entry), true, true)
+        .width(Math.min(224, this.effectivePageWidth() - 52))
+        .height(this.actionMenuHeight(entry))
+        .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
+        .borderRadius(22)
+        .clip(true)
       }
-      .width('100%')
+      .padding(0)
     }
-    .width(214)
-    .height(this.actionMenuHeight(entry))
-    .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
-    .borderRadius(22)
-    .clip(true)
+    .width(Math.min(224, this.effectivePageWidth() - 52))
+    .padding(0)
   }
 
   @Builder
@@ -5102,7 +5121,8 @@ struct Index {
    * The preview and original must be measured inside one stable frame.  The
    * Image component's Contain fit preserves the source ratio, but it does not
    * preserve the visible content rectangle when the source is replaced.
-   * Keep the frame ratio from the first known display geometry instead.
+   * Prefer original metadata before entry; otherwise correct the provisional
+   * frame atomically when the original pixels are revealed.
    */
   private viewerImageFrameAspectRatio(entry: FileEntry): number {
     const state = this.imageVisualState(entry.path)
@@ -5122,9 +5142,9 @@ struct Index {
   }
 
   /**
-   * A viewer frame is immutable for the lifetime of the page. If the NAS
-   * thumbnail cannot expose metadata, reserve a viewport-ratio frame now;
-   * original-file metadata must never replace it later and cause a jump.
+   * A viewer frame is stable throughout entry and exit animations. If the NAS
+   * thumbnail cannot expose metadata, reserve a provisional viewport frame;
+   * original geometry is committed only with the original pixels afterwards.
    */
   private viewerImageFrameCandidate(entry: FileEntry): ThumbnailSize | null {
     const state = this.imageVisualState(entry.path)
@@ -5643,13 +5663,33 @@ struct Index {
     this.ViewerImage(entry)
   }
 
+  private viewerImageFit(entry: FileEntry): ImageFit {
+    if (this.viewerActiveLayer(entry) === 'original') {
+      return ImageFit.Contain
+    }
+    const preview = this.viewerBitmap(entry)
+    const state = this.imageVisualState(entry.path)
+    const width = preview === null ? state.thumbnailDisplayWidth : preview.displayWidth
+    const height = preview === null ? state.thumbnailDisplayHeight : preview.displayHeight
+    if (width <= 0 || height <= 0) {
+      return ImageFit.Contain
+    }
+    const ratioDifference = (width / height) / this.viewerImageFrameAspectRatio(entry)
+    // Limit preview cropping to small metadata/rounding discrepancies. An
+    // unknown viewport frame or a differently cropped NAS thumbnail must not
+    // cause substantial content loss. Neither fit mode stretches the image.
+    return ratioDifference >= 0.98 && ratioDifference <= 1.02
+      ? ImageFit.Cover : ImageFit.Contain
+  }
+
   @Builder
   ViewerImage(entry: FileEntry): void {
     Image(this.viewerImageSource(entry))
       .width('100%')
       .height('100%')
       .orientation(this.viewerImageSourceOrientation(entry))
-      .objectFit(ImageFit.Contain)
+      // Cover crops only the preview's edges; both modes preserve source ratio.
+      .objectFit(this.viewerImageFit(entry))
       .geometryTransition(this.viewerImageTransitionId(entry, this.viewerTransitionLayer))
       .syncLoad(this.viewerImageShouldSyncLoad(entry, this.viewerTransitionLayer))
       .onComplete((event?: ViewerImageCompleteEvent): void => {
@@ -8652,51 +8692,29 @@ struct Index {
     if (this.screen !== 'files' || this.showSearch || this.selectionMode ||
       this.showDestinationPicker || this.showRenameDialog || this.showCreateFolderDialog ||
       this.showImageViewer || this.showAudioPlayer || this.videoPlaybackUiVisible() ||
-      this.showPageTransition) {
+      this.showPageTransition || this.contextMenuEntry !== null) {
       return
     }
 
-    let anchorX = this.effectivePageWidth() / 2
-    let anchorY = this.topSafeInset() + 80
-    if (event.fingerList.length > 0) {
-      anchorX = event.fingerList[0].globalX
-      anchorY = event.fingerList[0].globalY
-    }
-
     this.pendingContextAction = null
-    this.contextMenuAnchorX = Math.max(0, anchorX)
-    this.contextMenuAnchorY = Math.max(0, anchorY)
+    this.contextMenuSourceY = Math.max(this.topSafeInset(),
+      (event.fingerList.length > 0 ? event.fingerList[0].globalY -
+        this.getUIContext().px2vp(this.statusBarHeightPx) : this.pageHeightVp / 2) - 29)
     this.contextMenuEntry = entry
-    this.contextMenuAnimationToken += 1
-    this.getUIContext().animateTo({
-      duration: 220,
-      curve: curves.interpolatingSpring(0, 1, 320, 30)
-    }, () => {
-      this.contextMenuVisible = true
-    })
-    console.info('[UgreenContext] longPress path=' + entry.path +
-      ' anchor=' + this.contextMenuAnchorX.toString() + ',' + this.contextMenuAnchorY.toString())
+    // The anchor follows the long-press position. ArkUI moves the preview only
+    // as far as necessary to fit the preview and the measured action menu.
+    this.contextMenuVisible = true
   }
 
   private actionMenuSurfaceTransition(): TransitionEffect {
     const appear = TransitionEffect.opacity(0)
-      .combine(TransitionEffect.scale({ x: 0.94, y: 0.94, z: 1 }))
       .animation({
         duration: 220,
         curve: curves.interpolatingSpring(0, 1, 320, 30)
       })
     const disappear = TransitionEffect.opacity(0)
-      .combine(TransitionEffect.scale({ x: 0.98, y: 0.98, z: 1 }))
       .animation({ duration: 150, curve: Curve.EaseOut })
     return TransitionEffect.asymmetric(appear, disappear)
-  }
-
-  private actionMenuTop(entry: FileEntry): number {
-    const totalHeight = 58 + 8 + this.actionMenuHeight(entry)
-    const minimumTop = this.topSafeInset() + 44
-    const maximumTop = Math.max(minimumTop,
-      this.pageHeightVp - this.bottomSafeInset() - totalHeight - 16)
-    return Math.min(maximumTop, Math.max(minimumTop, this.contextMenuAnchorY - 29))
   }
 
   private runContextAction(action: () => void): void {
@@ -8718,18 +8736,18 @@ struct Index {
   }
 
   private dismissActionMenu(): void {
-    const token = this.contextMenuAnimationToken + 1
-    this.contextMenuAnimationToken = token
-    this.getUIContext().animateTo({ duration: 150, curve: Curve.EaseOut }, () => {
-      this.contextMenuVisible = false
-    })
-    setTimeout((): void => {
-      if (token !== this.contextMenuAnimationToken || this.contextMenuVisible) {
-        return
-      }
-      this.contextMenuEntry = null
-      this.runPendingContextAction()
-    }, 170)
+    this.contextMenuVisible = false
+  }
+
+  private finishActionMenuDismiss(): void {
+    if (this.contextMenuEntry === null) {
+      return
+    }
+    // Keep the preview data and the bottom bar's visibility stable until the
+    // native menu AND preview have completed their exit animation.
+    this.contextMenuVisible = false
+    this.contextMenuEntry = null
+    this.runPendingContextAction()
   }
 
   private actionMenuHeight(entry: FileEntry): number {
@@ -8752,7 +8770,8 @@ struct Index {
     height += middleRows * 51
     height += 8 // details/delete section gap
     height += 101
-    return Math.min(540, height)
+    return Math.min(540, height,
+      Math.max(120, this.pageHeightVp - this.topSafeInset() - this.bottomSafeInset() - 114))
   }
 
   private actionSupportsShare(entry: FileEntry): boolean {
@@ -9531,8 +9550,8 @@ struct Index {
       this.viewerHeaderTitle = entry.name
       this.resetViewerVisualSession(imageEntries, persistedState)
       // The original may have been released while its thumbnail remains.
-      // Seed the shared layout aspect ratio from that thumbnail before the
-      // viewer is mounted, including the persisted base-orientation swap.
+      // Prefer cached original metadata, falling back to the thumbnail before
+      // mounting, including the persisted base-orientation swap.
       await this.primeViewerFrameWindow(imageEntries, initialIndex, 2)
       this.ensureViewerImageFrame(entry)
       this.logViewerDiagnostic('open-frame-ready', entry.path)
@@ -10388,7 +10407,8 @@ struct Index {
     for (const adjacentIndex of adjacentIndexes) {
       const adjacent = this.viewerImages[adjacentIndex]
       this.loadEntryPreview(adjacent)
-      this.primeViewerPreviewGeometry(adjacent).then((): void => {
+      this.primeViewerPreviewGeometry(adjacent).then(async (): Promise<void> => {
+        await this.primeViewerOriginalFrame(adjacent)
         this.ensureViewerImageFrame(adjacent, false)
       }).catch((): void => {})
       this.enqueueViewerOriginal(adjacent, false, false)
@@ -10586,8 +10606,31 @@ struct Index {
     const end = Math.min(entries.length - 1, center + radius)
     for (let index = start; index <= end; index += 1) {
       await this.primeViewerPreviewGeometry(entries[index])
+      await this.primeViewerOriginalFrame(entries[index])
       this.ensureViewerImageFrame(entries[index], false)
     }
+  }
+
+  private async primeViewerOriginalFrame(entry: FileEntry): Promise<void> {
+    if (this.imageVisualState(entry.path).frameLocked || this.cacheDirectory.length === 0) {
+      return
+    }
+    // Read only metadata from an already cached original before mounting the
+    // page. The preview then fills this exact frame without stretching.
+    const localPath = CacheManager.findExisting(this.cacheDirectory, entry.name,
+      this.originalCacheKey(entry))
+    if (localPath.length === 0) {
+      return
+    }
+    const geometry = await this.readViewerImageGeometry(localPath, entry.path)
+    if (geometry === null || this.imageVisualState(entry.path).frameLocked) {
+      return
+    }
+    this.updateImageVisualState(entry.path, (state: ImageVisualState): void => {
+      state.frameWidth = geometry.displayWidth
+      state.frameHeight = geometry.displayHeight
+      state.frameLocked = true
+    })
   }
 
   private async primeViewerPreviewGeometryAtPath(entry: FileEntry, localPath: string,
@@ -10887,6 +10930,12 @@ struct Index {
       return
     }
     this.updateImageVisualState(path, (next: ImageVisualState): void => {
+      // With no cached original at entry, its true geometry becomes available
+      // only now. Publish geometry and pixels together, after shared-element,
+      // swipe and dismiss animations have finished (guarded above).
+      next.frameWidth = record.displayWidth
+      next.frameHeight = record.displayHeight
+      next.frameLocked = true
       next.visibleLayer = 'original'
       next.decodeState = 'displayed'
       next.progress = 100
