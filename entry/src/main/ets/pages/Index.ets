@@ -2630,12 +2630,13 @@ struct Index {
               }
             })
           } else {
-            // Downloads/settings root pages have no back button, but reserve
-            // the same 86vp side slot as the file header so the title remains
-            // optically centered.
+            // 下载页/设置页没有返回按钮，保留同样的侧边占位让标题保持居中，
+            // 与文件页顶栏的标题位置一致。
             Blank().width(this.screen === 'downloads' ? 86 : 40)
           }
 
+          // 设置页的标题和共享/下载页完全一致：17vp 居中显示在顶栏渐变区上；
+          // 页面说明文字留在内容区，内容区不再重复标题。
           Text(this.selectionMode ? this.selectionTitle() :
             (this.screen === 'settings' && this.showStorageSettings ? '缓存与存储' :
             (this.screen === 'settings' && this.showPlaybackSettings ? '播放与控制' :
@@ -2779,158 +2780,125 @@ struct Index {
     } else if (this.showNetworkSettings) {
       this.NetworkSettingsContent()
     } else {
-      Column() {
-        Column({ space: 12 }) {
-          Column() {
-            Row() {
-              Stack() {
-                SymbolGlyph($r('sys.symbol.folder'))
-                  .fontSize(22)
-                  .fontColor(['#2E6BFF'])
-              }
-              .width(42)
-              .height(42)
-              .borderRadius(14)
-              .backgroundColor('#EAF1FF')
-
-              Column({ space: 4 }) {
-                Text('缓存与存储')
-                  .fontSize(16)
-                  .fontWeight(FontWeight.Medium)
-                  .fontColor($r('app.color.text_primary'))
-                Text('查看占用、调整上限和清理缓存')
-                  .fontSize(12)
-                  .fontColor($r('app.color.text_tertiary'))
-              }
-              .alignItems(HorizontalAlign.Start)
-              .layoutWeight(1)
-              .margin({ left: 12 })
-
-              SymbolGlyph($r('sys.symbol.chevron_forward'))
-                .fontSize(18)
-                .fontColor([$r('app.color.icon_muted')])
-            }
+      Scroll() {
+        Column({ space: 16 }) {
+          Text('管理缓存、播放与网络策略')
+            .fontSize(14)
+            .fontColor($r('app.color.text_tertiary'))
             .width('100%')
-            .padding(16)
-          }
-          .width('100%')
-          .borderRadius(18)
-          .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true))
-          .onClick(() => this.openStorageSettings())
 
           Column() {
-            Row() {
-              Stack() {
-                SymbolGlyph($r('sys.symbol.play'))
-                  .fontSize(22)
-                  .fontColor(['#2E6BFF'])
-              }
-              .width(42)
-              .height(42)
-              .borderRadius(14)
-              .backgroundColor('#EAF1FF')
-
-              Column({ space: 4 }) {
-                Text('播放与控制')
-                  .fontSize(16)
-                  .fontWeight(FontWeight.Medium)
-                  .fontColor($r('app.color.text_primary'))
-                Text('管理自动播放、后台播放和视频小窗')
-                  .fontSize(12)
-                  .fontColor($r('app.color.text_tertiary'))
-              }
-              .alignItems(HorizontalAlign.Start)
-              .layoutWeight(1)
-              .margin({ left: 12 })
-
-              SymbolGlyph($r('sys.symbol.chevron_forward'))
-                .fontSize(18)
-                .fontColor([$r('app.color.icon_muted')])
-            }
-            .width('100%')
-            .padding(16)
+            this.SettingsEntryRow($r('sys.symbol.folder'), '#2E6BFF', '缓存与存储',
+              '查看占用、调整上限和清理缓存', () => this.openStorageSettings(), false)
+            this.SettingsGroupDivider()
+            this.SettingsEntryRow($r('sys.symbol.play'), '#7A5AF8', '播放与控制',
+              '管理自动播放、后台播放和视频小窗', () => this.openPlaybackSettings(), false)
+            this.SettingsGroupDivider()
+            this.SettingsEntryRow($r('sys.symbol.wifi'), '#0FA47F', '网络与流量',
+              '管理移动网络下的加载、刷新和下载策略', () => this.openNetworkSettings(), false)
           }
           .width('100%')
-          .borderRadius(18)
-          .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true))
-          .onClick(() => this.openPlaybackSettings())
+          .alignItems(HorizontalAlign.Start)
+          .borderRadius(20)
+          .clip(true)
+          .backgroundColor($r('app.color.surface_card'))
 
           Column() {
-            Row() {
-              Stack() {
-                SymbolGlyph($r('sys.symbol.wifi'))
-                  .fontSize(22)
-                  .fontColor(['#2E6BFF'])
-              }
-              .width(42)
-              .height(42)
-              .borderRadius(14)
-              .backgroundColor('#EAF1FF')
-
-              Column({ space: 4 }) {
-                Text('网络与流量')
-                  .fontSize(16)
-                  .fontWeight(FontWeight.Medium)
-                  .fontColor($r('app.color.text_primary'))
-                Text('管理移动网络下的加载、刷新和下载策略')
-                  .fontSize(12)
-                  .fontColor($r('app.color.text_tertiary'))
-              }
-              .alignItems(HorizontalAlign.Start)
-              .layoutWeight(1)
-              .margin({ left: 12 })
-
-              SymbolGlyph($r('sys.symbol.chevron_forward'))
-                .fontSize(18)
-                .fontColor([$r('app.color.icon_muted')])
-            }
-            .width('100%')
-            .padding(16)
+            this.SettingsEntryRow($r('sys.symbol.person_badge_nosign'), '#D34D5C', '退出账号', '',
+              () => {
+                if (!this.isBusy) {
+                  this.confirmLogout()
+                }
+              }, true)
           }
           .width('100%')
-          .borderRadius(18)
-          .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true))
-          .onClick(() => this.openNetworkSettings())
-
-          Button('退出账号')
-            .width('100%')
-            .height(48)
-            .fontSize(15)
-            .fontColor('#D34D5C')
-            .backgroundColor(Color.Transparent)
-            .borderRadius(16)
-            .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true, '#33D34D5C'))
-            .enabled(!this.isBusy)
-            .onClick(() => this.confirmLogout())
+          .alignItems(HorizontalAlign.Start)
+          .borderRadius(20)
+          .clip(true)
+          .backgroundColor($r('app.color.surface_card'))
+          .opacity(this.isBusy ? 0.5 : 1)
         }
         .width('100%')
         .alignItems(HorizontalAlign.Start)
+        .padding({ left: 20, right: 20, top: this.topSafeInset() + 76,
+          bottom: this.floatingBarContentInset(40) })
       }
       .width('100%')
       .height('100%')
-      .alignItems(HorizontalAlign.Start)
-      .padding({ left: 20, right: 20, top: this.topSafeInset() + 99,
-        bottom: this.floatingBarContentInset(40) })
+      // align 的默认值是 Alignment.Center：当子内容比视口矮时，Scroll 会把内容
+      // 垂直居中。这里显式置顶，避免设置页内容浮在页面中间。
+      .align(Alignment.TopStart)
+      .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
+      .scrollBar(BarState.Auto)
     }
+  }
+
+  // 设置页行项：40vp 圆角色块 + 白色符号 + 标题/说明 + 右侧 chevron，
+  // 对齐官方 UI Design Kit《设置列表卡片样式》的列表卡片设计语言。
+  // 底色统一使用实体色：官方文档明确沉浸光感对普通容器只在 Navigation
+  // 标题栏或底部 TabBar 区域内生效，放在页面内容区不会渲染，因此卡片
+  // 不能再依赖 systemMaterial 提供背景。
+  @Builder
+  SettingsEntryRow(icon: Resource, chipColor: string, title: string, description: string,
+    onTap: () => void, destructive: boolean) {
+    Row() {
+      Stack() {
+        SymbolGlyph(icon)
+          .fontSize(21)
+          .fontColor([Color.White])
+      }
+      .width(40)
+      .height(40)
+      .borderRadius(13)
+      .backgroundColor(chipColor)
+
+      Column({ space: 3 }) {
+        Text(title)
+          .fontSize(16)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(destructive ? chipColor : $r('app.color.text_primary'))
+        if (description.length > 0) {
+          Text(description)
+            .fontSize(12)
+            .fontColor($r('app.color.text_tertiary'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+      .margin({ left: 12 })
+
+      // 只有会进入二级页面的行才显示 chevron；退出账号是直接动作，不显示。
+      if (!destructive) {
+        SymbolGlyph($r('sys.symbol.chevron_forward'))
+          .fontSize(16)
+          .fontColor([$r('app.color.icon_muted')])
+      }
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+    .onClick(onTap)
+  }
+
+  @Builder
+  SettingsGroupDivider(): void {
+    Divider()
+      .width('calc(100% - 84vp)')
+      .strokeWidth(0.5)
+      .color($r('app.color.divider'))
+      .margin({ left: 68 })
   }
 
   @Builder
   StorageSettingsContent(): void {
     Scroll() {
       Column({ space: 16 }) {
-        Column() {
-          Text('缓存与存储')
-            .fontSize(28)
-            .fontWeight(FontWeight.Bold)
-            .fontColor($r('app.color.text_primary'))
-          Text('云盘文件会按缓存上限在本机临时保留，便于快速查看；不会出现在系统文件管理或图库中。缓存空间不足时，会优先清理较早的文件。')
-            .fontSize(14)
-            .fontColor($r('app.color.text_tertiary'))
-            .lineHeight(22)
-            .margin({ top: 8 })
-        }
-        .alignItems(HorizontalAlign.Start)
-        .width('100%')
+        Text('云盘文件会按缓存上限在本机临时保留，便于快速查看；不会出现在系统文件管理或图库中。缓存空间不足时，会优先清理较早的文件。')
+          .fontSize(14)
+          .fontColor($r('app.color.text_tertiary'))
+          .lineHeight(22)
+          .width('100%')
 
         Column({ space: 10 }) {
           Row() {
@@ -2982,9 +2950,8 @@ struct Index {
           .height(48)
           .fontSize(15)
           .fontColor('#D34D5C')
-          .backgroundColor(Color.Transparent)
+          .backgroundColor('#33D34D5C')
           .borderRadius(14)
-          .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true, '#33D34D5C'))
           .enabled(!this.isBusy)
           .onClick(() => this.clearCache())
 
@@ -2999,10 +2966,11 @@ struct Index {
       .width('100%')
       .alignItems(HorizontalAlign.Start)
       .justifyContent(FlexAlign.Start)
-      .padding({ left: 20, right: 20, top: this.topSafeInset() + 99, bottom: this.bottomSafeInset() + 112 })
+      .padding({ left: 20, right: 20, top: this.topSafeInset() + 76, bottom: this.bottomSafeInset() + 112 })
     }
     .width('100%')
     .height('100%')
+    .align(Alignment.TopStart)
     .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
     .scrollBar(BarState.Auto)
   }
@@ -3011,19 +2979,11 @@ struct Index {
   PlaybackSettingsContent(): void {
     Scroll() {
       Column({ space: 16 }) {
-        Column() {
-          Text('播放与控制')
-            .fontSize(28)
-            .fontWeight(FontWeight.Bold)
-            .fontColor($r('app.color.text_primary'))
-          Text('设置进入播放器和切换到后台时的播放行为。')
-            .fontSize(14)
-            .fontColor($r('app.color.text_tertiary'))
-            .lineHeight(22)
-            .margin({ top: 8 })
-        }
-        .alignItems(HorizontalAlign.Start)
-        .width('100%')
+        Text('设置进入播放器和切换到后台时的播放行为。')
+          .fontSize(14)
+          .fontColor($r('app.color.text_tertiary'))
+          .lineHeight(22)
+          .width('100%')
 
         Column({ space: 12 }) {
           Row() {
@@ -3107,7 +3067,7 @@ struct Index {
         .width('100%')
         .padding(16)
         .borderRadius(14)
-        .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true))
+        .backgroundColor($r('app.color.surface_card'))
 
         if (this.statusText.length > 0) {
           Text(this.statusText)
@@ -3120,11 +3080,12 @@ struct Index {
       .width('100%')
       .alignItems(HorizontalAlign.Start)
       .justifyContent(FlexAlign.Start)
-      .padding({ left: 20, right: 20, top: this.topSafeInset() + 99,
+      .padding({ left: 20, right: 20, top: this.topSafeInset() + 76,
         bottom: this.bottomSafeInset() + 112 })
     }
     .width('100%')
     .height('100%')
+    .align(Alignment.TopStart)
     .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
     .scrollBar(BarState.Auto)
   }
@@ -3133,19 +3094,11 @@ struct Index {
   NetworkSettingsContent(): void {
     Scroll() {
       Column({ space: 16 }) {
-        Column() {
-          Text('网络与流量')
-            .fontSize(28)
-            .fontWeight(FontWeight.Bold)
-            .fontColor($r('app.color.text_primary'))
-          Text('管理移动网络下的原图加载、目录刷新和下载策略。WiFi 下不受这些开关限制。')
-            .fontSize(14)
-            .fontColor($r('app.color.text_tertiary'))
-            .lineHeight(22)
-            .margin({ top: 8 })
-        }
-        .alignItems(HorizontalAlign.Start)
-        .width('100%')
+        Text('管理移动网络下的原图加载、目录刷新和下载策略。WiFi 下不受这些开关限制。')
+          .fontSize(14)
+          .fontColor($r('app.color.text_tertiary'))
+          .lineHeight(22)
+          .width('100%')
 
         Column({ space: 12 }) {
           Row() {
@@ -3225,7 +3178,7 @@ struct Index {
         .width('100%')
         .padding(16)
         .borderRadius(14)
-        .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true))
+        .backgroundColor($r('app.color.surface_card'))
 
         if (this.statusText.length > 0) {
           Text(this.statusText)
@@ -3238,10 +3191,11 @@ struct Index {
       .width('100%')
       .alignItems(HorizontalAlign.Start)
       .justifyContent(FlexAlign.Start)
-      .padding({ left: 20, right: 20, top: this.topSafeInset() + 99, bottom: this.bottomSafeInset() + 112 })
+      .padding({ left: 20, right: 20, top: this.topSafeInset() + 76, bottom: this.bottomSafeInset() + 112 })
     }
     .width('100%')
     .height('100%')
+    .align(Alignment.TopStart)
     .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
     .scrollBar(BarState.Auto)
   }
@@ -3784,11 +3738,8 @@ struct Index {
       .height(44)
       .fontSize(14)
       .fontColor(this.cacheLimitBytes === value ? Color.White : $r('app.color.text_secondary'))
-      .backgroundColor(Color.Transparent)
+      .backgroundColor(this.cacheLimitBytes === value ? '#2E6BFF' : $r('app.color.surface_card'))
       .borderRadius(12)
-      .systemMaterial(this.cacheLimitBytes === value
-        ? this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true, '#552E6BFF')
-        : this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THIN))
       .enabled(!this.isBusy)
       .onClick(() => this.setCacheLimit(value))
   }
@@ -7996,6 +7947,10 @@ struct Index {
     this.showNetworkSettings = false
     this.showPlaybackSettings = false
     this.errorText = ''
+    // statusText 是全局的操作状态文案：文件页浏览时会写入“个人目录”“正在读取目录…”
+    // 等消息，而设置页的二级页面底部也渲染它。进入设置页时先清空，避免这些
+    // 文件页文案串到设置页里。
+    this.statusText = ''
     this.selectedBottomTab = 'settings'
     this.screen = 'settings'
     this.updateTopTitle('设置', true)
