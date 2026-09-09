@@ -67,6 +67,11 @@ const FLOATING_BAR_MIN_GAP_VP: number = 8
 const FLOATING_BAR_MAX_GAP_VP: number = 16
 const FLOATING_BAR_CONTENT_EXTRA_VP: number = 32
 const FILE_TOOL_HEIGHT_VP: number = 40
+// 底栏胶囊宽度随按钮数量自适应：每个页签 82vp，4 项 = 328vp（对齐示例里
+// "按钮少就收窄"的做法）。文件详情页中间的排序胶囊沿用原来的 140vp。
+const BOTTOM_BAR_ITEM_WIDTH_VP: number = 82
+const BOTTOM_BAR_MAX_ITEMS: number = 4
+const FILE_TOOL_SORT_WIDTH_VP: number = 140
 
 interface ViewerReturnScrollOffset {
   xOffset: number
@@ -1085,14 +1090,10 @@ struct Index {
     return this.getUIContext().px2vp(this.navigationBarHeightPx)
   }
 
-  private floatingBarGap(): number {
-    const windowHeight = this.pageHeightVp > 0 ? this.pageHeightVp : 800
-    return Math.min(FLOATING_BAR_MAX_GAP_VP,
-      Math.max(FLOATING_BAR_MIN_GAP_VP, windowHeight * 0.02))
-  }
-
+  // 底栏底边到屏幕底边的距离。对齐系统「智慧生活」的悬浮底栏：直接贴导航条
+  // 安全区，不再额外留浮动间距（本机实测两者都是 28vp，底栏高同为 56vp）。
   private floatingBarBottomMargin(): number {
-    return this.bottomSafeInset() + this.floatingBarGap()
+    return this.bottomSafeInset()
   }
 
   private floatingBarContentInset(extra: number = FLOATING_BAR_CONTENT_EXTRA_VP): number {
@@ -1123,6 +1124,35 @@ struct Index {
     return normalizedPath === ('/home/' + accountName).toLowerCase()
   }
 
+  // 底栏只有三种形态，共用一个常驻外壳：
+  //   home      = 导航胶囊（主页/共享/下载/设置）
+  //   selection = 多选操作胶囊（分享/复制/删除/更多）
+  //   tools     = 文件详情页（左圆钮 + 中间排序胶囊 + 右圆钮）
+  // 三层内容全部常驻、只改 opacity/translate，材质胶囊不会重建，因此切换不闪。
+  private bottomBarMode(): string {
+    if (this.selectionMode) {
+      return 'selection'
+    }
+    if (this.shouldShowFileToolsBar()) {
+      return 'tools'
+    }
+    return 'home'
+  }
+
+  // 任一形态需要显示时，外壳就应该在位（隐藏靠 updateBottomBarVisibility 位移）。
+  private shouldShowAnyBottomBar(): boolean {
+    return this.shouldShowBottomBar() || this.selectionMode || this.shouldShowFileToolsBar()
+  }
+
+  // 胶囊宽度按按钮数量算：4 项 = 328vp；详情页的排序胶囊固定 140vp。
+  private bottomBarCapsuleWidth(): number {
+    const available = this.effectivePageWidth() - 32
+    if (this.bottomBarMode() === 'tools') {
+      return Math.min(FILE_TOOL_SORT_WIDTH_VP, available)
+    }
+    return Math.min(BOTTOM_BAR_ITEM_WIDTH_VP * BOTTOM_BAR_MAX_ITEMS, available)
+  }
+
   private shouldShowFileToolsBar(): boolean {
     return this.screen === 'files' && !this.showSearch &&
       !this.shouldShowBottomBar() && !this.contextMenuVisible &&
@@ -1137,7 +1167,7 @@ struct Index {
   }
 
   private updateBottomBarVisibility(animated: boolean = true): void {
-    const shouldShow = this.shouldShowBottomBar()
+    const shouldShow = this.shouldShowAnyBottomBar()
     const targetOffset = shouldShow ? 0 : 140
     const targetOpacity = shouldShow ? 1 : 0
     this.bottomBarAnimationToken += 1
@@ -1397,9 +1427,11 @@ struct Index {
         !this.showImageViewer &&
         !this.viewerEntryTransitionActive &&
         !this.viewerFallbackEntryActive &&
-        !this.showAudioPlayer && !this.videoPlaybackUiVisible() && !this.selectionMode) {
+        !this.showAudioPlayer && !this.videoPlaybackUiVisible()) {
+        // 三种底栏形态共用这一个常驻外壳，内部按 bottomBarMode() 交叉淡化；
+        // 显隐仍由 bottomBarOffsetY/bottomBarOpacity 控制。
         Stack({ alignContent: Alignment.Bottom }) {
-          this.FloatingBottomBar()
+          this.BottomBar()
         }
         .width('100%')
         .height('100%')
@@ -1411,31 +1443,8 @@ struct Index {
         .hitTestBehavior(HitTestMode.None)
       }
 
-      if (this.screen === 'files' && this.selectionMode &&
-        !this.showDestinationPicker && !this.showRenameDialog &&
-        !this.showImageViewer && !this.viewerEntryTransitionActive &&
-        !this.viewerFallbackEntryActive && !this.showAudioPlayer && !this.videoPlaybackUiVisible()) {
-        Stack({ alignContent: Alignment.Bottom }) {
-          this.SelectionBottomBar()
-        }
-        .width('100%')
-        .height('100%')
-        .zIndex(21)
-        .hitTestBehavior(HitTestMode.None)
-      }
-
       if (this.screen === 'downloads' && this.hasActiveDownload()) {
         this.DownloadSpeedBall()
-      }
-
-      if (this.shouldShowFileToolsBar() && !this.showDestinationPicker) {
-        Stack({ alignContent: Alignment.Bottom }) {
-          this.FileToolsBottomBar()
-        }
-        .width('100%')
-        .height('100%')
-        .zIndex(22)
-        .hitTestBehavior(HitTestMode.None)
       }
 
       if ((this.screen === 'files' || this.screen === 'downloads' || this.screen === 'settings') &&
@@ -3201,24 +3210,67 @@ struct Index {
   }
 
   @Builder
-  FloatingBottomBar(): void {
+  BottomBar(): void {
+    // 三态共用一个常驻外壳。外壳是 Tabs 的底部页签区，沉浸式材质才在生效
+    // 范围内；内部三层内容全部常驻，只改 opacity/translate，节点不重建。
     Tabs({ barPosition: BarPosition.End }) {
-      TabContent() {}.tabBar(this.HomeBarContent)
+      TabContent() {}.tabBar(this.BottomBarContent)
     }
     .vertical(false)
     .scrollable(false)
     .barOverlap(true)
-    .barHeight(FLOATING_BAR_HEIGHT_VP)
-    .barWidth(Math.min(328, this.effectivePageWidth() - 32))
-    .barFloatingStyle({
-      barBottomMargin: 40,
-      maskColor: Color.Transparent,
-      systemMaterial: this.bottomCapsuleMaterial
-    })
+    // 原来的悬浮底栏靠 barFloatingStyle 的 barBottomMargin=40 把胶囊抬高 40vp；
+    // 这里改成普通内容后，用 barHeight 预留出同样的 40vp，位置完全还原。
+    .barHeight(FLOATING_BAR_HEIGHT_VP + 40)
+    .barBackgroundColor(Color.Transparent)
+    .barBackgroundBlurStyle(BlurStyle.NONE)
     .width('100%')
     .height(FLOATING_BAR_HEIGHT_VP + 80)
     .margin({ bottom: this.floatingBarBottomMargin() - 40 })
     .clip(false)
+    .hitTestBehavior(HitTestMode.Default)
+  }
+
+  @Builder
+  BottomBarContent(): void {
+    Stack() {
+      // 首页 / 共享 / 下载 / 设置
+      Stack() {
+        this.HomeBarContent()
+      }
+      .width('100%')
+      .height('100%')
+      .opacity(this.bottomBarMode() === 'home' ? 1 : 0)
+      .translate({ x: 0, y: this.bottomBarMode() === 'home' ? 0 : 12, z: 0 })
+      .hitTestBehavior(this.bottomBarMode() === 'home' ? HitTestMode.Default : HitTestMode.None)
+      .animation({ duration: 200, curve: Curve.FastOutSlowIn })
+
+      // 多选操作
+      Stack() {
+        this.SelectionBarContent()
+      }
+      .width('100%')
+      .height('100%')
+      .opacity(this.bottomBarMode() === 'selection' ? 1 : 0)
+      .translate({ x: 0, y: this.bottomBarMode() === 'selection' ? 0 : 12, z: 0 })
+      .hitTestBehavior(this.bottomBarMode() === 'selection' ? HitTestMode.Default : HitTestMode.None)
+      .animation({ duration: 200, curve: Curve.FastOutSlowIn })
+
+      // 文件详情页：左圆钮 + 中间排序胶囊 + 右圆钮
+      Stack() {
+        this.FileToolsBarContent()
+      }
+      .width('100%')
+      .height('100%')
+      .opacity(this.bottomBarMode() === 'tools' ? 1 : 0)
+      .translate({ x: 0, y: this.bottomBarMode() === 'tools' ? 0 : 12, z: 0 })
+      .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
+      .animation({ duration: 200, curve: Curve.FastOutSlowIn })
+    }
+    .width('100%')
+    .height(FLOATING_BAR_HEIGHT_VP)
+    // 还原原来的悬浮高度：内容底边距外壳底部 40vp。
+    .margin({ bottom: 40 })
     .hitTestBehavior(HitTestMode.Default)
   }
 
@@ -3231,33 +3283,14 @@ struct Index {
         () => this.openDownloads())
       this.BottomNavItem($r('sys.symbol.gearshape'), '设置', 'settings', () => this.openSettings())
     }
-    .width('100%')
+    .width(this.bottomBarCapsuleWidth())
     .height(FLOATING_BAR_HEIGHT_VP)
     .padding({ left: 8, right: 8, top: 0, bottom: 0 })
     .borderRadius(FLOATING_BAR_HEIGHT_VP / 2)
+    .systemMaterial(this.bottomCapsuleMaterial)
     // The capsule is above the scrolling page. Keep a drag that starts here
     // inside the capsule instead of letting the underlying List receive it.
-    // Default keeps both this capsule and its nav-item children in the hit
-    // test, while still blocking the file page sibling beneath it.
-    .hitTestBehavior(HitTestMode.Default)
-  }
-
-  @Builder
-  FileToolsBottomBar(): void {
-    Tabs({ barPosition: BarPosition.End }) {
-      TabContent() {}.tabBar(this.FileToolsBarContent)
-    }
-    .vertical(false)
-    .scrollable(false)
-    .barOverlap(true)
-    .barHeight(FILE_TOOL_HEIGHT_VP + 80, true)
-    .barBackgroundColor(Color.Transparent)
-    .barBackgroundBlurStyle(BlurStyle.NONE)
-    .width('100%')
-    .height(FILE_TOOL_HEIGHT_VP + 80)
-    .margin({ bottom: this.floatingBarBottomMargin() - 40 })
-    .clip(false)
-    .hitTestBehavior(HitTestMode.Default)
+    .hitTestBehavior(this.bottomBarMode() === 'home' ? HitTestMode.Default : HitTestMode.None)
   }
 
   @Builder
@@ -3278,13 +3311,13 @@ struct Index {
         .justifyContent(FlexAlign.Center)
       }
       .type(ButtonType.Normal)
-      .width(140)
-      .height(FILE_TOOL_HEIGHT_VP)
-      .borderRadius(FILE_TOOL_HEIGHT_VP / 2)
+      .width(FILE_TOOL_SORT_WIDTH_VP)
+      .height(FLOATING_BAR_HEIGHT_VP)
+      .borderRadius(FLOATING_BAR_HEIGHT_VP / 2)
       .backgroundColor(Color.Transparent)
       .systemMaterial(this.bottomCapsuleMaterial)
-      .hitTestBehavior(HitTestMode.Default)
-      .monopolizeEvents(true)
+      .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
+      .monopolizeEvents(this.bottomBarMode() === 'tools')
       .onClick(() => this.toggleFileSortMenu())
       .bindPopup(this.showFileSortMenu, {
         builder: this.FileSortPopup,
@@ -3307,29 +3340,13 @@ struct Index {
       this.FileToolCircleButton(this.fileViewModeIcon(), () => this.toggleFileViewMode())
     }
     .width('100%')
-    .height(FILE_TOOL_HEIGHT_VP + 80)
+    .height(FLOATING_BAR_HEIGHT_VP)
     .padding({ left: 16, right: 16 })
     .justifyContent(FlexAlign.SpaceBetween)
-    .hitTestBehavior(HitTestMode.Default)
-  }
-
-  @Builder
-  SelectionBottomBar(): void {
-    Tabs({ barPosition: BarPosition.End }) {
-      TabContent() {}.tabBar(this.SelectionBarContent)
-    }
-    .vertical(false)
-    .scrollable(false)
-    .barOverlap(true)
-    .barHeight(FLOATING_BAR_HEIGHT_VP)
-    .barWidth(Math.min(360, this.effectivePageWidth() - 40))
-    .barFloatingStyle({ barBottomMargin: 40, maskColor: Color.Transparent,
-      systemMaterial: this.bottomCapsuleMaterial })
-    .width('100%')
-    .height(FLOATING_BAR_HEIGHT_VP + 80)
-    .margin({ bottom: this.floatingBarBottomMargin() - 40 })
-    .clip(false)
-    .hitTestBehavior(HitTestMode.Default)
+    // 原来的 40vp 圆钮/排序胶囊在 120vp 栏里居中，底边距栏底 40vp；
+    // 这里靠底对齐还原同一个位置。
+    .alignItems(VerticalAlign.Bottom)
+    .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
   }
 
   @Builder
@@ -3344,11 +3361,12 @@ struct Index {
       this.SelectionMoreButton()
     }
     .id('selection_bottom_bar_' + this.selectedEntryCount.toString())
-    .width('100%')
+    .width(this.bottomBarCapsuleWidth())
     .height(FLOATING_BAR_HEIGHT_VP)
-    .padding({ left: 4, right: 4, top: 0, bottom: 0 })
+    .padding({ left: 8, right: 8, top: 0, bottom: 0 })
     .borderRadius(FLOATING_BAR_HEIGHT_VP / 2)
-    .hitTestBehavior(HitTestMode.Default)
+    .systemMaterial(this.bottomCapsuleMaterial)
+    .hitTestBehavior(this.bottomBarMode() === 'selection' ? HitTestMode.Default : HitTestMode.None)
   }
 
   @Builder
@@ -3373,8 +3391,8 @@ struct Index {
     .backgroundColor(Color.Transparent)
     .stateEffect(false)
     .enabled(this.selectionActionEnabled(title))
-    .hitTestBehavior(HitTestMode.Default)
-    .monopolizeEvents(true)
+    .hitTestBehavior(this.bottomBarMode() === 'selection' ? HitTestMode.Default : HitTestMode.None)
+    .monopolizeEvents(this.bottomBarMode() === 'selection')
     .onClick(() => action())
   }
 
@@ -3400,8 +3418,8 @@ struct Index {
     .backgroundColor(Color.Transparent)
     .stateEffect(false)
     .enabled(this.selectedEntryCount > 0)
-    .hitTestBehavior(HitTestMode.Default)
-    .monopolizeEvents(true)
+    .hitTestBehavior(this.bottomBarMode() === 'selection' ? HitTestMode.Default : HitTestMode.None)
+    .monopolizeEvents(this.bottomBarMode() === 'selection')
     .onClick(() => this.toggleSelectionMoreMenu())
     .bindPopup(this.showSelectionMoreMenu, {
       builder: this.SelectionMorePopup,
@@ -3497,13 +3515,13 @@ struct Index {
         .fontColor([$r('app.color.icon_primary')])
     }
     .type(ButtonType.Normal)
-    .width(FILE_TOOL_HEIGHT_VP)
-    .height(FILE_TOOL_HEIGHT_VP)
-    .borderRadius(FILE_TOOL_HEIGHT_VP / 2)
+    .width(FLOATING_BAR_HEIGHT_VP)
+    .height(FLOATING_BAR_HEIGHT_VP)
+    .borderRadius(FLOATING_BAR_HEIGHT_VP / 2)
     .backgroundColor(Color.Transparent)
     .systemMaterial(this.bottomCapsuleMaterial)
-    .hitTestBehavior(HitTestMode.Default)
-    .monopolizeEvents(true)
+    .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
+    .monopolizeEvents(this.bottomBarMode() === 'tools')
     .onClick(action)
   }
 
@@ -3648,8 +3666,10 @@ struct Index {
     .layoutWeight(1)
     .height('100%')
     .justifyContent(FlexAlign.Center)
-    .hitTestBehavior(HitTestMode.Default)
-    .monopolizeEvents(true)
+    // 非当前形态的层仍挂在树上（材质不重建），但子按钮必须退出命中测试，
+    // 否则 monopolizeEvents 会越过父级 HitTestMode.None 挡住可见层。
+    .hitTestBehavior(this.bottomBarMode() === 'home' ? HitTestMode.Default : HitTestMode.None)
+    .monopolizeEvents(this.bottomBarMode() === 'home')
     .onClick(action)
   }
 
@@ -5856,8 +5876,8 @@ struct Index {
     .scrollable(false)
     .barOverlap(true)
     .barHeight(FLOATING_BAR_HEIGHT_VP)
-    .barWidth(this.viewerBottomBarWidthVp > 0 ? this.viewerBottomBarWidthVp :
-      Math.min(360, this.effectivePageWidth() - 32))
+    // 和首页/多选底栏统一宽度：5 项时每项约 61vp，与系统「智慧生活」底栏一致。
+    .barWidth(this.bottomBarCapsuleWidth())
     .barFloatingStyle({ barBottomMargin: 40, maskColor: Color.Transparent,
       systemMaterial: this.bottomCapsuleMaterial })
     .width('100%')
@@ -5874,6 +5894,7 @@ struct Index {
         () => this.saveCommittedViewerImage())
       this.ImageViewerActionItem($r('sys.symbol.share'), '分享',
         () => this.shareCommittedViewerImage())
+      // 进度环保持原尺寸，只在槽位内绝对居中。
       Stack() {
         Progress({ value: this.viewerProgress(), total: 100, type: ProgressType.Ring })
           .width(27)
@@ -5902,7 +5923,9 @@ struct Index {
       this.ImageViewerMoreButton()
     }
     .width('100%')
-    .height(FLOATING_BAR_HEIGHT_VP)
+    // TabBar 上下各保留 4vp，可见内容高度是 48vp；这里必须按 48 排版，
+    // 否则内容按 56vp 居中、视觉上会整体下沉约 14px（和系统底栏对不齐）。
+    .height(FLOATING_BAR_HEIGHT_VP - 8)
     .padding({ left: 8, right: 8, top: 0, bottom: 0 })
     .borderRadius(FLOATING_BAR_HEIGHT_VP / 2)
     .onAreaChange((_, area) => {
