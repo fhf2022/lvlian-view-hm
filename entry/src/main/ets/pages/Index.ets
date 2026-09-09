@@ -5633,7 +5633,7 @@ struct Index {
       })
 
       Column() {
-        this.ImageViewerTopOverlay()
+        this.ImageViewerNativeHeader()
         Blank()
           .layoutWeight(1)
           .hitTestBehavior(HitTestMode.None)
@@ -5816,6 +5816,26 @@ struct Index {
   }
 
   @Builder
+  ImageViewerNativeHeader(): void {
+    Navigation() {}
+      .mode(NavigationMode.Stack)
+      .hideBackButton(true)
+      .hideToolBar(true)
+      .title({ builder: this.ImageViewerTopOverlay, height: this.topSafeInset() + 94 }, {
+        barStyle: BarStyle.STACK,
+        paddingStart: LengthMetrics.vp(0),
+        paddingEnd: LengthMetrics.vp(0),
+        backgroundColor: Color.Transparent
+      })
+      .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM],
+        [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
+      .width('100%')
+      .height(this.topSafeInset() + 94)
+      .backgroundColor(Color.Transparent)
+      .hitTestBehavior(HitTestMode.Transparent)
+  }
+
+  @Builder
   ImageViewerTopOverlay(): void {
     Stack() {
       Row()
@@ -5842,7 +5862,20 @@ struct Index {
         .hitTestBehavior(HitTestMode.None)
 
       Row() {
-        this.OfficialBackButton(() => this.closeImageViewer())
+        Button() {
+          SymbolGlyph($r('sys.symbol.chevron_backward'))
+            .fontSize(21)
+            .fontColor([$r('sys.color.font_primary')])
+        }
+          .type(ButtonType.Normal)
+          .width(40)
+          .height(40)
+          .borderRadius(20)
+          .backgroundColor(Color.Transparent)
+          .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN))
+          .hitTestBehavior(HitTestMode.Default)
+          .monopolizeEvents(true)
+          .onClick(() => this.closeImageViewer())
         Text(this.viewerHeaderTitle)
           .fontSize(17)
           .fontWeight(FontWeight.Bold)
