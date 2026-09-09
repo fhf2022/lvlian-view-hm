@@ -27,6 +27,8 @@ export class ThumbnailPolicy {
   static readonly SERVER_THUMBNAIL_WARN_DIMENSION: number = 512
   static readonly SERVER_THUMBNAIL_MAX_BYTES: number = 2 * 1024 * 1024
   static readonly VIEWER_PREVIEW_MAX_DIMENSION: number = 1080
+  // 瀑布流每格只按列宽缩放，用像素预算兜底超长图，避免竖图被压得比列宽还小。
+  static readonly WATERFALL_MAX_PIXELS: number = 4 * 1024 * 1024
   // A longest-edge cap makes a tall original unusably soft: 1080 x 7460 was
   // reduced to 296 x 2048 and then enlarged to the full screen width. Keep
   // originals inside a bounded RGBA pixel budget instead, with a secondary

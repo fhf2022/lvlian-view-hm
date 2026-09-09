@@ -4669,6 +4669,9 @@ struct Index {
       if (waterfallBitmap !== undefined) {
         return waterfallBitmap.pixelMap
       }
+      // 瀑布流只显示原图：图片要等原图解码完成，避免退回 256px 服务端缩略图
+      // 让人误以为瀑布流是压缩图；非图片条目（视频等）直接用本地原文件 URI。
+      return this.isImage(entry) ? '' : this.waterfallUri(entry)
     }
     if (this.isImage(entry)) {
       const thumbnailBitmap = this.fileThumbnailBitmaps[entry.path]
@@ -4678,9 +4681,6 @@ struct Index {
       // Image URIs are transport/cache inputs only. Persisted rotation must be
       // baked by Image Kit before ArkUI is allowed to render the thumbnail.
       return ''
-    }
-    if (surface === 'waterfall') {
-      return this.waterfallUri(entry)
     }
     return this.previewUri(entry)
   }
@@ -7438,9 +7438,12 @@ struct Index {
     const ratio = this.waterfallAspectRatio(entry)
     let width = Math.max(1, Math.round(vp2px(columnVp)))
     let height = Math.max(1, Math.round(width / ratio))
-    const longest = Math.max(width, height)
-    if (longest > 1024) {
-      const scale = 1024 / longest
+    // 只按列宽缩放，不要再用最长边 1024 截断：竖图会被压到比列宽还小，
+    // 显示时再被放大，看起来就是压缩图（ThumbnailPolicy 里 viewerZoom 的
+    // 注释记录过同一个坑）。改用像素预算兜底极端长图。
+    const pixels = width * height
+    if (pixels > ThumbnailPolicy.WATERFALL_MAX_PIXELS) {
+      const scale = Math.sqrt(ThumbnailPolicy.WATERFALL_MAX_PIXELS / pixels)
       width = Math.max(1, Math.round(width * scale))
       height = Math.max(1, Math.round(height * scale))
     }
@@ -9722,7 +9725,9 @@ struct Index {
         if (searchIndex < 0) {
           return false
         }
-        this.searchResultScroller.scrollToIndex(searchIndex + 1, false, ScrollAlign.CENTER)
+        // AUTO = 滚动最小距离使该项完整可见；已可见则不动。返回时不应把
+        // 文件管理界面强行拽到中间。
+        this.searchResultScroller.scrollToIndex(searchIndex + 1, false, ScrollAlign.AUTO)
         return true
       }
       if (this.screen !== 'files') {
@@ -9736,11 +9741,67 @@ struct Index {
       const childIndex = this.fileViewMode === 'list' ? index + 1 : index
       const scroller = this.fileViewMode === 'waterfall'
         ? this.waterfallScroller : this.fileListScroller
-      scroller.scrollToIndex(childIndex, false, ScrollAlign.CENTER)
+      this.scrollItemIntoContentBand(scroller, childIndex)
       return true
     } catch (error) {
       console.warn('[UgreenViewer] position return source failed: ' + JSON.stringify(error))
       return false
+    }
+  }
+
+  /**
+   * 返回查看器来源时用的滚动：目标项已经完整落在「顶栏下沿 ~ 底栏上沿」之间
+   * 就完全不动；否则只滚动把它带进这条带子所需的最小距离（贴最近的边）。
+   *
+   * 不能直接用 ScrollAlign.AUTO：AUTO 只保证项在滚动容器视口里完整可见，而
+   * 顶栏和底部悬浮栏是盖在列表上的，落在它们下面的项其实看不见，共享元素
+   * 返回动画会飞到一个被遮挡的矩形。
+   */
+  private scrollItemIntoContentBand(scroller: Scroller, childIndex: number,
+    attempt: number = 0): void {
+    let itemY = 0
+    let itemHeight = 0
+    let hasRect = false
+    try {
+      const rect = scroller.getItemRect(childIndex)
+      if (rect !== undefined && typeof rect.y === 'number' && rect.height > 0) {
+        itemY = rect.y
+        itemHeight = rect.height
+        hasRect = true
+      }
+    } catch (_) {
+      hasRect = false
+    }
+    if (!hasRect) {
+      // 目标还没挂载：先滚进视口，下一帧拿到真实矩形后再按可视带校正。
+      if (attempt === 0) {
+        try {
+          scroller.scrollToIndex(childIndex, false, ScrollAlign.AUTO)
+        } catch (_) {
+        }
+        setTimeout((): void => {
+          this.scrollItemIntoContentBand(scroller, childIndex, attempt + 1)
+        }, 48)
+      }
+      return
+    }
+    // 列表视口从状态栏下方开始，所以可视带上沿就是顶栏高度本身（topSafeInset+94
+    // 减去视口起点 topSafeInset）。
+    const bandTop = 94
+    const bandBottom = this.pageHeightVp - this.floatingBarContentInset(0) - this.topSafeInset()
+    let delta = 0
+    if (itemY < bandTop) {
+      delta = itemY - bandTop
+    } else if (itemY + itemHeight > bandBottom) {
+      delta = itemY + itemHeight - bandBottom
+    }
+    if (Math.abs(delta) < 0.5) {
+      return
+    }
+    try {
+      scroller.scrollBy(0, delta)
+    } catch (error) {
+      console.warn('[UgreenScroll] content band scroll failed: ' + JSON.stringify(error))
     }
   }
 
