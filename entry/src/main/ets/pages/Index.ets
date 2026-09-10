@@ -6,6 +6,7 @@ import { preferences, uniformTypeDescriptor as utd } from '@kit.ArkData'
 import { image } from '@kit.ImageKit'
 import { media } from '@kit.MediaKit'
 import { AVCastPicker, AVCastPickerState, avSession } from '@kit.AVSessionKit'
+import { visionImageAnalyzer } from '@kit.VisionKit'
 import { hilog } from '@kit.PerformanceAnalysisKit'
 import { DownloadTaskRecord, FileEntry } from '../model/FileEntry'
 import { CacheManager } from '../download/CacheManager'
@@ -339,6 +340,8 @@ struct Index {
   @State showImageDetails: boolean = false
   @State viewerLastNavigationDirection: number = 1
   @State imageVisualStates: Record<string, ImageVisualState> = {}
+  @State imageAnalyzerTypes: ImageAnalyzerType[] = []
+  @State imageAnalyzerSupported: boolean = false
   @State imageScale: number = 1
   @State imageSavedScale: number = 1
   @State imageOffsetX: number = 0
@@ -521,6 +524,8 @@ struct Index {
   private fileThumbnailDecodeKeys: Record<string, string> = {}
   private waterfallBitmaps: Record<string, ViewerBitmapRecord> = {}
   private imageRotationStore: ImageRotationStore = new ImageRotationStore()
+  private imageAnalyzerController: visionImageAnalyzer.VisionImageAnalyzerController =
+    new visionImageAnalyzer.VisionImageAnalyzerController()
   // Keep the already rendered parent pages so system/back navigation does not
   // need to round-trip to the NAS again.
   private navigationEntryStack: FileEntry[][] = []
@@ -686,6 +691,7 @@ struct Index {
   })
   aboutToAppear(): void {
     this.statusText = ''
+    this.configureImageAnalyzer()
     this.ensureCacheState()
     this.ensureNetworkState()
     this.ensureDownloadState()
@@ -699,7 +705,38 @@ struct Index {
 
   aboutToDisappear(): void {
     this.closeVideoPlayer()
+    this.releaseImageAnalyzer()
     this.disableGestureShare()
+  }
+
+  private configureImageAnalyzer(): void {
+    try {
+      const supportTypes = this.imageAnalyzerController.getImageAnalyzerSupportTypes()
+      const enabledTypes: ImageAnalyzerType[] = []
+      for (const type of supportTypes) {
+        if ((type === ImageAnalyzerType.TEXT ||
+          type === ImageAnalyzerType.SUBJECT ||
+          type === ImageAnalyzerType.OBJECT_LOOKUP) && enabledTypes.indexOf(type) < 0) {
+          enabledTypes.push(type)
+        }
+      }
+      this.imageAnalyzerTypes = enabledTypes
+      this.imageAnalyzerSupported = enabledTypes.length > 0
+      console.info('[UgreenImageAnalyzer] supportTypes=' + JSON.stringify(enabledTypes))
+    } catch (error) {
+      this.imageAnalyzerTypes = []
+      this.imageAnalyzerSupported = false
+      console.warn('[UgreenImageAnalyzer] capability check failed: ' + JSON.stringify(error))
+    }
+  }
+
+  private releaseImageAnalyzer(): void {
+    try {
+      this.imageAnalyzerController.setImageAnalyzerVisibility(
+        visionImageAnalyzer.ImageAnalyzerVisibility.HIDDEN)
+    } catch (error) {
+      console.warn('[UgreenImageAnalyzer] hide failed: ' + JSON.stringify(error))
+    }
   }
 
   onPageHide(): void {
@@ -5682,14 +5719,26 @@ struct Index {
       ? ImageFit.Cover : ImageFit.Contain
   }
 
+  private viewerImageAnalyzerEnabled(entry: FileEntry): boolean {
+    const current = this.committedViewerEntry()
+    return this.imageAnalyzerSupported && this.imageAnalyzerTypes.length > 0 &&
+      current !== null && current.path === entry.path &&
+      this.viewerBitmap(entry) !== null && this.showImageViewer &&
+      !this.viewerClosePending && !this.viewerEntryTransitionActive
+  }
+
   @Builder
   ViewerImage(entry: FileEntry): void {
-    Image(this.viewerImageSource(entry))
+    Image(this.viewerImageSource(entry), {
+      types: this.imageAnalyzerTypes,
+      aiController: this.imageAnalyzerController
+    })
       .width('100%')
       .height('100%')
       .orientation(this.viewerImageSourceOrientation(entry))
       // Cover crops only the preview's edges; both modes preserve source ratio.
       .objectFit(this.viewerImageFit(entry))
+      .enableAnalyzer(this.viewerImageAnalyzerEnabled(entry))
       .geometryTransition(this.viewerImageTransitionId(entry, this.viewerTransitionLayer))
       .syncLoad(this.viewerImageShouldSyncLoad(entry, this.viewerTransitionLayer))
       .onComplete((event?: ViewerImageCompleteEvent): void => {
