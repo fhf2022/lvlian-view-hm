@@ -22,10 +22,10 @@ interface ThumbnailCacheDocument {
  * uses the private files directory and keeps its own bounded LRU directory.
  */
 export class ThumbnailCacheStore {
-  static readonly DEFAULT_LIMIT_BYTES: number = 256 * 1024 * 1024
+  static readonly DEFAULT_LIMIT_BYTES: number = 512 * 1024 * 1024
   private static readonly DIRECTORY_NAME: string = 'ugreen-thumbnail-cache'
   private static readonly INDEX_FILE_NAME: string = 'ugreen-thumbnail-index.json'
-  private static readonly MAX_INDEX_ITEMS: number = 512
+  private static readonly MAX_INDEX_ITEMS: number = 20000
 
   private directory: string = ''
   private indexPath: string = ''
@@ -140,7 +140,7 @@ export class ThumbnailCacheStore {
       for (const key of Object.keys(rawItems)) {
         const raw = this.asRecord(rawItems[key])
         const path = this.stringValue(raw['path'])
-        if (path.length === 0 || !CacheManager.exists(path)) {
+        if (!path.startsWith(this.directory + '/') || !CacheManager.exists(path)) {
           continue
         }
         this.items[key] = {
@@ -178,7 +178,11 @@ export class ThumbnailCacheStore {
       if (oldest === undefined) {
         break
       }
+      const oldPath = this.items[oldest].path
       this.removeKeys([oldest])
+      if (!Object.keys(this.items).some((key: string): boolean => this.items[key].path === oldPath)) {
+        try { fileIo.unlinkSync(oldPath) } catch (_) {}
+      }
     }
   }
 

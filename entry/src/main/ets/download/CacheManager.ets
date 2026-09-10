@@ -1,3 +1,4 @@
+import { StorageBudget } from './StorageBudget'
 import { fileIo } from '@kit.CoreFileKit'
 import { UgreenError, UgreenErrorKind } from '../ugreen/UgreenErrors'
 
@@ -41,6 +42,7 @@ export class CacheManager {
   static findExisting(directory: string, fileName: string, cacheKey: string = ''): string {
     const keyedPath = CacheManager.cachePath(directory, fileName, cacheKey)
     if (CacheManager.exists(keyedPath)) {
+      StorageBudget.touch(keyedPath)
       return keyedPath
     }
     // A keyed cache lookup must never fall back to an unscoped legacy file.
@@ -50,7 +52,8 @@ export class CacheManager {
       return ''
     }
     const legacyPath = CacheManager.cachePath(directory, fileName)
-    return CacheManager.exists(legacyPath) ? legacyPath : ''
+    if (CacheManager.exists(legacyPath)) { StorageBudget.touch(legacyPath); return legacyPath }
+    return ''
   }
 
   static async prepareForIncoming(directory: string, maxBytes: number, incomingBytes: number,
@@ -71,9 +74,20 @@ export class CacheManager {
     await CacheManager.makeRoom(directory, maxBytes, bytes.byteLength, targetPath)
     const file = fileIo.openSync(targetPath, fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC)
     try {
-      fileIo.writeSync(file.fd, bytes.buffer as ArrayBuffer)
+      StorageBudget.admit(targetPath, bytes.byteLength)
+      let written = 0
+      while (written < bytes.byteLength) {
+        const count = fileIo.writeSync(file.fd, bytes.slice(written).buffer as ArrayBuffer)
+        if (count <= 0) { throw new Error('缓存写入失败') }
+        written += count
+      }
+      StorageBudget.sync(targetPath)
+    } catch (error) {
+      try { fileIo.unlinkSync(targetPath) } catch (_) {}
+      throw error as Error
     } finally {
       fileIo.closeSync(file.fd)
+      StorageBudget.sync(targetPath)
     }
   }
 
@@ -91,6 +105,7 @@ export class CacheManager {
       for (const item of CacheManager.listFiles(directory)) {
         try {
           fileIo.unlinkSync(item.path)
+          StorageBudget.sync(item.path)
           removedBytes += item.size
         } catch (_) {
           // A system cache cleanup may remove a file while we are clearing it.
@@ -115,6 +130,7 @@ export class CacheManager {
         }
         try {
           fileIo.unlinkSync(item.path)
+          StorageBudget.sync(item.path)
           removedBytes += item.size
         } catch (_) {
           // Legacy thumbnails are disposable and can be regenerated.
@@ -130,6 +146,7 @@ export class CacheManager {
     const operation = CacheManager.writeQueue.then((): void => {
       try {
         fileIo.unlinkSync(path)
+        StorageBudget.sync(path)
       } catch (_) {
         // Cache entries are disposable and may already have been evicted.
       }
@@ -148,6 +165,18 @@ export class CacheManager {
 
   private static async makeRoom(directory: string, maxBytes: number, incomingBytes: number,
     targetPath: string, protectedPaths: string[] = []): Promise<void> {
+    if (StorageBudget.isTemporary(directory + '/probe')) {
+      StorageBudget.scan()
+      const protectedFiles = protectedPaths.concat([targetPath])
+      protectedFiles.forEach((path: string): void => StorageBudget.pin(path))
+      try { StorageBudget.admit(directory + '/__incoming__', incomingBytes) } finally {
+        protectedFiles.forEach((path: string): void => StorageBudget.unpin(path))
+      }
+      return
+    }
+    if (directory.endsWith('/ugreen-thumbnail-cache')) {
+      maxBytes = Math.min(maxBytes, StorageBudget.thumbnailAllowance())
+    }
     if (maxBytes <= 0) {
       return
     }
@@ -176,6 +205,7 @@ export class CacheManager {
       }
       try {
         fileIo.unlinkSync(item.path)
+          StorageBudget.sync(item.path)
         projected -= item.size
       } catch (_) {
         // Keep going so another old cache file can still be evicted.
@@ -198,7 +228,7 @@ export class CacheManager {
       const path = CacheManager.joinListedPath(directory, name)
       try {
         const stat = fileIo.statSync(path)
-        result.push({ path: path, size: stat.size, modifiedTime: stat.mtime })
+        if (stat.isFile()) { result.push({ path: path, size: stat.size, modifiedTime: stat.mtime }) }
       } catch (_) {
         // Ignore entries that disappear between listing and stat.
       }

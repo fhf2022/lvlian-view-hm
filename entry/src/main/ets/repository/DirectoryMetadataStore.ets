@@ -464,8 +464,10 @@ export class DirectoryMetadataStore {
   private async cleanupOrphanPages(store: relationalStore.RdbStore): Promise<void> {
     try {
       await store.executeSql(
-        'DELETE FROM directory_cache_pages WHERE snapshot_id NOT IN ' +
-          '(SELECT snapshot_id FROM directory_cache_index)'
+        'DELETE FROM directory_cache_pages WHERE NOT EXISTS ' +
+          '(SELECT 1 FROM directory_cache_index AS i WHERE i.scope = directory_cache_pages.scope ' +
+          'AND i.root_type = directory_cache_pages.root_type AND i.path = directory_cache_pages.path ' +
+          'AND i.snapshot_id = directory_cache_pages.snapshot_id)'
       )
     } catch (_) {
       // An orphan cleanup failure is harmless; the next save can retry it.

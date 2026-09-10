@@ -1,3 +1,4 @@
+import { StorageBudget } from './StorageBudget'
 import { fileIo } from '@kit.CoreFileKit'
 import { DownloadDescriptor } from '../model/FileEntry'
 import { BinaryProgressListener, HttpTransport, StreamDownloadResult } from '../core/network/HttpTransport'
@@ -13,6 +14,20 @@ export class DownloadManager {
 
   async download(descriptor: DownloadDescriptor, directory: string, maxBytes: number,
     cacheKey: string = '', onProgress?: BinaryProgressListener,
+    shouldContinue?: () => boolean): Promise<string> {
+    const target = CacheManager.cachePath(directory, descriptor.fileName, cacheKey)
+    StorageBudget.pin(target)
+    StorageBudget.pin(target + '.part')
+    try {
+      return await this.downloadPinned(descriptor, directory, maxBytes, cacheKey, onProgress, shouldContinue)
+    } finally {
+      StorageBudget.unpin(target + '.part')
+      StorageBudget.unpin(target)
+    }
+  }
+
+  private async downloadPinned(descriptor: DownloadDescriptor, directory: string, maxBytes: number,
+    cacheKey: string, onProgress?: BinaryProgressListener,
     shouldContinue?: () => boolean): Promise<string> {
     const targetPath = CacheManager.cachePath(directory, descriptor.fileName, cacheKey)
     if (CacheManager.exists(targetPath)) {

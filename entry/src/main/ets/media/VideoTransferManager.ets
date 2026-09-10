@@ -1,5 +1,8 @@
+import { DownloadDestination } from '../download/DownloadDestination'
+import { StorageBudget } from '../download/StorageBudget'
+import { DownloadTaskRecord } from '../model/FileEntry'
 import { Context } from '@kit.AbilityKit'
-import { Environment, fileIo } from '@kit.CoreFileKit'
+import { fileIo } from '@kit.CoreFileKit'
 import { media } from '@kit.MediaKit'
 import { CacheManager } from '../download/CacheManager'
 import { HttpTransport } from '../core/network/HttpTransport'
@@ -55,6 +58,9 @@ class VideoTransferSession {
   totalBytes: number = 0
   ranges: ByteRangeStore = new ByteRangeStore()
   inFlight: Map<string, Promise<void>> = new Map<string, Promise<void>>()
+  paused: boolean = false
+  removed: boolean = false
+  temporaryOnly: boolean = false
   closed: boolean = false
   downloadRequested: boolean = false
   downloadPromise: Promise<void> | null = null
@@ -82,6 +88,7 @@ export class VideoTransferManager {
   private initializedScopeKey: string = ''
   private store: MediaLocalStore = new MediaLocalStore()
   private transport: HttpTransport = new HttpTransport()
+  private readerPaths: Map<string, string[]> = new Map<string, string[]>()
   private sessions: Map<string, VideoTransferSession> = new Map<string, VideoTransferSession>()
   private states: Record<string, VideoTransferState> = {}
   private listeners: VideoTransferListener[] = []
@@ -89,6 +96,7 @@ export class VideoTransferManager {
   async initialize(context: Context, repository: UgreenRemoteRepository,
     cacheDirectory: string, cacheLimitBytes: number): Promise<void> {
     this.context = context
+    DownloadDestination.initialize(context)
     this.repository = repository
     this.cacheDirectory = cacheDirectory
     this.cacheLimitBytes = cacheLimitBytes > 0 ? cacheLimitBytes : CacheManager.DEFAULT_LIMIT_BYTES
@@ -99,15 +107,38 @@ export class VideoTransferManager {
       return
     }
     if (this.initialized) {
+      for (const session of this.sessions.values()) { session.paused = true; session.closed = true }
+      for (const session of this.sessions.values()) {
+        await this.closeStreamTask(session)
+        if (session.downloadPromise !== null) { try { await session.downloadPromise } catch (_) {} }
+      }
       await this.store.flush()
       this.sessions.clear()
       this.states = {}
     }
     this.store = new MediaLocalStore()
     await this.store.initialize(context, scopeKey)
+    if (!this.initialized) {
+      StorageBudget.onEvicted((path: string): void => {
+        for (const record of this.store.snapshot()) {
+          if (record.durablePath.length === 0 && (record.partPath === path || record.cachePath === path)) {
+            record.partPath = ''
+            record.cachePath = ''
+            record.ranges = []
+            record.receivedBytes = 0
+            record.status = 'partial'
+            this.store.put(record)
+            this.sessions.delete(record.sourceKey)
+            this.states[record.sourceKey] = new VideoTransferState()
+          }
+        }
+        this.notify()
+      })
+    }
     this.initialized = true
     this.initializedScopeKey = scopeKey
     this.reconcileStoredRecords()
+    this.archiveHistory()
     // Initialization can restore completed/partial records while the file
     // surface is already mounted.  Emit once so the right-side indicators do
     // not stay at "idle" until the next network event.
@@ -211,6 +242,11 @@ export class VideoTransferManager {
     const signature = this.signature(entry)
     handle.sourceKey = signature.key()
     if (localPath.length > 0) {
+      StorageBudget.pin(localPath)
+      const readerKey = this.signature(entry).key()
+      const paths = this.readerPaths.get(readerKey) || []
+      paths.push(localPath)
+      this.readerPaths.set(readerKey, paths)
       handle.localPath = localPath
       handle.totalBytes = signature.size > 0 ? signature.size : this.fileSize(localPath)
       return handle
@@ -324,7 +360,89 @@ export class VideoTransferManager {
     const session = await this.getSession(entry, signature)
     session.destinationRoot = destinationRoot
     session.relativePath = relativePath
+    session.paused = false
+    session.temporaryOnly = false
     await this.startDownload(session)
+  }
+
+  snapshotTasks(): DownloadTaskRecord[] {
+    const tasks: DownloadTaskRecord[] = []
+    for (const record of this.store.snapshot()) {
+      if (!record.userDownload) { continue }
+      const task = new DownloadTaskRecord()
+      task.id = 'video:' + record.sourceKey
+      task.sourceKey = record.sourceKey
+      task.remotePath = record.remotePath
+      task.name = record.name
+      task.mimeType = 'video/*'
+      task.size = record.totalBytes || record.size
+      task.createdAt = record.updatedAt
+      task.updatedAt = record.updatedAt
+      task.finalPath = record.durablePath
+      task.stagingPath = record.partPath
+      task.receivedBytes = record.receivedBytes
+      const state = this.states[record.sourceKey]
+      const session = this.sessions.get(record.sourceKey)
+      task.status = record.durablePath.length > 0 ? 'completed' :
+        (state !== undefined && state.status === 'failed' ? 'failed' :
+          (session !== undefined && session.downloadPromise !== null && !session.paused ? 'downloading' : 'paused'))
+      task.errorMessage = state === undefined ? '' : state.errorMessage
+      tasks.push(task)
+    }
+    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000
+    let completed = 0
+    return tasks.sort((a: DownloadTaskRecord, b: DownloadTaskRecord): number => b.updatedAt - a.updatedAt)
+      .filter((task: DownloadTaskRecord): boolean => {
+        if (task.status !== 'completed') { return true }
+        completed += 1
+        return completed <= 200 && task.updatedAt >= cutoff
+      })
+  }
+
+  async toggleTask(id: string): Promise<void> {
+    const key = id.substring('video:'.length)
+    const session = this.sessions.get(key)
+    if (session !== undefined && session.downloadPromise !== null) { session.paused = true; this.notify(); return }
+    const record = this.store.find(key)
+    if (record === null || record.durablePath.length > 0) { return }
+    const entry = new FileEntry()
+    entry.name = record.name
+    entry.path = record.remotePath
+    entry.size = record.size
+    entry.modifiedTime = record.modifiedTime
+    entry.etag = record.etag
+    entry.checksum = record.checksum
+    this.requestDownload(entry, '', record.relativePath).catch((): void => {})
+  }
+
+  async removeTask(id: string): Promise<void> {
+    const key = id.substring('video:'.length)
+    const session = this.sessions.get(key)
+    if (session !== undefined && session.downloadPromise !== null) {
+      session.removed = true
+      session.paused = true
+      await session.downloadPromise.catch((): void => {})
+    }
+    const record = this.store.find(key)
+    if (record !== null) {
+      if (record.durablePath.length === 0) {
+        this.removeFile(record.partPath)
+        this.store.remove(key)
+      } else {
+        record.userDownload = false
+        this.store.put(record)
+      }
+    }
+    this.notify()
+  }
+
+  async requestCachedFile(entry: FileEntry): Promise<string> {
+    const existing = await this.resolveLocal(entry)
+    if (existing.length > 0) { return existing }
+    const session = await this.getSession(entry, this.signature(entry))
+    if (session.downloadPromise === null) { session.temporaryOnly = true }
+    await this.startDownload(session)
+    return session.partPath
   }
 
   async savePlaybackPosition(entry: FileEntry, positionMs: number): Promise<void> {
@@ -343,6 +461,10 @@ export class VideoTransferManager {
 
   async releaseSource(entry: FileEntry): Promise<void> {
     const sourceKey = this.signature(entry).key()
+    const paths = this.readerPaths.get(sourceKey) || []
+    const local = paths.shift()
+    if (local !== undefined) { StorageBudget.unpin(local) }
+    if (paths.length === 0) { this.readerPaths.delete(sourceKey) }
     const session = this.sessions.get(sourceKey)
     if (session === undefined) {
       return
@@ -549,21 +671,43 @@ export class VideoTransferManager {
       return
     }
     session.closed = false
-    await this.useDownloadDescriptor(session)
+    session.paused = false
     session.downloadRequested = true
-    await this.adoptToDurableStaging(session)
-    const state = this.ensureState(session.sourceKey)
-    state.status = 'queued'
-    state.totalBytes = session.totalBytes
-    state.receivedBytes = session.ranges.coveredBytes()
-    state.localPath = session.partPath
-    state.errorMessage = ''
-    this.notify()
-    session.downloadPromise = this.downloadWhole(session)
+    this.persistSession(session)
+    StorageBudget.pin(session.partPath)
+    const pinnedPath = session.partPath
+    session.downloadPromise = (async (): Promise<void> => {
+      await this.store.flush()
+      await this.useDownloadDescriptor(session)
+      const state = this.ensureState(session.sourceKey)
+      state.status = 'queued'
+      state.totalBytes = session.totalBytes
+      state.receivedBytes = session.ranges.coveredBytes()
+      state.localPath = session.partPath
+      state.errorMessage = ''
+      this.notify()
+      await this.downloadWhole(session)
+    })()
     try {
       await session.downloadPromise
+    } catch (error) {
+      session.errorMessage = this.errorMessage(error)
+      const state = this.ensureState(session.sourceKey)
+      state.status = session.paused ? 'partial' : 'failed'
+      state.errorMessage = session.paused ? '' : session.errorMessage
+      this.persistSession(session)
+      this.notify()
+      throw error as Error
     } finally {
       session.downloadPromise = null
+      StorageBudget.unpin(pinnedPath)
+      if (session.removed) {
+        this.removeFile(pinnedPath)
+        this.store.remove(session.sourceKey)
+        this.sessions.delete(session.sourceKey)
+        this.states[session.sourceKey] = new VideoTransferState()
+      }
+      this.notify()
     }
   }
 
@@ -632,6 +776,7 @@ export class VideoTransferManager {
       await CacheManager.prepareForIncoming(this.cacheDirectory, this.cacheLimitBytes,
         result.bytes.byteLength, '', [session.partPath, session.cachePath])
     }
+    if (session.paused || session.removed) { throw new Error('下载已暂停') }
     this.writeAt(session.partPath, actualStart, result.bytes)
     session.ranges.add(actualStart, actualEnd)
     if (session.totalBytes > 0 && session.ranges.complete(session.totalBytes)) {
@@ -657,6 +802,7 @@ export class VideoTransferManager {
       let cursor = 0
       let safety = 0
       while (true) {
+        if (session.paused || session.removed) { throw new Error('下载已暂停') }
         safety += 1
         if (safety > 100000) {
           throw new Error('视频下载区间异常')
@@ -675,8 +821,9 @@ export class VideoTransferManager {
           }
           continue
         }
-        await this.fetchChunk(session, missing.start, missing.end - missing.start)
-        cursor = missing.end
+        const length = Math.min(VideoTransferManager.CHUNK_BYTES, missing.end - missing.start)
+        await this.fetchChunk(session, missing.start, length)
+        cursor = missing.start + length
         if (session.totalBytes <= 0 && cursor >= VideoTransferManager.CHUNK_BYTES) {
           // The first ranged response normally gives Content-Range. If it
           // does not, stop instead of claiming a complete durable file.
@@ -691,7 +838,7 @@ export class VideoTransferManager {
       finalState.status = 'completed'
       finalState.receivedBytes = session.totalBytes
       finalState.totalBytes = session.totalBytes
-      finalState.localPath = session.durablePath
+      finalState.localPath = session.durablePath.length > 0 ? session.durablePath : session.partPath
       finalState.durablePath = session.durablePath
       finalState.errorMessage = ''
       finalState.updatedAt = Date.now()
@@ -711,27 +858,6 @@ export class VideoTransferManager {
     }
   }
 
-  private async adoptToDurableStaging(session: VideoTransferSession): Promise<void> {
-    if (session.partPath.startsWith(this.stagingDirectory + '/')) {
-      return
-    }
-    // A player read may still be writing the cache .part file.  Finish the
-    // exact in-flight chunks before taking the durable copy so the download
-    // starts from a coherent sparse file and never duplicates those requests.
-    await this.waitForInflight(session)
-    const target = this.stagingDirectory + '/' + CacheManager.hash(session.sourceKey) + '.part'
-    this.ensureDirectory(this.stagingDirectory)
-    if (this.fileSize(session.partPath) > 0 && session.partPath !== target) {
-      this.removeFile(target)
-      await fileIo.copyFile(session.partPath, target)
-    }
-    if (session.partPath !== target && this.fileSize(target) > 0) {
-      this.removeFile(session.partPath)
-    }
-    session.partPath = target
-    this.persistSession(session)
-  }
-
   private async waitForInflight(session: VideoTransferSession): Promise<void> {
     while (session.inFlight.size > 0) {
       const pending: Promise<void>[] = []
@@ -746,35 +872,16 @@ export class VideoTransferManager {
   }
 
   private async promoteToDownload(session: VideoTransferSession): Promise<void> {
-    const defaultRoot = session.destinationRoot.length > 0
-      ? session.destinationRoot.replace(/[\\/]$/, '')
-      : this.userDownloadDirectory() + '/UGREENlink'
-    const relative = session.relativePath.length > 0
-      ? this.safeRelativePath(session.relativePath) : this.safeFileName(session.entry.name)
-    const relativeParts = relative.split('/').filter((part: string): boolean => part.length > 0)
-    let fileName = this.safeFileName(session.entry.name)
-    if (relativeParts.length > 0) {
-      fileName = this.safeFileName(relativeParts[relativeParts.length - 1])
-      relativeParts.pop()
+    if (session.paused || session.removed) { throw new Error('下载已暂停') }
+    if (session.temporaryOnly) {
+      session.downloadRequested = false
+      await this.finalizeCache(session)
+      return
     }
-    const finalDirectory = relativeParts.length > 0
-      ? defaultRoot + '/' + relativeParts.join('/') : defaultRoot
-    this.ensureDirectory(finalDirectory)
-    const finalPath = this.uniqueFinalPath(finalDirectory, fileName)
-    const temporaryPath = finalPath + '.part'
-    this.removeFile(temporaryPath)
-    await fileIo.copyFile(session.partPath, temporaryPath)
-    fileIo.renameSync(temporaryPath, finalPath)
-    if (session.partPath !== finalPath) {
-      this.removeFile(session.partPath)
-    }
-    if (session.cachePath !== finalPath) {
-      this.removeFile(session.cachePath)
-    }
+    const source = session.partPath
+    const finalPath = await DownloadDestination.save(source,
+      session.relativePath.length > 0 ? session.relativePath : session.entry.name)
     session.durablePath = finalPath
-    // A player may still be reading the MediaSource while the explicit
-    // download finishes. Keep that source backed by the durable file instead
-    // of leaving it pointed at the removed staging path.
     session.partPath = finalPath
     const record = this.recordFromStored(this.store.find(session.sourceKey), session.entry,
       session.signature)
@@ -785,7 +892,11 @@ export class VideoTransferManager {
     record.receivedBytes = session.totalBytes
     record.totalBytes = session.totalBytes
     record.status = 'downloaded'
+    record.userDownload = true
     this.store.put(record)
+    await this.store.flush()
+    await DownloadDestination.acknowledge(source)
+    this.archiveHistory()
   }
 
   private async finalizeCacheIfStreaming(session: VideoTransferSession): Promise<void> {
@@ -831,6 +942,8 @@ export class VideoTransferManager {
     record.cachePath = cacheComplete ? session.cachePath :
       (session.partPath.startsWith(this.stagingDirectory + '/') ? '' : session.cachePath)
     record.partPath = cacheComplete ? '' : session.partPath
+    record.userDownload = record.userDownload || (session.downloadRequested && !session.temporaryOnly)
+    record.relativePath = session.relativePath
     record.ranges = session.ranges.serialize()
     record.receivedBytes = session.ranges.coveredBytes()
     record.totalBytes = session.totalBytes
@@ -932,6 +1045,21 @@ export class VideoTransferManager {
     return stored !== null && stored.durablePath === path && this.validLocalPath(path, signature)
   }
 
+  private archiveHistory(): void {
+    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000
+    const completed = this.store.snapshot().filter((record: MediaLocalRecord): boolean =>
+      record.userDownload && record.durablePath.length > 0).sort(
+      (a: MediaLocalRecord, b: MediaLocalRecord): number => b.updatedAt - a.updatedAt)
+    for (let index = 0; index < completed.length; index += 1) {
+      const record = completed[index]
+      if (index >= 200 || record.updatedAt < cutoff) {
+        // Keep the durable mapping and playback position; archive only list history.
+        record.userDownload = false
+        this.store.put(record)
+      }
+    }
+  }
+
   private reconcileStoredRecords(): void {
     for (const record of this.store.snapshot()) {
       if (record.durablePath.length > 0 && !CacheManager.exists(record.durablePath)) {
@@ -1003,9 +1131,17 @@ export class VideoTransferManager {
 
   private writeAt(path: string, offset: number, bytes: Uint8Array): void {
     this.ensureParentDirectory(path)
+    StorageBudget.admit(path, Math.max(this.fileSize(path), offset + bytes.byteLength))
     const file = fileIo.openSync(path, fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.CREATE)
     try {
-      fileIo.writeSync(file.fd, bytes.buffer as ArrayBuffer, { offset: offset })
+      let written = 0
+      while (written < bytes.byteLength) {
+        const chunk = bytes.slice(written)
+        const count = fileIo.writeSync(file.fd, chunk.buffer as ArrayBuffer, { offset: offset + written })
+        if (count <= 0) { throw new Error('写入视频文件失败') }
+        written += count
+      }
+      StorageBudget.sync(path)
     } finally {
       fileIo.closeSync(file.fd)
     }
@@ -1057,6 +1193,7 @@ export class VideoTransferManager {
     }
     try {
       fileIo.unlinkSync(path)
+      StorageBudget.sync(path)
     } catch (_) {
       // Cache eviction or a previous cleanup may have removed it already.
     }
@@ -1074,21 +1211,6 @@ export class VideoTransferManager {
       index += 1
     }
     return candidate
-  }
-
-  private userDownloadDirectory(): string {
-    try {
-      const publicDirectory = Environment.getUserDownloadDir()
-      if (typeof publicDirectory === 'string' && publicDirectory.length > 0) {
-        return publicDirectory.replace(/[\\/]$/, '')
-      }
-    } catch (error) {
-      console.warn('[UgreenMedia] public download directory unavailable: ' + JSON.stringify(error))
-    }
-    if (this.context !== null && this.context.filesDir.length > 0) {
-      return this.context.filesDir.replace(/[\\/]$/, '')
-    }
-    throw new Error('没有可用的下载目录')
   }
 
   private safeRelativePath(path: string): string {

@@ -1,7 +1,9 @@
+import { StorageBudget } from '../download/StorageBudget'
+import { DownloadDestination } from '../download/DownloadDestination'
 import { promptAction, uiMaterial, curves, window, LengthMetrics, FrameCallback, PiPWindow } from '@kit.ArkUI'
 import { systemShare, harmonyShare } from '@kit.ShareKit'
 import { Context, Want, common, wantConstant } from '@kit.AbilityKit'
-import { Environment, fileIo, fileUri } from '@kit.CoreFileKit'
+import { fileIo, fileUri } from '@kit.CoreFileKit'
 import { preferences, uniformTypeDescriptor as utd } from '@kit.ArkData'
 import { image } from '@kit.ImageKit'
 import { media } from '@kit.MediaKit'
@@ -296,6 +298,7 @@ struct Index {
   @State navigationStack: string[] = []
   @State cacheLimitBytes: number = CacheManager.DEFAULT_LIMIT_BYTES
   @State cacheUsageBytes: number = 0
+  @State persistentUsageBytes: number = 0
   @State networkClass: NetworkClass = 'unknown'
   @State meteredAutoOriginal: boolean = false
   @State meteredBackgroundRefresh: boolean = false
@@ -665,7 +668,7 @@ struct Index {
     }
   }
   private downloadStateListener = (tasks: DownloadTaskRecord[], speed: number): void => {
-    this.downloadTasks = tasks
+    this.downloadTasks = tasks.concat(this.videoTransferManager.snapshotTasks())
     this.downloadSpeedBytesPerSecond = speed
   }
   private videoTransferStateListener = (states: VideoTransferState[]): void => {
@@ -674,6 +677,7 @@ struct Index {
       next[state.sourceKey] = state
     }
     this.videoTransferStates = next
+    this.downloadTasks = this.downloadQueue.snapshot().concat(this.videoTransferManager.snapshotTasks())
   }
   private gestureShareRegistered: boolean = false
   private gestureShareRegistering: boolean = false
@@ -2938,15 +2942,24 @@ struct Index {
   StorageSettingsContent(): void {
     Scroll() {
       Column({ space: 16 }) {
-        Text('云盘文件会按缓存上限在本机临时保留，便于快速查看；不会出现在系统文件管理或图库中。缓存空间不足时，会优先清理较早的文件。')
+        Text('持久化缓存保留缩略图、目录和显示设置。临时缓存包括原文件及断点数据，空间不足时按最近访问时间替换；已完成的下载文件保存在系统下载目录，不计入缓存。')
           .fontSize(14)
           .fontColor($r('app.color.text_tertiary'))
           .lineHeight(22)
           .width('100%')
 
         Column({ space: 10 }) {
+          Text('持久化缓存').fontSize(15).width('100%')
+          Text(this.formatStorageSize(this.persistentUsageBytes) + ' / 512 MB（保护上限）')
+            .fontSize(16).width('100%')
+          Text('自动优先淘汰旧缩略图，保留旋转方向等设置。')
+            .fontSize(12).fontColor($r('app.color.text_tertiary')).width('100%')
+        }
+        .width('100%').padding(16).backgroundColor($r('app.color.surface_card')).borderRadius(14)
+
+        Column({ space: 10 }) {
           Row() {
-            Text('当前缓存占用')
+            Text('临时缓存占用')
               .fontSize(15)
               .fontColor($r('app.color.text_secondary'))
               .layoutWeight(1)
@@ -2989,7 +3002,7 @@ struct Index {
         }
         .width('100%')
 
-        Button(this.isBusy ? '处理中…' : '清理全部缓存')
+        Button(this.isBusy ? '处理中…' : '清理临时缓存')
           .width('100%')
           .height(48)
           .fontSize(15)
@@ -6738,6 +6751,15 @@ struct Index {
   private async loadCacheState(): Promise<void> {
     const context = getContext(this) as Context
     this.cacheDirectory = context.cacheDir
+    DownloadDestination.initialize(context)
+    StorageBudget.initialize(context, this.cacheLimitBytes)
+    StorageBudget.protect((): string[] => {
+      const paths: string[] = [this.audioLocalPath, this.videoLocalPath]
+      if (this.showImageViewer) {
+        for (const key of Object.keys(this.viewerOriginalLocalPaths)) { paths.push(this.viewerOriginalLocalPaths[key]) }
+      }
+      return paths
+    })
     await this.repository.initializeThumbnailCache(context)
     this.thumbnailDirectory = this.repository.thumbnailCacheDirectory()
     this.repository.initializeMetadata(context)
@@ -6746,6 +6768,7 @@ struct Index {
       const storedLimit = await this.cachePreferences.get('cache_limit_bytes', CacheManager.DEFAULT_LIMIT_BYTES)
       if (typeof storedLimit === 'number' && storedLimit > 0) {
         this.cacheLimitBytes = storedLimit
+        StorageBudget.initialize(context, storedLimit)
       }
       const thumbnailGeneration = await this.cachePreferences.get('thumbnail_cache_generation', 0)
       if (typeof thumbnailGeneration !== 'number' || thumbnailGeneration < 2) {
@@ -6799,12 +6822,13 @@ struct Index {
   }
 
   private async loadDownloadState(): Promise<void> {
+    await this.ensureCacheState()
     await this.ensureNetworkState()
     try {
       const context = getContext(this) as Context
       await this.downloadQueue.initialize(context, this.repository, this.networkPolicy)
       this.downloadQueue.onChange(this.downloadStateListener)
-      this.downloadTasks = this.downloadQueue.snapshot()
+      this.downloadTasks = this.downloadQueue.snapshot().concat(this.videoTransferManager.snapshotTasks())
       this.downloadSpeedBytesPerSecond = this.downloadQueue.speed()
       await this.downloadQueue.setMeteredDownloadContinue(this.meteredDownloadContinue)
     } catch (error) {
@@ -6918,9 +6942,9 @@ struct Index {
     if (this.cacheDirectory.length === 0) {
       return
     }
-    const originalUsage = await CacheManager.usage(this.cacheDirectory)
-    const thumbnailUsage = await this.repository.thumbnailCacheUsage()
-    this.cacheUsageBytes = originalUsage + thumbnailUsage
+    this.cacheUsageBytes = StorageBudget.scan()
+    await this.repository.enforceThumbnailCacheLimit(StorageBudget.thumbnailAllowance())
+    this.persistentUsageBytes = StorageBudget.persistentUsage()
   }
 
   private ensureLoginState(): Promise<void> {
@@ -8275,6 +8299,7 @@ struct Index {
     this.updateTopTitle('下载', false)
     this.updateBottomBarVisibility(true)
     this.ensureDownloadState()
+    this.ensureVideoState()
   }
 
   private async setCacheLimit(value: number): Promise<void> {
@@ -8286,12 +8311,12 @@ struct Index {
     this.statusText = '正在调整缓存…'
     try {
       await this.ensureCacheState()
+      StorageBudget.setLimit(value)
       this.cacheLimitBytes = value
       if (this.cachePreferences !== null) {
         await this.cachePreferences.put('cache_limit_bytes', value)
         await this.cachePreferences.flush()
       }
-      await CacheManager.enforceLimit(this.cacheDirectory, value)
       await this.repository.enforceThumbnailCacheLimit(this.thumbnailCacheLimitBytes)
       await this.ensureVideoState()
       const videoContext = getContext(this) as Context
@@ -8316,9 +8341,7 @@ struct Index {
     this.statusText = '正在清理缓存…'
     try {
       await this.ensureCacheState()
-      await CacheManager.clear(this.cacheDirectory)
-      await this.repository.clearThumbnailCache()
-      await this.repository.clearPersistentDirectoryCache()
+      StorageBudget.clearDisposable()
       await this.refreshCacheUsage()
       this.statusText = '缓存已清理'
       this.showImmersiveToast('缓存已清理')
@@ -8940,7 +8963,7 @@ struct Index {
     this.statusText = '正在准备文件夹下载…'
     try {
       await this.ensureDownloadState()
-      const destinationRoot = this.userDownloadDirectory() + '/UGREENlink'
+      const destinationRoot = await DownloadDestination.directory()
       const count = await this.enqueueRemoteTree(entry, destinationRoot, entry.name)
       this.statusText = count > 0 ? '已加入下载队列' : '文件夹为空'
       if (count > 0) {
@@ -8962,7 +8985,7 @@ struct Index {
         // earlier stream is promoted instead of starting a second full-file
         // download. The route remains the same UGREENlink directory.
         await this.refreshVideoManager()
-        await this.videoTransferManager.requestDownload(entry, destinationRoot, relativePath)
+        this.videoTransferManager.requestDownload(entry, destinationRoot, relativePath).catch((): void => {})
       } else {
         await this.downloadQueue.enqueue(entry, destinationRoot, relativePath)
       }
@@ -9085,28 +9108,6 @@ struct Index {
     this.showDestinationPicker = true
     this.closeActionMenu()
     this.loadDestinationEntries()
-  }
-
-  private userDownloadDirectory(): string {
-    try {
-      const publicDirectory = Environment.getUserDownloadDir()
-      if (typeof publicDirectory === 'string' && publicDirectory.length > 0) {
-        return publicDirectory.replace(/[\\/]$/, '')
-      }
-    } catch (error) {
-      // Public Download is only used by the explicit download action. Its
-      // capability is optional on some devices, so keep that action safe too.
-      console.warn('[UgreenFile] public download directory unavailable: ' + JSON.stringify(error))
-    }
-    try {
-      const context = getContext(this) as Context
-      if (typeof context.filesDir === 'string' && context.filesDir.length > 0) {
-        return context.filesDir.replace(/[\\/]$/, '')
-      }
-    } catch (error) {
-      console.warn('[UgreenFile] private files directory unavailable: ' + JSON.stringify(error))
-    }
-    return ''
   }
 
   private closeDestinationPicker(): void {
@@ -12607,8 +12608,8 @@ struct Index {
     try {
       await this.refreshVideoManager()
       await this.videoTransferManager.requestDownload(entry)
-      this.statusText = '视频已下载到 UGREENlink'
-      this.showImmersiveToast('视频已下载到 UGREENlink：' + entry.name)
+      this.statusText = '视频已保存到系统下载目录'
+      this.showImmersiveToast('视频已保存到系统下载目录：' + entry.name)
     } catch (error) {
       this.reportError(error as Object, '视频下载失败')
       this.statusText = '视频下载失败'
@@ -12645,7 +12646,7 @@ struct Index {
       return '已缓存部分'
     }
     if (state.status === 'completed') {
-      return state.durablePath.length > 0 ? '已下载到 UGREENlink' : '已缓存，可离线播放'
+      return state.durablePath.length > 0 ? '已保存到系统下载目录' : '已缓存，可离线播放'
     }
     if (this.videoPrepared) {
       return this.videoPlaying ? '正在播放' : '已暂停'
@@ -13185,7 +13186,7 @@ struct Index {
       }
       // Explicit actions such as Save/Share/Open-with are allowed to promote
       // the resumable stream into the user Download/UGREENlink directory.
-      await this.videoTransferManager.requestDownload(entry)
+      await this.videoTransferManager.requestCachedFile(entry)
       const downloaded = await this.videoTransferManager.resolveLocal(entry)
       if (downloaded.length === 0) {
         throw new Error('视频下载未生成本地文件')
@@ -13269,8 +13270,8 @@ struct Index {
       try {
         await this.refreshVideoManager()
         await this.videoTransferManager.requestDownload(entry)
-        this.statusText = '视频已下载到 UGREENlink'
-        this.showImmersiveToast('视频已下载到 UGREENlink：' + entry.name)
+        this.statusText = '视频已保存到系统下载目录'
+        this.showImmersiveToast('视频已保存到系统下载目录：' + entry.name)
       } catch (error) {
         this.reportError(error as Object, '视频下载失败')
         this.statusText = '视频下载失败'
@@ -13588,13 +13589,13 @@ struct Index {
     try {
       await this.ensureDownloadState()
       await this.refreshVideoManager()
-      const destinationRoot = this.userDownloadDirectory() + '/UGREENlink'
+      const destinationRoot = await DownloadDestination.directory()
       let count = 0
       for (const entry of entries) {
         if (entry.isDirectory) {
           count += await this.enqueueRemoteTree(entry, destinationRoot, entry.name)
         } else if (this.isVideo(entry)) {
-          await this.videoTransferManager.requestDownload(entry)
+          this.videoTransferManager.requestDownload(entry).catch((): void => {})
           count += 1
         } else {
           await this.downloadQueue.enqueue(entry)
@@ -14325,6 +14326,7 @@ struct Index {
   private async toggleDownloadTask(task: DownloadTaskRecord): Promise<void> {
     try {
       await this.ensureDownloadState()
+      if (task.id.startsWith('video:')) { await this.videoTransferManager.toggleTask(task.id); return }
       const accepted = await this.downloadQueue.toggleTask(task.id)
       if (!accepted) {
         this.showImmersiveToast('请按顺序下载')
@@ -14342,7 +14344,7 @@ struct Index {
 
   private async confirmRemoveDownloadTask(task: DownloadTaskRecord): Promise<void> {
     const message = task.status === 'completed'
-      ? '只移除下载记录，不会删除 Download/UGREENlink 中的文件。'
+      ? '只移除下载记录，不会删除系统下载目录中的文件。'
       : '会删除当前未完成的临时文件，已下载的部分不能保留。'
     const response = await promptAction.showDialog({
       title: '移除下载记录？',
@@ -14357,7 +14359,8 @@ struct Index {
       return
     }
     await this.ensureDownloadState()
-    await this.downloadQueue.removeRecord(task.id)
+    if (task.id.startsWith('video:')) { await this.videoTransferManager.removeTask(task.id) }
+    else { await this.downloadQueue.removeRecord(task.id) }
     this.showImmersiveToast('已移除下载记录')
   }
 
@@ -14378,7 +14381,7 @@ struct Index {
     if (task.size <= 0) {
       return 0
     }
-    return Math.min(100, Math.max(0, task.receivedBytes / task.size * 100))
+    return Math.min(99, Math.max(0, task.receivedBytes / task.size * 100))
   }
 
   private downloadTaskInfo(task: DownloadTaskRecord): string {
@@ -14392,7 +14395,7 @@ struct Index {
       case 'paused':
         return transfer + ' · 已暂停'
       case 'failed':
-        return transfer + ' · 下载失败'
+        return transfer + ' · ' + (task.errorMessage || '下载失败')
       case 'completed':
         return this.formatSize(task.size) + ' · 已完成'
       default:

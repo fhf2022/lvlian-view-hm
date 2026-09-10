@@ -1,7 +1,8 @@
 import { Context } from '@kit.AbilityKit'
 import { fileIo } from '@kit.CoreFileKit'
 import { preferences } from '@kit.ArkData'
-import Environment from '@ohos.file.environment'
+import { DownloadDestination } from './DownloadDestination'
+import { StorageBudget } from './StorageBudget'
 import { DownloadDescriptor, DownloadTaskRecord, DownloadTaskStatus, FileEntry } from '../model/FileEntry'
 import { BinaryDownloadProgress, HttpTransport, StreamDownloadResult } from '../core/network/HttpTransport'
 import { NetworkClass, NetworkPolicy } from '../core/network/NetworkPolicy'
@@ -38,6 +39,7 @@ export class DownloadQueueManager {
   private initialized: boolean = false
   private ready: boolean = false
   private meteredDownloadContinue: boolean = false
+  private removedIds: Set<string> = new Set<string>()
   private activeRecordId: string = ''
   private activePauseReason: PauseReason = 'none'
   private activeStartBytes: number = 0
@@ -61,6 +63,7 @@ export class DownloadQueueManager {
       return
     }
     this.context = context
+    DownloadDestination.initialize(context)
     this.repository = repository
     this.networkPolicy = networkPolicy
     this.stagingDirectory = context.filesDir + '/ugreen-download-tasks'
@@ -79,6 +82,19 @@ export class DownloadQueueManager {
     } catch (error) {
       console.warn('[UgreenDownload] preferences unavailable: ' + JSON.stringify(error))
     }
+    StorageBudget.onEvicted((path: string): void => {
+      for (const task of this.tasks) {
+        if (task.stagingPath === path && task.status !== 'completed') {
+          task.receivedBytes = 0
+          task.status = 'paused'
+          task.errorMessage = '临时缓存已回收，继续时将重新下载'
+        }
+      }
+      this.requestPersist()
+      this.notify()
+    })
+    this.pruneHistory()
+    this.reconcileStaging()
     this.initialized = true
     networkPolicy.onChange(this.networkListener)
     this.notify()
@@ -222,11 +238,13 @@ export class DownloadQueueManager {
       return
     }
     if (this.activeRecordId === id) {
+      this.removedIds.add(id)
       this.activePauseReason = 'user'
-      this.activeRecordId = ''
+      task.status = 'paused'
       this.speedBytesPerSecond = 0
+    } else {
+      this.removeFile(task.stagingPath)
     }
-    this.removeFile(task.stagingPath)
     this.tasks = this.tasks.filter((item: DownloadTaskRecord): boolean => item.id !== id)
     this.requestPersist()
     this.notify()
@@ -278,6 +296,29 @@ export class DownloadQueueManager {
       this.tasks = result
     } catch (error) {
       console.warn('[UgreenDownload] task state parse failed: ' + JSON.stringify(error))
+    }
+  }
+
+  private pruneHistory(): void {
+    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000
+    const completed = this.tasks.filter((task: DownloadTaskRecord): boolean => task.status === 'completed')
+      .sort((a: DownloadTaskRecord, b: DownloadTaskRecord): number => b.updatedAt - a.updatedAt)
+      .filter((task: DownloadTaskRecord): boolean => task.updatedAt >= cutoff).slice(0, 200)
+    this.tasks = this.tasks.filter((task: DownloadTaskRecord): boolean =>
+      task.status !== 'completed' || completed.indexOf(task) >= 0)
+    this.requestPersist()
+  }
+
+  private reconcileStaging(): void {
+    // This directory belongs only to this queue. Video account stores use a different root.
+    const owned = this.tasks.filter((task: DownloadTaskRecord): boolean => task.status !== 'completed')
+      .map((task: DownloadTaskRecord): string => task.stagingPath)
+    for (const name of fileIo.listFileSync(this.stagingDirectory)) {
+      const path = this.stagingDirectory + '/' + name
+      if (owned.indexOf(path) < 0 && name.endsWith('.part')) { this.removeFile(path) }
+    }
+    for (const task of this.tasks) {
+      if (task.status !== 'completed') { task.receivedBytes = this.fileSize(task.stagingPath) }
     }
   }
 
@@ -404,6 +445,25 @@ export class DownloadQueueManager {
     if (this.repository === null) {
       return
     }
+    this.activeRecordId = record.id
+    this.activePauseReason = 'none'
+    StorageBudget.pin(record.stagingPath)
+    try {
+      await this.runDownload(record)
+    } finally {
+      StorageBudget.unpin(record.stagingPath)
+      if (this.removedIds.has(record.id)) {
+        this.removeFile(record.stagingPath)
+        this.removedIds.delete(record.id)
+      }
+      if (this.activeRecordId === record.id) { this.activeRecordId = '' }
+      this.activePauseReason = 'none'
+      this.schedule()
+    }
+  }
+
+  private async runDownload(record: DownloadTaskRecord): Promise<void> {
+    if (this.repository === null) { return }
     const stageSize = this.fileSize(record.stagingPath)
     if (record.size > 0 && stageSize > record.size) {
       this.removeFile(record.stagingPath)
@@ -417,6 +477,7 @@ export class DownloadQueueManager {
     }
     try {
       const descriptor = await this.repository.downloadDescriptor(record.remotePath)
+      if (this.removedIds.has(record.id) || this.activePauseReason === 'user') { return }
       if (descriptor.size > 0) {
         record.size = descriptor.size
       }
@@ -483,10 +544,7 @@ export class DownloadQueueManager {
         this.notify()
       }
     } finally {
-      if (this.activeRecordId === record.id) {
-        this.activeRecordId = ''
-      }
-      this.activePauseReason = 'none'
+      // startDownload owns the active slot until all file handles are closed.
       this.speedBytesPerSecond = 0
       this.requestPersist()
       this.notify()
@@ -591,21 +649,8 @@ export class DownloadQueueManager {
       return
     }
     try {
-      const defaultRoot = Environment.getUserDownloadDir().replace(/[\\/]$/, '') + '/UGREENlink'
-      const destinationRoot = record.destinationRoot.length > 0 ? record.destinationRoot : defaultRoot
-      const relativePath = record.relativePath.length > 0 ? this.safeRelativePath(record.relativePath) : record.name
-      const separator = relativePath.lastIndexOf('/')
-      const relativeDirectory = separator > 0 ? relativePath.substring(0, separator) : ''
-      const finalDirectory = relativeDirectory.length > 0
-        ? destinationRoot + '/' + relativeDirectory : destinationRoot
-      const finalName = separator >= 0 ? relativePath.substring(separator + 1) : relativePath
-      this.ensureDirectory(finalDirectory)
-      const finalPath = this.uniqueFinalPath(finalDirectory, finalName)
-      const temporaryPath = finalPath + '.part'
-      this.removeFile(temporaryPath)
-      await fileIo.copyFile(record.stagingPath, temporaryPath)
-      fileIo.renameSync(temporaryPath, finalPath)
-      this.removeFile(record.stagingPath)
+      const finalPath = await DownloadDestination.save(record.stagingPath,
+        record.relativePath.length > 0 ? record.relativePath : record.name)
       record.finalPath = finalPath
       record.receivedBytes = record.size > 0 ? record.size : actualSize
       if (record.size <= 0) {
@@ -615,11 +660,14 @@ export class DownloadQueueManager {
       record.errorMessage = ''
       record.updatedAt = Date.now()
       record.manualMobileResume = false
+      await this.persist()
+      await DownloadDestination.acknowledge(record.stagingPath)
+      this.pruneHistory()
       this.requestPersist()
       this.notify()
     } catch (error) {
       record.status = 'failed'
-      record.errorMessage = this.errorMessage(error, '已下载但保存到 Download 失败')
+      record.errorMessage = this.errorMessage(error, '文件已接收，保存到系统下载目录失败，可重试')
       record.updatedAt = Date.now()
       this.requestPersist()
       this.notify()
@@ -671,7 +719,7 @@ export class DownloadQueueManager {
 
   private async persist(): Promise<void> {
     if (this.preferencesStore === null) {
-      return
+      throw new Error('本地存储未就绪，无法保存下载记录')
     }
     await this.preferencesStore.put(DownloadQueueManager.TASKS_KEY, JSON.stringify(this.tasks))
     await this.preferencesStore.flush()
@@ -737,6 +785,7 @@ export class DownloadQueueManager {
     }
     try {
       fileIo.unlinkSync(path)
+      StorageBudget.sync(path)
     } catch (_) {
       // The file may already have been removed.
     }

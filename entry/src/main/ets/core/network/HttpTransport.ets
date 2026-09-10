@@ -1,3 +1,4 @@
+import { StorageBudget } from '../../download/StorageBudget'
 import { http } from '@kit.NetworkKit'
 import { util } from '@kit.ArkTS'
 import { fileIo } from '@kit.CoreFileKit'
@@ -183,6 +184,7 @@ export class HttpTransport {
         dataResolve = null
       }
     }
+    dataFinished.catch((): void => {})
     request.once('headersReceive', headersCallback)
     request.on('dataReceive', dataCallback)
     request.on('dataEnd', endCallback)
@@ -267,6 +269,8 @@ export class HttpTransport {
       requestHeaders['Range'] = 'bytes=' + resumeOffset.toString() + '-'
     }
 
+    StorageBudget.pin(targetPath)
+    let streamError: Object | null = null
     let fileFd: number = -1
     let receivedSize = 0
     let totalSize = expectedTotal
@@ -338,15 +342,23 @@ export class HttpTransport {
         if (fileFd < 0) {
           throw new UgreenError(UgreenErrorKind.NETWORK, '下载响应尚未准备好', 0)
         }
-        fileIo.writeSync(fileFd, chunk)
-        receivedSize += chunk.byteLength
+        StorageBudget.admit(targetPath, (appendMode ? resumeOffset : 0) + receivedSize + chunk.byteLength)
+        let written = 0
+        while (written < chunk.byteLength) {
+          const count = fileIo.writeSync(fileFd, chunk.slice(written))
+          if (count <= 0) { throw new Error('写入文件失败') }
+          written += count
+        }
+        receivedSize += written
+        StorageBudget.sync(targetPath)
         if (onProgress !== undefined) {
           onProgress({ receiveSize: (appendMode ? resumeOffset : 0) + receivedSize, totalSize: totalSize })
         }
       } catch (error) {
-        if (dataReject !== null) {
-          dataReject(error as Object)
-        }
+        streamError = error as Object
+        paused = true
+        if (dataReject !== null) { dataReject(error as Object) }
+        request.destroy()
       }
     }
     const endCallback = (): void => {
@@ -355,6 +367,8 @@ export class HttpTransport {
       }
     }
 
+    headerReady.catch((): void => {})
+    dataFinished.catch((): void => {})
     request.once('headersReceive', headersCallback)
     request.on('dataReceive', dataCallback)
     request.on('dataEnd', endCallback)
@@ -411,6 +425,7 @@ export class HttpTransport {
       if (error instanceof UgreenError) {
         throw error
       }
+      if (streamError !== null) { throw streamError as Error }
       console.warn('[UgreenHTTP] stream request failed: ' + url +
         ' response=' + responseCode.toString() + ' :: ' + String(error))
       throw new UgreenError(UgreenErrorKind.NETWORK, '文件下载失败，请检查网络连接')
@@ -426,6 +441,7 @@ export class HttpTransport {
       request.off('dataEnd', endCallback)
       request.off('headersReceive', headersCallback)
       request.destroy()
+      StorageBudget.unpin(targetPath)
     }
   }
 

@@ -50,6 +50,8 @@ export class MediaLocalRecord {
   receivedBytes: number = 0
   totalBytes: number = 0
   status: MediaLocalStatus = 'partial'
+  userDownload: boolean = false
+  relativePath: string = ''
   playbackPositionMs: number = 0
   updatedAt: number = 0
 }
@@ -152,6 +154,9 @@ export class MediaLocalStore {
         record.cachePath = this.stringValue(value['cachePath'])
         record.partPath = this.stringValue(value['partPath'])
         record.durablePath = this.stringValue(value['durablePath'])
+        record.userDownload = typeof value['userDownload'] === 'boolean' ? value['userDownload'] === true :
+          record.durablePath.length > 0 || record.partPath.length > 0
+        record.relativePath = this.stringValue(value['relativePath'])
         const ranges = value['ranges']
         record.ranges = ranges instanceof Array
           ? ranges.filter((item: Object): boolean => typeof item === 'string') as string[] : []
@@ -183,7 +188,7 @@ export class MediaLocalStore {
 
   private async persist(): Promise<void> {
     if (this.preferencesStore === null) {
-      return
+      throw new Error('本地存储未就绪，无法保存下载记录')
     }
     await this.preferencesStore.put(MediaLocalStore.RECORDS_KEY, JSON.stringify(this.records))
     await this.preferencesStore.flush()
@@ -217,6 +222,8 @@ export class MediaLocalStore {
     result.receivedBytes = source.receivedBytes
     result.totalBytes = source.totalBytes
     result.status = source.status
+    result.userDownload = source.userDownload
+    result.relativePath = source.relativePath
     result.playbackPositionMs = source.playbackPositionMs
     result.updatedAt = source.updatedAt
     return result
