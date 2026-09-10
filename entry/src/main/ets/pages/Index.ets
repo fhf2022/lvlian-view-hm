@@ -2663,7 +2663,17 @@ struct Index {
             // Keep one stable button node while entering/leaving selection.
             // The symbol and action change inside the node; the container is
             // never removed and recreated.
-            this.FileHeaderLeadingControl()
+            if (this.rootKind === 'shared' && this.currentPath.length === 0 &&
+              !this.selectionMode) {
+              // The shared-space root has no parent to return to. Keep the
+              // leading slot so the title remains centered, but remove the
+              // disabled glass circle that used to appear at the top-left.
+              Blank()
+                .width(86)
+                .height(40)
+            } else {
+              this.FileHeaderLeadingControl()
+            }
           } else if ((this.screen === 'settings' &&
             (this.showStorageSettings || this.showPlaybackSettings || this.showNetworkSettings))) {
             this.OfficialBackButton(() => {
