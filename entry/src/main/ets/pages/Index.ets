@@ -6364,181 +6364,15 @@ struct Index {
         })
 
       if (!this.videoPipBackgrounded) {
-        // Official video-player layout: the controls are a transparent overlay
-        // on the video, not a second card below it. Keep every control in one
-        // horizontal row, with the Slider taking the remaining width.
         Stack({ alignContent: Alignment.Bottom }) {
-        Column()
-          .width('100%')
-          .height(112)
-          .linearGradient({
-            direction: GradientDirection.Bottom,
-            colors: [['#00000000', 0.0], ['#B8000000', 1.0]]
-          })
-          .hitTestBehavior(HitTestMode.None)
-
-        Column({ space: 4 }) {
-          Row({ space: 4 }) {
-            // Keep playback controls at the leading edge, as in the official
-            // video controller.  A previous-video action is intentionally not
-            // exposed; only the next item is available when the window is
-            // landscape.
-            Button() {
-              SymbolGlyph(this.videoPlaying
-                ? $r('sys.symbol.pause') : $r('sys.symbol.play'))
-                .fontSize(24)
-                .fontColor([Color.White])
-            }
-              .type(ButtonType.Normal)
-              .width(40)
-              .height(40)
-              .backgroundColor(Color.Transparent)
-              .enabled(this.videoPrepared && !this.isBusy && !this.videoControlPending)
-              .onClick(() => this.toggleVideo())
-
-            if (this.videoLandscape) {
-              Button() {
-                SymbolGlyph($r('sys.symbol.chevron_forward'))
-                  .fontSize(20)
-                  .fontColor([Color.White])
-              }
-                .type(ButtonType.Normal)
-                .width(36)
-                .height(40)
-                .backgroundColor(Color.Transparent)
-                .enabled(this.videoSibling(1) !== null && !this.isBusy)
-                .onClick(() => this.switchVideo(1))
-            }
-
-            Text(this.formatPlaybackTime(this.videoCurrentMs))
-              .fontSize(11)
-              .fontColor(Color.White)
-              .width(40)
-            // Keep the native AVPlayer buffer visible behind the playback
-            // thumb, following the official network-video example.  The
-            // buffering callback reports an estimated duration ahead of the
-            // playhead, which VideoPlaybackManager converts to this absolute
-            // timeline percentage.
-            Stack({ alignContent: Alignment.Center }) {
-              Slider({
-                value: this.videoBufferedTimelineMs(),
-                min: 0,
-                max: Math.max(1, this.videoDurationMs),
-                direction: Axis.Horizontal,
-                // Keep the buffer and seek layers on the same track geometry.
-                // SliderStyle.NONE removes the thumb's layout inset, so a
-                // stacked NONE/OutSet pair leaves a visible extra segment at
-                // the leading edge.
-                style: SliderStyle.OutSet
-              })
-                .trackColor('#55FFFFFF')
-                .selectedColor('#66FFFFFF')
-                .blockColor(Color.Transparent)
-                .blockBorderColor(Color.Transparent)
-                .trackThickness(4)
-                .enabled(false)
-
-              Slider({
-                value: Math.min(this.videoCurrentMs, Math.max(1, this.videoDurationMs)),
-                min: 0,
-                max: Math.max(1, this.videoDurationMs),
-                direction: Axis.Horizontal,
-                style: SliderStyle.OutSet
-              })
-                .trackColor(Color.Transparent)
-                .selectedColor('#2E6BFF')
-                .trackThickness(4)
-                .enabled(this.videoDurationMs > 0)
-                .onChange((value: number) => this.seekVideo(value))
-            }
-              .layoutWeight(1)
-              Text(this.formatPlaybackTime(this.videoDurationMs))
-              .fontSize(11)
-              .fontColor(Color.White)
-              .width(40)
-              .textAlign(TextAlign.End)
-
-            Button() {
-              SymbolGlyph($r('sys.symbol.rotate_left'))
-                .fontSize(22)
-                .fontColor([Color.White])
-            }
-              .type(ButtonType.Normal)
-              .width(40)
-              .height(40)
-              .backgroundColor(Color.Transparent)
-              .enabled(!this.isBusy && !this.videoOrientationChanging)
-              .onClick(() => this.rotateVideoInterface())
-          }
-          .width('100%')
-          .alignItems(VerticalAlign.Center)
-
-          if (this.videoTransferError(entry).length > 0) {
-            Text(this.videoStatusText(entry))
-              .fontSize(12)
-              .fontColor('#FFFF8A8A')
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
-        }
-          .width('100%')
-          .padding({ left: 12, right: 12, top: 16, bottom: this.videoBottomInset() + 8 })
+          this.VideoPlayerGlassBar(entry)
         }
           .width('100%')
           .height('100%')
           .zIndex(2)
-          // The parent is only a visual overlay. Let empty areas fall through
-          // to the media gesture while its button/slider children still handle
-          // their own touches.
           .hitTestBehavior(HitTestMode.None)
 
-        // Keep the same back affordance as the file and image pages, but float
-        // it over the video instead of allocating a separate header band.
-        Row() {
-        this.OfficialBackButton(() => this.closeVideoPlayer())
-        Text(entry.name)
-          .fontSize(17)
-          .fontWeight(FontWeight.Bold)
-          .fontColor(Color.White)
-          .layoutWeight(1)
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-        Button() {
-          // Keep the supplied PiP artwork as a hand-drawn vector asset.  The
-          // SVG has no raster background, so it stays crisp at every density.
-          Image($r('app.media.video_pip_icon'))
-            .width(24)
-            .height(24)
-            .objectFit(ImageFit.Contain)
-        }
-          .type(ButtonType.Normal)
-          .width(40)
-          .height(40)
-          .backgroundColor(Color.Transparent)
-          .enabled(this.videoSurfaceReady && this.videoPrepared &&
-            !this.videoPipCreating && !this.isBusy)
-          .onClick(() => this.toggleVideoPip())
-        // Keep the official AVCastPicker (including its stateful vector
-        // glyph) and shrink only its visual box to match the PiP symbol.  The
-        // surrounding Stack preserves a 40vp touch target in the header.
-        Stack({ alignContent: Alignment.Center }) {
-          AVCastPicker({
-            sessionType: 'video',
-            normalColor: Color.White,
-            activeColor: '#2E6BFF',
-            onStateChange: (state: AVCastPickerState): void => this.handleVideoCastPickerState(state)
-          })
-            .width(24)
-            .height(24)
-            .backgroundColor(Color.Transparent)
-        }
-          .width(40)
-          .height(40)
-        }
-          .width('100%')
-          .height(this.videoTopInset() + 76)
-          .padding({ left: 12, right: 12, top: this.videoTopInset() + 8, bottom: 28 })
-          .zIndex(3)
+        this.VideoPlayerNativeHeader()
       }
     }
     // Keep the original XComponent mounted while PiP is active so the system
@@ -6548,6 +6382,241 @@ struct Index {
     .height(this.videoPipBackgrounded ? 1 : '100%')
     .backgroundColor(this.videoPipBackgrounded ? Color.Transparent : Color.Black)
     .hitTestBehavior(this.videoPipBackgrounded ? HitTestMode.None : HitTestMode.Default)
+  }
+
+  @Builder
+  VideoPlayerNativeHeader(): void {
+    Navigation() {}
+      .mode(NavigationMode.Stack)
+      .hideBackButton(true)
+      .hideToolBar(true)
+      // Keep the title builder and its height stable during window rotation.
+      // Move the safe-area inset outside Navigation so AVCastPicker keeps its
+      // native node instead of rebuilding with the title configuration.
+      .title({ builder: this.VideoPlayerHeaderContent, height: 76 }, {
+        barStyle: BarStyle.STACK,
+        paddingStart: LengthMetrics.vp(0),
+        paddingEnd: LengthMetrics.vp(0),
+        backgroundColor: Color.Transparent
+      })
+      .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM],
+        [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
+      .width('100%')
+      .height(76)
+      .margin({ top: this.videoTopInset() })
+      .backgroundColor(Color.Transparent)
+      .hitTestBehavior(HitTestMode.Transparent)
+      .zIndex(3)
+  }
+
+  @Builder
+  VideoPlayerHeaderContent(): void {
+    Row({ space: 8 }) {
+    Button() {
+      SymbolGlyph($r('sys.symbol.chevron_backward'))
+        .fontSize(24)
+        .fontColor([Color.White])
+    }
+      .type(ButtonType.Normal)
+      .width(40)
+      .height(40)
+      .borderRadius(20)
+      .backgroundColor(Color.Transparent)
+      .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true, '#44202020'))
+      .onClick(() => this.closeVideoPlayer())
+    Text(this.videoEntry === null ? '' : (this.videoEntry as FileEntry).name)
+      .fontSize(17)
+      .fontWeight(FontWeight.Bold)
+      .fontColor(Color.White)
+      .layoutWeight(1)
+      .maxLines(1)
+      .textOverflow({ overflow: TextOverflow.Ellipsis })
+    Button() {
+      // Keep the supplied PiP artwork as a hand-drawn vector asset.  The
+      // SVG has no raster background, so it stays crisp at every density.
+      Image($r('app.media.video_pip_icon'))
+        .width(24)
+        .height(24)
+        .objectFit(ImageFit.Contain)
+    }
+      .type(ButtonType.Normal)
+      .width(40)
+      .height(40)
+      .backgroundColor(Color.Transparent)
+      .borderRadius(20)
+      .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true, '#44202020'))
+      .enabled(this.videoSurfaceReady && this.videoPrepared &&
+        !this.videoPipCreating && !this.isBusy)
+      .onClick(() => this.toggleVideoPip())
+    // Use the official picker with a synchronously loaded local glyph. Its
+    // default symbol initializes asynchronously when Navigation relayouts.
+    Stack({ alignContent: Alignment.Center }) {
+      AVCastPicker({
+        sessionType: 'video',
+        normalColor: Color.White,
+        activeColor: '#2E6BFF',
+        customPicker: this.VideoCastIcon,
+        onStateChange: (state: AVCastPickerState): void => this.handleVideoCastPickerState(state)
+      })
+        .width(24)
+        .height(24)
+        .backgroundColor(Color.Transparent)
+    }
+      .width(40)
+      .height(40)
+      .borderRadius(20)
+      .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true, '#44202020'))
+    }
+      .width('100%')
+      .height(76)
+      .padding({ left: 12, right: 12, top: 8, bottom: 28 })
+      .zIndex(3)
+  }
+
+  @Builder
+  VideoCastIcon(): void {
+    Image($r('app.media.video_cast_icon'))
+      .width(24)
+      .height(24)
+      .objectFit(ImageFit.Contain)
+      .fillColor(this.videoCasting ? '#2E6BFF' : '#FFFFFF')
+      .syncLoad(true)
+  }
+
+  @Builder
+  VideoPlayerGlassBar(entry: FileEntry): void {
+    Tabs({ barPosition: BarPosition.End }) {
+      TabContent() {}.tabBar(this.VideoPlayerTabBar)
+    }
+      .vertical(false)
+      .scrollable(false)
+      .barOverlap(true)
+      .barHeight(this.videoTransferError(entry).length > 0 ? 80 : 56)
+      .barWidth(Math.max(240, this.pageWidthVp - 24))
+      .barFloatingStyle({ barBottomMargin: 40, maskColor: Color.Transparent,
+        systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, false, '#66202020') })
+      .width('100%')
+      .height((this.videoTransferError(entry).length > 0 ? 80 : 56) + 80)
+      .margin({ bottom: this.videoBottomInset() + 8 - 40 })
+      .clip(false)
+      .hitTestBehavior(HitTestMode.Default)
+  }
+
+  @Builder
+  VideoPlayerTabBar(): void {
+    if (this.videoEntry !== null) {
+      this.VideoPlayerBarContent(this.videoEntry as FileEntry)
+    }
+  }
+
+  @Builder
+  VideoPlayerBarContent(entry: FileEntry): void {
+    Column({ space: 4 }) {
+      Row({ space: 4 }) {
+        // Keep playback controls at the leading edge, as in the official
+        // video controller.  A previous-video action is intentionally not
+        // exposed; only the next item is available when the window is
+        // landscape.
+        Button() {
+          SymbolGlyph(this.videoPlaying
+            ? $r('sys.symbol.pause') : $r('sys.symbol.play'))
+            .fontSize(24)
+            .fontColor([Color.White])
+        }
+          .type(ButtonType.Normal)
+          .width(40)
+          .height(40)
+          .backgroundColor(Color.Transparent)
+          .enabled(this.videoPrepared && !this.isBusy && !this.videoControlPending)
+          .onClick(() => this.toggleVideo())
+
+        if (this.videoLandscape) {
+          Button() {
+            SymbolGlyph($r('sys.symbol.chevron_forward'))
+              .fontSize(20)
+              .fontColor([Color.White])
+          }
+            .type(ButtonType.Normal)
+            .width(36)
+            .height(40)
+            .backgroundColor(Color.Transparent)
+            .enabled(this.videoSibling(1) !== null && !this.isBusy)
+            .onClick(() => this.switchVideo(1))
+        }
+
+        Text(this.formatPlaybackTime(this.videoCurrentMs))
+          .fontSize(11)
+          .fontColor(Color.White)
+          .width(40)
+        // Keep the native AVPlayer buffer visible behind the playback
+        // thumb, following the official network-video example.  The
+        // buffering callback reports an estimated duration ahead of the
+        // playhead, which VideoPlaybackManager converts to this absolute
+        // timeline percentage.
+        Stack({ alignContent: Alignment.Center }) {
+          Slider({
+            value: this.videoBufferedTimelineMs(),
+            min: 0,
+            max: Math.max(1, this.videoDurationMs),
+            direction: Axis.Horizontal,
+            // Keep the buffer and seek layers on the same track geometry.
+            // SliderStyle.NONE removes the thumb's layout inset, so a
+            // stacked NONE/OutSet pair leaves a visible extra segment at
+            // the leading edge.
+            style: SliderStyle.OutSet
+          })
+            .trackColor('#55FFFFFF')
+            .selectedColor('#66FFFFFF')
+            .blockColor(Color.Transparent)
+            .blockBorderColor(Color.Transparent)
+            .trackThickness(4)
+            .enabled(false)
+
+          Slider({
+            value: Math.min(this.videoCurrentMs, Math.max(1, this.videoDurationMs)),
+            min: 0,
+            max: Math.max(1, this.videoDurationMs),
+            direction: Axis.Horizontal,
+            style: SliderStyle.OutSet
+          })
+            .trackColor(Color.Transparent)
+            .selectedColor('#2E6BFF')
+            .trackThickness(4)
+            .enabled(this.videoDurationMs > 0)
+            .onChange((value: number) => this.seekVideo(value))
+        }
+          .layoutWeight(1)
+          Text(this.formatPlaybackTime(this.videoDurationMs))
+          .fontSize(11)
+          .fontColor(Color.White)
+          .width(40)
+          .textAlign(TextAlign.End)
+
+        Button() {
+          SymbolGlyph($r('sys.symbol.rotate_left'))
+            .fontSize(22)
+            .fontColor([Color.White])
+        }
+          .type(ButtonType.Normal)
+          .width(40)
+          .height(40)
+          .backgroundColor(Color.Transparent)
+          .enabled(!this.isBusy && !this.videoOrientationChanging)
+          .onClick(() => this.rotateVideoInterface())
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+
+      if (this.videoTransferError(entry).length > 0) {
+        Text(this.videoStatusText(entry))
+          .fontSize(12)
+          .fontColor('#FFFF8A8A')
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+    }
+      .width('100%')
+      .padding({ left: 8, right: 8, top: 8, bottom: 8 })
   }
 
   private immersiveMaterial(style: uiMaterial.ImmersiveStyle, interactive: boolean = true,
