@@ -622,7 +622,6 @@ struct Index {
   private imageTouchStartX: number = 0
   private imageTouchStartY: number = 0
   private imageDismissDragging: boolean = false
-  private imageDismissParentChromeVisible: boolean = false
   private imageDismissChromeWasVisible: boolean = true
   private viewerSwiperController: SwiperController = new SwiperController()
   private viewerLoadQueue: FileEntry[] = []
@@ -1195,28 +1194,32 @@ struct Index {
     return this.shouldShowBottomBar() || this.selectionMode || this.shouldShowFileToolsBar()
   }
 
-  // The file surface remains mounted under the image viewer. During dismissal
-  // its own chrome must become visible at the same time as the shared-element
-  // image starts moving back, so the pull-down never reveals an empty layer.
-  private viewerBlocksParentChrome(): boolean {
-    return !this.viewerClosePending && !this.imageDismissParentChromeVisible &&
-      (this.showImageViewer || this.viewerEntryTransitionActive || this.viewerFallbackEntryActive)
+  // The whole parent page stays mounted behind the viewer so a pull-down only
+  // reveals already rendered content. Keep that page inert until the viewer
+  // has fully handed control back after its exit transition.
+  private viewerOwnsParentInteraction(): boolean {
+    return this.showImageViewer || this.viewerEntryTransitionActive ||
+      this.viewerFallbackEntryActive || this.viewerClosePending
   }
 
   // 胶囊宽度按按钮数量算：4 项 = 328vp；详情页的排序胶囊固定 140vp。
+  private wideBottomBarCapsuleWidth(): number {
+    return Math.min(BOTTOM_BAR_ITEM_WIDTH_VP * BOTTOM_BAR_MAX_ITEMS,
+      this.effectivePageWidth() - 32)
+  }
+
   private bottomBarCapsuleWidth(): number {
     const available = this.effectivePageWidth() - 32
     if (this.bottomBarMode() === 'tools') {
       return Math.min(FILE_TOOL_SORT_WIDTH_VP, available)
     }
-    return Math.min(BOTTOM_BAR_ITEM_WIDTH_VP * BOTTOM_BAR_MAX_ITEMS, available)
+    return this.wideBottomBarCapsuleWidth()
   }
 
   private shouldShowFileToolsBar(): boolean {
     return this.screen === 'files' && !this.showSearch &&
       !this.shouldShowBottomBar() && this.contextMenuEntry === null &&
       !this.showRenameDialog &&
-      !this.viewerBlocksParentChrome() &&
       !this.showAudioPlayer && !this.videoPlaybackUiVisible() && !this.selectionMode
   }
 
@@ -1474,6 +1477,8 @@ struct Index {
       .height('100%')
       .backgroundColor($r('app.color.page_background'))
       .translate({ x: this.pageOffsetX, y: 0, z: 0 })
+      .hitTestBehavior(this.viewerOwnsParentInteraction()
+        ? HitTestMode.BLOCK_DESCENDANTS : HitTestMode.Default)
       .onAreaChange((_, area) => {
         if (typeof area.width === 'number' && area.width > 0) {
           this.pageWidthVp = area.width
@@ -1486,7 +1491,6 @@ struct Index {
       if ((this.screen === 'files' || this.screen === 'downloads' || this.screen === 'settings') &&
         this.contextMenuEntry === null && !this.showRenameDialog &&
         !this.showDestinationPicker &&
-        !this.viewerBlocksParentChrome() &&
         !this.showAudioPlayer && !this.videoPlaybackUiVisible()) {
         // 三种底栏形态共用这一个常驻外壳，内部按 bottomBarMode() 交叉淡化；
         // 显隐仍由 bottomBarOffsetY/bottomBarOpacity 控制。
@@ -1500,7 +1504,8 @@ struct Index {
         .zIndex(20)
         // The host is transparent and contains only the capsule. Its empty
         // area must pass through to the file surface below.
-        .hitTestBehavior(HitTestMode.None)
+        .hitTestBehavior(this.viewerOwnsParentInteraction()
+          ? HitTestMode.BLOCK_DESCENDANTS : HitTestMode.None)
       }
 
       if (this.screen === 'downloads' && this.transferDirection === 'download' && this.hasActiveDownload()) {
@@ -1514,7 +1519,6 @@ struct Index {
       if (this.screen === 'files' && this.currentPath.length > 0 && !this.showSearch &&
         !this.selectionMode && !this.importSelecting && this.contextMenuEntry === null &&
         !this.showRenameDialog && !this.showCreateFolderDialog && !this.showDestinationPicker &&
-        !this.viewerBlocksParentChrome() &&
         !this.showAudioPlayer && !this.videoPlaybackUiVisible()) {
         if (this.importExpanded) {
           Row().width('100%').height('100%').backgroundColor(Color.Transparent).zIndex(24)
@@ -1534,11 +1538,12 @@ struct Index {
           // The overlay is a full page sized host whose only interactive part is
           // the ball itself. Keeping the host out of the touch test lets taps
           // reach the file list under it.
-          .hitTestBehavior(HitTestMode.None)
+          .hitTestBehavior(this.viewerOwnsParentInteraction()
+            ? HitTestMode.BLOCK_DESCENDANTS : HitTestMode.None)
       }
 
       if ((this.screen === 'files' || this.screen === 'downloads' || this.screen === 'settings') &&
-        !this.showDestinationPicker && !this.viewerBlocksParentChrome() &&
+        !this.showDestinationPicker &&
         !this.showAudioPlayer && !this.videoPlaybackUiVisible()) {
         Stack({ alignContent: Alignment.TopStart }) {
           this.NativeFileHeader()
@@ -1546,7 +1551,8 @@ struct Index {
         .width('100%')
         .height('100%')
         .zIndex(10)
-        .hitTestBehavior(HitTestMode.None)
+        .hitTestBehavior(this.viewerOwnsParentInteraction()
+          ? HitTestMode.BLOCK_DESCENDANTS : HitTestMode.None)
       }
 
       this.ActionMenuOverlay()
@@ -6178,7 +6184,9 @@ struct Index {
     .barOverlap(true)
     .barHeight(FLOATING_BAR_HEIGHT_VP)
     // 和首页/多选底栏统一宽度：5 项时每项约 61vp，与系统「智慧生活」底栏一致。
-    .barWidth(this.bottomBarCapsuleWidth())
+    // Do not derive this from the parent file bar mode: that bar remains
+    // mounted behind the viewer and is normally in the 140vp tools mode.
+    .barWidth(this.wideBottomBarCapsuleWidth())
     .barFloatingStyle({ barBottomMargin: 40, maskColor: Color.Transparent,
       systemMaterial: this.bottomCapsuleMaterial })
     .width('100%')
@@ -10437,7 +10445,6 @@ struct Index {
 
   private resetImageDismissTransform(): void {
     this.imageDismissDragging = false
-    this.imageDismissParentChromeVisible = false
     this.imageDismissScale = 1
     this.imageDismissOffsetY = 0
     this.imageDismissBackdropOpacity = 1
@@ -10467,7 +10474,6 @@ struct Index {
       return
     }
     this.imageDismissChromeWasVisible = this.imageChromeVisible
-    this.imageDismissParentChromeVisible = true
     this.setImageChromeVisible(false, false)
     this.imageDismissDragging = true
     this.imageTouchMoved = true
@@ -10495,7 +10501,6 @@ struct Index {
     this.getUIContext().animateTo({
       curve: curves.interpolatingSpring(0, 1, 320, 30),
       onFinish: (): void => {
-        this.imageDismissParentChromeVisible = false
         if (this.imageDismissChromeWasVisible) {
           this.setImageChromeVisible(true, false)
         }
