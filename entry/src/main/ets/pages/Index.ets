@@ -428,6 +428,8 @@ struct Index {
   @State directoryCounts: Record<string, number> = {}
   @State pageOffsetX: number = 0
   @State outgoingPageOffsetX: number = 0
+  @State transitionSnapshotOnTop: boolean = false
+  @State transitionSnapshotMode: FileViewMode = 'list'
   @State pageWidthVp: number = 360
   @State pageHeightVp: number = 800
   @State transferDirection: string = 'download'
@@ -606,6 +608,8 @@ struct Index {
   private titleAnimationToken: number = 0
   private pageTransitionToken: number = 0
   private pageTransitionTimer: number = 0
+  private pageTransitionFinishing: boolean = false
+  private resetPreviewAfterPageTransition: boolean = false
   private bottomBarAnimationToken: number = 0
   private imageChromeAnimationToken: number = 0
   private viewerEntryTransitionToken: number = 0
@@ -1289,6 +1293,9 @@ struct Index {
   }
 
   private cancelFileTransition(): void {
+    const shouldResetPreview = this.resetPreviewAfterPageTransition
+    this.resetPreviewAfterPageTransition = false
+    this.pageTransitionFinishing = false
     this.pageTransitionToken += 1
     if (this.pageTransitionTimer > 0) {
       clearTimeout(this.pageTransitionTimer)
@@ -1297,34 +1304,47 @@ struct Index {
     this.showPageTransition = false
     this.pageOffsetX = 0
     this.outgoingPageOffsetX = 0
+    this.transitionSnapshotOnTop = false
+    this.transitionSnapshotMode = 'list'
     this.outgoingEntries = []
+    if (shouldResetPreview) {
+      this.resetPreviewState(false)
+    }
   }
 
-  private startFileTransition(outgoingEntries: FileEntry[], direction: PageTransitionDirection): void {
+  private prepareFileTransition(outgoingEntries: FileEntry[], direction: PageTransitionDirection): number {
     this.cancelFileTransition()
     const token = this.pageTransitionToken
     const width = this.effectivePageWidth()
     this.outgoingEntries = outgoingEntries.slice()
+    this.transitionSnapshotMode = this.fileViewMode
+    this.transitionSnapshotOnTop = false
     this.outgoingPageOffsetX = 0
     this.pageOffsetX = direction === 'push' ? width : -width
     this.showPageTransition = true
+    return token
+  }
 
+  private animatePreparedFileTransition(token: number, direction: PageTransitionDirection,
+    incomingTitle: string): void {
+    if (token !== this.pageTransitionToken || !this.showPageTransition) {
+      return
+    }
+    const width = this.effectivePageWidth()
     // The incoming page travels one full screen width while the outgoing
     // page travels half a screen width in the same duration. Linear motion
     // keeps the 1:1/2 speed ratio visible instead of hiding it in easing.
-    setTimeout((): void => {
-      if (token !== this.pageTransitionToken || !this.showPageTransition) {
+    const outgoingTarget = direction === 'push' ? -width * 0.5 : width * 0.5
+    this.getUIContext().animateTo({ duration: 180, curve: Curve.FastOutSlowIn }, () => {
+      if (token !== this.pageTransitionToken) {
         return
       }
-      const outgoingTarget = direction === 'push' ? -width * 0.5 : width * 0.5
-      this.getUIContext().animateTo({ duration: 180, curve: Curve.FastOutSlowIn }, () => {
-        if (token !== this.pageTransitionToken) {
-          return
-        }
-        this.pageOffsetX = 0
-        this.outgoingPageOffsetX = outgoingTarget
-      })
-    }, 0)
+      // Match the selection-mode header: keep the same Text node visible and
+      // switch its content in the same animation transaction as the page.
+      this.updateTopTitle(incomingTitle, false)
+      this.pageOffsetX = 0
+      this.outgoingPageOffsetX = outgoingTarget
+    })
 
     this.pageTransitionTimer = setTimeout((): void => {
       if (token !== this.pageTransitionToken) {
@@ -1334,9 +1354,164 @@ struct Index {
       this.showPageTransition = false
       this.pageOffsetX = 0
       this.outgoingPageOffsetX = 0
+      this.transitionSnapshotOnTop = false
+      this.transitionSnapshotMode = 'list'
       this.outgoingEntries = []
       this.isBusy = false
+      if (this.resetPreviewAfterPageTransition) {
+        this.resetPreviewAfterPageTransition = false
+        this.resetPreviewState(false)
+      }
     }, 210)
+  }
+
+  private startFileTransition(outgoingEntries: FileEntry[], direction: PageTransitionDirection,
+    incomingTitle: string): void {
+    const token = this.prepareFileTransition(outgoingEntries, direction)
+    this.postRenderFrame((): void => this.animatePreparedFileTransition(token, direction, incomingTitle))
+  }
+
+  /**
+   * Keep the outgoing lazy container intact for one submitted frame before
+   * reloading the hidden incoming container. This follows ArkUI's documented
+   * transition ordering: insertion first, data replacement second, animation
+   * only after both surfaces have completed an initial frame.
+   */
+  private async transitionFileContent(outgoingEntries: FileEntry[], direction: PageTransitionDirection,
+    incomingTitle: string, commitIncoming: () => void, settleIncoming: (() => void) | null = null,
+    resetPreviewOnFinish: boolean = false): Promise<boolean> {
+    const token = this.prepareFileTransition(outgoingEntries, direction)
+    this.resetPreviewAfterPageTransition = resetPreviewOnFinish
+    await this.nextRenderFrame()
+    if (token !== this.pageTransitionToken || !this.showPageTransition) {
+      return false
+    }
+    try {
+      commitIncoming()
+    } catch (error) {
+      this.cancelFileTransition()
+      const message = error instanceof Error ? error.message : JSON.stringify(error)
+      throw new Error(message)
+    }
+    await this.nextRenderFrame()
+    if (token !== this.pageTransitionToken || !this.showPageTransition) {
+      return false
+    }
+    if (settleIncoming !== null) {
+      settleIncoming()
+      await this.nextRenderFrame()
+      if (token !== this.pageTransitionToken || !this.showPageTransition) {
+        return false
+      }
+    }
+    this.animatePreparedFileTransition(token, direction, incomingTitle)
+    return true
+  }
+
+  private settleFileTransitionSnapshot(state: DirectoryViewState | null): void {
+    if (state === null || state.mode === 'waterfall' || state.offset === null) {
+      return
+    }
+    try {
+      this.transitionScroller.scrollTo({
+        xOffset: state.offset.xOffset,
+        yOffset: state.offset.yOffset,
+        animation: false
+      })
+    } catch (_) {
+      // The transition surface may still be completing its first layout.
+    }
+  }
+
+  private finishBackFileTransition(token: number, incomingState: DirectoryViewState | null,
+    commitIncoming: () => void): void {
+    if (token !== this.pageTransitionToken || !this.showPageTransition || this.pageTransitionFinishing) {
+      return
+    }
+    this.pageTransitionFinishing = true
+    if (this.pageTransitionTimer > 0) {
+      clearTimeout(this.pageTransitionTimer)
+      this.pageTransitionTimer = 0
+    }
+    // The parent snapshot entered above the live child and now covers the
+    // viewport completely. Rebuild the real parent behind that stable surface.
+    try {
+      commitIncoming()
+    } catch (error) {
+      this.cancelFileTransition()
+      this.isBusy = false
+      this.reportError(error as Object, '返回目录失败')
+      return
+    }
+    this.postRenderFrame((): void => {
+      if (token !== this.pageTransitionToken || !this.showPageTransition) {
+        return
+      }
+      this.settleDirectoryViewStateForTransition(incomingState)
+      this.postRenderFrame((): void => {
+        if (token !== this.pageTransitionToken || !this.showPageTransition) {
+          return
+        }
+        this.pageOffsetX = 0
+        this.outgoingPageOffsetX = 0
+        this.showPageTransition = false
+        this.transitionSnapshotOnTop = false
+        this.transitionSnapshotMode = 'list'
+        this.outgoingEntries = []
+        this.resetPreviewState(false)
+        this.pageTransitionFinishing = false
+        this.isBusy = false
+      })
+    })
+  }
+
+  /**
+   * Pop keeps the current file surface mounted for the whole exit animation.
+   * The parent snapshot enters above it; only after the animation completes
+   * do we replace the live data source and release the outgoing previews.
+   */
+  private async transitionBackFileContent(incomingEntries: FileEntry[], incomingState: DirectoryViewState | null,
+    incomingTitle: string, commitIncoming: () => void): Promise<boolean> {
+    this.cancelFileTransition()
+    const token = this.pageTransitionToken
+    const width = this.effectivePageWidth()
+    this.outgoingEntries = incomingEntries.slice()
+    this.transitionSnapshotMode = incomingState === null || incomingState.mode === 'waterfall'
+      ? 'list' : incomingState.mode
+    // Keep the returning parent above the outgoing child for the entire pop.
+    // At x = -width it is outside the viewport; at x = 0 it already forms the
+    // complete final frame, so no end-of-animation z-order handoff is needed.
+    this.transitionSnapshotOnTop = true
+    this.outgoingPageOffsetX = -width
+    this.pageOffsetX = 0
+    this.showPageTransition = true
+
+    await this.nextRenderFrame()
+    if (token !== this.pageTransitionToken || !this.showPageTransition) {
+      return false
+    }
+    this.settleFileTransitionSnapshot(incomingState)
+    await this.nextRenderFrame()
+    if (token !== this.pageTransitionToken || !this.showPageTransition) {
+      return false
+    }
+
+    this.getUIContext().animateTo({
+      duration: 180,
+      curve: Curve.FastOutSlowIn,
+      finishCallbackType: FinishCallbackType.REMOVED,
+      onFinish: (): void => {
+        this.finishBackFileTransition(token, incomingState, commitIncoming)
+      }
+    }, () => {
+      if (token !== this.pageTransitionToken) {
+        return
+      }
+      this.updateTopTitle(incomingTitle, false)
+      this.pageOffsetX = width * 0.5
+      this.outgoingPageOffsetX = 0
+    })
+    return true
   }
 
   onBackPress(): boolean {
@@ -1443,11 +1618,12 @@ struct Index {
     Stack() {
       if (this.screen === 'files' && !this.showSearch && this.showPageTransition) {
         Stack() {
-          this.FileContentSnapshot(this.outgoingEntries)
+          this.FileContentSnapshot(this.outgoingEntries, this.transitionSnapshotMode)
         }
         .width('100%')
         .height('100%')
         .translate({ x: this.outgoingPageOffsetX, y: 0, z: 0 })
+        .zIndex(this.transitionSnapshotOnTop ? 5 : 0)
       }
 
       Column() {
@@ -2674,9 +2850,63 @@ struct Index {
   }
 
   @Builder
-  FileContentSnapshot(snapshotEntries: FileEntry[]): void {
+  FileContentSnapshot(snapshotEntries: FileEntry[], snapshotMode: FileViewMode): void {
     Column() {
-      List({ space: 0, scroller: this.transitionScroller }) {
+      if (snapshotMode === 'grid') {
+        Grid(this.transitionScroller) {
+          ForEach(snapshotEntries, (entry: FileEntry) => {
+            GridItem() {
+              Column({ space: 6 }) {
+                Stack({ alignContent: Alignment.Center }) {
+                  if (this.fileImageSourceAvailable(entry, 'grid')) {
+                    Image(this.fileImageSource(entry, 'grid'))
+                      .width('100%')
+                      .height(82)
+                      .orientation(this.fileImageSourceOrientation(entry, 'grid'))
+                      .objectFit(ImageFit.Cover)
+                      .borderRadius(10)
+                  } else if (entry.isDirectory) {
+                    this.FolderIcon(44)
+                  } else {
+                    Image(this.fileIcon(entry))
+                      .width(48)
+                      .height(48)
+                      .objectFit(ImageFit.Contain)
+                  }
+                }
+                .width('100%')
+                .height(82)
+                .borderRadius(10)
+                .clip(true)
+
+                Text(entry.name)
+                  .fontSize(14)
+                  .fontColor($r('app.color.text_primary'))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .width('100%')
+                  .textAlign(TextAlign.Center)
+                if (entry.isDirectory && this.entryInfo(entry).length > 0) {
+                  Text(this.entryInfo(entry))
+                    .fontSize(11)
+                    .fontColor($r('app.color.text_muted'))
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                }
+              }
+              .width('100%')
+              .padding({ left: 6, right: 6, top: 8, bottom: 8 })
+            }
+          }, (entry: FileEntry) => entry.path)
+        }
+        .columnsTemplate('1fr 1fr')
+        .columnsGap(8)
+        .rowsGap(8)
+        .width('100%')
+        .layoutWeight(1)
+        .padding({ left: 10, right: 10, top: this.fileContentTopInset(), bottom: 0 })
+      } else {
+        List({ space: 0, scroller: this.transitionScroller }) {
         ListItem() {
           Row()
             .width('100%')
@@ -2726,10 +2956,11 @@ struct Index {
           }
         }, (entry: FileEntry) => entry.path)
 
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
       }
-      .width('100%')
-      .layoutWeight(1)
-      .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
     }
     .width('100%')
     .height('100%')
@@ -3452,7 +3683,8 @@ struct Index {
       .height(FLOATING_BAR_HEIGHT_VP)
       .opacity(this.bottomBarMode() === 'home' ? 1 : 0)
       .translate({ x: 0, y: this.bottomBarMode() === 'home' ? 0 : 12, z: 0 })
-      .hitTestBehavior(this.bottomBarMode() === 'home' ? HitTestMode.Default : HitTestMode.None)
+      .hitTestBehavior(this.bottomBarMode() === 'home'
+        ? HitTestMode.Default : HitTestMode.BLOCK_DESCENDANTS)
       .animation({ duration: 200, curve: Curve.FastOutSlowIn })
 
       // 多选操作
@@ -3463,7 +3695,8 @@ struct Index {
       .height(FLOATING_BAR_HEIGHT_VP)
       .opacity(this.bottomBarMode() === 'selection' ? 1 : 0)
       .translate({ x: 0, y: this.bottomBarMode() === 'selection' ? 0 : 12, z: 0 })
-      .hitTestBehavior(this.bottomBarMode() === 'selection' ? HitTestMode.Default : HitTestMode.None)
+      .hitTestBehavior(this.bottomBarMode() === 'selection'
+        ? HitTestMode.Default : HitTestMode.BLOCK_DESCENDANTS)
       .animation({ duration: 200, curve: Curve.FastOutSlowIn })
 
       // 文件详情页：左圆钮 + 中间排序胶囊 + 右圆钮
@@ -3474,7 +3707,8 @@ struct Index {
       .height(FLOATING_BAR_HEIGHT_VP)
       .opacity(this.bottomBarMode() === 'tools' ? 1 : 0)
       .translate({ x: 0, y: this.bottomBarMode() === 'tools' ? 0 : 12, z: 0 })
-      .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
+      .hitTestBehavior(this.bottomBarMode() === 'tools'
+        ? HitTestMode.Default : HitTestMode.BLOCK_DESCENDANTS)
       .animation({ duration: 200, curve: Curve.FastOutSlowIn })
     }
     .width('100%')
@@ -7570,6 +7804,23 @@ struct Index {
     }, 0)
   }
 
+  private settleDirectoryViewStateForTransition(state: DirectoryViewState | null): void {
+    if (state === null || this.screen !== 'files' || this.showSearch) {
+      return
+    }
+    if (state.mode === 'waterfall' && !this.currentDirectoryHasImages) {
+      this.fileViewMode = 'list'
+      return
+    }
+    this.fileViewMode = state.mode
+    this.waterfallAnchorRestoreToken += 1
+    const token = this.waterfallAnchorRestoreToken
+    // The incoming container has already completed its first layout frame.
+    // Restore it once while it is still outside the viewport; retrying every
+    // 48 ms would relayout the page throughout the horizontal transition.
+    this.restoreFileViewModePosition(state.mode, state.anchor, state.offset, token, 0, 0)
+  }
+
   private toggleFileViewMode(): void {
     if (this.isBusy || this.showSearch) {
       return
@@ -7617,7 +7868,7 @@ struct Index {
 
   private restoreFileViewModePosition(sourceMode: FileViewMode,
     anchor: FileViewAnchor | null, sourceOffset: ViewerReturnScrollOffset | null,
-    token: number, attempt: number): void {
+    token: number, attempt: number, maxAttempts: number = 8): void {
     if (token !== this.waterfallAnchorRestoreToken || this.screen !== 'files' ||
       this.showSearch) {
       return
@@ -7629,7 +7880,7 @@ struct Index {
     // the target container.
     const needsAnchor = this.fileViewMode === 'waterfall' || sourceMode === 'waterfall'
     if (needsAnchor && anchor !== null) {
-      this.restoreFileViewAnchor(anchor, token, 0)
+      this.restoreFileViewAnchor(anchor, token, 0, maxAttempts)
       if (this.fileViewMode === 'waterfall') {
         return
       }
@@ -7650,10 +7901,10 @@ struct Index {
     // The new List/Grid node can be created one or more frames after the
     // state change. Retry without animation so it settles at the captured
     // position rather than briefly showing the top of the directory.
-    if (attempt < 8 && token === this.waterfallAnchorRestoreToken) {
+    if (attempt < maxAttempts && token === this.waterfallAnchorRestoreToken) {
       setTimeout((): void => {
         this.restoreFileViewModePosition(sourceMode, anchor, sourceOffset,
-          token, attempt + 1)
+          token, attempt + 1, maxAttempts)
       }, 48)
     }
   }
@@ -7716,7 +7967,7 @@ struct Index {
   }
 
   private restoreFileViewAnchor(anchor: FileViewAnchor | null, token: number,
-    attempt: number = 0): void {
+    attempt: number = 0, maxAttempts: number = 8): void {
     if (token !== this.waterfallAnchorRestoreToken || anchor === null ||
       this.screen !== 'files' || this.showSearch) {
       return
@@ -7738,7 +7989,7 @@ struct Index {
     // short bounded window; without this, the early scrollToIndex is ignored
     // and the container stays at its first image.
     const isWaterfall = this.fileViewMode === 'waterfall'
-    const maxRestoreAttempts = isWaterfall ? 8 : 0
+    const maxRestoreAttempts = isWaterfall ? maxAttempts : 0
     try {
       scroller.scrollToIndex(targetIndex + childIndexOffset, false, ScrollAlign.START, {
         extraOffset: LengthMetrics.vp(Math.max(-120, Math.min(160, anchor.y)))
@@ -7754,7 +8005,7 @@ struct Index {
     if (isWaterfall && attempt < maxRestoreAttempts &&
       token === this.waterfallAnchorRestoreToken) {
       setTimeout((): void => {
-        this.restoreFileViewAnchor(anchor, token, attempt + 1)
+        this.restoreFileViewAnchor(anchor, token, attempt + 1, maxAttempts)
       }, 48)
     }
     this.waterfallAnchor = null
@@ -8307,11 +8558,10 @@ struct Index {
       this.currentRootType = targetRootType
       this.setCurrentPageState(1, false)
       this.replaceEntries(targetEntries)
-      this.updateTopTitle(this.fileTitle(targetParent), true)
       this.updateBottomBarVisibility(true)
       this.updateDirectoryCount(targetParent, targetEntries.length)
       this.resetPreviewState()
-      this.startFileTransition(outgoingEntries, 'push')
+      this.startFileTransition(outgoingEntries, 'push', this.fileTitle(targetParent))
       const located = targetEntries.find((item: FileEntry) => item.path === entry.path)
       this.isBusy = false
       if (located !== undefined) {
@@ -8856,24 +9106,30 @@ struct Index {
       if (requestId !== this.navigationRequestId) {
         return
       }
-      this.navigationStack = this.navigationStack.concat([this.currentPath])
-      this.navigationEntryStack = this.navigationEntryStack.concat([this.entries.slice()])
-      this.navigationRootTypeStack = this.navigationRootTypeStack.concat([this.currentRootType])
-      this.navigationViewStateStack = this.navigationViewStateStack.concat([
-        this.cloneDirectoryViewState(outgoingViewState)])
-      this.navigationPageIndexStack = this.navigationPageIndexStack.concat([this.currentPageIndex])
-      this.navigationPageHasMoreStack = this.navigationPageHasMoreStack.concat([this.currentPageHasMore])
-      this.currentPath = nextPath
-      this.currentRootType = nextRootType
-      this.setCurrentPageState(nextPage.pageIndex, nextPage.hasMore)
-      this.replaceEntries(nextPage.entries)
-      this.updateTopTitle(this.fileTitle(nextPath), true)
-      this.updateBottomBarVisibility(true)
-      this.updateDirectoryCount(nextPath, nextPage.totalCount >= 0
-        ? nextPage.totalCount : nextPage.entries.length)
-      this.resetPreviewState()
+      // The directory read has completed. From this point the staged visual
+      // transition owns input until its finish callback releases isBusy.
       this.isNavigating = false
-      this.startFileTransition(outgoingEntries, 'push')
+      const transitioned = await this.transitionFileContent(outgoingEntries, 'push',
+        this.fileTitle(nextPath), (): void => {
+        this.navigationStack = this.navigationStack.concat([this.currentPath])
+        this.navigationEntryStack = this.navigationEntryStack.concat([this.entries.slice()])
+        this.navigationRootTypeStack = this.navigationRootTypeStack.concat([this.currentRootType])
+        this.navigationViewStateStack = this.navigationViewStateStack.concat([
+          this.cloneDirectoryViewState(outgoingViewState)])
+        this.navigationPageIndexStack = this.navigationPageIndexStack.concat([this.currentPageIndex])
+        this.navigationPageHasMoreStack = this.navigationPageHasMoreStack.concat([this.currentPageHasMore])
+        this.currentPath = nextPath
+        this.currentRootType = nextRootType
+        this.setCurrentPageState(nextPage.pageIndex, nextPage.hasMore)
+        this.replaceEntries(nextPage.entries)
+        this.updateBottomBarVisibility(true)
+        this.updateDirectoryCount(nextPath, nextPage.totalCount >= 0
+          ? nextPage.totalCount : nextPage.entries.length)
+        this.resetPreviewState()
+      })
+      if (!transitioned) {
+        return
+      }
       this.statusText = nextPage.entries.length === 0 ? '目录读取成功（空目录）' : '目录读取成功'
     } catch (error) {
       if (requestId === this.navigationRequestId) {
@@ -8925,31 +9181,30 @@ struct Index {
       ? viewStateStack.pop() as DirectoryViewState : null
     const previousPageIndex = pageIndexStack.length > 0 ? pageIndexStack.pop() as number : 1
     const previousPageHasMore = pageHasMoreStack.length > 0 ? pageHasMoreStack.pop() as boolean : false
-    const outgoingEntries = this.entries.slice()
     if (this.shouldRestoreSearch(previousPath, stack.length)) {
       this.restoreSearchSession()
       return
     }
     if (previousPath.length === 0) {
-      this.navigationStack = stack
-      this.navigationEntryStack = entryStack
-      this.navigationRootTypeStack = rootTypeStack
-      this.navigationViewStateStack = viewStateStack
-      this.navigationPageIndexStack = pageIndexStack
-      this.navigationPageHasMoreStack = pageHasMoreStack
-      this.currentPath = previousPath
-      this.currentRootType = this.rootKind === 'personal' ? 4 : 3
-      this.setCurrentPageState(1, false)
-      if (previousViewState !== null) {
-        this.fileViewMode = previousViewState.mode
-      }
-      this.replaceEntries(this.rootKind === 'personal' ? this.personalRoots : this.sharedRoots)
-      this.updateTopTitle(this.fileTitle('', this.rootKind), true)
-      this.updateBottomBarVisibility(true)
-      this.resetPreviewState(false)
-      this.restoreDirectoryViewState(previousViewState)
       this.isBusy = true
-      this.startFileTransition(outgoingEntries, 'pop')
+      const incomingEntries = this.rootKind === 'personal' ? this.personalRoots : this.sharedRoots
+      await this.transitionBackFileContent(incomingEntries, previousViewState,
+        this.fileTitle('', this.rootKind), (): void => {
+        this.navigationStack = stack
+        this.navigationEntryStack = entryStack
+        this.navigationRootTypeStack = rootTypeStack
+        this.navigationViewStateStack = viewStateStack
+        this.navigationPageIndexStack = pageIndexStack
+        this.navigationPageHasMoreStack = pageHasMoreStack
+        this.currentPath = previousPath
+        this.currentRootType = this.rootKind === 'personal' ? 4 : 3
+        this.setCurrentPageState(1, false)
+        if (previousViewState !== null) {
+          this.fileViewMode = previousViewState.mode
+        }
+        this.replaceEntries(incomingEntries)
+        this.updateBottomBarVisibility(true)
+      })
       return
     }
 
@@ -8957,51 +9212,49 @@ struct Index {
     // that snapshot immediately; the repository cache remains available for
     // a later explicit refresh.
     if (previousEntries !== null) {
-      this.navigationStack = stack
-      this.navigationEntryStack = entryStack
-      this.navigationRootTypeStack = rootTypeStack
-      this.navigationViewStateStack = viewStateStack
-      this.navigationPageIndexStack = pageIndexStack
-      this.navigationPageHasMoreStack = pageHasMoreStack
-      this.currentPath = previousPath
-      this.currentRootType = previousRootType
-      this.setCurrentPageState(previousPageIndex, previousPageHasMore)
-      if (previousViewState !== null) {
-        this.fileViewMode = previousViewState.mode
-      }
-      this.replaceEntries(previousEntries)
-      this.updateTopTitle(this.fileTitle(previousPath), true)
-      this.updateBottomBarVisibility(true)
-      this.resetPreviewState(false)
-      this.restoreDirectoryViewState(previousViewState)
       this.isBusy = true
-      this.startFileTransition(outgoingEntries, 'pop')
+      await this.transitionBackFileContent(previousEntries, previousViewState,
+        this.fileTitle(previousPath), (): void => {
+        this.navigationStack = stack
+        this.navigationEntryStack = entryStack
+        this.navigationRootTypeStack = rootTypeStack
+        this.navigationViewStateStack = viewStateStack
+        this.navigationPageIndexStack = pageIndexStack
+        this.navigationPageHasMoreStack = pageHasMoreStack
+        this.currentPath = previousPath
+        this.currentRootType = previousRootType
+        this.setCurrentPageState(previousPageIndex, previousPageHasMore)
+        if (previousViewState !== null) {
+          this.fileViewMode = previousViewState.mode
+        }
+        this.replaceEntries(previousEntries)
+        this.updateBottomBarVisibility(true)
+      })
       return
     }
 
     this.isBusy = true
     try {
       const loadedPage = await this.repository.listPage(previousPath, previousRootType, 1)
-      this.navigationStack = stack
-      this.navigationEntryStack = entryStack
-      this.navigationRootTypeStack = rootTypeStack
-      this.navigationViewStateStack = viewStateStack
-      this.navigationPageIndexStack = pageIndexStack
-      this.navigationPageHasMoreStack = pageHasMoreStack
-      this.currentPath = previousPath
-      this.currentRootType = previousRootType
-      this.setCurrentPageState(loadedPage.pageIndex, loadedPage.hasMore)
-      if (previousViewState !== null) {
-        this.fileViewMode = previousViewState.mode
-      }
-      this.replaceEntries(loadedPage.entries)
-      this.updateTopTitle(this.fileTitle(previousPath), true)
-      this.updateBottomBarVisibility(true)
-      this.updateDirectoryCount(previousPath, loadedPage.totalCount >= 0
-        ? loadedPage.totalCount : loadedPage.entries.length)
-      this.resetPreviewState(false)
-      this.restoreDirectoryViewState(previousViewState)
-      this.startFileTransition(outgoingEntries, 'pop')
+      await this.transitionBackFileContent(loadedPage.entries, previousViewState,
+        this.fileTitle(previousPath), (): void => {
+        this.navigationStack = stack
+        this.navigationEntryStack = entryStack
+        this.navigationRootTypeStack = rootTypeStack
+        this.navigationViewStateStack = viewStateStack
+        this.navigationPageIndexStack = pageIndexStack
+        this.navigationPageHasMoreStack = pageHasMoreStack
+        this.currentPath = previousPath
+        this.currentRootType = previousRootType
+        this.setCurrentPageState(loadedPage.pageIndex, loadedPage.hasMore)
+        if (previousViewState !== null) {
+          this.fileViewMode = previousViewState.mode
+        }
+        this.replaceEntries(loadedPage.entries)
+        this.updateBottomBarVisibility(true)
+        this.updateDirectoryCount(previousPath, loadedPage.totalCount >= 0
+          ? loadedPage.totalCount : loadedPage.entries.length)
+      })
     } catch (error) {
       this.reportError(error as Object, '返回目录失败')
     } finally {

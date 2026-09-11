@@ -100,7 +100,8 @@ export struct FloatingImportControl {
     if (this.dragging) { return this.dragY }
     return this.safeTop + this.fraction * (this.maxY() - this.safeTop)
   }
-  private surfaceWidth(): number { return this.expanded ? Math.min(216, this.viewportWidth - 16) : 56 }
+  private expandedSurfaceWidth(): number { return Math.min(216, this.viewportWidth - 16) }
+  private surfaceWidth(): number { return this.expanded ? this.expandedSurfaceWidth() : 56 }
   private surfaceHeight(): number { return this.expanded ? 160 : 56 }
   private x(): number { return Math.max(8, Math.min(this.circleX(), this.viewportWidth - this.surfaceWidth() - 8)) }
   private y(): number {
@@ -208,7 +209,7 @@ export struct FloatingImportControl {
 
   @Builder
   Surface() {
-    Stack() {
+    Stack({ alignContent: Alignment.TopStart }) {
       this.TouchLight()
       Row() {
         SymbolGlyph($r('sys.symbol.plus'))
@@ -217,13 +218,21 @@ export struct FloatingImportControl {
         .width(56).height(56).justifyContent(FlexAlign.Center)
         .opacity(this.expanded ? 0 : 1)
         .hitTestBehavior(this.expanded ? HitTestMode.None : HitTestMode.Default)
-      if (this.expanded) {
-        Column() {
-          this.Choice($r('sys.symbol.folder'), '文件', 'files')
-          this.Choice($r('sys.symbol.rectangle_on_rectangle'), '图库', 'gallery')
-          this.Choice($r('sys.symbol.folder_badge_plus'), '新建文件夹', 'folder')
-        }.padding({ top: 8, bottom: 8 })
+      // Keep the choices at their final dimensions while the material surface
+      // morphs. If this column follows the shrinking parent, Row/Text is laid
+      // out again on every frame and the labels visibly scatter into the ball.
+      Column() {
+        this.Choice($r('sys.symbol.folder'), '文件', 'files')
+        this.Choice($r('sys.symbol.rectangle_on_rectangle'), '图库', 'gallery')
+        this.Choice($r('sys.symbol.folder_badge_plus'), '新建文件夹', 'folder')
       }
+      .width(this.expandedSurfaceWidth())
+      .height(160)
+      .padding({ top: 8, bottom: 8 })
+      .position({ x: 0, y: 0 })
+      .opacity(this.expanded ? 1 : 0)
+      .animation({ duration: this.expanded ? 120 : 70, curve: Curve.EaseOut })
+      .hitTestBehavior(this.expanded ? HitTestMode.Default : HitTestMode.BLOCK_DESCENDANTS)
     }
     .backgroundColor(Color.Transparent)
     .width(this.surfaceWidth()).height(this.surfaceHeight())
