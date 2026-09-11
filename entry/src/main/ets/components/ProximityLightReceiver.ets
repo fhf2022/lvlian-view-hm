@@ -3,6 +3,7 @@ import { ImportLightState, ProximityLighting } from './ProximityLighting'
 /** Decorative overlay; each receiver draws only its own light-facing outline. */
 @Component
 export struct ProximityLightReceiver {
+  @Prop mode: string = 'capsule'
   @StorageLink('ugreen.importLight') @Watch('redraw') light: ImportLightState = new ImportLightState()
   private context: CanvasRenderingContext2D = new CanvasRenderingContext2D(new RenderingContextSettings(true))
   private ready: boolean = false
@@ -28,7 +29,24 @@ export struct ProximityLightReceiver {
     light.addColorStop(0.65, 'rgba(235,250,255,0.35)')
     light.addColorStop(1, 'rgba(235,250,255,0)')
     this.context.beginPath()
-    this.context.roundRect(0.9, 0.9, this.widthVp - 1.8, this.heightVp - 1.8, cornerRadius - 0.9)
+    if (this.mode === 'fileTools') {
+      const sidePadding = 16
+      const circleSize = this.heightVp
+      const sortWidth = 140
+      const gap = Math.max(0,
+        (this.widthVp - sidePadding * 2 - circleSize * 2 - sortWidth) / 2)
+      const sortX = sidePadding + circleSize + gap
+      const rightX = this.widthVp - sidePadding - circleSize
+      this.context.roundRect(sidePadding + 0.9, 0.9,
+        circleSize - 1.8, circleSize - 1.8, cornerRadius - 0.9)
+      this.context.roundRect(sortX + 0.9, 0.9,
+        sortWidth - 1.8, this.heightVp - 1.8, cornerRadius - 0.9)
+      this.context.roundRect(rightX + 0.9, 0.9,
+        circleSize - 1.8, circleSize - 1.8, cornerRadius - 0.9)
+    } else {
+      this.context.roundRect(0.9, 0.9,
+        this.widthVp - 1.8, this.heightVp - 1.8, cornerRadius - 0.9)
+    }
     this.context.strokeStyle = light
     this.context.lineWidth = 1.8
     this.context.stroke()
@@ -37,7 +55,6 @@ export struct ProximityLightReceiver {
   build() {
     Canvas(this.context)
       .width('100%').height('100%')
-      .borderRadius(1000).clip(true)
       .hitTestBehavior(HitTestMode.None)
       .accessibilityLevel('no')
       .onReady(() => { this.ready = true; this.redraw() })

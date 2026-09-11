@@ -12,8 +12,8 @@ const DRAG_SLOP: number = 10
  * Draggable import ball.
  *
  * The immersive material only renders inside a Navigation title bar, so the
- * ball carries a small Navigation host that is exactly as large as the ball and
- * travels with it (see build()).
+ * ball uses a visual-only title-bar scope while its exact-size sibling handles
+ * content and input (see build()).
  */
 @Component
 export struct FloatingImportControl {
@@ -66,7 +66,7 @@ export struct FloatingImportControl {
   private surfaceMaterial(): uiMaterial.ImmersiveMaterial {
     return new uiMaterial.ImmersiveMaterial({
       style: uiMaterial.ImmersiveStyle.THIN,
-      applyShadow: false,
+      applyShadow: true,
       colorInvert: true,
       interactive: false,
       lightEffect: null
@@ -134,13 +134,24 @@ export struct FloatingImportControl {
   @Builder
   MaterialHost() {
     Stack() {
-      this.Surface()
+      this.MaterialSurface()
     }
     .width('100%').height('100%')
     .clip(false)
-    // Pure host: keep it out of the touch test so taps in its empty area reach
-    // the file list behind it instead of dying on a full screen transparent node.
+    // This title builder only supplies the supported material scope. Input is
+    // handled by the exact-size Surface sibling in build().
     .hitTestBehavior(HitTestMode.None)
+  }
+
+  @Builder
+  MaterialSurface() {
+    Stack() {}
+      .width(this.surfaceWidth()).height(this.surfaceHeight())
+      .borderRadius(this.expanded ? 24 : 28)
+      .backgroundColor(Color.Transparent)
+      .systemMaterial(this.surfaceMaterial())
+      .position({ x: this.x(), y: this.y() })
+      .hitTestBehavior(HitTestMode.None)
   }
 
   @Builder
@@ -217,15 +228,9 @@ export struct FloatingImportControl {
     .backgroundColor(Color.Transparent)
     .width(this.surfaceWidth()).height(this.surfaceHeight())
     .borderRadius(this.expanded ? 24 : 28)
-    .systemMaterial(this.surfaceMaterial())
-    // The ball is the only interactive part of this pass through overlay.
-    // Blocking the rest of the hierarchy makes sure a press on the ball never
-    // also lands on the folder row that happens to sit behind it.
-    .hitTestBehavior(HitTestMode.BLOCK_HIERARCHY)
+    .hitTestBehavior(HitTestMode.Default)
     .monopolizeEvents(true)
-    // The navigation host above already sits at the ball position and is
-    // exactly as large as the ball, so the surface only fills it.
-    .position({ x: 0, y: 0 })
+    .position({ x: this.x(), y: this.y() })
     .onTouch((event: TouchEvent) => {
       if (this.expanded) { return }
       if (event.type === TouchType.Down) {
@@ -282,21 +287,22 @@ export struct FloatingImportControl {
 
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
-      // The material only renders inside a Navigation title bar, so the ball
-      // needs this host. The host is kept exactly as large as the ball and is
-      // moved with it: a full screen host would put a full screen navigation
-      // bar above the page, and that bar takes part in the touch test and
-      // swallows every tap meant for the file list below.
+      // Keep the title bar full-size so the native material shadow has no local
+      // rectangular clipping edge. BLOCK_DESCENDANTS makes this visual-only
+      // scope transparent to hit testing, including Navigation's generated bar.
       Navigation() {}
         .mode(NavigationMode.Stack).hideBackButton(true).hideToolBar(true)
         .title({ builder: this.MaterialHost, height: '100%' }, {
           barStyle: BarStyle.STACK, paddingStart: LengthMetrics.vp(0), paddingEnd: LengthMetrics.vp(0),
-          backgroundColor: Color.Transparent
+          backgroundColor: Color.Transparent, backgroundBlurStyle: BlurStyle.NONE
         })
-        .width(this.surfaceWidth()).height(this.surfaceHeight())
-        .position({ x: this.x(), y: this.y() })
+        .width('100%').height('100%')
         .backgroundColor(Color.Transparent).clip(false)
-        .hitTestBehavior(HitTestMode.None)
+        .hitTestBehavior(HitTestMode.BLOCK_DESCENDANTS)
+
+      // Content and gestures use only the visible control bounds. Nothing in
+      // the full-size Navigation above can consume a tap meant for the page.
+      this.Surface()
     }
     .width('100%').height('100%')
     .clip(false)

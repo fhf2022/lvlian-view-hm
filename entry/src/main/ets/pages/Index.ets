@@ -70,6 +70,8 @@ const IMAGE_DISMISS_MAX_SCALE_REDUCTION: number = 0.28
 // Keep the custom glass capsules on the same 8vp grid and only adapt their
 // distance from the navigation-indicator avoid area across window heights.
 const FLOATING_BAR_HEIGHT_VP: number = 56
+/** Room above the visible bar for native material shadow and deformation. */
+const FLOATING_BAR_EFFECT_TOP_INSET_VP: number = 20
 const FLOATING_BAR_MIN_GAP_VP: number = 8
 const FLOATING_BAR_MAX_GAP_VP: number = 16
 const FLOATING_BAR_CONTENT_EXTRA_VP: number = 32
@@ -620,6 +622,7 @@ struct Index {
   private imageTouchStartX: number = 0
   private imageTouchStartY: number = 0
   private imageDismissDragging: boolean = false
+  private imageDismissParentChromeVisible: boolean = false
   private imageDismissChromeWasVisible: boolean = true
   private viewerSwiperController: SwiperController = new SwiperController()
   private viewerLoadQueue: FileEntry[] = []
@@ -1192,6 +1195,14 @@ struct Index {
     return this.shouldShowBottomBar() || this.selectionMode || this.shouldShowFileToolsBar()
   }
 
+  // The file surface remains mounted under the image viewer. During dismissal
+  // its own chrome must become visible at the same time as the shared-element
+  // image starts moving back, so the pull-down never reveals an empty layer.
+  private viewerBlocksParentChrome(): boolean {
+    return !this.viewerClosePending && !this.imageDismissParentChromeVisible &&
+      (this.showImageViewer || this.viewerEntryTransitionActive || this.viewerFallbackEntryActive)
+  }
+
   // 胶囊宽度按按钮数量算：4 项 = 328vp；详情页的排序胶囊固定 140vp。
   private bottomBarCapsuleWidth(): number {
     const available = this.effectivePageWidth() - 32
@@ -1205,8 +1216,7 @@ struct Index {
     return this.screen === 'files' && !this.showSearch &&
       !this.shouldShowBottomBar() && this.contextMenuEntry === null &&
       !this.showRenameDialog &&
-      !this.showImageViewer && !this.viewerEntryTransitionActive &&
-      !this.viewerFallbackEntryActive &&
+      !this.viewerBlocksParentChrome() &&
       !this.showAudioPlayer && !this.videoPlaybackUiVisible() && !this.selectionMode
   }
 
@@ -1476,9 +1486,7 @@ struct Index {
       if ((this.screen === 'files' || this.screen === 'downloads' || this.screen === 'settings') &&
         this.contextMenuEntry === null && !this.showRenameDialog &&
         !this.showDestinationPicker &&
-        !this.showImageViewer &&
-        !this.viewerEntryTransitionActive &&
-        !this.viewerFallbackEntryActive &&
+        !this.viewerBlocksParentChrome() &&
         !this.showAudioPlayer && !this.videoPlaybackUiVisible()) {
         // 三种底栏形态共用这一个常驻外壳，内部按 bottomBarMode() 交叉淡化；
         // 显隐仍由 bottomBarOffsetY/bottomBarOpacity 控制。
@@ -1506,7 +1514,7 @@ struct Index {
       if (this.screen === 'files' && this.currentPath.length > 0 && !this.showSearch &&
         !this.selectionMode && !this.importSelecting && this.contextMenuEntry === null &&
         !this.showRenameDialog && !this.showCreateFolderDialog && !this.showDestinationPicker &&
-        !this.showImageViewer && !this.viewerEntryTransitionActive && !this.viewerFallbackEntryActive &&
+        !this.viewerBlocksParentChrome() &&
         !this.showAudioPlayer && !this.videoPlaybackUiVisible()) {
         if (this.importExpanded) {
           Row().width('100%').height('100%').backgroundColor(Color.Transparent).zIndex(24)
@@ -1522,7 +1530,7 @@ struct Index {
           safeTop: this.topSafeInset() + 64, safeBottom: this.floatingBarContentInset(8),
           expanded: $importExpanded, onSelect: (source: string): void => { this.selectImportSource(source) } })
           .position({ x: 0, y: 0 })
-          .zIndex(25)
+          .zIndex(this.viewerClosePending ? 8 : 25)
           // The overlay is a full page sized host whose only interactive part is
           // the ball itself. Keeping the host out of the touch test lets taps
           // reach the file list under it.
@@ -1530,8 +1538,7 @@ struct Index {
       }
 
       if ((this.screen === 'files' || this.screen === 'downloads' || this.screen === 'settings') &&
-        !this.showDestinationPicker && !this.showImageViewer &&
-        !this.viewerEntryTransitionActive && !this.viewerFallbackEntryActive &&
+        !this.showDestinationPicker && !this.viewerBlocksParentChrome() &&
         !this.showAudioPlayer && !this.videoPlaybackUiVisible()) {
         Stack({ alignContent: Alignment.TopStart }) {
           this.NativeFileHeader()
@@ -1547,8 +1554,19 @@ struct Index {
       if (this.showDestinationPicker) {
         this.DestinationPickerOverlay()
       }
-      if (this.showImageViewer && this.committedViewerEntry() !== null) {
-        this.ImageViewer()
+      if ((this.showImageViewer || this.viewerEntryTransitionActive ||
+        this.viewerFallbackEntryActive || this.viewerClosePending) &&
+        this.committedViewerEntry() !== null) {
+        Stack() {
+          if (this.showImageViewer) {
+            this.ImageViewer()
+          }
+          this.ImageViewerChrome()
+        }
+        .width('100%')
+        .height('100%')
+        .zIndex(30)
+        .hitTestBehavior(this.showImageViewer ? HitTestMode.Transparent : HitTestMode.None)
       }
       if (this.showAudioPlayer && this.audioEntry !== null) {
         this.AudioPlayerOverlay(this.audioEntry as FileEntry)
@@ -3405,11 +3423,13 @@ struct Index {
     .barOverlap(true)
     // 原来的悬浮底栏靠 barFloatingStyle 的 barBottomMargin=40 把胶囊抬高 40vp；
     // 这里改成普通内容后，用 barHeight 预留出同样的 40vp，位置完全还原。
-    .barHeight(FLOATING_BAR_HEIGHT_VP + 40)
+    .barHeight(FLOATING_BAR_HEIGHT_VP + FLOATING_BAR_EFFECT_TOP_INSET_VP + 40)
+    // This Tabs instance only supplies the supported bottom-TabBar material
+    // scope. Its own rectangular bar must stay visually transparent.
     .barBackgroundColor(Color.Transparent)
     .barBackgroundBlurStyle(BlurStyle.NONE)
     .width('100%')
-    .height(FLOATING_BAR_HEIGHT_VP + 80)
+    .height(FLOATING_BAR_HEIGHT_VP + FLOATING_BAR_EFFECT_TOP_INSET_VP + 80)
     .margin({ bottom: this.floatingBarBottomMargin() - 40 })
     .clip(false)
     .hitTestBehavior(HitTestMode.Default)
@@ -3417,13 +3437,13 @@ struct Index {
 
   @Builder
   BottomBarContent(): void {
-    Stack() {
+    Stack({ alignContent: Alignment.Bottom }) {
       // 首页 / 共享 / 下载 / 设置
       Stack() {
         this.HomeBarContent()
       }
       .width('100%')
-      .height('100%')
+      .height(FLOATING_BAR_HEIGHT_VP)
       .opacity(this.bottomBarMode() === 'home' ? 1 : 0)
       .translate({ x: 0, y: this.bottomBarMode() === 'home' ? 0 : 12, z: 0 })
       .hitTestBehavior(this.bottomBarMode() === 'home' ? HitTestMode.Default : HitTestMode.None)
@@ -3434,7 +3454,7 @@ struct Index {
         this.SelectionBarContent()
       }
       .width('100%')
-      .height('100%')
+      .height(FLOATING_BAR_HEIGHT_VP)
       .opacity(this.bottomBarMode() === 'selection' ? 1 : 0)
       .translate({ x: 0, y: this.bottomBarMode() === 'selection' ? 0 : 12, z: 0 })
       .hitTestBehavior(this.bottomBarMode() === 'selection' ? HitTestMode.Default : HitTestMode.None)
@@ -3445,15 +3465,16 @@ struct Index {
         this.FileToolsBarContent()
       }
       .width('100%')
-      .height('100%')
+      .height(FLOATING_BAR_HEIGHT_VP)
       .opacity(this.bottomBarMode() === 'tools' ? 1 : 0)
       .translate({ x: 0, y: this.bottomBarMode() === 'tools' ? 0 : 12, z: 0 })
       .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
       .animation({ duration: 200, curve: Curve.FastOutSlowIn })
     }
     .width('100%')
-    .height(FLOATING_BAR_HEIGHT_VP)
-    // 还原原来的悬浮高度：内容底边距外壳底部 40vp。
+    .height(FLOATING_BAR_HEIGHT_VP + FLOATING_BAR_EFFECT_TOP_INSET_VP)
+    // The visible 56vp controls stay bottom-aligned at their previous screen
+    // position. The extra top area only carries native shadow/deformation.
     .margin({ bottom: 40 })
     .hitTestBehavior(HitTestMode.Default)
   }
@@ -3488,58 +3509,68 @@ struct Index {
 
   @Builder
   FileToolsBarContent(): void {
-    Row() {
-      this.FileToolCircleButton($r('sys.symbol.folder_badge_plus'), () => this.openCreateFolder())
+    Stack() {
+      Row() {
+        this.FileToolCircleButton($r('sys.symbol.folder_badge_plus'), () => this.openCreateFolder())
 
-      Button() {
-        Row({ space: 6 }) {
-          Text(this.fileSortTitle())
-            .fontSize(15)
-            .fontColor($r('app.color.text_primary'))
-          SymbolGlyph($r('sys.symbol.arrowtriangle_down_fill'))
-            .fontSize(10)
-            .fontColor([$r('app.color.icon_primary')])
-            .rotate({ angle: this.showFileSortMenu ? 180 : 0 })
-        }
-        .justifyContent(FlexAlign.Center)
-      }
-      .type(ButtonType.Normal)
-      .width(FILE_TOOL_SORT_WIDTH_VP)
-      .height(FLOATING_BAR_HEIGHT_VP)
-      .borderRadius(FLOATING_BAR_HEIGHT_VP / 2)
-      .backgroundColor(Color.Transparent)
-      .systemMaterial(this.bottomCapsuleMaterial)
-      .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
-      .overlay(this.ImportLightOverlay, { align: Alignment.Center })
-      .monopolizeEvents(this.bottomBarMode() === 'tools')
-      .onClick(() => this.toggleFileSortMenu())
-      .bindPopup(this.showFileSortMenu, {
-        builder: this.FileSortPopup,
-        placement: Placement.Top,
-        maskColor: Color.Transparent,
-        enableArrow: false,
-        autoCancel: true,
-        // CustomPopupOptions exposes the official transition hook. The SDK does
-        // not provide a HarmonyOS 7-only sort-popup animation name; keep the
-        // popup on ArkUI's supported transition path instead of faking one.
-        transition: this.fileSortPopupTransition(),
-        systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
-        onStateChange: (state: PopupStateChange): void => {
-          if (!state.isVisible) {
-            this.showFileSortMenu = false
+        Button() {
+          Row({ space: 6 }) {
+            Text(this.fileSortTitle())
+              .fontSize(15)
+              .fontColor($r('app.color.text_primary'))
+            SymbolGlyph($r('sys.symbol.arrowtriangle_down_fill'))
+              .fontSize(10)
+              .fontColor([$r('app.color.icon_primary')])
+              .rotate({ angle: this.showFileSortMenu ? 180 : 0 })
           }
+          .justifyContent(FlexAlign.Center)
         }
-      })
+        .type(ButtonType.Normal)
+        .width(FILE_TOOL_SORT_WIDTH_VP)
+        .height(FLOATING_BAR_HEIGHT_VP)
+        .borderRadius(FLOATING_BAR_HEIGHT_VP / 2)
+        .backgroundColor(Color.Transparent)
+        .systemMaterial(this.bottomCapsuleMaterial)
+        .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
+        .monopolizeEvents(this.bottomBarMode() === 'tools')
+        .onClick(() => this.toggleFileSortMenu())
+        .bindPopup(this.showFileSortMenu, {
+          builder: this.FileSortPopup,
+          placement: Placement.Top,
+          maskColor: Color.Transparent,
+          enableArrow: false,
+          autoCancel: true,
+          // CustomPopupOptions exposes the official transition hook. The SDK does
+          // not provide a HarmonyOS 7-only sort-popup animation name; keep the
+          // popup on ArkUI's supported transition path instead of faking one.
+          transition: this.fileSortPopupTransition(),
+          systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
+          onStateChange: (state: PopupStateChange): void => {
+            if (!state.isVisible) {
+              this.showFileSortMenu = false
+            }
+          }
+        })
 
-      this.FileToolCircleButton(this.fileViewModeIcon(), () => this.toggleFileViewMode())
+        this.FileToolCircleButton(this.fileViewModeIcon(), () => this.toggleFileViewMode())
+      }
+      .width('100%')
+      .height(FLOATING_BAR_HEIGHT_VP)
+      .padding({ left: 16, right: 16 })
+      .justifyContent(FlexAlign.SpaceBetween)
+      // 原来的 40vp 圆钮/排序胶囊在 120vp 栏里居中，底边距栏底 40vp；
+      // 这里靠底对齐还原同一个位置。
+      .alignItems(VerticalAlign.Bottom)
+
+      // One canvas draws the three real material outlines. This keeps the
+      // moving light continuous without introducing a full-width outline.
+      ProximityLightReceiver({ mode: 'fileTools' })
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.None)
     }
     .width('100%')
     .height(FLOATING_BAR_HEIGHT_VP)
-    .padding({ left: 16, right: 16 })
-    .justifyContent(FlexAlign.SpaceBetween)
-    // 原来的 40vp 圆钮/排序胶囊在 120vp 栏里居中，底边距栏底 40vp；
-    // 这里靠底对齐还原同一个位置。
-    .alignItems(VerticalAlign.Bottom)
     .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
   }
 
@@ -3722,7 +3753,6 @@ struct Index {
     .backgroundColor(Color.Transparent)
     .systemMaterial(this.bottomCapsuleMaterial)
     .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
-    .overlay(this.ImportLightOverlay, { align: Alignment.Center })
     .monopolizeEvents(this.bottomBarMode() === 'tools')
     .onClick(action)
   }
@@ -5788,7 +5818,8 @@ struct Index {
       .curve(Curve.FastOutSlowIn)
       .effectMode(EdgeEffect.Spring)
       .disableSwipe(this.imageScale > 1.001 || this.viewerTransitionActive ||
-        this.viewerEntryTransitionActive || this.isBusy || this.showImageMoreMenu ||
+        this.viewerEntryTransitionActive || this.imageDismissDragging ||
+        this.isBusy || this.showImageMoreMenu ||
         this.showImageDetails || this.showRenameDialog)
       .width('100%')
       .height('100%')
@@ -5828,14 +5859,23 @@ struct Index {
           this.closeImageViewer()
         }
       })
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor(Color.Transparent)
+    .opacity(this.viewerSurfaceOpacity)
+  }
 
+  @Builder
+  ImageViewerChrome(): void {
+    Stack() {
       Column() {
         this.ImageViewerNativeHeader()
         Blank()
           .layoutWeight(1)
           .hitTestBehavior(HitTestMode.None)
-          }
-          .width('100%')
+      }
+      .width('100%')
       .height('100%')
       .opacity(this.imageChromeOpacity)
       .translate({ x: 0, y: this.imageTopChromeOffsetY, z: 0 })
@@ -5852,12 +5892,10 @@ struct Index {
       .opacity(this.imageChromeOpacity)
       .translate({ x: 0, y: this.imageBottomChromeOffsetY, z: 0 })
       .hitTestBehavior(HitTestMode.None)
-
     }
     .width('100%')
     .height('100%')
-    .backgroundColor(Color.Transparent)
-    .opacity(this.viewerSurfaceOpacity)
+    .hitTestBehavior(this.showImageViewer ? HitTestMode.Transparent : HitTestMode.None)
   }
 
   @Builder
@@ -5962,7 +6000,11 @@ struct Index {
     .height('100%')
     .alignContent(Alignment.Center)
     .clip(true)
-    .gesture(
+    // VisionImageAnalyzer installs its long-press interaction on the child
+    // Image. Bind the viewer gestures in parallel so a normal moving finger
+    // can reach the vertical pan recognizer while a stationary long press is
+    // still available to text/subject recognition.
+    .parallelGesture(
         GestureGroup(
           GestureMode.Parallel,
           // A double tap must win over a single tap. Parallel tap
@@ -6030,7 +6072,7 @@ struct Index {
             PanGesture({
               fingers: 1,
               direction: PanDirection.Vertical,
-              distance: this.imageDismissGestureEnabled(index) ? 10 : 100000
+              distance: this.imageDismissGestureEnabled(index) ? 5 : 100000
             })
               .onActionStart(() => this.handleImageDismissStart(index))
               .onActionUpdate((event: GestureEvent) =>
@@ -6039,7 +6081,8 @@ struct Index {
                 this.handleImageDismissEnd(index, event))
               .onActionCancel(() => this.handleImageDismissCancel())
           )
-        )
+        ),
+        GestureMask.Normal
       )
     .onTouch((event: TouchEvent) => this.handleImageTouch(event, index))
   }
@@ -9871,6 +9914,10 @@ struct Index {
             onFinish: resolve
           }, () => {
             this.showImageViewer = true
+            this.imageChromeVisible = true
+            this.imageChromeOpacity = 1
+            this.imageTopChromeOffsetY = 0
+            this.imageBottomChromeOffsetY = 0
           })
         })
         await this.nextRenderFrame()
@@ -9889,6 +9936,10 @@ struct Index {
             onFinish: resolve
           }, () => {
             this.viewerSurfaceOpacity = 1
+            this.imageChromeVisible = true
+            this.imageChromeOpacity = 1
+            this.imageTopChromeOffsetY = 0
+            this.imageBottomChromeOffsetY = 0
           })
         })
         await this.nextRenderFrame()
@@ -9903,7 +9954,6 @@ struct Index {
         this.postRenderFrame((): void => this.closeImageViewer())
         return
       }
-      this.setImageChromeVisible(true, false)
       this.enableImageViewerAutoRotation()
       // Mount the viewer and its ring before doing any local original work.
       // A cache hit has no HTTP byte progress, so it stays gray during local
@@ -10387,6 +10437,7 @@ struct Index {
 
   private resetImageDismissTransform(): void {
     this.imageDismissDragging = false
+    this.imageDismissParentChromeVisible = false
     this.imageDismissScale = 1
     this.imageDismissOffsetY = 0
     this.imageDismissBackdropOpacity = 1
@@ -10416,13 +10467,18 @@ struct Index {
       return
     }
     this.imageDismissChromeWasVisible = this.imageChromeVisible
+    this.imageDismissParentChromeVisible = true
     this.setImageChromeVisible(false, false)
     this.imageDismissDragging = true
     this.imageTouchMoved = true
   }
 
   private handleImageDismissUpdate(index: number, event: GestureEvent): void {
-    if (!this.imageDismissDragging || !this.imageDismissGestureEnabled(index)) {
+    // Eligibility is decided once in handleImageDismissStart. Rechecking the
+    // whole predicate here made an already accepted vertical drag stop when
+    // Swiper briefly changed viewerTransitionActive for a diagonal movement.
+    if (!this.imageDismissDragging || !this.showImageViewer ||
+      index !== this.viewerImageIndex || this.imageScale > 1.001) {
       return
     }
     // A downward pull is the dismiss gesture. Keep a small, resisted upward
@@ -10439,6 +10495,7 @@ struct Index {
     this.getUIContext().animateTo({
       curve: curves.interpolatingSpring(0, 1, 320, 30),
       onFinish: (): void => {
+        this.imageDismissParentChromeVisible = false
         if (this.imageDismissChromeWasVisible) {
           this.setImageChromeVisible(true, false)
         }
