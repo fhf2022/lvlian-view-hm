@@ -671,6 +671,63 @@ export class UgreenRemoteClient {
     }
   }
 
+  // Protocol matches the UGOS web client's createUploadData/uploadWebFileStream.
+  async prepareUpload(dir: string, name: string, uuid: string, size: number,
+    changed: number): Promise<boolean> {
+    const boundary = 'UGREENlink' + uuid.replace(/[^a-zA-Z0-9]/g, '')
+    const fields: Record<string, string> = { 'uuid': uuid, 'dir': dir, 'filename': name,
+      'action_type': '0', 'size': String(size), 'begin_size': '0', 'current_size': '0',
+      'change_time': String(changed), 'resume': 'true', 'first_request': 'true' }
+    let form = ''
+    for (const key of Object.keys(fields)) {
+      form += '--' + boundary + '\r\nContent-Disposition: form-data; name="' + key +
+        '"\r\n\r\n' + fields[key] + '\r\n'
+    }
+    form += '--' + boundary + '\r\nContent-Disposition: form-data; name="file"; filename="' +
+      encodeURIComponent(name) + '"\r\nContent-Type: application/octet-stream\r\n\r\n\r\n--' + boundary + '--\r\n'
+    const headers = await this.authHeaders()
+    headers['Content-Type'] = 'multipart/form-data; boundary=' + boundary
+    const bytes = new util.TextEncoder().encodeInto(form)
+    const data = this.successData(await this.transport.postUpload(
+      this.requireEndpoints().baseUrl + '/ugreen/v1/filemgr/fileUpload', bytes.buffer as ArrayBuffer,
+      headers), '上传预创建失败')
+    return Boolean(data['result'])
+  }
+
+  async uploadOffset(dir: string, uuid: string, size: number): Promise<number> {
+    const response = await this.transport.requestJson(this.requireEndpoints().baseUrl +
+      '/ugreen/v1/filemgr/getUpdateTmpInfo?dir=' + encodeURIComponent(dir) +
+      '&uuid=' + encodeURIComponent(uuid) + '&size=' + size, http.RequestMethod.GET,
+      undefined, await this.authHeaders())
+    const count = Number(this.successData(response.body, '查询上传断点失败')['result'] || 0)
+    if (!Number.isFinite(count) || count < 0 || count > size) { throw new Error('上传断点无效') }
+    // UGOS's browser uploader replays the last acknowledged byte on resume.
+    return Math.max(0, count - 1)
+  }
+
+  async uploadChunk(dir: string, name: string, uuid: string, size: number,
+    changed: number, offset: number, bytes: ArrayBuffer): Promise<void> {
+    const params: JsonObject = { 'uuid': uuid, 'file_name': encodeURIComponent(name), 'action_type': 0,
+      'size': size, 'current_size': bytes.byteLength, 'resume': true, 'dir': encodeURIComponent(dir),
+      'change_time': changed, 'is_live_photo': false, 'first_request': false, 'begin_size': offset }
+    const headers = await this.authHeaders()
+    headers['Content-Type'] = 'application/octet-stream'
+    headers['ug-param'] = JSON.stringify(params)
+    headers['Content-Disposition'] = 'attachment; filename="' + encodeURIComponent(name) + '"'
+    this.successData(await this.transport.postUpload(this.requireEndpoints().baseUrl +
+      '/ugreen/v1/filemgr/fileUploadV2', bytes, headers), '上传分块失败')
+  }
+
+  async removeUploadTemporary(dir: string, uuid: string): Promise<void> {
+    const headers = await this.authHeaders()
+    headers['Content-Type'] = 'application/json'
+    const item: JsonObject = { 'dir': dir, 'uuid': uuid }
+    const items: JsonObject[] = [item]
+    const bytes = new util.TextEncoder().encodeInto(JSON.stringify(items))
+    this.successData(await this.transport.postUpload(this.requireEndpoints().baseUrl +
+      '/ugreen/v1/filemgr/delUpTemFile', bytes.buffer as ArrayBuffer, headers), '清理上传断点失败')
+  }
+
   private requireEndpoints(): UgreenEndpoints {
     const value = this.endpoints
     if (value === null) {

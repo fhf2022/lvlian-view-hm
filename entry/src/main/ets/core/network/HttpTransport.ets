@@ -28,6 +28,22 @@ export interface BinaryRangeResult {
 }
 
 export class HttpTransport {
+  async postUpload(url: string, bytes: ArrayBuffer,
+    headers: Record<string, string>): Promise<JsonObject> {
+    const request = http.createHttp()
+    try {
+      const response = await request.request(url, {
+        method: http.RequestMethod.POST, header: headers, extraData: bytes,
+        expectDataType: http.HttpDataType.STRING, usingCache: false,
+        connectTimeout: 30000, readTimeout: 60000
+      })
+      if (response.responseCode < 200 || response.responseCode >= 300) {
+        throw new Error('上传请求失败（HTTP ' + response.responseCode + '）')
+      }
+      return JSON.parse(this.responseText(response.result)) as JsonObject
+    } finally { request.destroy() }
+  }
+
   async requestJson(url: string, method: http.RequestMethod, body?: JsonObject,
     headers: Record<string, string> = {}): Promise<HttpResult<JsonObject>> {
     const request = http.createHttp()

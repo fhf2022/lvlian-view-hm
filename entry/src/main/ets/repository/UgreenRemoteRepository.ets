@@ -671,6 +671,22 @@ export class UgreenRemoteRepository {
     this.clearDirectoryCache()
   }
 
+  async prepareUpload(dir: string, name: string, uuid: string, size: number,
+    changed: number): Promise<boolean> {
+    return this.client.prepareUpload(dir, name, uuid, size, changed)
+  }
+  async uploadOffset(dir: string, uuid: string, size: number): Promise<number> {
+    return this.client.uploadOffset(dir, uuid, size)
+  }
+  async uploadChunk(dir: string, name: string, uuid: string, size: number,
+    changed: number, offset: number, bytes: ArrayBuffer): Promise<void> {
+    await this.client.uploadChunk(dir, name, uuid, size, changed, offset, bytes)
+    if (offset + bytes.byteLength >= size) { this.clearDirectoryCache() }
+  }
+  async removeUploadTemporary(dir: string, uuid: string): Promise<void> {
+    await this.client.removeUploadTemporary(dir, uuid)
+  }
+
   async trash(entry: FileEntry): Promise<void> {
     await this.client.trash(entry.path)
     this.clearDirectoryCache()

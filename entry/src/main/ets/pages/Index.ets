@@ -3,7 +3,11 @@ import { DownloadDestination } from '../download/DownloadDestination'
 import { promptAction, uiMaterial, curves, window, LengthMetrics, FrameCallback, PiPWindow } from '@kit.ArkUI'
 import { systemShare, harmonyShare } from '@kit.ShareKit'
 import { Context, Want, common, wantConstant } from '@kit.AbilityKit'
-import { fileIo, fileUri } from '@kit.CoreFileKit'
+import { fileIo, fileUri, picker } from '@kit.CoreFileKit'
+import { photoAccessHelper } from '@kit.MediaLibraryKit'
+import { FloatingImportControl } from '../components/FloatingImportControl'
+import { ProximityLightReceiver } from '../components/ProximityLightReceiver'
+import { UploadQueueManager, UploadTaskRecord } from '../upload/UploadQueueManager'
 import { preferences, uniformTypeDescriptor as utd } from '@kit.ArkData'
 import { image } from '@kit.ImageKit'
 import { media } from '@kit.MediaKit'
@@ -424,6 +428,11 @@ struct Index {
   @State outgoingPageOffsetX: number = 0
   @State pageWidthVp: number = 360
   @State pageHeightVp: number = 800
+  @State transferDirection: string = 'download'
+  @State uploadTasks: UploadTaskRecord[] = []
+  @State importExpanded: boolean = false
+  @State importSelecting: boolean = false
+  private uploadQueue: UploadQueueManager = new UploadQueueManager()
   @State showPageTransition: boolean = false
   @State outgoingEntries: FileEntry[] = []
   @State showSearch: boolean = false
@@ -1318,6 +1327,10 @@ struct Index {
   }
 
   onBackPress(): boolean {
+    if (this.importExpanded) {
+      this.getUIContext().animateTo({ duration: 220, curve: Curve.EaseOut }, () => { this.importExpanded = false })
+      return true
+    }
     if (this.destinationFolderDialog) {
       this.closeDestinationFolderDialog()
       return true
@@ -1482,8 +1495,38 @@ struct Index {
         .hitTestBehavior(HitTestMode.None)
       }
 
-      if (this.screen === 'downloads' && this.hasActiveDownload()) {
+      if (this.screen === 'downloads' && this.transferDirection === 'download' && this.hasActiveDownload()) {
         this.DownloadSpeedBall()
+      }
+
+      if (this.screen === 'downloads') {
+        this.TransferDirectionControl()
+      }
+
+      if (this.screen === 'files' && this.currentPath.length > 0 && !this.showSearch &&
+        !this.selectionMode && !this.importSelecting && this.contextMenuEntry === null &&
+        !this.showRenameDialog && !this.showCreateFolderDialog && !this.showDestinationPicker &&
+        !this.showImageViewer && !this.viewerEntryTransitionActive && !this.viewerFallbackEntryActive &&
+        !this.showAudioPlayer && !this.videoPlaybackUiVisible()) {
+        if (this.importExpanded) {
+          Row().width('100%').height('100%').backgroundColor(Color.Transparent).zIndex(24)
+            .onClick(() => {
+              this.getUIContext().animateTo({ duration: 220, curve: Curve.EaseOut }, () => {
+                this.importExpanded = false
+              })
+            })
+        }
+        FloatingImportControl({ viewportWidth: this.pageWidthVp, viewportHeight: this.pageHeightVp,
+          // The title controls end at topSafeInset + 56vp. Keep only an 8vp
+          // clearance instead of treating the 30vp gradient tail as a blocker.
+          safeTop: this.topSafeInset() + 64, safeBottom: this.floatingBarContentInset(8),
+          expanded: $importExpanded, onSelect: (source: string): void => { this.selectImportSource(source) } })
+          .position({ x: 0, y: 0 })
+          .zIndex(25)
+          // The overlay is a full page sized host whose only interactive part is
+          // the ball itself. Keeping the host out of the touch test lets taps
+          // reach the file list under it.
+          .hitTestBehavior(HitTestMode.None)
       }
 
       if ((this.screen === 'files' || this.screen === 'downloads' || this.screen === 'settings') &&
@@ -2179,13 +2222,13 @@ struct Index {
         ListItem() {
           Row()
             .width('100%')
-            .height(this.topSafeInset() + 76)
+            .height(this.topSafeInset() + 120)
         }
         .width('100%')
 
-        if (this.downloadTasks.length === 0) {
+        if (this.visibleTransferTasks().length === 0) {
           ListItem() {
-            Text('暂无下载任务')
+            Text(this.transferDirection === 'upload' ? '暂无上传任务' : '暂无下载任务')
               .fontSize(14)
               .fontColor($r('app.color.text_muted'))
               .width('100%')
@@ -2194,7 +2237,7 @@ struct Index {
           }
           .width('100%')
         } else {
-          ForEach(this.downloadTasks, (task: DownloadTaskRecord) => {
+          ForEach(this.visibleTransferTasks(), (task: DownloadTaskRecord) => {
             ListItem() {
               this.DownloadTaskRow(task)
             }
@@ -2230,6 +2273,87 @@ struct Index {
     }
     .width('100%')
     .layoutWeight(1)
+  }
+
+  private visibleTransferTasks(): DownloadTaskRecord[] {
+    return this.transferDirection === 'upload' ? this.uploadTasks : this.downloadTasks
+  }
+
+  @Builder
+  TransferDirectionSurface(): void {
+    Row({ space: 8 }) {
+      Button('下载', { type: ButtonType.Capsule })
+        .width(88).height(36).fontSize(15)
+        .fontColor(this.transferDirection === 'download' ? '#2E6BFF' : $r('app.color.text_primary'))
+        .fontWeight(this.transferDirection === 'download' ? FontWeight.Medium : FontWeight.Normal)
+        .backgroundColor(Color.Transparent)
+        .systemMaterial(this.transferControlMaterial())
+        .accessibilitySelected(this.transferDirection === 'download')
+        .onClick(() => { this.transferDirection = 'download' })
+      Button('上传', { type: ButtonType.Capsule })
+        .width(88).height(36).fontSize(15)
+        .fontColor(this.transferDirection === 'upload' ? '#2E6BFF' : $r('app.color.text_primary'))
+        .fontWeight(this.transferDirection === 'upload' ? FontWeight.Medium : FontWeight.Normal)
+        .backgroundColor(Color.Transparent)
+        .systemMaterial(this.transferControlMaterial())
+        .accessibilitySelected(this.transferDirection === 'upload')
+        .onClick(() => { this.transferDirection = 'upload' })
+    }.width(184).height(36)
+  }
+
+  private transferControlMaterial(): uiMaterial.ImmersiveMaterial {
+    // A compact title host clips native material shadows at its rectangular bounds.
+    return new uiMaterial.ImmersiveMaterial({ style: uiMaterial.ImmersiveStyle.THIN,
+      applyShadow: false, colorInvert: true, interactive: true, lightEffect: { color: '#66FFFFFF' } })
+  }
+
+  @Builder
+  TransferDirectionControl(): void {
+    Navigation() {}
+      .mode(NavigationMode.Stack).hideBackButton(true).hideToolBar(true)
+      .title({ builder: this.TransferDirectionSurface, height: 36 }, {
+        barStyle: BarStyle.STACK, paddingStart: LengthMetrics.vp(0), paddingEnd: LengthMetrics.vp(0),
+        backgroundColor: Color.Transparent
+      })
+      .width(184).height(36).backgroundColor(Color.Transparent).clip(false)
+      .position({ x: (this.pageWidthVp - 184) / 2, y: this.topSafeInset() + 72 })
+      .zIndex(15)
+  }
+
+  private async selectImportSource(source: string): Promise<void> {
+    this.importExpanded = false
+    if (source === 'folder') { this.openCreateFolder(); return }
+    if (this.currentPath.length === 0 || this.importSelecting || this.isBusy) { return }
+    const target = this.currentPath
+    const scope = this.repository.cacheScopeHash()
+    this.importSelecting = true
+    try {
+      await this.ensureDownloadState()
+      let uris: string[] = []
+      if (source === 'gallery') {
+        const options = new photoAccessHelper.PhotoSelectOptions()
+        options.MIMEType = photoAccessHelper.PhotoViewMIMETypes.IMAGE_VIDEO_TYPE
+        options.maxSelectNumber = 100
+        const result = await new photoAccessHelper.PhotoViewPicker().select(options)
+        uris = result.photoUris
+      } else {
+        const options = new picker.DocumentSelectOptions()
+        options.maxSelectNumber = 100
+        options.selectMode = picker.DocumentSelectMode.FILE
+        uris = await new picker.DocumentViewPicker(getContext(this)).select(options)
+      }
+      if (uris.length === 0) { return }
+      // Reading starts after the system picker has returned and the user confirms the destination.
+      const confirmation = await promptAction.showDialog({ title: '上传 ' + uris.length + ' 个文件',
+        message: '上传到：' + target + '\n保留原文件，同名文件跳过。',
+        buttons: [{ text: '取消', color: '#536174' }, { text: '上传', color: '#2E6BFF' }],
+        systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THICK, false) })
+      if (confirmation.index !== 1) { return }
+      this.transferDirection = 'upload'
+      this.openDownloads()
+      for (const uri of uris) { await this.uploadQueue.enqueue(uri, target, scope) }
+    } catch (error) { this.reportError(error as Object, '文件导入失败') }
+    finally { this.importSelecting = false }
   }
 
   @Builder
@@ -2700,7 +2824,7 @@ struct Index {
             (this.screen === 'settings' && this.showPlaybackSettings ? '播放与控制' :
             (this.screen === 'settings' && this.showNetworkSettings ? '网络与流量' :
             (this.screen === 'settings' ? '设置' :
-              (this.screen === 'downloads' ? '下载' : this.topTitle))))))
+              (this.screen === 'downloads' ? '传输' : this.topTitle))))))
             .fontSize(this.selectionMode ? 22 : 17)
             .fontWeight(FontWeight.Bold)
             .fontColor($r('app.color.text_primary'))
@@ -2794,6 +2918,7 @@ struct Index {
       .padding({ left: 0, right: 0, top: 0, bottom: 0 })
       .position({ x: this.topActionButtonX(), y: 0 })
       .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true))
+      .overlay(this.ImportLightOverlay, { align: Alignment.Center })
       .enabled(this.selectionMode ? this.entries.length > 0 : !this.isBusy)
       .monopolizeEvents(true)
       .onClick(() => {
@@ -2821,6 +2946,7 @@ struct Index {
       .opacity(this.selectionMode ? 0 : 1)
       .enabled(!this.selectionMode)
       .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true))
+      .overlay(this.ImportLightOverlay, { align: Alignment.Center })
       .monopolizeEvents(true)
       .onClick(() => this.openSearch())
       .animation({ duration: 180, curve: Curve.FastOutSlowIn })
@@ -3334,16 +3460,25 @@ struct Index {
 
   @Builder
   HomeBarContent(): void {
-    Row() {
-      this.BottomNavItem($r('sys.symbol.house'), '主页', 'home', () => this.openHome())
-      this.BottomNavItem($r('sys.symbol.folder'), '共享', 'shared', () => this.openShared())
-      this.BottomNavItem($r('sys.symbol.square_and_arrow_down'), '下载', 'downloads',
-        () => this.openDownloads())
-      this.BottomNavItem($r('sys.symbol.gearshape'), '设置', 'settings', () => this.openSettings())
+    Stack({ alignContent: Alignment.Center }) {
+      Row() {
+        this.BottomNavItem($r('sys.symbol.house'), '主页', 'home', () => this.openHome())
+        this.BottomNavItem($r('sys.symbol.folder'), '共享', 'shared', () => this.openShared())
+        this.BottomNavItem($r('sys.symbol.arrow_2_circlepath'), '传输', 'downloads',
+          () => this.openDownloads())
+        this.BottomNavItem($r('sys.symbol.gearshape'), '设置', 'settings', () => this.openSettings())
+      }
+      .width('100%')
+      .height('100%')
+      .padding({ left: 8, right: 8, top: 0, bottom: 0 })
+
+      ProximityLightReceiver()
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.None)
     }
     .width(this.bottomBarCapsuleWidth())
     .height(FLOATING_BAR_HEIGHT_VP)
-    .padding({ left: 8, right: 8, top: 0, bottom: 0 })
     .borderRadius(FLOATING_BAR_HEIGHT_VP / 2)
     .systemMaterial(this.bottomCapsuleMaterial)
     // The capsule is above the scrolling page. Keep a drag that starts here
@@ -3375,6 +3510,7 @@ struct Index {
       .backgroundColor(Color.Transparent)
       .systemMaterial(this.bottomCapsuleMaterial)
       .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
+      .overlay(this.ImportLightOverlay, { align: Alignment.Center })
       .monopolizeEvents(this.bottomBarMode() === 'tools')
       .onClick(() => this.toggleFileSortMenu())
       .bindPopup(this.showFileSortMenu, {
@@ -3566,6 +3702,13 @@ struct Index {
   }
 
   @Builder
+  ImportLightOverlay(): void {
+    ProximityLightReceiver()
+      .width('100%').height('100%')
+      .hitTestBehavior(HitTestMode.None)
+  }
+
+  @Builder
   FileToolCircleButton(icon: Resource, action: () => void): void {
     Button() {
       SymbolGlyph(icon)
@@ -3579,6 +3722,7 @@ struct Index {
     .backgroundColor(Color.Transparent)
     .systemMaterial(this.bottomCapsuleMaterial)
     .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
+    .overlay(this.ImportLightOverlay, { align: Alignment.Center })
     .monopolizeEvents(this.bottomBarMode() === 'tools')
     .onClick(action)
   }
@@ -3744,6 +3888,7 @@ struct Index {
     .borderRadius(20)
     .backgroundColor(Color.Transparent)
     .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN))
+    .overlay(this.ImportLightOverlay, { align: Alignment.Center })
     .hitTestBehavior(HitTestMode.Default)
     .monopolizeEvents(true)
     .onClick(action)
@@ -3775,6 +3920,7 @@ struct Index {
       .backgroundColor(Color.Transparent)
       .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN))
       .enabled(this.fileHeaderLeadingVisible())
+      .overlay(this.ImportLightOverlay, { align: Alignment.Center })
       .hitTestBehavior(this.fileHeaderLeadingVisible() ? HitTestMode.Default : HitTestMode.None)
       .monopolizeEvents(true)
       .onClick(() => {
@@ -6837,6 +6983,8 @@ struct Index {
     try {
       const context = getContext(this) as Context
       await this.downloadQueue.initialize(context, this.repository, this.networkPolicy)
+      await this.uploadQueue.initialize(context, this.repository, this.networkPolicy,
+        (tasks: UploadTaskRecord[]): void => { this.uploadTasks = tasks.slice() })
       this.downloadQueue.onChange(this.downloadStateListener)
       this.downloadTasks = this.downloadQueue.snapshot().concat(this.videoTransferManager.snapshotTasks())
       this.downloadSpeedBytesPerSecond = this.downloadQueue.speed()
@@ -8306,7 +8454,8 @@ struct Index {
     this.selectedEntryCount = 0
     this.selectedBottomTab = 'downloads'
     this.screen = 'downloads'
-    this.updateTopTitle('下载', false)
+    this.importExpanded = false
+    this.updateTopTitle('传输', false)
     this.updateBottomBarVisibility(true)
     this.ensureDownloadState()
     this.ensureVideoState()
@@ -8409,6 +8558,7 @@ struct Index {
       await this.refreshVideoManager()
       await this.ensureDownloadState()
       await this.downloadQueue.setReady(true)
+      await this.uploadQueue.setReady(true)
       this.screen = 'files'
       this.updateBottomBarVisibility(false)
       this.statusText = silent ? '' : '登录成功'
@@ -8436,6 +8586,7 @@ struct Index {
       await this.refreshVideoManager()
       await this.ensureDownloadState()
       await this.downloadQueue.setReady(true)
+      await this.uploadQueue.setReady(true)
       this.screen = 'files'
       this.updateBottomBarVisibility(false)
       this.statusText = result.message
@@ -14336,6 +14487,7 @@ struct Index {
   private async toggleDownloadTask(task: DownloadTaskRecord): Promise<void> {
     try {
       await this.ensureDownloadState()
+      if (task.id.startsWith('upload:')) { await this.uploadQueue.toggle(task.id); return }
       if (task.id.startsWith('video:')) { await this.videoTransferManager.toggleTask(task.id); return }
       const accepted = await this.downloadQueue.toggleTask(task.id)
       if (!accepted) {
@@ -14353,6 +14505,18 @@ struct Index {
   }
 
   private async confirmRemoveDownloadTask(task: DownloadTaskRecord): Promise<void> {
+    if (task.id.startsWith('upload:')) {
+      const response = await promptAction.showDialog({ title: '移除上传记录？',
+        message: task.status === 'completed' ? '只移除记录，保留云盘中的文件。' :
+          '清理此次上传的本地暂存与云盘断点；原文件不受影响。',
+        buttons: [{ text: '取消', color: '#536174' }, { text: '移除', color: '#D34D5C' }],
+        systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THICK, false) })
+      if (response.index === 1) {
+        try { await this.uploadQueue.remove(task.id) }
+        catch (error) { this.reportError(error as Object, '上传记录清理失败，请重试') }
+      }
+      return
+    }
     const message = task.status === 'completed'
       ? '只移除下载记录，不会删除系统下载目录中的文件。'
       : '会删除当前未完成的临时文件，已下载的部分不能保留。'
@@ -14395,6 +14559,17 @@ struct Index {
   }
 
   private downloadTaskInfo(task: DownloadTaskRecord): string {
+    if (task.id.startsWith('upload:')) {
+      const upload = task as UploadTaskRecord
+      const progress = this.formatSize(task.receivedBytes) + ' / ' + this.formatSize(task.size)
+      if (upload.importing) { return '正在导入原文件…' }
+      if (upload.skipped) { return '已跳过同名文件 · 未覆盖' }
+      if (task.status === 'downloading') { return progress + ' · 上传中' }
+      if (task.status === 'failed') { return progress + ' · ' + (task.errorMessage || '上传失败') }
+      if (task.status === 'completed') { return this.formatSize(task.size) + ' · 已上传' }
+      if (task.status === 'waiting_wifi') { return progress + ' · 等待 WiFi（点击继续）' }
+      return progress + (task.status === 'paused' ? ' · 已暂停' : ' · 排队中')
+    }
     const received = task.receivedBytes <= 0 ? '0 B' : this.formatSize(task.receivedBytes)
     const transfer = task.size > 0 ? received + ' / ' + this.formatSize(task.size) : received
     switch (task.status) {
@@ -14584,6 +14759,7 @@ struct Index {
     await this.videoTransferManager.flush()
     await this.ensureDownloadState()
     await this.downloadQueue.setReady(false)
+    await this.uploadQueue.setReady(false)
     this.repository.logout()
     this.navigationRequestId += 1
     this.isNavigating = false

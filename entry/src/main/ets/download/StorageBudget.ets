@@ -35,7 +35,8 @@ export class StorageBudget {
 
   static initialize(context: Context, limit: number): void {
     StorageBudget.roots = [context.cacheDir, context.tempDir,
-      context.filesDir + '/ugreen-download-tasks', context.filesDir + '/ugreen-video-transfers']
+      context.filesDir + '/ugreen-download-tasks', context.filesDir + '/ugreen-video-transfers',
+      context.filesDir + '/ugreen-upload-tasks']
     StorageBudget.thumbnailRoot = context.filesDir + '/ugreen-thumbnail-cache'
     StorageBudget.metadataRoots = [context.databaseDir, context.preferencesDir,
       context.filesDir + '/ugreen-thumbnail-index.json']
