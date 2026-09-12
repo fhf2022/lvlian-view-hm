@@ -6,6 +6,7 @@ import { VideoSourceHandle } from './VideoTransferManager'
 export interface VideoPlaybackCallbacks {
   onTime: (timeMs: number) => void
   onDuration: (durationMs: number) => void
+  onSeekDone: (requestedMs: number, actualMs: number) => void
   onState: (state: media.AVPlayerState) => void
   onBuffering: (percent: number) => void
   onSize: (width: number, height: number) => void
@@ -33,6 +34,7 @@ export class VideoPlaybackManager {
   private durationHintMs: number = 0
   private currentTimeHintMs: number = 0
   private cachedDurationHintMs: number = 0
+  private completionReported: boolean = false
 
   async open(handle: VideoSourceHandle, positionMs: number,
     callbacks: VideoPlaybackCallbacks, autoPlay: boolean = true): Promise<void> {
@@ -48,6 +50,7 @@ export class VideoPlaybackManager {
     this.durationHintMs = 0
     this.currentTimeHintMs = Math.max(0, positionMs)
     this.cachedDurationHintMs = 0
+    this.completionReported = false
     const generation = this.generation
 
     player.on('stateChange', (state: media.AVPlayerState): void => {
@@ -55,6 +58,11 @@ export class VideoPlaybackManager {
         return
       }
       console.info('[UgreenVideo] player state=' + state)
+      if (state === 'completed') {
+        this.completionReported = true
+      } else if (state === 'playing') {
+        this.completionReported = false
+      }
       this.callbacks.onState(state)
       if (state === 'prepared' || state === 'playing' || state === 'paused' ||
         state === 'completed') {
@@ -75,6 +83,24 @@ export class VideoPlaybackManager {
       }
       this.currentTimeHintMs = Math.max(0, timeMs)
       this.callbacks.onTime(this.currentTimeHintMs)
+      // A few device builds update AVPlayer.state to completed without
+      // delivering stateChange. Keep the controls authoritative at the end
+      // of the timeline using the documented 100 ms timeUpdate cadence.
+      if (!this.completionReported && this.durationHintMs > 0 &&
+        this.currentTimeHintMs >= Math.max(0, this.durationHintMs - 200)) {
+        this.completionReported = true
+        this.callbacks.onState('completed')
+      }
+    })
+    player.on('seekDone', (requestedMs: number): void => {
+      if (generation !== this.generation || this.callbacks === null) {
+        return
+      }
+      // seekDone reports the requested position. The SDK requires reading
+      // currentTime for the actual sync-frame position.
+      const actualMs = Math.max(0, player.currentTime)
+      this.currentTimeHintMs = actualMs
+      this.callbacks.onSeekDone(Math.max(0, requestedMs), actualMs)
     })
     player.on('durationUpdate', (durationMs: number): void => {
       if (generation !== this.generation || this.callbacks === null) {
@@ -137,6 +163,7 @@ export class VideoPlaybackManager {
 
   async play(): Promise<void> {
     this.pendingPlay = true
+    this.completionReported = false
     if (this.player !== null && this.isPlayableState(this.player.state)) {
       await this.player.play()
     }
@@ -153,7 +180,11 @@ export class VideoPlaybackManager {
     if (this.player === null || !this.isSeekableState(this.player.state)) {
       return
     }
-    this.player.seek(Math.max(0, Math.floor(timeMs)))
+    const targetMs = Math.max(0, Math.floor(timeMs))
+    if (this.durationHintMs <= 0 || targetMs < this.durationHintMs - 200) {
+      this.completionReported = false
+    }
+    this.player.seek(targetMs)
   }
 
   setMuted(muted: boolean): void {
@@ -161,6 +192,20 @@ export class VideoPlaybackManager {
       return
     }
     this.player.setVolume(muted ? 0 : 1)
+  }
+
+  setPlaybackRate(rate: number): boolean {
+    if (this.player === null || !this.isPlayableState(this.player.state)) {
+      return false
+    }
+    try {
+      // API 20+ accepts a continuous rate from 0.125x through 4x.
+      this.player.setPlaybackRate(Math.min(4, Math.max(0.125, rate)))
+      return true
+    } catch (error) {
+      console.warn('[UgreenVideo] set playback rate failed: ' + JSON.stringify(error))
+      return false
+    }
   }
 
   currentTime(): number {
@@ -191,6 +236,7 @@ export class VideoPlaybackManager {
     this.durationHintMs = 0
     this.currentTimeHintMs = 0
     this.cachedDurationHintMs = 0
+    this.completionReported = false
     if (player !== null) {
       try {
         if (player.state !== 'released') {
@@ -223,7 +269,10 @@ export class VideoPlaybackManager {
     const playbackStrategy: media.PlaybackStrategy = {
       preferredBufferDurationForPlaying: 0.3,
       preferredBufferDuration: 20,
-      showFirstFrameOnPrepare: true
+      // The poster remains visible while the player is prepared. Rendering
+      // frame zero here makes the native Surface flash before playback (and
+      // before a saved position has finished seeking).
+      showFirstFrameOnPrepare: false
     }
     try {
       // AVPlayer starts in idle.  The source assignment is the state
@@ -296,10 +345,23 @@ export class VideoPlaybackManager {
         }
       }
       if (positionMs > 0 && player.duration > positionMs && this.isSeekableState(player.state)) {
-        player.seek(Math.floor(positionMs))
+        // AVPlayer.seek() is asynchronous. The SDK defines seekDone as the
+        // point at which the request has taken effect, so playback must not
+        // start until that event arrives or frame zero can be submitted first.
+        await this.seekBeforePlayback(player, generation, Math.floor(positionMs))
+        if (!this.isCurrentPlayer(player, generation)) {
+          return
+        }
       }
       if (this.pendingPlay) {
         await player.play()
+        // Some device builds complete play() without publishing a
+        // stateChange('playing') event to this listener.  A fulfilled play()
+        // is the authoritative completion of the requested transition, so
+        // synchronize the page state here as well.
+        if (this.isCurrentPlayer(player, generation) && this.callbacks !== null) {
+          this.callbacks.onState('playing')
+        }
       }
     } finally {
       if (openedFd >= 0) {
@@ -391,6 +453,40 @@ export class VideoPlaybackManager {
       if (player.state === 'initialized') {
         finish(null)
       }
+    })
+  }
+
+  private seekBeforePlayback(player: media.AVPlayer, generation: number,
+    targetMs: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      let settled: boolean = false
+      const finish = (error: Error | null): void => {
+        if (settled) {
+          return
+        }
+        settled = true
+        clearTimeout(timeoutId)
+        player.off('seekDone', onSeekDone)
+        if (error === null) {
+          resolve()
+        } else {
+          reject(error)
+        }
+      }
+      const onSeekDone = (requestedMs: number): void => {
+        if (Math.abs(requestedMs - targetMs) <= 1) {
+          finish(null)
+        }
+      }
+      const timeoutId = setTimeout((): void => {
+        if (!this.isCurrentPlayer(player, generation)) {
+          finish(new Error('视频播放器已切换'))
+          return
+        }
+        finish(new Error('视频恢复播放位置超时'))
+      }, 30000)
+      player.on('seekDone', onSeekDone)
+      player.seek(targetMs)
     })
   }
 

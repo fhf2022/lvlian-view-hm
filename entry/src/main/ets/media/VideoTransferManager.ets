@@ -185,6 +185,64 @@ export class VideoTransferManager {
     return state
   }
 
+  /**
+   * Validate only durable video downloads represented by the directory the
+   * user has just entered. This avoids a global Download scan and avoids a
+   * filesystem stat for remote files that have never been downloaded.
+   */
+  async reconcileDirectoryDownloads(entries: FileEntry[]): Promise<void> {
+    await this.requireInitialized()
+    let changed = false
+    for (const entry of entries) {
+      if (entry.isDirectory) {
+        continue
+      }
+      const signature = this.signature(entry)
+      const sourceKey = signature.key()
+      const record = this.store.find(sourceKey)
+      if (record === null || record.durablePath.length === 0 ||
+        this.validLocalPath(record.durablePath, signature)) {
+        continue
+      }
+
+      const session = this.sessions.get(sourceKey)
+      if (session !== undefined && session.downloadPromise !== null) {
+        continue
+      }
+      if (session !== undefined) {
+        session.closed = true
+        await this.closeStreamTask(session)
+        this.sessions.delete(sourceKey)
+      }
+
+      // Keep playback position and the remote signature, while removing the
+      // stale user-file mapping and its completed byte ranges. A later play
+      // can stream normally and a later download creates a fresh mapping.
+      record.durablePath = ''
+      record.userDownload = false
+      record.cachePath = ''
+      record.partPath = ''
+      record.ranges = []
+      record.receivedBytes = 0
+      record.status = 'partial'
+      this.store.put(record)
+
+      const state = this.ensureState(sourceKey)
+      state.status = 'idle'
+      state.receivedBytes = 0
+      state.totalBytes = 0
+      state.localPath = ''
+      state.durablePath = ''
+      state.errorMessage = ''
+      state.updatedAt = Date.now()
+      changed = true
+    }
+    if (changed) {
+      await this.store.flush()
+      this.notify()
+    }
+  }
+
   async resolveLocal(entry: FileEntry): Promise<string> {
     await this.requireInitialized()
     const signature = this.signature(entry)

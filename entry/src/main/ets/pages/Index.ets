@@ -55,6 +55,9 @@ type DestinationOperation = 'copy' | 'move'
 // file-row frame to the viewer without delaying network/decode work.
 const IMAGE_GEOMETRY_TRANSITION_DURATION: number = 420
 const IMAGE_FALLBACK_TRANSITION_DURATION: number = 160
+const VIDEO_GEOMETRY_TRANSITION_DURATION: number = 420
+const VIDEO_FALLBACK_TRANSITION_DURATION: number = 160
+const VIDEO_FRAME_CROSSFADE_DURATION: number = 120
 const IMAGE_RETURN_MOUNT_FRAME_LIMIT: number = 8
 const IMAGE_VIEWER_DIAGNOSTICS: boolean = true
 const IMAGE_VIEWER_HILOG_DOMAIN: number = 0xD003
@@ -395,12 +398,25 @@ struct Index {
   @State videoBackgroundAutoPip: boolean = false
   @State autoPlayOnOpen: boolean = true
   @State showVideoPlayer: boolean = false
+  @State videoOverlayClosing: boolean = false
+  @State videoChromeVisible: boolean = true
+  @State videoEntryTransitionActive: boolean = false
+  @State videoEntryTransitionPath: string = ''
+  @State videoTransitionKind: ViewerTransitionKind = 'none'
+  @State videoOverlayOpacity: number = 1
+  @State videoSurfaceOpacity: number = 0
+  @State videoPosterOpacity: number = 1
+  @State videoPosterPath: string = ''
+  @State videoPosterUri: string = ''
+  @State videoPosterFixedOrientation: ImageRotateOrientation = ImageRotateOrientation.AUTO
   @State videoEntry: FileEntry | null = null
   @State videoSourceKey: string = ''
   @State videoLocalPath: string = ''
   @State videoDurationMs: number = 0
   @State videoCurrentMs: number = 0
+  @State videoTimelineReady: boolean = false
   @State videoPlaying: boolean = false
+  @State videoFastPlaybackActive: boolean = false
   @State videoMuted: boolean = false
   @State videoPrepared: boolean = false
   @State videoFirstFrame: boolean = false
@@ -413,6 +429,14 @@ struct Index {
   @State videoBufferingPercent: number = 0
   @State videoPipActive: boolean = false
   @State videoPipBackgrounded: boolean = false
+  private videoSeekDragging: boolean = false
+  private videoSeekPending: boolean = false
+  private videoSeekTargetMs: number = 0
+  private videoCloseRequested: boolean = false
+  private videoFrameRevealScheduled: boolean = false
+  private videoOpeningPath: string = ''
+  private videoReconcileDirectoryKey: string = ''
+  private videoReconciledEntries: Record<string, boolean> = {}
   @State videoPipCreating: boolean = false
   @State videoCasting: boolean = false
   @State videoTransferStates: Record<string, VideoTransferState> = {}
@@ -1228,7 +1252,7 @@ struct Index {
   }
 
   private videoPlaybackUiVisible(): boolean {
-    return this.showVideoPlayer && !this.videoPipBackgrounded
+    return (this.showVideoPlayer || this.videoOverlayClosing) && !this.videoPipBackgrounded
   }
 
   private updateBottomBarVisibility(animated: boolean = true): void {
@@ -1564,7 +1588,7 @@ struct Index {
       return true
     }
     if (this.videoPlaybackUiVisible()) {
-      this.closeVideoPlayer()
+      this.closeVideoPlayer(true)
       return true
     }
     if (this.showRenameDialog) {
@@ -2059,20 +2083,19 @@ struct Index {
           .fontColor([$r('sys.color.icon_secondary')])
           .margin({ left: 8, right: 4 })
       } else if (this.videoStateForEntry(entry).status === 'completed') {
-        SymbolGlyph($r('sys.symbol.checkmark_circle'))
-          .fontSize(20)
-          .fontColor([$r('sys.color.icon_emphasize')])
+        Progress({ value: 100, total: 100, type: ProgressType.Ring })
+          .width(25)
+          .height(25)
+          .backgroundColor('#AAB3C1')
+          .color('#2E6BFF')
+          .style({
+            strokeWidth: 3,
+            enableSmoothEffect: false,
+            status: ProgressStatus.PROGRESSING
+          })
           .margin({ left: 8, right: 4 })
-      } else if (this.videoStateForEntry(entry).status !== 'idle') {
-        // Network playback is buffered inside AVPlayer rather than written to
-        // our durable cache.  Until a native CACHED_DURATION value is
-        // available, a zero-byte Progress ring would render as a permanently
-        // grey circle; use the same active indicator as the file manager for
-        // this indeterminate phase.
+      } else if (this.videoTransferIndicatorActive(entry)) {
         if (this.videoTransferIsIndeterminate(entry)) {
-          // A gateway that omits Content-Range cannot provide a truthful
-          // percentage yet.  Keep that state visibly active instead of
-          // rendering a permanently grey zero-value Progress ring.
           LoadingProgress()
             .width(25)
             .height(25)
@@ -2091,8 +2114,23 @@ struct Index {
             })
             .margin({ left: 8, right: 4 })
         }
+      } else {
+        Blank()
+          .width(0)
+          .height(0)
       }
     }
+  }
+
+  private videoTransferIndicatorActive(entry: FileEntry): boolean {
+    const state = this.videoStateForEntry(entry)
+    if (state.status === 'queued' || state.status === 'downloading') {
+      return true
+    }
+    // AVPlayer's online buffer is not app cache. A streaming/partial state is
+    // visible only when the app actually owns resumable bytes on disk.
+    return (state.status === 'streaming' || state.status === 'partial') &&
+      state.receivedBytes > 0
   }
 
   private videoTransferIsIndeterminate(entry: FileEntry): boolean {
@@ -5909,6 +5947,15 @@ struct Index {
   }
 
   private shouldReplaceViewerTransitionSource(entry: FileEntry): boolean {
+    // A shared element must leave the source hierarchy when its target is
+    // inserted. Keeping the video thumbnail Image mounted (and merely
+    // clearing its id) makes the opening hierarchy contain two real images,
+    // so ArkUI has no source-removal event to animate. The image viewer has
+    // always used this placeholder swap; apply the same rule to video.
+    if (this.showVideoPlayer && this.videoEntry !== null &&
+      this.videoEntry.path === entry.path && this.isVideo(entry)) {
+      return true
+    }
     if (!this.showImageViewer) {
       return false
     }
@@ -5936,6 +5983,11 @@ struct Index {
 
   private fileImageTransitionId(entry: FileEntry,
     surface: ThumbnailSurfaceKind): string {
+    if (this.videoEntryTransitionActive && !this.showVideoPlayer &&
+      this.videoEntryTransitionPath === entry.path && this.isVideo(entry) &&
+      this.thumbnailSurfaceIsCurrent(surface)) {
+      return this.videoTransitionId(entry.path)
+    }
     if (this.showImageViewer || !this.viewerGeometryBound) {
       return ''
     }
@@ -5947,6 +5999,83 @@ struct Index {
       return ''
     }
     return this.imageTransitionId(entry.path)
+  }
+
+  private videoTransitionId(path: string): string {
+    return path.length > 0 ? 'ugreen-video-geometry-' + path : ''
+  }
+
+  private currentThumbnailSurface(): ThumbnailSurfaceKind {
+    if (this.screen !== 'files') {
+      return 'none'
+    }
+    if (this.showSearch) {
+      return 'search'
+    }
+    return this.fileViewMode
+  }
+
+  private videoPosterSource(entry: FileEntry): image.PixelMap | string {
+    if (this.videoPosterPath === entry.path && this.videoPosterUri.length > 0) {
+      return this.videoPosterUri
+    }
+    const surface = this.currentThumbnailSurface()
+    if (surface === 'none') {
+      return this.previewUri(entry)
+    }
+    return this.fileImageSource(entry, surface)
+  }
+
+  private videoPosterOrientation(entry: FileEntry): ImageRotateOrientation {
+    if (this.videoPosterPath === entry.path && this.videoPosterUri.length > 0) {
+      return this.videoPosterFixedOrientation
+    }
+    const surface = this.currentThumbnailSurface()
+    return surface === 'none' ? ImageRotateOrientation.AUTO :
+      this.fileImageSourceOrientation(entry, surface)
+  }
+
+  private videoPosterAvailable(entry: FileEntry): boolean {
+    const source = this.videoPosterSource(entry)
+    return typeof source === 'string' ? source.length > 0 : true
+  }
+
+  private videoPosterTransitionId(entry: FileEntry): string {
+    if (!this.videoEntryTransitionActive ||
+      this.videoEntryTransitionPath !== entry.path) {
+      return ''
+    }
+    return this.videoTransitionId(entry.path)
+  }
+
+  private clearVideoEntryTransition(): void {
+    this.videoEntryTransitionActive = false
+    this.videoEntryTransitionPath = ''
+    this.videoTransitionKind = 'none'
+  }
+
+  private startVideoEntryTransition(entry: FileEntry): boolean {
+    this.clearVideoEntryTransition()
+    if (this.showVideoPlayer || this.currentThumbnailSurface() === 'none' ||
+      !this.videoPosterAvailable(entry)) {
+      return false
+    }
+    this.videoEntryTransitionPath = entry.path
+    this.videoTransitionKind = 'entry'
+    this.videoEntryTransitionActive = true
+    return true
+  }
+
+  private startVideoExitTransition(entry: FileEntry): boolean {
+    this.clearVideoEntryTransition()
+    if (this.currentThumbnailSurface() === 'none' ||
+      !this.videoPosterAvailable(entry)) {
+      return false
+    }
+    this.videoEntryTransitionPath = entry.path
+    this.videoTransitionKind = 'exit'
+    this.videoEntryTransitionActive = true
+    return true
   }
 
   private viewerImageTransitionId(entry: FileEntry, layer: ViewerImageLayer): string {
@@ -6847,41 +6976,67 @@ struct Index {
           .width('100%')
           .height('100%')
           .backgroundColor(Color.Black)
-          .opacity(this.videoFirstFrame ? 1 : 0)
+          .opacity(this.videoSurfaceOpacity)
           .onLoad(() => this.handleVideoSurfaceLoad())
 
-        if (!this.videoFirstFrame) {
-          if (this.previewUri(entry).length > 0) {
-            Image(this.previewUri(entry))
+        if (this.videoPosterAvailable(entry)) {
+            Image(this.videoPosterSource(entry))
               .width('100%')
               .height('100%')
+              .syncLoad(true)
+              .orientation(this.videoPosterOrientation(entry))
               .objectFit(ImageFit.Contain)
-          } else {
+              .opacity(this.videoPosterOpacity)
+              .geometryTransition(this.videoPosterTransitionId(entry))
+              .hitTestBehavior(HitTestMode.None)
+        } else if (!this.videoFirstFrame) {
             SymbolGlyph($r('sys.symbol.play'))
               .fontSize(72)
               .fontColor([$r('sys.color.icon_secondary')])
-          }
-          if (!this.videoPrepared || this.videoBufferingPercent < 100) {
+              .opacity(this.videoPosterOpacity)
+        }
+        if (!this.videoEntryTransitionActive && !this.videoFirstFrame &&
+          (!this.videoPrepared || this.videoBufferingPercent < 100)) {
             LoadingProgress()
               .width(32)
               .height(32)
               .color('#2E6BFF')
-          }
         }
 
-        // XComponent can consume touch events itself.  A transparent sibling
-        // with an official ArkUI TapGesture keeps double-tap recognition
-        // reliable while HitTestMode.Transparent lets the surface continue
-        // receiving its normal input.
+        // XComponent can consume touch events itself. A transparent sibling
+        // owns one exclusive group. Long press wins while the finger remains
+        // down; among taps, double tap remains before single tap so playback
+        // never also toggles the chrome. Transparent preserves normal surface
+        // input outside recognized gestures.
         Column()
           .width('100%')
           .height('100%')
           .backgroundColor(Color.Transparent)
           .hitTestBehavior(HitTestMode.Transparent)
           .gesture(
-            TapGesture({ count: 2, distanceThreshold: 8 })
-              .onAction(() => this.handleVideoDoubleTap())
+            GestureGroup(
+              GestureMode.Exclusive,
+              LongPressGesture({ fingers: 1, repeat: false, duration: 500 })
+                .onAction(() => this.beginVideoFastPlayback())
+                .onActionEnd(() => this.endVideoFastPlayback())
+                .onActionCancel(() => this.endVideoFastPlayback()),
+              TapGesture({ count: 2, distanceThreshold: 8 })
+                .onAction(() => this.handleVideoDoubleTap()),
+              TapGesture({ count: 1, distanceThreshold: 8 })
+                .onAction(() => this.handleVideoSingleTap())
+            )
           )
+
+        if (this.videoFastPlaybackActive) {
+          Text('2.0×')
+            .fontSize(16)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(Color.White)
+            .padding({ left: 14, right: 14, top: 7, bottom: 7 })
+            .borderRadius(18)
+            .backgroundColor('#66000000')
+            .hitTestBehavior(HitTestMode.None)
+        }
       }
         .width('100%')
         .height('100%')
@@ -6900,7 +7055,10 @@ struct Index {
           .width('100%')
           .height('100%')
           .zIndex(2)
-          .hitTestBehavior(HitTestMode.None)
+          .opacity(this.videoChromeVisible ? 1 : 0)
+          .translate({ x: 0, y: this.videoChromeVisible ? 0 : 18, z: 0 })
+          .hitTestBehavior(this.videoChromeVisible
+            ? HitTestMode.None : HitTestMode.BLOCK_DESCENDANTS)
 
         this.VideoPlayerNativeHeader()
       }
@@ -6911,7 +7069,9 @@ struct Index {
     .width(this.videoPipBackgrounded ? 1 : '100%')
     .height(this.videoPipBackgrounded ? 1 : '100%')
     .backgroundColor(this.videoPipBackgrounded ? Color.Transparent : Color.Black)
-    .hitTestBehavior(this.videoPipBackgrounded ? HitTestMode.None : HitTestMode.Default)
+    .opacity(this.videoPipBackgrounded ? 1 : this.videoOverlayOpacity)
+    .hitTestBehavior(this.videoPipBackgrounded ? HitTestMode.None :
+      (this.videoOverlayClosing ? HitTestMode.Block : HitTestMode.Default))
   }
 
   @Builder
@@ -6935,7 +7095,10 @@ struct Index {
       .height(76)
       .margin({ top: this.videoTopInset() })
       .backgroundColor(Color.Transparent)
-      .hitTestBehavior(HitTestMode.Transparent)
+      .opacity(this.videoChromeVisible ? 1 : 0)
+      .translate({ x: 0, y: this.videoChromeVisible ? 0 : -14, z: 0 })
+      .hitTestBehavior(this.videoChromeVisible
+        ? HitTestMode.Transparent : HitTestMode.BLOCK_DESCENDANTS)
       .zIndex(3)
   }
 
@@ -6953,7 +7116,7 @@ struct Index {
       .borderRadius(20)
       .backgroundColor(Color.Transparent)
       .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true, '#44202020'))
-      .onClick(() => this.closeVideoPlayer())
+      .onClick(() => this.closeVideoPlayer(true))
     Text(this.videoEntry === null ? '' : (this.videoEntry as FileEntry).name)
       .fontSize(17)
       .fontWeight(FontWeight.Bold)
@@ -7105,7 +7268,8 @@ struct Index {
             .enabled(false)
 
           Slider({
-            value: Math.min(this.videoCurrentMs, Math.max(1, this.videoDurationMs)),
+            value: this.videoTimelineReady
+              ? Math.min(this.videoCurrentMs, Math.max(1, this.videoDurationMs)) : 0,
             min: 0,
             max: Math.max(1, this.videoDurationMs),
             direction: Axis.Horizontal,
@@ -7114,8 +7278,10 @@ struct Index {
             .trackColor(Color.Transparent)
             .selectedColor('#2E6BFF')
             .trackThickness(4)
-            .enabled(this.videoDurationMs > 0)
-            .onChange((value: number) => this.seekVideo(value))
+            .opacity(this.videoTimelineReady ? 1 : 0)
+            .enabled(this.videoTimelineReady && this.videoDurationMs > 0)
+            .onChange((value: number, mode: SliderChangeMode) =>
+              this.seekVideo(value, mode))
         }
           .layoutWeight(1)
           Text(this.formatPlaybackTime(this.videoDurationMs))
@@ -12194,8 +12360,15 @@ struct Index {
     if (!await this.confirmMeteredDownload(entry)) {
       return
     }
+    const openingSurface = this.currentThumbnailSurface()
+    this.videoOpeningPath = entry.path
+    this.videoPosterPath = entry.path
+    this.videoPosterUri = this.previewUri(entry)
+    this.videoPosterFixedOrientation = openingSurface === 'none'
+      ? ImageRotateOrientation.AUTO : this.fileImageSourceOrientation(entry, openingSurface)
     await this.ensurePlaybackState()
 
+    const playerAlreadyVisible = this.showVideoPlayer && this.videoEntry !== null
     const token = this.videoOpenToken + 1
     this.videoOpenToken = token
     this.isBusy = true
@@ -12217,12 +12390,30 @@ struct Index {
         return
       }
       const position = await this.videoTransferManager.playbackPosition(entry)
+      if (this.videoPosterUri.length === 0) {
+        this.videoPosterUri = this.previewUri(entry)
+      }
       this.videoSourceHandle = handle
       this.videoSourceKey = handle.sourceKey
       this.videoLocalPath = handle.localPath
       this.videoEntry = entry
+      this.videoOverlayClosing = false
+      this.videoCloseRequested = false
+      this.videoOverlayOpacity = 1
+      // A SURFACE XComponent may expose its native layer before AVPlayer has
+      // submitted a drawable buffer. Keep that layer hidden under the poster
+      // until startRenderFrame and the compositor hand-off have both settled.
+      this.videoSurfaceOpacity = 0
+      this.videoPosterOpacity = 1
+      this.videoFrameRevealScheduled = false
+      this.clearVideoEntryTransition()
       this.videoDurationMs = 0
       this.videoCurrentMs = position
+      this.videoTimelineReady = false
+      this.videoFastPlaybackActive = false
+      this.videoSeekDragging = false
+      this.videoSeekPending = position > 0
+      this.videoSeekTargetMs = Math.max(0, position)
       this.videoPlaying = false
       this.videoMuted = false
       this.videoPrepared = false
@@ -12249,6 +12440,9 @@ struct Index {
             this.videoEntry.path !== entry.path) {
             return
           }
+          if (this.videoSeekDragging || this.videoSeekPending) {
+            return
+          }
           this.videoCurrentMs = Math.max(0, timeMs)
           const now = Date.now()
           if (now - this.videoPositionPersistAt >= 500) {
@@ -12262,15 +12456,45 @@ struct Index {
           if (token === this.videoOpenToken && this.videoEntry !== null &&
             this.videoEntry.path === entry.path) {
             this.videoDurationMs = Math.max(0, durationMs)
+            // A saved end position is not resumable. AVPlayer starts that
+            // case from zero, so expose zero rather than waiting for a seek
+            // operation that the player deliberately does not issue.
+            if (this.videoSeekPending && this.videoDurationMs > 0 &&
+              this.videoSeekTargetMs >= this.videoDurationMs) {
+              this.videoSeekPending = false
+              this.videoSeekTargetMs = 0
+              this.videoCurrentMs = 0
+            }
+            this.videoTimelineReady = this.videoDurationMs > 0 && !this.videoSeekPending
             this.updateVideoMediaSession(true)
           }
+        },
+        onSeekDone: (requestedMs: number, actualMs: number): void => {
+          if (token !== this.videoOpenToken || this.videoEntry === null ||
+            this.videoEntry.path !== entry.path || !this.videoSeekPending ||
+            Math.abs(requestedMs - this.videoSeekTargetMs) > 1) {
+            return
+          }
+          this.videoSeekPending = false
+          this.videoCurrentMs = this.videoDurationMs > 0
+            ? Math.min(this.videoDurationMs, Math.max(0, actualMs)) : Math.max(0, actualMs)
+          this.videoTimelineReady = this.videoDurationMs > 0
+          this.videoTransferManager.savePlaybackPosition(entry, this.videoCurrentMs)
+            .catch((): void => {})
+          this.updateVideoMediaSession(true)
         },
         onState: (state: media.AVPlayerState): void => {
           if (token !== this.videoOpenToken || this.videoEntry === null ||
             this.videoEntry.path !== entry.path) {
             return
           }
-          this.videoPlaying = state === 'playing'
+          if (state === 'playing') {
+            this.videoPlaying = true
+          } else if (state === 'paused' || state === 'completed' ||
+            state === 'stopped' || state === 'released' || state === 'error') {
+            this.videoPlaying = false
+            this.endVideoFastPlayback()
+          }
           this.syncVideoBackgroundTask()
           this.updateVideoPipControlStatus()
           if (state === 'prepared' || state === 'playing' || state === 'paused' ||
@@ -12320,6 +12544,7 @@ struct Index {
             this.videoEntry.path === entry.path) {
             this.videoPrepared = true
             this.videoFirstFrame = true
+            this.revealVideoSurfaceIfReady(entry)
             this.syncVideoBackgroundTask()
             this.updateVideoPipControlStatus()
             this.updateVideoMediaSession(true)
@@ -12341,7 +12566,49 @@ struct Index {
       if (token !== this.videoOpenToken) {
         return
       }
-      this.showVideoPlayer = true
+      if (playerAlreadyVisible) {
+        this.videoChromeVisible = true
+        this.showVideoPlayer = true
+      } else {
+        const useGeometryTransition = this.startVideoEntryTransition(entry)
+        this.videoChromeVisible = false
+        this.videoOverlayOpacity = useGeometryTransition ? 1 : 0
+        if (useGeometryTransition) {
+          await this.nextRenderFrame()
+          await new Promise<void>((resolve: () => void): void => {
+            this.getUIContext().animateTo({
+              duration: VIDEO_GEOMETRY_TRANSITION_DURATION,
+              curve: Curve.FastOutSlowIn,
+              onFinish: resolve
+            }, (): void => {
+              this.showVideoPlayer = true
+              this.videoChromeVisible = true
+            })
+          })
+          await this.nextRenderFrame()
+          this.clearVideoEntryTransition()
+        } else {
+          this.showVideoPlayer = true
+          await this.nextRenderFrame()
+          await new Promise<void>((resolve: () => void): void => {
+            this.getUIContext().animateTo({
+              duration: VIDEO_FALLBACK_TRANSITION_DURATION,
+              curve: Curve.EaseOut,
+              onFinish: resolve
+            }, (): void => {
+              this.videoOverlayOpacity = 1
+              this.videoChromeVisible = true
+            })
+          })
+        }
+      }
+      this.revealVideoSurfaceIfReady(entry)
+      this.videoOpeningPath = ''
+      if (this.videoCloseRequested) {
+        this.videoCloseRequested = false
+        this.closeVideoPlayer(true)
+        return
+      }
       this.enableVideoPlayerAutoRotation()
       this.startVideoMediaSession(entry)
       this.syncVideoBackgroundTask()
@@ -12354,8 +12621,25 @@ struct Index {
         this.videoLocalPath = ''
         this.videoEntry = null
         this.showVideoPlayer = false
+        this.videoOverlayClosing = false
+        this.videoCloseRequested = false
+        this.videoChromeVisible = true
+        this.videoOverlayOpacity = 1
+        this.videoSurfaceOpacity = 0
+        this.videoPosterOpacity = 1
+        this.videoPosterPath = ''
+        this.videoPosterUri = ''
+        this.videoPosterFixedOrientation = ImageRotateOrientation.AUTO
+        this.videoFrameRevealScheduled = false
+        this.videoOpeningPath = ''
+        this.clearVideoEntryTransition()
         this.videoPrepared = false
         this.videoFirstFrame = false
+        this.videoTimelineReady = false
+        this.videoFastPlaybackActive = false
+        this.videoSeekDragging = false
+        this.videoSeekPending = false
+        this.videoSeekTargetMs = 0
         this.videoPlaying = false
         this.videoCasting = false
         this.videoCastPreparing = false
@@ -12651,7 +12935,137 @@ struct Index {
     })
   }
 
-  private closeVideoPlayer(): void {
+  private revealVideoSurfaceIfReady(entry: FileEntry): void {
+    if (!this.showVideoPlayer || this.videoOverlayClosing ||
+      this.videoEntryTransitionActive || !this.videoFirstFrame ||
+      this.videoEntry === null || this.videoEntry.path !== entry.path ||
+      this.videoFrameRevealScheduled) {
+      return
+    }
+    const token = this.videoOpenToken
+    this.videoFrameRevealScheduled = true
+    // startRenderFrame means decoding has entered rendering, while the native
+    // Surface may still reach the compositor one or two frames later. Keep it
+    // hidden first, enable it under the opaque poster, and only fade the poster
+    // after that layer has survived one submitted frame.
+    this.postRenderFrame((): void => {
+      this.postRenderFrame((): void => {
+        if (token !== this.videoOpenToken || !this.showVideoPlayer ||
+          this.videoOverlayClosing || this.videoEntryTransitionActive ||
+          this.videoEntry === null || this.videoEntry.path !== entry.path) {
+          this.videoFrameRevealScheduled = false
+          return
+        }
+        this.videoSurfaceOpacity = 1
+        this.postRenderFrame((): void => {
+          this.videoFrameRevealScheduled = false
+          if (token !== this.videoOpenToken || !this.showVideoPlayer ||
+            this.videoOverlayClosing || this.videoEntryTransitionActive ||
+            this.videoEntry === null || this.videoEntry.path !== entry.path) {
+            return
+          }
+          if (this.videoPosterOpacity <= 0) {
+            return
+          }
+          this.getUIContext().animateTo({
+            duration: VIDEO_FRAME_CROSSFADE_DURATION,
+            curve: Curve.EaseOut
+          }, (): void => {
+            if (token === this.videoOpenToken && this.showVideoPlayer &&
+              !this.videoOverlayClosing && this.videoEntry !== null &&
+              this.videoEntry.path === entry.path) {
+              this.videoPosterOpacity = 0
+            }
+          })
+        })
+      })
+    })
+  }
+
+  private async beginCloseVideoPlayer(): Promise<void> {
+    if (this.videoOverlayClosing || !this.showVideoPlayer ||
+      this.videoEntry === null || this.videoPipBackgrounded) {
+      return
+    }
+    const entry = this.videoEntry as FileEntry
+    this.videoOverlayClosing = true
+    this.videoCloseRequested = false
+    this.videoPlaying = false
+    this.videoPlaybackManager.pause().catch((): void => {})
+    this.syncVideoBackgroundTask()
+    this.updateVideoPipControlStatus()
+    this.updateVideoMediaSession(true)
+
+    if (this.videoPosterAvailable(entry) && this.videoPosterOpacity < 1) {
+      await new Promise<void>((resolve: () => void): void => {
+        this.getUIContext().animateTo({
+          duration: VIDEO_FRAME_CROSSFADE_DURATION,
+          curve: Curve.EaseIn,
+          onFinish: resolve
+        }, (): void => {
+          this.videoChromeVisible = false
+          this.videoPosterOpacity = 1
+        })
+      })
+      this.videoSurfaceOpacity = 0
+    } else {
+      this.videoChromeVisible = false
+      this.videoSurfaceOpacity = 0
+      this.videoPosterOpacity = 1
+    }
+    if (this.videoEntry === null || this.videoEntry.path !== entry.path) {
+      return
+    }
+
+    const useGeometryTransition = this.startVideoExitTransition(entry)
+    if (useGeometryTransition) {
+      await this.nextRenderFrame()
+      await new Promise<void>((resolve: () => void): void => {
+        this.getUIContext().animateTo({
+          duration: VIDEO_GEOMETRY_TRANSITION_DURATION,
+          curve: Curve.FastOutSlowIn,
+          onFinish: resolve
+        }, (): void => {
+          this.showVideoPlayer = false
+        })
+      })
+    } else {
+      await new Promise<void>((resolve: () => void): void => {
+        this.getUIContext().animateTo({
+          duration: VIDEO_FALLBACK_TRANSITION_DURATION,
+          curve: Curve.EaseIn,
+          onFinish: resolve
+        }, (): void => {
+          this.videoOverlayOpacity = 0
+        })
+      })
+      this.showVideoPlayer = false
+    }
+    await this.nextRenderFrame()
+    if (this.videoEntry !== null && this.videoEntry.path === entry.path) {
+      this.closeVideoPlayer()
+    }
+  }
+
+  private closeVideoPlayer(animated: boolean = false): void {
+    this.endVideoFastPlayback()
+    if (animated) {
+      if (this.videoOverlayClosing) {
+        return
+      }
+      if (this.videoEntryTransitionActive && this.videoTransitionKind === 'entry') {
+        this.videoCloseRequested = true
+        this.videoChromeVisible = false
+        return
+      }
+      if (this.showVideoPlayer && this.videoEntry !== null && !this.videoPipBackgrounded) {
+        this.beginCloseVideoPlayer().catch((error: Error): void => {
+          console.warn('[UgreenVideo] close transition failed: ' + JSON.stringify(error))
+          this.closeVideoPlayer()
+        })
+        return
+      }
+    }
     const closingEntry = this.videoEntry
     const closingPosition = this.videoCurrentMs
     const shouldRestoreSearch = this.searchSession !== null && this.searchSession.returnMode === 'video'
@@ -12679,11 +13093,28 @@ struct Index {
       this.videoTransferManager.releaseSource(closingEntry).catch((): void => {})
     }
     this.showVideoPlayer = false
+    this.videoOverlayClosing = false
+    this.videoCloseRequested = false
+    this.videoChromeVisible = true
+    this.videoOverlayOpacity = 1
+    this.videoSurfaceOpacity = 0
+    this.videoPosterOpacity = 1
+    this.videoPosterPath = ''
+    this.videoPosterUri = ''
+    this.videoPosterFixedOrientation = ImageRotateOrientation.AUTO
+    this.videoFrameRevealScheduled = false
+    this.videoOpeningPath = ''
+    this.clearVideoEntryTransition()
     this.videoEntry = null
     this.videoSourceKey = ''
     this.videoLocalPath = ''
     this.videoDurationMs = 0
     this.videoCurrentMs = 0
+    this.videoTimelineReady = false
+    this.videoFastPlaybackActive = false
+    this.videoSeekDragging = false
+    this.videoSeekPending = false
+    this.videoSeekTargetMs = 0
     this.videoPlaying = false
     this.videoPrepared = false
     this.videoLandscape = false
@@ -13037,6 +13468,44 @@ struct Index {
     await this.toggleVideo()
   }
 
+  /**
+   * A confirmed single tap changes only the player chrome.  It shares one
+   * Exclusive gesture group with double tap, so playback double taps and
+   * control/slider gestures keep their existing behavior.
+   */
+  private handleVideoSingleTap(): void {
+    if (!this.showVideoPlayer || this.videoOverlayClosing ||
+      this.videoPipBackgrounded || this.videoEntry === null) {
+      return
+    }
+    const visible = !this.videoChromeVisible
+    this.getUIContext().animateTo({
+      duration: visible ? 220 : 180,
+      curve: Curve.FastOutSlowIn
+    }, (): void => {
+      this.videoChromeVisible = visible
+    })
+  }
+
+  private beginVideoFastPlayback(): void {
+    if (!this.showVideoPlayer || this.videoOverlayClosing || this.videoPipBackgrounded ||
+      this.videoEntry === null || !this.videoPrepared || !this.videoPlaying ||
+      this.videoCasting || this.videoControlPending || this.videoFastPlaybackActive) {
+      return
+    }
+    if (this.videoPlaybackManager.setPlaybackRate(2)) {
+      this.videoFastPlaybackActive = true
+    }
+  }
+
+  private endVideoFastPlayback(): void {
+    if (!this.videoFastPlaybackActive) {
+      return
+    }
+    this.videoPlaybackManager.setPlaybackRate(1)
+    this.videoFastPlaybackActive = false
+  }
+
   private async toggleVideo(): Promise<void> {
     if (this.isBusy || !this.videoPrepared || this.videoEntry === null ||
       this.videoControlPending) {
@@ -13103,15 +13572,29 @@ struct Index {
     this.videoPlaybackManager.setMuted(this.videoMuted)
   }
 
-  private seekVideo(value: number): void {
+  private seekVideo(value: number, mode?: SliderChangeMode): void {
     if (!this.videoPrepared || this.videoDurationMs <= 0) {
       return
     }
     const timeMs = Math.min(this.videoDurationMs, Math.max(0, Math.floor(value)))
     this.videoCurrentMs = timeMs
+    if (mode === SliderChangeMode.Begin || mode === SliderChangeMode.Moving) {
+      // During the drag the thumb is the source of truth. Issuing one seek
+      // per pointer move makes 100 ms timeUpdate callbacks pull it backwards.
+      this.videoSeekDragging = true
+      this.videoSeekPending = false
+      this.videoSeekTargetMs = timeMs
+      return
+    }
+    this.videoSeekDragging = false
+    this.videoSeekPending = true
+    this.videoSeekTargetMs = timeMs
     if (this.videoCasting) {
       this.videoMediaSession.sendCastControl({ command: 'seek', parameter: timeMs })
         .catch((error: Error): void => {
+          if (this.videoSeekTargetMs === timeMs) {
+            this.videoSeekPending = false
+          }
           console.warn('[UgreenAVSession] remote seek command failed: ' + JSON.stringify(error))
         })
     } else {
@@ -13578,7 +14061,14 @@ struct Index {
     if (snapshot.durationMs > 0) {
       this.videoDurationMs = snapshot.durationMs
     }
-    this.videoCurrentMs = Math.max(0, snapshot.positionMs)
+    if (!this.videoSeekDragging) {
+      const positionMs = Math.max(0, snapshot.positionMs)
+      if (!this.videoSeekPending || Math.abs(positionMs - this.videoSeekTargetMs) <= 1500) {
+        this.videoSeekPending = false
+        this.videoCurrentMs = positionMs
+        this.videoTimelineReady = this.videoDurationMs > 0
+      }
+    }
     this.syncVideoBackgroundTask()
     this.updateVideoPipControlStatus()
     this.updateVideoMediaSession(true)
@@ -14492,6 +14982,16 @@ struct Index {
     if (this.showImageViewer || this.viewerEntryTransitionActive || this.viewerClosePending) {
       return
     }
+    // Keep the enlarged video poster byte-for-byte stable from the source
+    // thumbnail through first-frame hand-off. Replacing its URI with a newly
+    // cached preview rebuilds the full-screen Image and produces one flash.
+    const freezesCurrentVideoPoster = this.videoPosterPath === path &&
+      this.videoPosterUri.length > 0 &&
+      (this.videoOpeningPath === path || this.showVideoPlayer ||
+        this.videoEntryTransitionActive || this.videoOverlayClosing)
+    if (freezesCurrentVideoPoster) {
+      return
+    }
     const order: string[] = this.previewUriOrder.filter((key: string): boolean => key !== path)
     order.push(path)
     const evictedPaths: string[] = []
@@ -14557,6 +15057,39 @@ struct Index {
     this.fileEntryDataSource.replace(this.entries)
     this.syncWaterfallEntries(this.entries, appendWaterfall)
     this.refreshFileListImageRotations(this.entries)
+    this.scheduleDirectoryVideoReconcile(this.entries)
+  }
+
+  private scheduleDirectoryVideoReconcile(entries: FileEntry[]): void {
+    if (this.screen !== 'files' || this.showSearch) {
+      return
+    }
+    const directoryKey = this.currentRootType.toString() + ':' + this.currentPath
+    if (directoryKey !== this.videoReconcileDirectoryKey) {
+      this.videoReconcileDirectoryKey = directoryKey
+      this.videoReconciledEntries = {}
+    }
+    const pending: FileEntry[] = []
+    for (const entry of entries) {
+      if (entry.isDirectory || !this.isVideo(entry) ||
+        this.videoReconciledEntries[entry.path] === true) {
+        continue
+      }
+      this.videoReconciledEntries[entry.path] = true
+      pending.push(entry)
+    }
+    if (pending.length === 0) {
+      return
+    }
+    this.ensureVideoState().then((): Promise<void> =>
+      this.videoTransferManager.reconcileDirectoryDownloads(pending)
+    ).catch((error: Error): void => {
+      for (const entry of pending) {
+        this.videoReconciledEntries[entry.path] = false
+      }
+      console.warn('[UgreenVideo] directory download reconcile failed: ' +
+        JSON.stringify(error))
+    })
   }
 
   private appendEntries(nextEntries: FileEntry[]): void {
