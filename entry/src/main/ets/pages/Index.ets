@@ -2056,12 +2056,12 @@ struct Index {
       if (this.videoStateForEntry(entry).status === 'failed') {
         SymbolGlyph($r('sys.symbol.exclamationmark_triangle'))
           .fontSize(18)
-          .fontColor([$r('app.color.icon_muted')])
+          .fontColor([$r('sys.color.icon_secondary')])
           .margin({ left: 8, right: 4 })
       } else if (this.videoStateForEntry(entry).status === 'completed') {
         SymbolGlyph($r('sys.symbol.checkmark_circle'))
           .fontSize(20)
-          .fontColor(['#2E6BFF'])
+          .fontColor([$r('sys.color.icon_emphasize')])
           .margin({ left: 8, right: 4 })
       } else if (this.videoStateForEntry(entry).status !== 'idle') {
         // Network playback is buffered inside AVPlayer rather than written to
@@ -2126,7 +2126,7 @@ struct Index {
   FileRowChevron(): void {
     SymbolGlyph($r('sys.symbol.chevron_forward'))
       .fontSize(18)
-      .fontColor([$r('app.color.icon_muted')])
+      .fontColor([$r('sys.color.icon_secondary')])
   }
 
   @Builder
@@ -2171,7 +2171,7 @@ struct Index {
               Button() {
                 SymbolGlyph($r('sys.symbol.trash'))
                   .fontSize(18)
-                  .fontColor([$r('app.color.icon_primary')])
+                  .fontColor([$r('sys.color.icon_primary')])
               }
               .type(ButtonType.Normal)
               .width(34)
@@ -2183,7 +2183,7 @@ struct Index {
                 SymbolGlyph(this.searchHistoryExpanded
                   ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
                   .fontSize(17)
-                  .fontColor([$r('app.color.icon_primary')])
+                  .fontColor([$r('sys.color.icon_primary')])
               }
               .type(ButtonType.Normal)
               .width(34)
@@ -2274,7 +2274,7 @@ struct Index {
                 if (entry.isDirectory) {
                   SymbolGlyph($r('sys.symbol.chevron_forward'))
                     .fontSize(18)
-                    .fontColor([$r('app.color.icon_muted')])
+                    .fontColor([$r('sys.color.icon_secondary')])
                 }
               }
               .width('100%')
@@ -2486,7 +2486,8 @@ struct Index {
     Row({ space: 8 }) {
       Button('下载', { type: ButtonType.Capsule })
         .width(88).height(36).fontSize(15)
-        .fontColor(this.transferDirection === 'download' ? '#2E6BFF' : $r('app.color.text_primary'))
+        .fontColor(this.transferDirection === 'download'
+          ? $r('sys.color.font_emphasize') : $r('sys.color.font_primary'))
         .fontWeight(this.transferDirection === 'download' ? FontWeight.Medium : FontWeight.Normal)
         .backgroundColor(Color.Transparent)
         .systemMaterial(this.transferControlMaterial())
@@ -2494,7 +2495,8 @@ struct Index {
         .onClick(() => { this.transferDirection = 'download' })
       Button('上传', { type: ButtonType.Capsule })
         .width(88).height(36).fontSize(15)
-        .fontColor(this.transferDirection === 'upload' ? '#2E6BFF' : $r('app.color.text_primary'))
+        .fontColor(this.transferDirection === 'upload'
+          ? $r('sys.color.font_emphasize') : $r('sys.color.font_primary'))
         .fontWeight(this.transferDirection === 'upload' ? FontWeight.Medium : FontWeight.Normal)
         .backgroundColor(Color.Transparent)
         .systemMaterial(this.transferControlMaterial())
@@ -2614,10 +2616,10 @@ struct Index {
         Column({ space: 1 }) {
           SymbolGlyph($r('sys.symbol.arrow_down'))
             .fontSize(16)
-            .fontColor([$r('app.color.icon_primary')])
+            .fontColor([$r('sys.color.icon_primary')])
           Text(this.formatSpeed(this.downloadSpeedBytesPerSecond))
             .fontSize(10)
-            .fontColor($r('app.color.text_primary'))
+            .fontColor($r('sys.color.font_primary'))
             .maxLines(1)
         }
         .justifyContent(FlexAlign.Center)
@@ -2625,7 +2627,7 @@ struct Index {
       .width(64)
       .height(64)
       .borderRadius(32)
-      .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true, '#442E6BFF'))
+      .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN, true, '#442E6BFF'))
       .hitTestBehavior(HitTestMode.Default)
       .monopolizeEvents(true)
       .onClick(() => this.openDownloads())
@@ -3022,11 +3024,12 @@ struct Index {
           Search({ value: this.searchQuery, placeholder: '搜索文件' })
             .layoutWeight(1)
             .height(40)
-            .fontColor($r('app.color.text_primary'))
+            .fontColor($r('sys.color.font_primary'))
+            .placeholderColor($r('sys.color.font_secondary'))
             .backgroundColor(Color.Transparent)
             .borderRadius(20)
             .cancelButton({ style: CancelButtonStyle.INPUT })
-            .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true))
+            .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN, true))
             .monopolizeEvents(true)
             .onChange((value: string) => this.scheduleSearch(value))
             .onSubmit((value: string) => this.submitSearch(value))
@@ -3147,19 +3150,19 @@ struct Index {
         Stack({ alignContent: Alignment.Center }) {
           Text('多选')
             .fontSize(15)
-            .fontColor($r('app.color.text_primary'))
+            .fontColor($r('sys.color.font_primary'))
             .textAlign(TextAlign.Center)
             .width(104)
             .opacity(this.selectionMode ? 0 : 1)
           Text('全选')
             .fontSize(16)
-            .fontColor($r('app.color.text_primary'))
+            .fontColor($r('sys.color.font_primary'))
             .textAlign(TextAlign.Center)
             .width(104)
             .opacity(this.selectionMode && !this.allEntriesSelected() ? 1 : 0)
           Text('取消全选')
             .fontSize(16)
-            .fontColor($r('app.color.text_primary'))
+            .fontColor($r('sys.color.font_primary'))
             .textAlign(TextAlign.Center)
             .width(104)
             .opacity(this.selectionMode && this.allEntriesSelected() ? 1 : 0)
@@ -3168,14 +3171,14 @@ struct Index {
         .height('100%')
       }
       .fontSize(16)
-      .fontColor($r('app.color.text_primary'))
+      .fontColor($r('sys.color.font_primary'))
       .backgroundColor(Color.Transparent)
       .borderRadius(20)
       .width(this.topActionButtonWidth())
       .height(40)
       .padding({ left: 0, right: 0, top: 0, bottom: 0 })
       .position({ x: this.topActionButtonX(), y: 0 })
-      .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true))
+      .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN, true))
       .overlay(this.ImportLightOverlay, { align: Alignment.Center })
       .enabled(this.selectionMode ? this.entries.length > 0 : !this.isBusy)
       .monopolizeEvents(true)
@@ -3192,8 +3195,8 @@ struct Index {
       // hit testing while the persistent multi-select button moves over it.
       Button() {
         SymbolGlyph($r('sys.symbol.magnifyingglass'))
-          .fontSize(20)
-          .fontColor([$r('app.color.icon_primary')])
+          .fontSize(24)
+          .fontColor([$r('sys.color.icon_primary')])
       }
       .type(ButtonType.Normal)
       .width(40)
@@ -3203,7 +3206,7 @@ struct Index {
       .position({ x: 68, y: 0 })
       .opacity(this.selectionMode ? 0 : 1)
       .enabled(!this.selectionMode)
-      .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true))
+      .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN, true))
       .overlay(this.ImportLightOverlay, { align: Alignment.Center })
       .monopolizeEvents(true)
       .onClick(() => this.openSearch())
@@ -3315,7 +3318,7 @@ struct Index {
       if (!destructive) {
         SymbolGlyph($r('sys.symbol.chevron_forward'))
           .fontSize(16)
-          .fontColor([$r('app.color.icon_muted')])
+          .fontColor([$r('sys.color.icon_secondary')])
       }
     }
     .width('100%')
@@ -3728,7 +3731,7 @@ struct Index {
       Row() {
         this.BottomNavItem($r('sys.symbol.house'), '主页', 'home', () => this.openHome())
         this.BottomNavItem($r('sys.symbol.folder'), '共享', 'shared', () => this.openShared())
-        this.BottomNavItem($r('sys.symbol.arrow_2_circlepath'), '传输', 'downloads',
+        this.BottomNavItem($r('sys.symbol.transfer'), '传输', 'downloads',
           () => this.openDownloads())
         this.BottomNavItem($r('sys.symbol.gearshape'), '设置', 'settings', () => this.openSettings())
       }
@@ -3760,10 +3763,10 @@ struct Index {
           Row({ space: 6 }) {
             Text(this.fileSortTitle())
               .fontSize(15)
-              .fontColor($r('app.color.text_primary'))
+              .fontColor($r('sys.color.font_primary'))
             SymbolGlyph($r('sys.symbol.arrowtriangle_down_fill'))
               .fontSize(10)
-              .fontColor([$r('app.color.icon_primary')])
+              .fontColor([$r('sys.color.icon_primary')])
               .rotate({ angle: this.showFileSortMenu ? 180 : 0 })
           }
           .justifyContent(FlexAlign.Center)
@@ -3822,7 +3825,7 @@ struct Index {
     Row() {
       this.SelectionActionButton($r('sys.symbol.share'), '分享',
         () => this.shareSelectedEntries())
-      this.SelectionActionButton($r('sys.symbol.doc'), '复制',
+      this.SelectionActionButton($r('sys.symbol.doc_text_on_doc_text'), '复制',
         () => this.beginSelectionDestinationPicker('copy'))
       this.SelectionActionButton($r('sys.symbol.trash'), '删除',
         () => this.deleteSelectedEntries())
@@ -3844,11 +3847,11 @@ struct Index {
         SymbolGlyph(icon)
           .fontSize(24)
           .fontColor([this.selectionActionEnabled(title)
-            ? $r('app.color.icon_primary') : $r('app.color.icon_muted')])
+            ? $r('sys.color.icon_primary') : $r('sys.color.icon_tertiary')])
         Text(title)
           .fontSize(12)
           .fontColor(this.selectionActionEnabled(title)
-            ? $r('app.color.text_primary') : $r('app.color.text_muted'))
+            ? $r('sys.color.font_primary') : $r('sys.color.font_tertiary'))
       }
       .justifyContent(FlexAlign.Center)
     }
@@ -3868,14 +3871,14 @@ struct Index {
   SelectionMoreButton(): void {
     Button() {
       Column({ space: 2 }) {
-        SymbolGlyph($r('sys.symbol.ellipsis_circle'))
+        SymbolGlyph($r('sys.symbol.more'))
           .fontSize(24)
           .fontColor([this.selectedEntryCount > 0
-            ? $r('app.color.icon_primary') : $r('app.color.icon_muted')])
+            ? $r('sys.color.icon_primary') : $r('sys.color.icon_tertiary')])
         Text('更多')
           .fontSize(12)
           .fontColor(this.selectedEntryCount > 0
-            ? $r('app.color.text_primary') : $r('app.color.text_muted'))
+            ? $r('sys.color.font_primary') : $r('sys.color.font_tertiary'))
       }
       .justifyContent(FlexAlign.Center)
     }
@@ -3908,15 +3911,15 @@ struct Index {
   @Builder
   SelectionMorePopup(): void {
     Column() {
-      this.SelectionMoreRow($r('sys.symbol.folder'), '移动',
+      this.SelectionMoreRow($r('sys.symbol.move'), '移动',
         () => this.beginSelectionDestinationPicker('move'))
-      this.SelectionMoreRow($r('sys.symbol.square_and_arrow_down'), '下载',
+      this.SelectionMoreRow($r('sys.symbol.download'), '下载',
         () => this.downloadSelectedEntries())
 
       if (this.selectedPaths.length === 1) {
         if (this.selectedSingleEntry() !== null &&
           this.actionSupportsOpenWith(this.selectedSingleEntry() as FileEntry)) {
-          this.SelectionMoreRow($r('sys.symbol.square_and_arrow_down'), '其他应用打开',
+          this.SelectionMoreRow($r('sys.symbol.rectangle_and_arrowshape_turn_up_right'), '其他应用打开',
             () => this.openWithSelectedEntry(this.selectedSingleEntry() as FileEntry))
         }
         if (this.selectedSingleEntry() !== null &&
@@ -3927,7 +3930,7 @@ struct Index {
         if (this.selectedSingleEntry() !== null &&
           !(this.selectedSingleEntry() as FileEntry).isDirectory &&
           this.isMedia(this.selectedSingleEntry() as FileEntry)) {
-          this.SelectionMoreRow($r('sys.symbol.doc'), '保存图库',
+          this.SelectionMoreRow($r('sys.symbol.picture_badge_arrow_down'), '保存图库',
             () => this.saveSelectedGallery(this.selectedSingleEntry() as FileEntry))
         }
         if (this.selectedSingleEntry() !== null &&
@@ -3936,9 +3939,9 @@ struct Index {
             () => this.releaseSelectedCaches())
         }
         if (this.selectedSingleEntry() !== null) {
-          this.SelectionMoreRow($r('sys.symbol.doc_text'), '重命名',
+          this.SelectionMoreRow($r('sys.symbol.rename'), '重命名',
             () => this.renameSelectedEntry(this.selectedSingleEntry() as FileEntry))
-          this.SelectionMoreRow($r('sys.symbol.doc'), '详情',
+          this.SelectionMoreRow($r('sys.symbol.info_circle'), '详情',
             () => this.showEntryDetailsSelected(this.selectedSingleEntry() as FileEntry))
         }
       } else if (this.selectedCachedEntries().length > 0) {
@@ -3957,11 +3960,11 @@ struct Index {
     Row() {
       Text(title)
         .fontSize(16)
-        .fontColor($r('app.color.text_primary'))
+        .fontColor($r('sys.color.font_primary'))
         .layoutWeight(1)
       SymbolGlyph(icon)
         .fontSize(21)
-        .fontColor([$r('app.color.icon_primary')])
+        .fontColor([$r('sys.color.icon_primary')])
         .width(30)
     }
     .width('100%')
@@ -3986,8 +3989,8 @@ struct Index {
   FileToolCircleButton(icon: Resource, action: () => void): void {
     Button() {
       SymbolGlyph(icon)
-        .fontSize(22)
-        .fontColor([$r('app.color.icon_primary')])
+        .fontSize(24)
+        .fontColor([$r('sys.color.icon_primary')])
     }
     .type(ButtonType.Normal)
     .width(FLOATING_BAR_HEIGHT_VP)
@@ -4105,7 +4108,7 @@ struct Index {
           ? $r('sys.symbol.arrow_up')
           : $r('sys.symbol.arrow_down'))
           .fontSize(20)
-          .fontColor([$r('app.color.icon_primary')])
+          .fontColor([$r('sys.color.icon_primary')])
       }
     }
     .width('100%')
@@ -4128,7 +4131,8 @@ struct Index {
       Stack() {
         SymbolGlyph(icon)
           .fontSize(24)
-          .fontColor([this.selectedBottomTab === tab ? '#2E6BFF' : $r('app.color.icon_primary')])
+          .fontColor([this.selectedBottomTab === tab
+            ? $r('sys.color.icon_emphasize') : $r('sys.color.icon_primary')])
       }
       .width('100%')
       .height(24)
@@ -4136,7 +4140,8 @@ struct Index {
       Text(title)
         .fontSize(12)
         .fontWeight(this.selectedBottomTab === tab ? FontWeight.Medium : FontWeight.Normal)
-        .fontColor(this.selectedBottomTab === tab ? '#2E6BFF' : $r('app.color.text_primary'))
+        .fontColor(this.selectedBottomTab === tab
+          ? $r('sys.color.font_emphasize') : $r('sys.color.font_primary'))
     }
     .layoutWeight(1)
     .height('100%')
@@ -4152,15 +4157,15 @@ struct Index {
   OfficialBackButton(action: () => void): void {
     Button() {
       SymbolGlyph($r('sys.symbol.chevron_backward'))
-        .fontSize(21)
-        .fontColor([$r('app.color.icon_primary')])
+        .fontSize(24)
+        .fontColor([$r('sys.color.icon_primary')])
     }
     .type(ButtonType.Normal)
     .width(40)
     .height(40)
     .borderRadius(20)
     .backgroundColor(Color.Transparent)
-    .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN))
+    .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN))
     .overlay(this.ImportLightOverlay, { align: Alignment.Center })
     .hitTestBehavior(HitTestMode.Default)
     .monopolizeEvents(true)
@@ -4176,8 +4181,8 @@ struct Index {
           // two stacked glyphs produced a bright/blank frame during selection.
           SymbolGlyph(this.selectionMode
             ? $r('sys.symbol.xmark') : $r('sys.symbol.chevron_backward'))
-            .fontSize(21)
-            .fontColor([$r('app.color.icon_primary')])
+            .fontSize(24)
+            .fontColor([$r('sys.color.icon_primary')])
             .opacity(this.fileHeaderLeadingVisible() ? 1 : 0)
         }
         .width('100%')
@@ -4188,7 +4193,7 @@ struct Index {
       .height(40)
       .borderRadius(20)
       .backgroundColor(Color.Transparent)
-      .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN))
+      .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN))
       .enabled(this.fileHeaderLeadingVisible())
       .overlay(this.ImportLightOverlay, { align: Alignment.Center })
       .hitTestBehavior(this.fileHeaderLeadingVisible() ? HitTestMode.Default : HitTestMode.None)
@@ -4209,15 +4214,15 @@ struct Index {
   SelectionCloseButton(action: () => void): void {
     Button() {
       SymbolGlyph($r('sys.symbol.xmark'))
-        .fontSize(21)
-        .fontColor([$r('app.color.icon_primary')])
+        .fontSize(24)
+        .fontColor([$r('sys.color.icon_primary')])
     }
     .type(ButtonType.Normal)
     .width(40)
     .height(40)
     .borderRadius(20)
     .backgroundColor(Color.Transparent)
-    .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN))
+    .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN))
     .hitTestBehavior(HitTestMode.Default)
     .monopolizeEvents(true)
     .onClick(action)
@@ -4333,18 +4338,18 @@ struct Index {
           Column() {
             Row() {
               if (entry.isDirectory) {
-                this.ActionQuickButton($r('sys.symbol.doc'), '复制',
+                this.ActionQuickButton($r('sys.symbol.doc_text_on_doc_text'), '复制',
                   () => this.beginDestinationPicker('copy', entry))
-                this.ActionQuickButton($r('sys.symbol.folder'), '移动',
+                this.ActionQuickButton($r('sys.symbol.move'), '移动',
                   () => this.beginDestinationPicker('move', entry))
               } else {
                 if (this.actionSupportsShare(entry)) {
                   this.ActionQuickButton($r('sys.symbol.share'), '分享',
                     () => this.shareViewerImage(entry))
                 }
-                this.ActionQuickButton($r('sys.symbol.doc'), '复制',
+                this.ActionQuickButton($r('sys.symbol.doc_text_on_doc_text'), '复制',
                   () => this.beginDestinationPicker('copy', entry))
-                this.ActionQuickButton($r('sys.symbol.folder'), '移动',
+                this.ActionQuickButton($r('sys.symbol.move'), '移动',
                   () => this.beginDestinationPicker('move', entry))
               }
             }
@@ -4354,7 +4359,7 @@ struct Index {
             this.ActionSectionGap()
 
             if (!entry.isDirectory && this.actionSupportsOpenWith(entry)) {
-              this.ActionMenuRow($r('sys.symbol.square_and_arrow_down'), '其他应用打开',
+              this.ActionMenuRow($r('sys.symbol.rectangle_and_arrowshape_turn_up_right'), '其他应用打开',
                 () => this.openWithOtherApp(entry), false, true)
               this.ActionSectionGap()
             }
@@ -4365,22 +4370,22 @@ struct Index {
             }
             this.ActionMenuRow($r('sys.symbol.list_bullet_square'), '多选',
               () => this.enterSelection(entry), false, false)
-            this.ActionMenuRow($r('sys.symbol.square_and_arrow_down'), '下载',
+            this.ActionMenuRow($r('sys.symbol.download'), '下载',
               () => this.downloadEntryFromMenu(entry), false, false)
             if (!entry.isDirectory && this.isMedia(entry)) {
-              this.ActionMenuRow($r('sys.symbol.doc'), '保存图库',
+              this.ActionMenuRow($r('sys.symbol.picture_badge_arrow_down'), '保存图库',
                 () => this.saveToGallery(entry), false, !this.actionHasLocalCache(entry))
             }
             if (!entry.isDirectory && this.actionHasLocalCache(entry)) {
               this.ActionMenuRow($r('sys.symbol.arrow_down'), '释放缓存',
                 () => this.releaseCache(entry), false, false)
             }
-            this.ActionMenuRow($r('sys.symbol.doc_text'), '重命名',
+            this.ActionMenuRow($r('sys.symbol.rename'), '重命名',
               () => this.openRename(entry), false, true)
 
             this.ActionSectionGap()
 
-            this.ActionMenuRow($r('sys.symbol.doc'), '详情',
+            this.ActionMenuRow($r('sys.symbol.info_circle'), '详情',
               () => this.showEntryDetails(entry), false, false)
             this.ActionMenuRow($r('sys.symbol.trash'), '删除',
               () => this.deleteEntry(entry), true, true)
@@ -4411,11 +4416,11 @@ struct Index {
   ActionQuickButton(icon: Resource, title: string, action: () => void): void {
     Column({ space: 4 }) {
       SymbolGlyph(icon)
-        .fontSize(23)
-        .fontColor([$r('app.color.icon_primary')])
+        .fontSize(24)
+        .fontColor([$r('sys.color.icon_primary')])
       Text(title)
         .fontSize(12)
-        .fontColor($r('app.color.text_primary'))
+        .fontColor($r('sys.color.font_primary'))
         .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
     }
@@ -4434,11 +4439,11 @@ struct Index {
       Row() {
         Text(title)
           .fontSize(16)
-          .fontColor(danger ? '#D34D5C' : $r('app.color.text_primary'))
+          .fontColor(danger ? $r('sys.color.warning') : $r('sys.color.font_primary'))
           .layoutWeight(1)
         SymbolGlyph(icon)
           .fontSize(21)
-          .fontColor([danger ? '#D34D5C' : $r('app.color.icon_primary')])
+          .fontColor([danger ? $r('sys.color.warning') : $r('sys.color.icon_primary')])
           .width(30)
       }
       .width('100%')
@@ -4637,15 +4642,15 @@ struct Index {
   DestinationCloseButton(action: () => void): void {
     Button() {
       SymbolGlyph($r('sys.symbol.xmark'))
-        .fontSize(21)
-        .fontColor([$r('app.color.icon_primary')])
+        .fontSize(24)
+        .fontColor([$r('sys.color.icon_primary')])
     }
     .type(ButtonType.Normal)
     .width(40)
     .height(40)
     .borderRadius(20)
     .backgroundColor(Color.Transparent)
-    .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN))
+    .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN))
     .hitTestBehavior(HitTestMode.Default)
     .monopolizeEvents(true)
     .stateEffect(true)
@@ -4656,15 +4661,15 @@ struct Index {
   DestinationCircleButton(icon: Resource, action: () => void, enabled: boolean = true): void {
     Button() {
       SymbolGlyph(icon)
-        .fontSize(21)
-        .fontColor([$r('app.color.icon_primary')])
+        .fontSize(24)
+        .fontColor([$r('sys.color.icon_primary')])
     }
     .type(ButtonType.Normal)
     .width(40)
     .height(40)
     .borderRadius(20)
     .backgroundColor(Color.Transparent)
-    .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN))
+    .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN))
     .hitTestBehavior(HitTestMode.Default)
     .monopolizeEvents(true)
     .stateEffect(true)
@@ -4695,7 +4700,7 @@ struct Index {
         SymbolGlyph(this.destinationRootExpanded
           ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_forward'))
           .fontSize(18)
-          .fontColor([$r('app.color.icon_muted')])
+          .fontColor([$r('sys.color.icon_secondary')])
         Blank()
           .width('7.2%')
       }
@@ -4747,7 +4752,7 @@ struct Index {
           ? $r('sys.symbol.chevron_down')
           : $r('sys.symbol.chevron_forward'))
           .fontSize(18)
-          .fontColor([$r('app.color.icon_muted')])
+          .fontColor([$r('sys.color.icon_secondary')])
         Blank()
           .width('7.2%')
       }
@@ -6374,15 +6379,15 @@ struct Index {
       Row() {
         Button() {
           SymbolGlyph($r('sys.symbol.chevron_backward'))
-            .fontSize(21)
-            .fontColor([$r('sys.color.font_primary')])
+            .fontSize(24)
+            .fontColor([$r('sys.color.icon_primary')])
         }
           .type(ButtonType.Normal)
           .width(40)
           .height(40)
           .borderRadius(20)
           .backgroundColor(Color.Transparent)
-          .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN))
+          .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN))
           .hitTestBehavior(HitTestMode.Default)
           .monopolizeEvents(true)
           .onClick(() => this.closeImageViewer())
@@ -6425,13 +6430,23 @@ struct Index {
     .height(FLOATING_BAR_HEIGHT_VP + 80)
     .margin({ bottom: this.floatingBarBottomMargin() - 40 })
     .clip(false)
-    .hitTestBehavior(HitTestMode.Default)
+    // barFloatingStyle places the 56vp capsule 40vp from the bottom of this
+    // 136vp Tabs host. Restrict the host to that exact visual rectangle, then
+    // let the material-owning Tabs block image gestures without cutting off
+    // its own press light and deformation handling.
+    .responseRegion({
+      x: Math.max(0, (this.effectivePageWidth() - this.wideBottomBarCapsuleWidth()) / 2),
+      y: 40,
+      width: this.wideBottomBarCapsuleWidth(),
+      height: FLOATING_BAR_HEIGHT_VP
+    })
+    .hitTestBehavior(HitTestMode.BLOCK_HIERARCHY)
   }
 
   @Builder
   ImageViewerBarContent(): void {
     Row() {
-      this.ImageViewerActionItem($r('sys.symbol.square_and_arrow_down'), '保存',
+      this.ImageViewerActionItem($r('sys.symbol.picture_badge_arrow_down'), '保存',
         () => this.saveCommittedViewerImage())
       this.ImageViewerActionItem($r('sys.symbol.share'), '分享',
         () => this.shareCommittedViewerImage())
@@ -6475,10 +6490,6 @@ struct Index {
         this.viewerBottomBarWidthVp = area.width
       }
     })
-    // Do not allow a drag on the floating action capsule to become a
-    // Swiper gesture underneath it.
-    // The action items are children of this capsule. Block would stop their
-    // hit test; Default keeps child clicks and blocks the Swiper underneath.
     .hitTestBehavior(HitTestMode.Default)
   }
 
@@ -6488,14 +6499,14 @@ struct Index {
       Stack() {
         SymbolGlyph(icon)
           .fontSize(24)
-          .fontColor([$r('app.color.icon_primary')])
+          .fontColor([$r('sys.color.icon_primary')])
       }
       .width('100%')
       .height(24)
 
       Text(title)
         .fontSize(12)
-        .fontColor($r('app.color.text_primary'))
+        .fontColor($r('sys.color.font_primary'))
     }
     .layoutWeight(1)
     .height('100%')
@@ -6508,7 +6519,7 @@ struct Index {
   @Builder
   ImageViewerMoreButton(): void {
     Row() {
-      this.ImageViewerActionItem($r('sys.symbol.ellipsis_circle'), '更多',
+      this.ImageViewerActionItem($r('sys.symbol.more'), '更多',
         () => this.openImageMoreMenu())
     }
     .layoutWeight(1)
@@ -6516,8 +6527,12 @@ struct Index {
     .bindPopup(this.showImageMoreMenu, {
       builder: this.ImageViewerMoreContent,
       placement: Placement.Top,
+      targetSpace: 6,
+      maskColor: Color.Transparent,
       enableArrow: false,
       autoCancel: true,
+      radius: 24,
+      transition: this.imageMoreMenuTransition(),
       systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
       onStateChange: (state: PopupStateChange) => {
         if (!state.isVisible && this.showImageMoreMenu) {
@@ -6530,17 +6545,19 @@ struct Index {
   @Builder
   ImageViewerMoreContent(): void {
     Column() {
-      this.ImageViewerMoreRow($r('sys.symbol.arrow_2_circlepath'), '旋转',
+      this.ImageViewerMoreRow($r('sys.symbol.rotate_left'), '旋转',
         () => this.rotateViewerOverlayImage(), true)
       this.ImageViewerMoreRow($r('sys.symbol.rectangle_and_arrowshape_turn_up_right'), '其他应用打开',
         () => this.openViewerOverlayWithOtherApp(), true)
-      this.ImageViewerMoreRow($r('sys.symbol.rectangle_on_rectangle'), '重命名',
+      this.ImageViewerMoreRow($r('sys.symbol.rename'), '重命名',
         () => this.openRenameFromViewerOverlay(), true)
-      this.ImageViewerMoreRow($r('sys.symbol.doc'), '详情',
+      this.ImageViewerMoreRow($r('sys.symbol.info_circle'), '详情',
         () => this.openImageDetails(), false)
     }
-    .width(Math.min(340, this.effectivePageWidth() - 40))
+    .width(Math.min(228, this.effectivePageWidth() - 40))
     .padding({ left: 10, right: 10, top: 8, bottom: 8 })
+    .borderRadius(24)
+    .hitTestBehavior(HitTestMode.Default)
   }
 
   /**
@@ -6575,12 +6592,12 @@ struct Index {
         x: 0.08,
         y: 0.08,
         z: 1,
-        centerX: '94%',
+        centerX: '78%',
         centerY: '100%'
       }))
-      .combine(TransitionEffect.translate({ y: 14 }))
+      .combine(TransitionEffect.translate({ y: 28 }))
       .animation({
-        duration: 300,
+        duration: 280,
         curve: curves.interpolatingSpring(0, 1, 320, 30)
       })
     const disappear = TransitionEffect.opacity(0)
@@ -6588,12 +6605,12 @@ struct Index {
         x: 0.08,
         y: 0.08,
         z: 1,
-        centerX: '94%',
+        centerX: '78%',
         centerY: '100%'
       }))
-      .combine(TransitionEffect.translate({ y: 14 }))
+      .combine(TransitionEffect.translate({ y: 28 }))
       .animation({
-        duration: 180,
+        duration: 170,
         curve: Curve.EaseIn
       })
     return TransitionEffect.asymmetric(appear, disappear)
@@ -6601,27 +6618,39 @@ struct Index {
 
   @Builder
   ImageViewerMoreRow(icon: Resource, title: string, action: () => void, showDivider: boolean): void {
-    Row() {
-      SymbolGlyph(icon)
-        .fontSize(21)
-        .fontColor([$r('app.color.icon_primary')])
-        .width(38)
-      Text(title)
-        .fontSize(15)
-        .fontColor($r('app.color.text_primary'))
-        .layoutWeight(1)
+    Column() {
+      Button() {
+        Row() {
+          Text(title)
+            .fontSize(16)
+            .fontColor($r('sys.color.font_primary'))
+            .layoutWeight(1)
+          SymbolGlyph(icon)
+            .fontSize(22)
+            .fontColor([$r('sys.color.icon_primary')])
+            .width(32)
+        }
+        .width('100%')
+        .height('100%')
+        .padding({ left: 10, right: 8 })
+      }
+      .type(ButtonType.Normal)
+      .width('100%')
+      .height(48)
+      .padding(0)
+      .borderRadius(14)
+      .backgroundColor(Color.Transparent)
+      .stateEffect(true)
+      .onClick(action)
+
+      if (showDivider) {
+        Divider()
+          .strokeWidth(0.5)
+          .color($r('sys.color.comp_divider'))
+          .margin({ left: 10, right: 10 })
+      }
     }
     .width('100%')
-    .height(52)
-    .padding({ left: 12, right: 12 })
-    .borderRadius(14)
-    .backgroundColor(Color.Transparent)
-    .border({
-      width: { bottom: showDivider ? 0.5 : 0 },
-      color: '#229AA5B5',
-      style: BorderStyle.Solid
-    })
-    .onClick(action)
   }
 
   @Builder
@@ -6721,7 +6750,7 @@ struct Index {
         } else {
           SymbolGlyph($r('sys.symbol.doc_text'))
             .fontSize(78)
-            .fontColor([$r('app.color.icon_muted')])
+            .fontColor([$r('sys.color.icon_secondary')])
         }
         Text(entry.name)
           .fontSize(20)
@@ -6830,7 +6859,7 @@ struct Index {
           } else {
             SymbolGlyph($r('sys.symbol.play'))
               .fontSize(72)
-              .fontColor([$r('app.color.icon_muted')])
+              .fontColor([$r('sys.color.icon_secondary')])
           }
           if (!this.videoPrepared || this.videoBufferingPercent < 100) {
             LoadingProgress()
@@ -6916,7 +6945,7 @@ struct Index {
     Button() {
       SymbolGlyph($r('sys.symbol.chevron_backward'))
         .fontSize(24)
-        .fontColor([Color.White])
+        .fontColor([$r('sys.color.font_on_primary')])
     }
       .type(ButtonType.Normal)
       .width(40)
@@ -6928,7 +6957,7 @@ struct Index {
     Text(this.videoEntry === null ? '' : (this.videoEntry as FileEntry).name)
       .fontSize(17)
       .fontWeight(FontWeight.Bold)
-      .fontColor(Color.White)
+      .fontColor($r('sys.color.font_on_primary'))
       .layoutWeight(1)
       .maxLines(1)
       .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -6939,6 +6968,7 @@ struct Index {
         .width(24)
         .height(24)
         .objectFit(ImageFit.Contain)
+        .syncLoad(true)
     }
       .type(ButtonType.Normal)
       .width(40)
@@ -6980,7 +7010,8 @@ struct Index {
       .width(24)
       .height(24)
       .objectFit(ImageFit.Contain)
-      .fillColor(this.videoCasting ? '#2E6BFF' : '#FFFFFF')
+      .fillColor(this.videoCasting
+        ? $r('sys.color.icon_emphasize') : $r('sys.color.font_on_primary'))
       .syncLoad(true)
   }
 
@@ -7022,7 +7053,7 @@ struct Index {
           SymbolGlyph(this.videoPlaying
             ? $r('sys.symbol.pause') : $r('sys.symbol.play'))
             .fontSize(24)
-            .fontColor([Color.White])
+            .fontColor([$r('sys.color.font_on_primary')])
         }
           .type(ButtonType.Normal)
           .width(40)
@@ -7034,8 +7065,8 @@ struct Index {
         if (this.videoLandscape) {
           Button() {
             SymbolGlyph($r('sys.symbol.chevron_forward'))
-              .fontSize(20)
-              .fontColor([Color.White])
+              .fontSize(24)
+              .fontColor([$r('sys.color.font_on_primary')])
           }
             .type(ButtonType.Normal)
             .width(36)
@@ -7047,7 +7078,7 @@ struct Index {
 
         Text(this.formatPlaybackTime(this.videoCurrentMs))
           .fontSize(11)
-          .fontColor(Color.White)
+          .fontColor($r('sys.color.font_on_primary'))
           .width(40)
         // Keep the native AVPlayer buffer visible behind the playback
         // thumb, following the official network-video example.  The
@@ -7089,14 +7120,14 @@ struct Index {
           .layoutWeight(1)
           Text(this.formatPlaybackTime(this.videoDurationMs))
           .fontSize(11)
-          .fontColor(Color.White)
+          .fontColor($r('sys.color.font_on_primary'))
           .width(40)
           .textAlign(TextAlign.End)
 
         Button() {
-          SymbolGlyph($r('sys.symbol.rotate_left'))
-            .fontSize(22)
-            .fontColor([Color.White])
+          SymbolGlyph($r('sys.symbol.screen_rotation'))
+            .fontSize(24)
+            .fontColor([$r('sys.color.font_on_primary')])
         }
           .type(ButtonType.Normal)
           .width(40)
@@ -7124,6 +7155,26 @@ struct Index {
     materialColor: string = ''): uiMaterial.Material {
     const options: uiMaterial.ImmersiveOptions = {
       style: style,
+      interactive: interactive,
+      applyShadow: true,
+      lightEffect: { color: '#FFFFFFFF' }
+    }
+    if (materialColor.length > 0) {
+      options.materialColor = materialColor
+    }
+    return new uiMaterial.ImmersiveMaterial(options)
+  }
+
+  /**
+   * Material for small floating controls whose glyphs sit over changing page
+   * content. Keep automatic inversion on this narrow subtree only; menus and
+   * dialogs continue to use immersiveMaterial without broad color processing.
+   */
+  private adaptiveControlMaterial(style: uiMaterial.ImmersiveStyle = uiMaterial.ImmersiveStyle.THIN,
+    interactive: boolean = true, materialColor: string = ''): uiMaterial.Material {
+    const options: uiMaterial.ImmersiveOptions = {
+      style: style,
+      colorInvert: true,
       interactive: interactive,
       applyShadow: true,
       lightEffect: { color: '#FFFFFFFF' }

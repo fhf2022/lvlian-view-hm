@@ -156,7 +156,31 @@ export struct FloatingImportControl {
 
   @Builder
   MaterialSurface() {
-    Stack() {}
+    Stack({ alignContent: Alignment.TopStart }) {
+      Row() {
+        SymbolGlyph($r('sys.symbol.plus'))
+          .fontSize(24)
+          .fontColor([$r('sys.color.icon_primary')])
+      }
+      .width(56)
+      .height(56)
+      .justifyContent(FlexAlign.Center)
+      .opacity(this.expanded ? 0 : 1)
+
+      // The visible choices must stay inside the material subtree for
+      // colorInvert to react to the content underneath the floating panel.
+      Column() {
+        this.ChoiceVisual($r('sys.symbol.folder'), '文件')
+        this.ChoiceVisual($r('sys.symbol.picture_on_square'), '图库')
+        this.ChoiceVisual($r('sys.symbol.folder_badge_plus'), '新建文件夹')
+      }
+      .width(this.expandedSurfaceWidth())
+      .height(160)
+      .padding({ top: 8, bottom: 8 })
+      .position({ x: 0, y: 0 })
+      .opacity(this.expanded ? 1 : 0)
+      .animation({ duration: this.expanded ? 120 : 70, curve: Curve.EaseOut })
+    }
       .width(this.surfaceWidth()).height(this.surfaceHeight())
       .borderRadius(this.expanded ? 24 : 28)
       .backgroundColor(Color.Transparent)
@@ -166,11 +190,22 @@ export struct FloatingImportControl {
   }
 
   @Builder
-  Choice(symbol: Resource, label: string, source: string) {
+  ChoiceVisual(symbol: Resource, label: string) {
     Row({ space: 14 }) {
-      SymbolGlyph(symbol).fontSize(23).fontColor([$r('app.color.text_primary')])
-      Text(label).fontSize(16).fontColor($r('app.color.text_primary'))
+      SymbolGlyph(symbol)
+        .fontSize(24)
+        .fontColor([$r('sys.color.icon_primary')])
+      Text(label)
+        .fontSize(16)
+        .fontColor($r('sys.color.font_primary'))
     }
+    .width('100%').height(48).padding({ left: 20, right: 16 })
+    .hitTestBehavior(HitTestMode.None)
+  }
+
+  @Builder
+  ChoiceHitTarget(label: string, source: string) {
+    Row()
     .width('100%').height(48).padding({ left: 20, right: 16 })
     .onClick(() => this.choose(source))
     .accessibilityText(label)
@@ -219,12 +254,8 @@ export struct FloatingImportControl {
 
   @Builder
   CollapsedBall() {
-    Row() {
-      SymbolGlyph($r('sys.symbol.plus'))
-        .fontSize(26).fontColor([$r('app.color.text_primary')])
-    }
+    Row()
     .width(56).height(56).justifyContent(FlexAlign.Center)
-    .opacity(this.expanded ? 0 : 1)
     // The drag recognizer lives on the exact 56vp ball only. Removing the
     // recognizer from the panel ancestor avoids competing with Choice clicks.
     .hitTestBehavior(this.expanded ? HitTestMode.BLOCK_DESCENDANTS : HitTestMode.Default)
@@ -292,9 +323,9 @@ export struct FloatingImportControl {
       // morphs. If this column follows the shrinking parent, Row/Text is laid
       // out again on every frame and the labels visibly scatter into the ball.
       Column() {
-        this.Choice($r('sys.symbol.folder'), '文件', 'files')
-        this.Choice($r('sys.symbol.rectangle_on_rectangle'), '图库', 'gallery')
-        this.Choice($r('sys.symbol.folder_badge_plus'), '新建文件夹', 'folder')
+        this.ChoiceHitTarget('文件', 'files')
+        this.ChoiceHitTarget('图库', 'gallery')
+        this.ChoiceHitTarget('新建文件夹', 'folder')
       }
       .width(this.expandedSurfaceWidth())
       .height(160)
