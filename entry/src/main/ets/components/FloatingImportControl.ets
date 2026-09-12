@@ -109,7 +109,17 @@ export struct FloatingImportControl {
   }
   private changeExpanded(value: boolean): void {
     this.publishLight(false)
-    this.getUIContext().animateTo({ duration: 220, curve: Curve.EaseInOut }, () => { this.expanded = value })
+    const context = this.getUIContext()
+    if (!value) {
+      // A system picker can take the window in the same event turn. Dispatch
+      // the collapse to the render service immediately so it starts in
+      // parallel instead of waiting for the next vsync behind picker startup.
+      context.animateToImmediately({ duration: 220, curve: Curve.EaseInOut }, () => {
+        this.expanded = false
+      })
+      return
+    }
+    context.animateTo({ duration: 220, curve: Curve.EaseInOut }, () => { this.expanded = true })
   }
   private choose(source: string): void {
     this.changeExpanded(false)
@@ -208,38 +218,17 @@ export struct FloatingImportControl {
   }
 
   @Builder
-  Surface() {
-    Stack({ alignContent: Alignment.TopStart }) {
-      this.TouchLight()
-      Row() {
-        SymbolGlyph($r('sys.symbol.plus'))
-          .fontSize(26).fontColor([$r('app.color.text_primary')])
-      }
-        .width(56).height(56).justifyContent(FlexAlign.Center)
-        .opacity(this.expanded ? 0 : 1)
-        .hitTestBehavior(this.expanded ? HitTestMode.None : HitTestMode.Default)
-      // Keep the choices at their final dimensions while the material surface
-      // morphs. If this column follows the shrinking parent, Row/Text is laid
-      // out again on every frame and the labels visibly scatter into the ball.
-      Column() {
-        this.Choice($r('sys.symbol.folder'), '文件', 'files')
-        this.Choice($r('sys.symbol.rectangle_on_rectangle'), '图库', 'gallery')
-        this.Choice($r('sys.symbol.folder_badge_plus'), '新建文件夹', 'folder')
-      }
-      .width(this.expandedSurfaceWidth())
-      .height(160)
-      .padding({ top: 8, bottom: 8 })
-      .position({ x: 0, y: 0 })
-      .opacity(this.expanded ? 1 : 0)
-      .animation({ duration: this.expanded ? 120 : 70, curve: Curve.EaseOut })
-      .hitTestBehavior(this.expanded ? HitTestMode.Default : HitTestMode.BLOCK_DESCENDANTS)
+  CollapsedBall() {
+    Row() {
+      SymbolGlyph($r('sys.symbol.plus'))
+        .fontSize(26).fontColor([$r('app.color.text_primary')])
     }
-    .backgroundColor(Color.Transparent)
-    .width(this.surfaceWidth()).height(this.surfaceHeight())
-    .borderRadius(this.expanded ? 24 : 28)
-    .hitTestBehavior(HitTestMode.Default)
-    .monopolizeEvents(true)
-    .position({ x: this.x(), y: this.y() })
+    .width(56).height(56).justifyContent(FlexAlign.Center)
+    .opacity(this.expanded ? 0 : 1)
+    // The drag recognizer lives on the exact 56vp ball only. Removing the
+    // recognizer from the panel ancestor avoids competing with Choice clicks.
+    .hitTestBehavior(this.expanded ? HitTestMode.BLOCK_DESCENDANTS : HitTestMode.Default)
+    .monopolizeEvents(!this.expanded)
     .onTouch((event: TouchEvent) => {
       if (this.expanded) { return }
       if (event.type === TouchType.Down) {
@@ -292,6 +281,34 @@ export struct FloatingImportControl {
       })
       .onActionEnd(() => { if (this.dragging) { this.dock() } })
       .onActionCancel(() => { if (this.dragging) { this.dock() } }))
+  }
+
+  @Builder
+  Surface() {
+    Stack({ alignContent: Alignment.TopStart }) {
+      this.TouchLight()
+      this.CollapsedBall()
+      // Keep the choices at their final dimensions while the material surface
+      // morphs. If this column follows the shrinking parent, Row/Text is laid
+      // out again on every frame and the labels visibly scatter into the ball.
+      Column() {
+        this.Choice($r('sys.symbol.folder'), '文件', 'files')
+        this.Choice($r('sys.symbol.rectangle_on_rectangle'), '图库', 'gallery')
+        this.Choice($r('sys.symbol.folder_badge_plus'), '新建文件夹', 'folder')
+      }
+      .width(this.expandedSurfaceWidth())
+      .height(160)
+      .padding({ top: 8, bottom: 8 })
+      .position({ x: 0, y: 0 })
+      .opacity(this.expanded ? 1 : 0)
+      .animation({ duration: this.expanded ? 120 : 70, curve: Curve.EaseOut })
+      .hitTestBehavior(this.expanded ? HitTestMode.Default : HitTestMode.BLOCK_DESCENDANTS)
+    }
+    .backgroundColor(Color.Transparent)
+    .width(this.surfaceWidth()).height(this.surfaceHeight())
+    .borderRadius(this.expanded ? 24 : 28)
+    .hitTestBehavior(HitTestMode.Default)
+    .position({ x: this.x(), y: this.y() })
   }
 
   build() {

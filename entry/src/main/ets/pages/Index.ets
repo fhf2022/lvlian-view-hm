@@ -1693,8 +1693,8 @@ struct Index {
       }
 
       if (this.screen === 'files' && this.currentPath.length > 0 && !this.showSearch &&
-        !this.selectionMode && !this.importSelecting && this.contextMenuEntry === null &&
-        !this.showRenameDialog && !this.showCreateFolderDialog && !this.showDestinationPicker &&
+        !this.selectionMode && this.contextMenuEntry === null &&
+        !this.showRenameDialog && !this.showDestinationPicker &&
         !this.showAudioPlayer && !this.videoPlaybackUiVisible()) {
         if (this.importExpanded) {
           Row().width('100%').height('100%').backgroundColor(Color.Transparent).zIndex(24)
@@ -1715,7 +1715,9 @@ struct Index {
           // the ball itself. Keeping the host out of the touch test lets taps
           // reach the file list under it.
           .hitTestBehavior(this.viewerOwnsParentInteraction()
-            ? HitTestMode.BLOCK_DESCENDANTS : HitTestMode.None)
+            ? HitTestMode.BLOCK_DESCENDANTS
+            : (this.importSelecting || this.showCreateFolderDialog
+              ? HitTestMode.BLOCK_DESCENDANTS : HitTestMode.None))
       }
 
       if ((this.screen === 'files' || this.screen === 'downloads' || this.screen === 'settings') &&
@@ -2521,14 +2523,12 @@ struct Index {
   }
 
   private async selectImportSource(source: string): Promise<void> {
-    this.importExpanded = false
     if (source === 'folder') { this.openCreateFolder(); return }
     if (this.currentPath.length === 0 || this.importSelecting || this.isBusy) { return }
     const target = this.currentPath
     const scope = this.repository.cacheScopeHash()
     this.importSelecting = true
     try {
-      await this.ensureDownloadState()
       let uris: string[] = []
       if (source === 'gallery') {
         const options = new photoAccessHelper.PhotoSelectOptions()
@@ -2549,6 +2549,9 @@ struct Index {
         buttons: [{ text: '取消', color: '#536174' }, { text: '上传', color: '#2E6BFF' }],
         systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THICK, false) })
       if (confirmation.index !== 1) { return }
+      // Opening a system picker does not depend on the transfer queues. Wait
+      // for them only after the user has selected files and confirmed upload.
+      await this.ensureDownloadState()
       this.transferDirection = 'upload'
       this.openDownloads()
       for (const uri of uris) { await this.uploadQueue.enqueue(uri, target, scope) }
@@ -4169,16 +4172,13 @@ struct Index {
     Stack({ alignContent: Alignment.Center }) {
       Button() {
         Stack({ alignContent: Alignment.Center }) {
-          // Both symbols are mounted once. Selection only cross-fades the
-          // glyphs, so the material circle does not blink or get recreated.
-          SymbolGlyph($r('sys.symbol.chevron_backward'))
+          // Keep one glyph node and replace its symbol directly. Cross-fading
+          // two stacked glyphs produced a bright/blank frame during selection.
+          SymbolGlyph(this.selectionMode
+            ? $r('sys.symbol.xmark') : $r('sys.symbol.chevron_backward'))
             .fontSize(21)
             .fontColor([$r('app.color.icon_primary')])
-            .opacity(this.selectionMode ? 0 : (this.currentPath.length > 0 ? 1 : 0))
-          SymbolGlyph($r('sys.symbol.xmark'))
-            .fontSize(21)
-            .fontColor([$r('app.color.icon_primary')])
-            .opacity(this.selectionMode ? 1 : 0)
+            .opacity(this.fileHeaderLeadingVisible() ? 1 : 0)
         }
         .width('100%')
         .height('100%')
@@ -4200,11 +4200,9 @@ struct Index {
           this.goBack()
         }
       })
-      .animation({ duration: 180, curve: Curve.FastOutSlowIn })
     }
     .width(this.fileHeaderLeadingWidth())
     .height(40)
-    .animation({ duration: 180, curve: Curve.FastOutSlowIn })
   }
 
   @Builder
