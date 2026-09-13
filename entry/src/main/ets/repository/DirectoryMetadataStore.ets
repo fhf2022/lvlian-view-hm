@@ -2,11 +2,14 @@ import { Context } from '@kit.AbilityKit'
 import { relationalStore } from '@kit.ArkData'
 import { FileEntry } from '../model/FileEntry'
 import { JsonObject } from '../core/network/HttpTypes'
+import { DirectoryTimeline, DirectoryTimelinePolicy, TimelineDayBucket } from '../model/DirectoryTimeline'
 
 export interface DirectoryMetadataSnapshot {
   entries: FileEntry[]
   fetchedAt: number
   totalCount: number
+  timeline: DirectoryTimeline
+  contentSignature: string
 }
 
 export interface DirectoryMetadataPage {
@@ -32,7 +35,7 @@ interface CacheIndexRow {
  */
 export class DirectoryMetadataStore {
   private static readonly DATABASE_NAME: string = 'ugreen_directory_cache'
-  private static readonly DATABASE_VERSION: number = 2
+  private static readonly DATABASE_VERSION: number = 3
   private static readonly MAX_TOTAL_CACHE_BYTES: number = 64 * 1024 * 1024
   private static readonly MAX_PAGE_BYTES: number = 512 * 1024
   private static readonly PAGE_SIZE: number = 200
@@ -58,7 +61,7 @@ export class DirectoryMetadataStore {
     let resultSet: relationalStore.ResultSet | null = null
     try {
       resultSet = await store.querySql(
-        'SELECT snapshot_id, fetched_at, total_count, page_count ' +
+        'SELECT snapshot_id, fetched_at, total_count, page_count, complete, timeline_json ' +
           'FROM directory_cache_index WHERE scope = ? AND root_type = ? AND path = ? LIMIT 1',
         [scope, rootType, path]
       )
@@ -70,7 +73,9 @@ export class DirectoryMetadataStore {
       const fetchedAt = resultSet.getLong(1)
       const totalCount = resultSet.getLong(2)
       const pageCount = resultSet.getLong(3)
-      if (pageCount <= 0) {
+      const complete = resultSet.getLong(4) === 1
+      const timeline = this.decodeTimeline(resultSet.getString(5))
+      if (!complete || pageCount <= 0 || timeline === null) {
         return null
       }
 
@@ -110,7 +115,9 @@ export class DirectoryMetadataStore {
       return {
         entries: entries,
         fetchedAt: fetchedAt,
-        totalCount: totalCount >= 0 ? totalCount : entries.length
+        totalCount: totalCount >= 0 ? totalCount : entries.length,
+        timeline: timeline,
+        contentSignature: DirectoryTimelinePolicy.contentSignature(entries)
       }
     } catch (_) {
       return null
@@ -175,7 +182,7 @@ export class DirectoryMetadataStore {
   }
 
   async saveSnapshot(scope: string, path: string, rootType: number,
-    pages: FileEntry[][], totalCount: number): Promise<void> {
+    pages: FileEntry[][], totalCount: number, timeline: DirectoryTimeline): Promise<void> {
     if (scope.length === 0 || pages.length === 0) {
       return
     }
@@ -196,6 +203,13 @@ export class DirectoryMetadataStore {
       return
     }
 
+    let timelineJson = ''
+    try {
+      timelineJson = JSON.stringify(timeline)
+      totalBytes += timelineJson.length * 2
+    } catch (_) {
+      return
+    }
     const normalizedTotalCount = totalCount >= 0 ? totalCount : pages.reduce(
       (count: number, entries: FileEntry[]): number => count + entries.length, 0)
     const operation = this.writeQueue.then(async (): Promise<void> => {
@@ -217,9 +231,10 @@ export class DirectoryMetadataStore {
       await store.executeSql(
         'INSERT OR REPLACE INTO directory_cache_index ' +
           '(scope, root_type, path, snapshot_id, fetched_at, last_access_at, ' +
-          'total_count, page_count, total_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          'total_count, page_count, total_bytes, complete, timeline_json) ' +
+          'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         [scope, rootType, path, snapshotId, now, now, normalizedTotalCount,
-          serializedPages.length, totalBytes]
+          serializedPages.length, totalBytes, 1, timelineJson]
       )
       await store.executeSql(
         'DELETE FROM directory_cache_pages WHERE scope = ? AND root_type = ? AND path = ? ' +
@@ -256,21 +271,29 @@ export class DirectoryMetadataStore {
       const now = Date.now()
       let snapshotId = this.nextSnapshotId()
       let fetchedAt = now
+      let existingComplete = false
       let existing: relationalStore.ResultSet | null = null
       try {
         existing = await store.querySql(
-          'SELECT snapshot_id, fetched_at FROM directory_cache_index ' +
+          'SELECT snapshot_id, fetched_at, complete FROM directory_cache_index ' +
             'WHERE scope = ? AND root_type = ? AND path = ? LIMIT 1',
           [scope, rootType, path]
         )
         if (existing.goToFirstRow()) {
           snapshotId = existing.getLong(0)
           fetchedAt = existing.getLong(1)
+          existingComplete = existing.getLong(2) === 1
         }
       } finally {
         if (existing !== null) {
           existing.close()
         }
+      }
+      // A foreground first-page request may finish after the background full
+      // index. Keep the complete snapshot instead of replacing it with a
+      // partial row from the older request.
+      if (existingComplete) {
+        return
       }
 
       await store.executeSql(
@@ -301,10 +324,11 @@ export class DirectoryMetadataStore {
       await store.executeSql(
         'INSERT OR REPLACE INTO directory_cache_index ' +
           '(scope, root_type, path, snapshot_id, fetched_at, last_access_at, ' +
-          'total_count, page_count, total_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          'total_count, page_count, total_bytes, complete, timeline_json) ' +
+          'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         [scope, rootType, path, snapshotId, fetchedAt, now,
           totalCount >= 0 ? totalCount : pageIndex * DirectoryMetadataStore.PAGE_SIZE,
-          pageCount, totalBytes]
+          pageCount, totalBytes, 0, '']
       )
       await this.cleanupOrphanPages(store)
       await this.trim(store)
@@ -327,6 +351,28 @@ export class DirectoryMetadataStore {
         await store.executeSql('DELETE FROM directory_cache_index WHERE scope = ?', [scope])
       }
       this.snapshotSequence = 0
+    })
+    this.writeQueue = operation.catch((): void => {})
+    await operation.catch((): void => {})
+  }
+
+  async remove(scope: string, path: string, rootType: number): Promise<void> {
+    if (scope.length === 0) {
+      return
+    }
+    const operation = this.writeQueue.then(async (): Promise<void> => {
+      const store = await this.readyStore()
+      if (store === null) {
+        return
+      }
+      await store.executeSql(
+        'DELETE FROM directory_cache_pages WHERE scope = ? AND root_type = ? AND path = ?',
+        [scope, rootType, path]
+      )
+      await store.executeSql(
+        'DELETE FROM directory_cache_index WHERE scope = ? AND root_type = ? AND path = ?',
+        [scope, rootType, path]
+      )
     })
     this.writeQueue = operation.catch((): void => {})
     await operation.catch((): void => {})
@@ -359,6 +405,8 @@ export class DirectoryMetadataStore {
           'total_count INTEGER NOT NULL, ' +
           'page_count INTEGER NOT NULL, ' +
           'total_bytes INTEGER NOT NULL, ' +
+          'complete INTEGER NOT NULL DEFAULT 0, ' +
+          'timeline_json TEXT NOT NULL DEFAULT \'\', ' +
           'PRIMARY KEY (scope, root_type, path)' +
         ')'
       )
@@ -507,6 +555,37 @@ export class DirectoryMetadataStore {
         entries.push(entry)
       }
       return entries
+    } catch (_) {
+      return null
+    }
+  }
+
+  private decodeTimeline(json: string): DirectoryTimeline | null {
+    if (json.length === 0) {
+      return null
+    }
+    try {
+      const raw = JSON.parse(json) as JsonObject
+      const timeline = new DirectoryTimeline()
+      timeline.complete = this.booleanValue(raw['complete'])
+      timeline.directImageCount = this.numberValue(raw['directImageCount'])
+      timeline.earliestTime = this.numberValue(raw['earliestTime'])
+      timeline.latestTime = this.numberValue(raw['latestTime'])
+      const bucketValues = raw['buckets'] as Object
+      if (bucketValues instanceof Array) {
+        const buckets: TimelineDayBucket[] = []
+        for (const value of bucketValues as Object[]) {
+          const bucketRaw = value as JsonObject
+          const bucket = new TimelineDayBucket()
+          bucket.dayStart = this.numberValue(bucketRaw['dayStart'])
+          bucket.count = this.numberValue(bucketRaw['count'])
+          if (bucket.dayStart > 0 && bucket.count > 0) {
+            buckets.push(bucket)
+          }
+        }
+        timeline.buckets = buckets
+      }
+      return timeline.complete ? timeline : null
     } catch (_) {
       return null
     }

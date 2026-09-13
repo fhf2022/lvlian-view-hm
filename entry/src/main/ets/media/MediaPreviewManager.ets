@@ -19,7 +19,7 @@ export class MediaPreviewManager {
     if (this.kind(entry) !== 'image' || cacheDirectory.length === 0) {
       return ''
     }
-    return CacheManager.findExisting(cacheDirectory, this.imagePreviewFileName(entry),
+    return CacheManager.findExistingFast(cacheDirectory, this.imagePreviewFileName(entry),
       this.imagePreviewCacheKey(entry))
   }
 

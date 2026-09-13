@@ -23,7 +23,9 @@ export interface UgreenDirectoryPage {
 
 export class UgreenRemoteClient {
   private static readonly DIRECTORY_PAGE_SIZE: number = 200
-  private static readonly MAX_DIRECTORY_PAGES: number = 100
+  // Metadata-only indexing must cover large photo directories. The guard is
+  // still finite so a broken endpoint cannot create an endless page loop.
+  private static readonly MAX_DIRECTORY_PAGES: number = 1000
   private transport: HttpTransport
   private sessionStore: SessionStore
   private endpoints: UgreenEndpoints | null = null

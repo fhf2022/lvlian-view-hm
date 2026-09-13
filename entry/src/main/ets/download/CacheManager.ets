@@ -56,6 +56,23 @@ export class CacheManager {
     return ''
   }
 
+  /**
+   * Read-only cache lookup for rendering hot paths. It deliberately skips
+   * synchronous LRU timestamp maintenance; callers that need eviction
+   * accounting can continue to use findExisting().
+   */
+  static findExistingFast(directory: string, fileName: string, cacheKey: string = ''): string {
+    const keyedPath = CacheManager.cachePath(directory, fileName, cacheKey)
+    if (CacheManager.exists(keyedPath)) {
+      return keyedPath
+    }
+    if (cacheKey.length > 0) {
+      return ''
+    }
+    const legacyPath = CacheManager.cachePath(directory, fileName)
+    return CacheManager.exists(legacyPath) ? legacyPath : ''
+  }
+
   static async prepareForIncoming(directory: string, maxBytes: number, incomingBytes: number,
     targetPath: string, protectedPaths: string[] = []): Promise<void> {
     await CacheManager.makeRoom(directory, maxBytes, incomingBytes, targetPath, protectedPaths)

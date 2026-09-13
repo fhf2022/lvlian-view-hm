@@ -45,8 +45,10 @@ export class PreviewLoadQueue {
     return true
   }
 
-  cancelPending(): void {
+  cancelPending(): string[] {
+    const keys = this.pending.map((task: PreviewTask): string => task.key)
     this.pending = []
+    return keys
   }
 
   clear(): void {

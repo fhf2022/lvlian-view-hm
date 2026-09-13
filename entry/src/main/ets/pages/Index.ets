@@ -6,6 +6,7 @@ import { Context, Want, common, wantConstant } from '@kit.AbilityKit'
 import { fileIo, fileUri, picker } from '@kit.CoreFileKit'
 import { photoAccessHelper } from '@kit.MediaLibraryKit'
 import { FloatingImportControl } from '../components/FloatingImportControl'
+import { FisheyeTimeline } from '../components/FisheyeTimeline'
 import { ProximityLightReceiver } from '../components/ProximityLightReceiver'
 import { UploadQueueManager, UploadTaskRecord } from '../upload/UploadQueueManager'
 import { preferences, uniformTypeDescriptor as utd } from '@kit.ArkData'
@@ -38,6 +39,13 @@ import { ThumbnailPolicy, ThumbnailSize } from '../media/ThumbnailPolicy'
 import { ThumbnailCacheStore } from '../media/ThumbnailCacheStore'
 import { ViewerBitmapRecord, ViewerBitmapStore } from '../media/ViewerBitmapStore'
 import { NetworkClass, NetworkPolicy } from '../core/network/NetworkPolicy'
+import {
+  DirectoryIndexedSnapshot,
+  DirectoryQuery,
+  DirectoryTimeline,
+  DirectoryTimelinePolicy,
+  TimelinePeriod
+} from '../model/DirectoryTimeline'
 
 type RemoteScreen = 'login' | 'otp' | 'files' | 'downloads' | 'settings'
 type RootKind = 'personal' | 'shared'
@@ -78,6 +86,9 @@ const FLOATING_BAR_EFFECT_TOP_INSET_VP: number = 20
 const FLOATING_BAR_MIN_GAP_VP: number = 8
 const FLOATING_BAR_MAX_GAP_VP: number = 16
 const FLOATING_BAR_CONTENT_EXTRA_VP: number = 32
+const FLOATING_TIMELINE_WIDTH_VP: number = 68
+const FLOATING_TIMELINE_GAP_VP: number = 8
+const DIRECTORY_INDEX_STALE_MS: number = 30 * 1000
 const FILE_TOOL_HEIGHT_VP: number = 40
 // 底栏胶囊宽度随按钮数量自适应：每个页签 82vp，4 项 = 328vp（对齐示例里
 // "按钮少就收窄"的做法）。文件详情页中间的排序胶囊沿用原来的 140vp。
@@ -351,7 +362,10 @@ struct Index {
   @State showImageMoreMenu: boolean = false
   @State showImageDetails: boolean = false
   @State viewerLastNavigationDirection: number = 1
-  @State imageVisualStates: Record<string, ImageVisualState> = {}
+  // Pixel/geometry metadata is kept in a private identity map. The previous
+  // @State record was copied in full for every visible-row callback, so the
+  // cost grew with the number of images visited during a scroll session.
+  @State imageVisualEpoch: number = 0
   @State imageAnalyzerTypes: ImageAnalyzerType[] = []
   @State imageAnalyzerSupported: boolean = false
   @State imageScale: number = 1
@@ -441,13 +455,15 @@ struct Index {
   @State videoCasting: boolean = false
   @State videoTransferStates: Record<string, VideoTransferState> = {}
   @State previewCanonicalPaths: Record<string, boolean> = {}
-  @State waterfallOriginalUris: Record<string, string> = {}
+  // Waterfall identity maps stay private so a recycled FlowItem does not
+  // copy every visited path. Epochs are the small reactive invalidation keys
+  // consumed by the builders below.
+  @State waterfallSourceEpoch: number = 0
   // PixelMap source changes are committed on a render frame.  The epoch is
   // intentionally the only reactive value; native PixelMap objects stay in
   // the private store and are never copied through @State records.
   @State viewerBitmapEpoch: number = 0
-  @State waterfallAspectRatios: Record<string, number> = {}
-  @State waterfallVisiblePaths: Record<string, boolean> = {}
+  @State waterfallAspectEpoch: number = 0
   @State waterfallColumnWidthVp: number = 0
   @State directoryCounts: Record<string, number> = {}
   @State pageOffsetX: number = 0
@@ -476,6 +492,9 @@ struct Index {
   @State currentDirectoryHasImages: boolean = false
   @State fileSortKey: FileSortKey = 'time'
   @State fileSortAscending: boolean = false
+  @State directoryTimeline: DirectoryTimeline = new DirectoryTimeline()
+  @State timelineFocusTime: number = 0
+  @State timelineIndexing: boolean = false
   @State showFileSortMenu: boolean = false
   @State showCreateFolderDialog: boolean = false
   @State newFolderText: string = ''
@@ -564,6 +583,8 @@ struct Index {
   private fileThumbnailDecodeKeys: Record<string, string> = {}
   private waterfallBitmaps: Record<string, ViewerBitmapRecord> = {}
   private imageRotationStore: ImageRotationStore = new ImageRotationStore()
+  private fileListPersistedDisplayState: ImageDisplayState = new ImageDisplayState()
+  private fileListRotationReady: boolean = false
   private imageAnalyzerController: visionImageAnalyzer.VisionImageAnalyzerController =
     new visionImageAnalyzer.VisionImageAnalyzerController()
   // Keep the already rendered parent pages so system/back navigation does not
@@ -582,6 +603,7 @@ struct Index {
   private fileEntryDataSource: FileEntryDataSource = new FileEntryDataSource()
   private waterfallDataSource: FileEntryDataSource = new FileEntryDataSource()
   private viewerImageDataSource: FileEntryDataSource = new FileEntryDataSource()
+  private transitionFileEntryDataSource: FileEntryDataSource = new FileEntryDataSource()
   private fileListScroller: Scroller = new Scroller()
   private waterfallScroller: Scroller = new Scroller()
   // Keep the exact offset of the file surface below ImageViewer so returning
@@ -600,12 +622,42 @@ struct Index {
   private transitionScroller: Scroller = new Scroller()
   private previewRequests: Record<string, boolean> = {}
   private previewLocalPaths: Record<string, string> = {}
+  private previewLocalSignatures: Record<string, string> = {}
   private previewQueue: PreviewLoadQueue = new PreviewLoadQueue(
     ThumbnailPolicy.LIST_MAX_CONCURRENT, ThumbnailPolicy.MAX_PENDING_TASKS)
   private previewUriOrder: string[] = []
   private currentPageIndex: number = 1
   private currentPageHasMore: boolean = false
   private loadingNextPage: boolean = false
+  private directoryIndexRequestToken: number = 0
+  private indexedDirectoryKey: string = ''
+  private photosPreindexHomePath: string = ''
+  private timelineEntryIndexByDay: Record<string, number> = {}
+  private timelineWaterfallIndexByDay: Record<string, number> = {}
+  private timelineScrubActive: boolean = false
+  private timelineScrubLastScrollAt: number = 0
+  private timelineScrubPendingTime: number = 0
+  private timelineScrubTimer: number = 0
+  private timelineInteractionToken: number = 0
+  private timelineFocusPinned: boolean = false
+  private timelineIgnoreScrollStartUntil: number = 0
+  private timelineVisibleFocusPendingTime: number = 0
+  private timelineVisibleFocusTimer: number = 0
+  private timelineLastJumpDay: number = 0
+  private timelineLastJumpIndex: number = -1
+  private timelineLastJumpPath: string = ''
+  private timelineLastJumpMode: FileViewMode = 'list'
+  private fileContentScrolling: boolean = false
+  private pendingDirectoryIndexSnapshot: DirectoryIndexedSnapshot | null = null
+  private indexedDirectoryContentSignature: string = ''
+  private imageVisualStates: Record<string, ImageVisualState> = {}
+  private imageVisualPruneTimer: number = 0
+  private imageVisualNotifyTimer: number = 0
+  private waterfallOriginalUris: Record<string, string> = {}
+  private waterfallAspectRatios: Record<string, number> = {}
+  private waterfallVisiblePaths: Record<string, boolean> = {}
+  private waterfallSourceNotifyTimer: number = 0
+  private waterfallAspectNotifyTimer: number = 0
   private directoryCountRequests: Record<string, boolean> = {}
   private directoryCountTimers: Record<string, number> = {}
   private previewGeneration: number = 0
@@ -1178,6 +1230,58 @@ struct Index {
     return this.floatingBarBottomMargin() + FLOATING_BAR_HEIGHT_VP + extra
   }
 
+  private shouldShowTimeline(): boolean {
+    const visibleImageCount = this.timelineVisibleImageCount()
+    const currentDirectoryKey = this.currentRootType.toString() + ':' + this.currentPath
+    // The index is keyed by directory. During a push/pop the live page and its
+    // metadata can be one step apart; never paint the previous directory's
+    // rail over the incoming page.
+    return this.fileSortKey === 'time' && !this.showPageTransition &&
+      !this.showDestinationPicker && !this.showCreateFolderDialog &&
+      this.indexedDirectoryKey === currentDirectoryKey && this.directoryTimeline.eligible(
+      DirectoryTimelinePolicy.minimumImageCount(visibleImageCount)) &&
+      this.shouldShowFileToolsBar()
+  }
+
+  private timelineVisibleImageCount(): number {
+    let source = this.entries
+    let start = this.fileVisibleStartIndex
+    let end = this.fileVisibleEndIndex
+    if (this.fileViewMode === 'waterfall') {
+      source = this.waterfallEntries
+      start = this.waterfallVisibleStartIndex
+      end = this.waterfallVisibleEndIndex
+    } else if (this.fileViewMode === 'list') {
+      // List index zero is the fixed top spacer, not a file entry.
+      start = Math.max(0, start - 1)
+      end = Math.max(start, end - 1)
+    }
+    if (source.length === 0 || end < start) {
+      return 0
+    }
+    const lower = Math.max(0, start)
+    const upper = Math.min(source.length - 1, end)
+    let count = 0
+    for (let index = lower; index <= upper; index += 1) {
+      if (!source[index].isDirectory && this.isImage(source[index])) {
+        count += 1
+      }
+    }
+    return count
+  }
+
+  private floatingTimelineHeight(): number {
+    const fileRegionHeight = this.pageHeightVp - this.fileContentTopInset() -
+      this.floatingBarBottomMargin() - FLOATING_BAR_HEIGHT_VP
+    // Equal gaps above and below keep the long vertical rail centered in the
+    // visible file region, independent of status/navigation-bar insets.
+    return Math.max(180, fileRegionHeight - FLOATING_TIMELINE_GAP_VP * 2)
+  }
+
+  private fileToolsBarHeight(): number {
+    return FLOATING_BAR_HEIGHT_VP
+  }
+
   private shouldShowBottomBar(): boolean {
     if (this.showSearch) {
       return false
@@ -1336,15 +1440,22 @@ struct Index {
     }
   }
 
-  private prepareFileTransition(outgoingEntries: FileEntry[], direction: PageTransitionDirection): number {
+  private prepareFileTransition(outgoingEntries: FileEntry[], direction: PageTransitionDirection,
+    stageIncomingOffscreen: boolean = true): number {
     this.cancelFileTransition()
     const token = this.pageTransitionToken
     const width = this.effectivePageWidth()
     this.outgoingEntries = outgoingEntries.slice()
+    this.transitionFileEntryDataSource.replace(this.outgoingEntries)
     this.transitionSnapshotMode = this.fileViewMode
     this.transitionSnapshotOnTop = false
     this.outgoingPageOffsetX = 0
-    this.pageOffsetX = direction === 'push' ? width : -width
+    // A transactional directory push first submits the outgoing snapshot while
+    // the live page is still covering it. Moving the live page in that same
+    // insertion frame can expose an unpainted conditional snapshot for one
+    // frame. Callers that have already replaced the live page keep the legacy
+    // offscreen staging through the default value.
+    this.pageOffsetX = stageIncomingOffscreen ? (direction === 'push' ? width : -width) : 0
     this.showPageTransition = true
     return token
   }
@@ -1359,7 +1470,14 @@ struct Index {
     // page travels half a screen width in the same duration. Linear motion
     // keeps the 1:1/2 speed ratio visible instead of hiding it in easing.
     const outgoingTarget = direction === 'push' ? -width * 0.5 : width * 0.5
-    this.getUIContext().animateTo({ duration: 180, curve: Curve.FastOutSlowIn }, () => {
+    this.getUIContext().animateTo({
+      duration: 180,
+      curve: Curve.FastOutSlowIn,
+      finishCallbackType: FinishCallbackType.REMOVED,
+      onFinish: (): void => {
+        this.finishPreparedFileTransition(token)
+      }
+    }, () => {
       if (token !== this.pageTransitionToken) {
         return
       }
@@ -1369,24 +1487,24 @@ struct Index {
       this.pageOffsetX = 0
       this.outgoingPageOffsetX = outgoingTarget
     })
+  }
 
-    this.pageTransitionTimer = setTimeout((): void => {
-      if (token !== this.pageTransitionToken) {
-        return
-      }
-      this.pageTransitionTimer = 0
-      this.showPageTransition = false
-      this.pageOffsetX = 0
-      this.outgoingPageOffsetX = 0
-      this.transitionSnapshotOnTop = false
-      this.transitionSnapshotMode = 'list'
-      this.outgoingEntries = []
-      this.isBusy = false
-      if (this.resetPreviewAfterPageTransition) {
-        this.resetPreviewAfterPageTransition = false
-        this.resetPreviewState(false)
-      }
-    }, 210)
+  private finishPreparedFileTransition(token: number): void {
+    if (token !== this.pageTransitionToken || !this.showPageTransition) {
+      return
+    }
+    this.pageTransitionTimer = 0
+    this.showPageTransition = false
+    this.pageOffsetX = 0
+    this.outgoingPageOffsetX = 0
+    this.transitionSnapshotOnTop = false
+    this.transitionSnapshotMode = 'list'
+    this.outgoingEntries = []
+    this.isBusy = false
+    if (this.resetPreviewAfterPageTransition) {
+      this.resetPreviewAfterPageTransition = false
+      this.resetPreviewState(false)
+    }
   }
 
   private startFileTransition(outgoingEntries: FileEntry[], direction: PageTransitionDirection,
@@ -1402,14 +1520,26 @@ struct Index {
    * only after both surfaces have completed an initial frame.
    */
   private async transitionFileContent(outgoingEntries: FileEntry[], direction: PageTransitionDirection,
-    incomingTitle: string, commitIncoming: () => void, settleIncoming: (() => void) | null = null,
+    incomingTitle: string, outgoingState: DirectoryViewState | null, commitIncoming: () => void,
+    settleIncoming: (() => void) | null = null,
     resetPreviewOnFinish: boolean = false): Promise<boolean> {
-    const token = this.prepareFileTransition(outgoingEntries, direction)
+    const token = this.prepareFileTransition(outgoingEntries, direction, false)
     this.resetPreviewAfterPageTransition = resetPreviewOnFinish
     await this.nextRenderFrame()
     if (token !== this.pageTransitionToken || !this.showPageTransition) {
       return false
     }
+    // The snapshot is still covered by the live outgoing page. Position it
+    // now and submit that frame before exposing it; otherwise a reused
+    // transitionScroller can show the position left by an earlier directory.
+    if (!await this.settleFileTransitionSnapshotBeforeReveal(token, outgoingState)) {
+      return false
+    }
+    // The outgoing snapshot now owns a submitted frame. Replace and place the
+    // incoming live surface offscreen in one update so no intermediate empty
+    // directory frame can reach the compositor.
+    const width = this.effectivePageWidth()
+    this.pageOffsetX = direction === 'push' ? width : -width
     try {
       commitIncoming()
     } catch (error) {
@@ -1447,6 +1577,39 @@ struct Index {
     }
   }
 
+  private transitionSnapshotStateIsSettled(state: DirectoryViewState | null): boolean {
+    if (state === null || state.mode === 'waterfall' || state.offset === null) {
+      return true
+    }
+    try {
+      const offset = this.transitionScroller.currentOffset()
+      return offset !== undefined && typeof offset.yOffset === 'number' &&
+        Math.abs(offset.yOffset - state.offset.yOffset) <= 1
+    } catch (_) {
+      return false
+    }
+  }
+
+  private async settleFileTransitionSnapshotBeforeReveal(token: number,
+    state: DirectoryViewState | null): Promise<boolean> {
+    if (state === null || state.mode === 'waterfall' || state.offset === null) {
+      return true
+    }
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      this.settleFileTransitionSnapshot(state)
+      await this.nextRenderFrame()
+      if (token !== this.pageTransitionToken || !this.showPageTransition) {
+        return false
+      }
+      if (this.transitionSnapshotStateIsSettled(state)) {
+        return true
+      }
+    }
+    // A changed or shortened directory may clamp an old offset. The snapshot
+    // still holds the closest valid position and must not block navigation.
+    return true
+  }
+
   private finishBackFileTransition(token: number, incomingState: DirectoryViewState | null,
     commitIncoming: () => void): void {
     if (token !== this.pageTransitionToken || !this.showPageTransition || this.pageTransitionFinishing) {
@@ -1467,26 +1630,63 @@ struct Index {
       this.reportError(error as Object, '返回目录失败')
       return
     }
+    // The live parent is behind the fully arrived snapshot. Try immediately,
+    // then verify its real Scroller position on submitted frames. The snapshot
+    // is removed only after the live page is at the captured position.
+    this.settleDirectoryViewStateForTransition(incomingState)
+    this.waitForBackDirectoryPosition(token, incomingState, 0)
+  }
+
+  private waitForBackDirectoryPosition(token: number, incomingState: DirectoryViewState | null,
+    attempt: number): void {
     this.postRenderFrame((): void => {
       if (token !== this.pageTransitionToken || !this.showPageTransition) {
         return
       }
+      if (this.directoryViewStateIsSettled(incomingState) || attempt >= 5) {
+        this.completeBackFileTransition()
+        return
+      }
       this.settleDirectoryViewStateForTransition(incomingState)
-      this.postRenderFrame((): void => {
-        if (token !== this.pageTransitionToken || !this.showPageTransition) {
-          return
-        }
-        this.pageOffsetX = 0
-        this.outgoingPageOffsetX = 0
-        this.showPageTransition = false
-        this.transitionSnapshotOnTop = false
-        this.transitionSnapshotMode = 'list'
-        this.outgoingEntries = []
-        this.resetPreviewState(false)
-        this.pageTransitionFinishing = false
-        this.isBusy = false
-      })
+      this.waitForBackDirectoryPosition(token, incomingState, attempt + 1)
     })
+  }
+
+  private directoryViewStateIsSettled(state: DirectoryViewState | null): boolean {
+    if (state === null || state.offset === null || this.screen !== 'files' || this.showSearch) {
+      return true
+    }
+    try {
+      if (state.mode === 'waterfall' && state.anchor !== null) {
+        const index = this.waterfallEntries.findIndex(
+          (entry: FileEntry): boolean => entry.path === state.anchor?.path)
+        if (index < 0) {
+          return true
+        }
+        const rect = this.waterfallScroller.getItemRect(index)
+        return rect !== undefined && typeof rect.y === 'number' &&
+          Math.abs(rect.y - state.anchor.y) <= 1
+      }
+      const scroller = this.fileViewMode === 'waterfall'
+        ? this.waterfallScroller : this.fileListScroller
+      const offset = scroller.currentOffset()
+      return offset !== undefined && typeof offset.yOffset === 'number' &&
+        Math.abs(offset.yOffset - state.offset.yOffset) <= 1
+    } catch (_) {
+      return false
+    }
+  }
+
+  private completeBackFileTransition(): void {
+    this.pageOffsetX = 0
+    this.outgoingPageOffsetX = 0
+    this.showPageTransition = false
+    this.transitionSnapshotOnTop = false
+    this.transitionSnapshotMode = 'list'
+    this.outgoingEntries = []
+    this.resetPreviewState(false)
+    this.pageTransitionFinishing = false
+    this.isBusy = false
   }
 
   /**
@@ -1500,6 +1700,7 @@ struct Index {
     const token = this.pageTransitionToken
     const width = this.effectivePageWidth()
     this.outgoingEntries = incomingEntries.slice()
+    this.transitionFileEntryDataSource.replace(this.outgoingEntries)
     this.transitionSnapshotMode = incomingState === null || incomingState.mode === 'waterfall'
       ? 'list' : incomingState.mode
     // Keep the returning parent above the outgoing child for the entire pop.
@@ -1514,9 +1715,7 @@ struct Index {
     if (token !== this.pageTransitionToken || !this.showPageTransition) {
       return false
     }
-    this.settleFileTransitionSnapshot(incomingState)
-    await this.nextRenderFrame()
-    if (token !== this.pageTransitionToken || !this.showPageTransition) {
+    if (!await this.settleFileTransitionSnapshotBeforeReveal(token, incomingState)) {
       return false
     }
 
@@ -1706,6 +1905,35 @@ struct Index {
         // area must pass through to the file surface below.
         .hitTestBehavior(this.viewerOwnsParentInteraction()
           ? HitTestMode.BLOCK_DESCENDANTS : HitTestMode.None)
+      }
+
+      if (this.screen === 'files') {
+        // Keep the immersive-material scope as narrow as the timeline itself.
+        // A full-width, full-height TabBar consumes file-row taps even when
+        // its authored child is transparent.
+        // Keep the material/renderer node mounted for the whole file screen.
+        // Recreating it around directory transitions can leave a native draw
+        // buffer targeting an already released UIContext. Visibility and
+        // interaction therefore change independently, like the bottom bar.
+        Stack() {
+          this.DirectoryTimelineBar()
+        }
+        .width(FLOATING_TIMELINE_WIDTH_VP)
+        .height(this.floatingTimelineHeight())
+        .position({
+          x: Math.max(0, this.effectivePageWidth() - FLOATING_TIMELINE_WIDTH_VP - 8),
+          y: this.fileContentTopInset() + FLOATING_TIMELINE_GAP_VP
+        })
+        .translate({ x: 0, y: this.bottomBarOffsetY, z: 0 })
+        .opacity(this.shouldShowTimeline() ? this.bottomBarOpacity : 0)
+        // Opacity alone does not reliably suppress the native material and
+        // Canvas sublayers during a directory transaction. Hidden preserves
+        // the renderer node and its layout while removing it from painting,
+        // so the previous directory's rail cannot survive the pop frame.
+        .visibility(this.shouldShowTimeline() ? Visibility.Visible : Visibility.Hidden)
+        .zIndex(21)
+        .hitTestBehavior(this.shouldShowTimeline() && !this.viewerOwnsParentInteraction()
+          ? HitTestMode.None : HitTestMode.BLOCK_DESCENDANTS)
       }
 
       if (this.screen === 'downloads' && this.transferDirection === 'download' && this.hasActiveDownload()) {
@@ -2421,7 +2649,8 @@ struct Index {
             )
           }
           .onAppear(() => {
-            this.loadEntryPreview(entry, 0)
+            this.resolveFileListImageRotation(entry)
+            this.loadEntryPreview(entry, this.previewPriority(index, 'list'))
             this.recordThumbnailMountedSource(entry, this.previewUri(entry), index, 'list')
             this.scheduleCachedDirectoryCount(entry)
           })
@@ -2435,7 +2664,10 @@ struct Index {
       .onScrollIndex((start: number, end: number, _center: number): void => {
         this.fileVisibleStartIndex = Math.max(0, start)
         this.fileVisibleEndIndex = Math.max(this.fileVisibleStartIndex, end)
+        this.updateTimelineFocusFromVisible(start, 'list')
       })
+      .onScrollStart((): void => this.onFileContentScrollStart())
+      .onScrollStop((): void => this.onFileContentScrollStop())
       .onReachEnd(() => this.loadNextDirectoryPage())
       .padding({ left: 0, right: 0 })
       .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
@@ -2754,7 +2986,8 @@ struct Index {
           )
         }
         .onAppear(() => {
-          this.loadEntryPreview(entry, index)
+          this.resolveFileListImageRotation(entry)
+          this.loadEntryPreview(entry, this.previewPriority(index, 'grid'))
           this.recordThumbnailMountedSource(entry, this.previewUri(entry), index, 'grid')
           this.scheduleCachedDirectoryCount(entry)
         })
@@ -2768,7 +3001,10 @@ struct Index {
     .onScrollIndex((first: number, last: number): void => {
       this.fileVisibleStartIndex = Math.max(0, first)
       this.fileVisibleEndIndex = Math.max(this.fileVisibleStartIndex, last)
+      this.updateTimelineFocusFromVisible(first, 'grid')
     })
+    .onScrollStart((): void => this.onFileContentScrollStart())
+    .onScrollStop((): void => this.onFileContentScrollStop())
     .onReachEnd(() => this.loadNextDirectoryPage())
     .width('100%')
     .layoutWeight(1)
@@ -2854,6 +3090,7 @@ struct Index {
         // naturally under the common TopFileOverlay, just like list/grid.
         .margin({ top: index < 2 ? this.fileContentTopInset() : 0 })
         .onAppear(() => {
+          this.resolveFileListImageRotation(entry)
           this.markWaterfallVisible(entry, true)
           this.recordThumbnailMountedSource(entry, this.waterfallUri(entry), index, 'waterfall')
           this.enqueueWaterfallOriginal(entry, index)
@@ -2873,8 +3110,11 @@ struct Index {
     .onScrollIndex((first: number, last: number): void => {
       this.waterfallVisibleStartIndex = Math.max(0, first)
       this.waterfallVisibleEndIndex = Math.max(this.waterfallVisibleStartIndex, last)
+      this.updateTimelineFocusFromVisible(first, 'waterfall')
       this.prefetchWaterfallRange(first, last)
     })
+    .onScrollStart((): void => this.onFileContentScrollStart())
+    .onScrollStop((): void => this.onFileContentScrollStop())
     .onReachEnd(() => this.loadNextDirectoryPage())
     .onAreaChange((_, area) => {
       if (typeof area.width === 'number' && area.width > 0) {
@@ -2897,7 +3137,7 @@ struct Index {
     Column() {
       if (snapshotMode === 'grid') {
         Grid(this.transitionScroller) {
-          ForEach(snapshotEntries, (entry: FileEntry) => {
+          LazyForEach(this.transitionFileEntryDataSource, (entry: FileEntry) => {
             GridItem() {
               Column({ space: 6 }) {
                 Stack({ alignContent: Alignment.Center }) {
@@ -2957,7 +3197,7 @@ struct Index {
         }
         .width('100%')
 
-        ForEach(snapshotEntries, (entry: FileEntry, index: number) => {
+        LazyForEach(this.transitionFileEntryDataSource, (entry: FileEntry, index: number) => {
           ListItem() {
             Column() {
               Row() {
@@ -3693,6 +3933,40 @@ struct Index {
   }
 
   @Builder
+  DirectoryTimelineBar(): void {
+    Tabs({ barPosition: BarPosition.End }) {
+      TabContent() {}.tabBar(this.DirectoryTimelineBarContent)
+    }
+    .vertical(false)
+    .scrollable(false)
+    .barOverlap(true)
+    .barHeight(this.floatingTimelineHeight())
+    .barBackgroundColor(Color.Transparent)
+    .barBackgroundBlurStyle(BlurStyle.NONE)
+    .width(FLOATING_TIMELINE_WIDTH_VP)
+    .height(this.floatingTimelineHeight())
+    .clip(false)
+    .hitTestBehavior(HitTestMode.Default)
+  }
+
+  @Builder
+  DirectoryTimelineBarContent(): void {
+    FisheyeTimeline({
+      timeline: this.directoryTimeline,
+      focusTime: $timelineFocusTime,
+      widthVp: FLOATING_TIMELINE_WIDTH_VP,
+      heightVp: this.floatingTimelineHeight(),
+      material: this.bottomCapsuleMaterial,
+      onScrubStart: (): void => { this.beginTimelineScrub() },
+      onScrub: (time: number): void => { this.previewTimelineTime(time) },
+      onScrubEnd: (time: number): void => { this.finishTimelineScrub(time) },
+      onSelect: (time: number, period: TimelinePeriod): void => {
+        this.selectTimelinePeriod(time, period)
+      }
+    })
+  }
+
+  @Builder
   BottomBar(): void {
     // 三态共用一个常驻外壳。外壳是 Tabs 的底部页签区，沉浸式材质才在生效
     // 范围内；内部三层内容全部常驻，只改 opacity/translate，节点不重建。
@@ -3704,13 +3978,13 @@ struct Index {
     .barOverlap(true)
     // 原来的悬浮底栏靠 barFloatingStyle 的 barBottomMargin=40 把胶囊抬高 40vp；
     // 这里改成普通内容后，用 barHeight 预留出同样的 40vp，位置完全还原。
-    .barHeight(FLOATING_BAR_HEIGHT_VP + FLOATING_BAR_EFFECT_TOP_INSET_VP + 40)
+    .barHeight(this.fileToolsBarHeight() + FLOATING_BAR_EFFECT_TOP_INSET_VP + 40)
     // This Tabs instance only supplies the supported bottom-TabBar material
     // scope. Its own rectangular bar must stay visually transparent.
     .barBackgroundColor(Color.Transparent)
     .barBackgroundBlurStyle(BlurStyle.NONE)
     .width('100%')
-    .height(FLOATING_BAR_HEIGHT_VP + FLOATING_BAR_EFFECT_TOP_INSET_VP + 80)
+    .height(this.fileToolsBarHeight() + FLOATING_BAR_EFFECT_TOP_INSET_VP + 80)
     .margin({ bottom: this.floatingBarBottomMargin() - 40 })
     .clip(false)
     .hitTestBehavior(HitTestMode.Default)
@@ -3748,7 +4022,7 @@ struct Index {
         this.FileToolsBarContent()
       }
       .width('100%')
-      .height(FLOATING_BAR_HEIGHT_VP)
+      .height(this.fileToolsBarHeight())
       .opacity(this.bottomBarMode() === 'tools' ? 1 : 0)
       .translate({ x: 0, y: this.bottomBarMode() === 'tools' ? 0 : 12, z: 0 })
       .hitTestBehavior(this.bottomBarMode() === 'tools'
@@ -3756,7 +4030,7 @@ struct Index {
       .animation({ duration: 200, curve: Curve.FastOutSlowIn })
     }
     .width('100%')
-    .height(FLOATING_BAR_HEIGHT_VP + FLOATING_BAR_EFFECT_TOP_INSET_VP)
+    .height(this.fileToolsBarHeight() + FLOATING_BAR_EFFECT_TOP_INSET_VP)
     // The visible 56vp controls stay bottom-aligned at their previous screen
     // position. The extra top area only carries native shadow/deformation.
     .margin({ bottom: 40 })
@@ -3793,7 +4067,7 @@ struct Index {
 
   @Builder
   FileToolsBarContent(): void {
-    Stack() {
+    Stack({ alignContent: Alignment.TopStart }) {
       Row() {
         this.FileToolCircleButton($r('sys.symbol.folder_badge_plus'), () => this.openCreateFolder())
 
@@ -3850,11 +4124,11 @@ struct Index {
       // moving light continuous without introducing a full-width outline.
       ProximityLightReceiver({ mode: 'fileTools' })
         .width('100%')
-        .height('100%')
+        .height(FLOATING_BAR_HEIGHT_VP)
         .hitTestBehavior(HitTestMode.None)
     }
     .width('100%')
-    .height(FLOATING_BAR_HEIGHT_VP)
+    .height(this.fileToolsBarHeight())
     .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
   }
 
@@ -5122,18 +5396,102 @@ struct Index {
     return state === undefined ? new ImageVisualState() : state
   }
 
-  private updateImageVisualState(path: string, update: (state: ImageVisualState) => void): void {
+  private updateImageVisualState(path: string, update: (state: ImageVisualState) => void,
+    notify: boolean = true): void {
     if (path.length === 0) {
       return
     }
-    const nextStates: Record<string, ImageVisualState> = {}
-    for (const key of Object.keys(this.imageVisualStates)) {
-      nextStates[key] = this.imageVisualStates[key]
-    }
     const next = this.copyImageVisualState(this.imageVisualStates[path])
     update(next)
-    nextStates[path] = next
-    this.imageVisualStates = nextStates
+    this.imageVisualStates[path] = next
+    if (notify) {
+      this.imageVisualEpoch += 1
+    }
+  }
+
+  private scheduleImageVisualNotify(): void {
+    if (this.imageVisualNotifyTimer > 0) {
+      return
+    }
+    this.imageVisualNotifyTimer = setTimeout((): void => {
+      this.imageVisualNotifyTimer = 0
+      this.imageVisualEpoch += 1
+    }, 16)
+  }
+
+  private scheduleImageVisualPrune(): void {
+    if (this.imageVisualPruneTimer > 0) {
+      return
+    }
+    this.imageVisualPruneTimer = setTimeout((): void => {
+      this.imageVisualPruneTimer = 0
+      this.pruneImageVisualStates()
+    }, 450)
+  }
+
+  private pruneImageVisualStates(): void {
+    const keys = Object.keys(this.imageVisualStates)
+    if (keys.length <= 768) {
+      return
+    }
+
+    const keep: Record<string, boolean> = {}
+    const keepEntries = (items: FileEntry[], start: number, end: number): void => {
+      const lower = Math.max(0, start)
+      const upper = Math.min(items.length - 1, Math.max(lower, end))
+      for (let index = lower; index <= upper; index += 1) {
+        keep[items[index].path] = true
+      }
+    }
+
+    let visibleItems = this.entries
+    let visibleStart = this.fileVisibleStartIndex
+    let visibleEnd = this.fileVisibleEndIndex
+    if (this.fileViewMode === 'waterfall') {
+      visibleItems = this.waterfallEntries
+      visibleStart = this.waterfallVisibleStartIndex
+      visibleEnd = this.waterfallVisibleEndIndex
+    } else if (this.fileViewMode === 'list') {
+      visibleStart = Math.max(0, visibleStart - 1)
+      visibleEnd = Math.max(visibleStart, visibleEnd - 1)
+    }
+    keepEntries(visibleItems, visibleStart - 8, visibleEnd + 8)
+
+    // The bounded URI LRU is the source used when a recycled row is mounted
+    // again. Keep its state record so a return to a recently visited window
+    // does not need to publish the same URI a second time.
+    for (const path of this.previewUriOrder) {
+      keep[path] = true
+    }
+    for (const path of Object.keys(this.waterfallVisiblePaths)) {
+      if (this.waterfallVisiblePaths[path] === true) {
+        keep[path] = true
+      }
+    }
+    for (const entry of this.viewerImages) {
+      keep[entry.path] = true
+    }
+    if (this.viewerImageEntry !== null) {
+      keep[this.viewerImageEntry.path] = true
+    }
+    if (this.viewerEntryTransitionPath.length > 0) {
+      keep[this.viewerEntryTransitionPath] = true
+    }
+
+    const nextStates: Record<string, ImageVisualState> = {}
+    let removed = 0
+    for (const key of keys) {
+      const state = this.imageVisualStates[key]
+      if (keep[key] === true || (state !== undefined && state.thumbnailVisibleRatio > 0)) {
+        nextStates[key] = state
+      } else {
+        removed += 1
+      }
+    }
+    if (removed > 0) {
+      this.imageVisualStates = nextStates
+      this.imageVisualEpoch += 1
+    }
   }
 
   private nextRenderFrame(): Promise<void> {
@@ -5173,6 +5531,10 @@ struct Index {
   }
 
   private viewerImageSource(entry: FileEntry): image.PixelMap | string {
+    const visualEpoch = this.imageVisualEpoch
+    if (visualEpoch < 0) {
+      return ''
+    }
     const bitmap = this.viewerBitmap(entry)
     if (bitmap !== null) {
       return bitmap.pixelMap
@@ -5185,11 +5547,12 @@ struct Index {
   }
 
   private fileImageSource(entry: FileEntry, surface: ThumbnailSurfaceKind): image.PixelMap | string {
-    // The maps contain native resources and intentionally are not @State.
-    // Reading the epoch makes every file-surface Image react to an atomic map
-    // replacement without copying PixelMaps through observable state.
+    // Native bitmap maps and the private visual-state map are intentionally
+    // outside @State. Reading both scalar epochs makes a targeted source or
+    // orientation change re-render without copying all visited rows.
     const epoch = this.viewerBitmapEpoch
-    if (epoch < 0) {
+    const visualEpoch = this.imageVisualEpoch
+    if (epoch < 0 || visualEpoch < 0) {
       return ''
     }
     if (this.viewerEntryTransitionActive && this.viewerEntryTransitionPath === entry.path) {
@@ -5210,21 +5573,15 @@ struct Index {
       return this.isImage(entry) ? '' : this.waterfallUri(entry)
     }
     if (this.isImage(entry)) {
-      const thumbnailBitmap = this.fileThumbnailBitmaps[entry.path]
-      if (thumbnailBitmap !== undefined) {
-        return thumbnailBitmap.pixelMap
-      }
-      // Image URIs are transport/cache inputs only. Persisted rotation must be
-      // baked by Image Kit before ArkUI is allowed to render the thumbnail.
-      return ''
+      // The normal file surface is URI-backed. ArkUI owns the bounded
+      // thumbnail decode and can reuse its native image cache while scrolling;
+      // Image Kit PixelMaps are reserved for viewer transitions.
+      return this.previewUri(entry)
     }
     return this.previewUri(entry)
   }
 
   private fileImageSourceAvailable(entry: FileEntry, surface: ThumbnailSurfaceKind): boolean {
-    if (this.isImage(entry) && !this.imageVisualState(entry.path).rotationResolved) {
-      return false
-    }
     const source = this.fileImageSource(entry, surface)
     return typeof source === 'string' ? source.length > 0 : true
   }
@@ -5236,6 +5593,10 @@ struct Index {
   }
 
   private viewerImageSourceOrientation(entry: FileEntry): ImageRotateOrientation {
+    const visualEpoch = this.imageVisualEpoch
+    if (visualEpoch < 0) {
+      return ImageRotateOrientation.AUTO
+    }
     if (this.viewerBitmap(entry) !== null) {
       return ImageRotateOrientation.UP
     }
@@ -5447,20 +5808,16 @@ struct Index {
     if (generation !== this.previewGeneration || localPath.length === 0) {
       return
     }
-    await this.primeViewerPreviewGeometryAtPath(entry, localPath, canonical)
-    const record = await this.installFileThumbnailBitmap(entry, localPath)
-    if (record === null || generation !== this.previewGeneration) {
-      return
-    }
+    // Normal file rows stay URI-backed. Image Kit metadata/PixelMap work is
+    // reserved for the selected viewer image and its shared-element handoff;
+    // doing it here for every visible row was the main source of scroll jank.
     this.setPreviewUri(entry, fileUri.getUriFromPath(localPath), localPath, canonical)
   }
 
   /**
-   * Images need the Image Kit decode/rotation pipeline before their URI can
-   * be exposed. Video and audio thumbnails are already raster previews from
-   * the server, so publishing the URI directly avoids sending them through
-   * the image-only rotation store while still allowing the file row and the
-   * video poster to render the same cached asset.
+   * Images, video and audio thumbnails are all published as bounded local
+   * URIs. The viewer alone promotes the selected image to a PixelMap when a
+   * rotation-aware transition or analysis session needs it.
    */
   private async publishThumbnailPreview(entry: FileEntry, localPath: string,
     canonical: boolean, generation: number): Promise<void> {
@@ -5723,6 +6080,13 @@ struct Index {
   }
 
   private viewerProgress(): number {
+    // The progress value lives in the private visual-state map. Read the
+    // scalar epoch here so the bottom-bar ring is rebuilt when the original
+    // reaches 95%/100%, just like the viewer Image source.
+    const visualEpoch = this.imageVisualEpoch
+    if (visualEpoch < 0) {
+      return 0
+    }
     return this.imageVisualState(this.committedViewerPath()).progress
   }
 
@@ -5837,7 +6201,7 @@ struct Index {
         state.thumbnailDecodedUri = ''
         state.transitionThumbnailUri = resolvedUri
       }
-    })
+    }, false)
   }
 
   private recordThumbnailComplete(entry: FileEntry, uri: string, index: number,
@@ -5862,7 +6226,7 @@ struct Index {
       state.thumbnailDecodedUri = uri
       state.thumbnailDisplayWidth = displayWidth
       state.thumbnailDisplayHeight = displayHeight
-    })
+    }, false)
     if (surface === 'waterfall' &&
       (this.waterfallAspectRatios[entry.path] === undefined ||
         this.waterfallAspectRatios[entry.path] <= 0)) {
@@ -5914,7 +6278,7 @@ struct Index {
       if (uri.length > 0) {
         state.transitionThumbnailUri = uri
       }
-    })
+    }, false)
   }
 
   private recordThumbnailVisibility(entry: FileEntry, index: number,
@@ -5930,7 +6294,7 @@ struct Index {
       if (uri.length > 0) {
         state.transitionThumbnailUri = uri
       }
-    })
+    }, false)
   }
 
   /**
@@ -8036,6 +8400,20 @@ struct Index {
     this.restoreFileViewModePosition(state.mode, state.anchor, state.offset, token, 0, 0)
   }
 
+  private settleNewDirectoryAtTopForTransition(): void {
+    // List, Grid and WaterFlow reuse their Scroller across directory pages.
+    // Reset the incoming page while it is still staged offscreen so a new
+    // child never inherits the offset of the directory that launched it.
+    this.waterfallAnchorRestoreToken += 1
+    try {
+      const scroller = this.fileViewMode === 'waterfall'
+        ? this.waterfallScroller : this.fileListScroller
+      scroller.scrollTo({ xOffset: 0, yOffset: 0, animation: false })
+    } catch (_) {
+      // transitionFileContent calls this after the first incoming layout.
+    }
+  }
+
   private toggleFileViewMode(): void {
     if (this.isBusy || this.showSearch) {
       return
@@ -8238,6 +8616,7 @@ struct Index {
     this.waterfallActiveDecodes = 0
     this.waterfallOriginalUris = {}
     this.waterfallVisiblePaths = {}
+    this.waterfallSourceEpoch += 1
   }
 
   private stopWaterfallPipeline(): void {
@@ -8254,6 +8633,7 @@ struct Index {
     this.waterfallActiveDecodes = 0
     this.waterfallOriginalUris = {}
     this.waterfallVisiblePaths = {}
+    this.waterfallSourceEpoch += 1
     const bitmaps = this.waterfallBitmaps
     this.waterfallBitmaps = {}
     this.bumpViewerBitmapEpoch()
@@ -8268,6 +8648,10 @@ struct Index {
   }
 
   private waterfallUri(entry: FileEntry): string {
+    const sourceEpoch = this.waterfallSourceEpoch
+    if (sourceEpoch < 0) {
+      return ''
+    }
     if (this.waterfallVisiblePaths[entry.path] !== true) {
       return ''
     }
@@ -8276,6 +8660,10 @@ struct Index {
   }
 
   private waterfallAspectRatio(entry: FileEntry): number {
+    const aspectEpoch = this.waterfallAspectEpoch
+    if (aspectEpoch < 0) {
+      return 1
+    }
     const value = this.waterfallAspectRatios[entry.path]
     // This cache contains the final Image Kit raster ratio after EXIF and the
     // persisted user rotation. WaterFlow must measure the same axes that the
@@ -8316,12 +8704,7 @@ struct Index {
     // reload after returning from the viewer.
     const retainedForViewer = !visible &&
       (this.showImageViewer || this.viewerEntryTransitionActive || this.viewerClosePending)
-    const nextVisible: Record<string, boolean> = {}
-    for (const key of Object.keys(this.waterfallVisiblePaths)) {
-      nextVisible[key] = this.waterfallVisiblePaths[key]
-    }
-    nextVisible[entry.path] = retainedForViewer ? true : visible
-    this.waterfallVisiblePaths = nextVisible
+    this.waterfallVisiblePaths[entry.path] = retainedForViewer ? true : visible
     if (retainedForViewer) {
       // Do not enqueue a new decode while WaterFlow is hidden. Existing
       // downloads continue under the same generation; onAppear will only
@@ -8330,13 +8713,8 @@ struct Index {
     }
     if (!visible && !retainedForViewer) {
       this.releaseViewerBitmap(this.waterfallBitmaps, entry.path).catch((): void => {})
-      const nextUris: Record<string, string> = {}
-      for (const key of Object.keys(this.waterfallOriginalUris)) {
-        if (key !== entry.path) {
-          nextUris[key] = this.waterfallOriginalUris[key]
-        }
-      }
-      this.waterfallOriginalUris = nextUris
+      this.waterfallOriginalUris[entry.path] = ''
+      this.scheduleWaterfallSourceNotify()
       this.waterfallDecodedPaths[entry.path] = false
       if (this.waterfallActiveDecodePaths[entry.path] === true) {
         this.waterfallActiveDecodePaths[entry.path] = false
@@ -8351,39 +8729,52 @@ struct Index {
   }
 
   private setWaterfallOriginalUri(path: string, uri: string): void {
-    const next: Record<string, string> = {}
-    for (const key of Object.keys(this.waterfallOriginalUris)) {
-      if (key !== path) {
-        next[key] = this.waterfallOriginalUris[key]
-      }
-    }
     if (uri.length > 0) {
-      next[path] = uri
+      this.waterfallOriginalUris[path] = uri
+    } else {
+      this.waterfallOriginalUris[path] = ''
     }
-    this.waterfallOriginalUris = next
+    this.scheduleWaterfallSourceNotify()
     this.updateImageVisualState(path, (state: ImageVisualState): void => {
       state.thumbnailDecodedUri = ''
       if (uri.length > 0) {
         state.transitionThumbnailUri = uri
       }
-    })
+    }, false)
   }
 
   private setWaterfallAspectRatio(path: string, width: number, height: number): void {
     if (path.length === 0 || width <= 0 || height <= 0) {
       return
     }
-    const next: Record<string, number> = {}
-    for (const key of Object.keys(this.waterfallAspectRatios)) {
-      next[key] = this.waterfallAspectRatios[key]
+    this.waterfallAspectRatios[path] = width / height
+    this.scheduleWaterfallAspectNotify()
+  }
+
+  private scheduleWaterfallSourceNotify(): void {
+    if (this.waterfallSourceNotifyTimer > 0) {
+      return
     }
-    next[path] = width / height
-    this.waterfallAspectRatios = next
+    this.waterfallSourceNotifyTimer = setTimeout((): void => {
+      this.waterfallSourceNotifyTimer = 0
+      this.waterfallSourceEpoch += 1
+    }, 16)
+  }
+
+  private scheduleWaterfallAspectNotify(): void {
+    if (this.waterfallAspectNotifyTimer > 0) {
+      return
+    }
+    this.waterfallAspectNotifyTimer = setTimeout((): void => {
+      this.waterfallAspectNotifyTimer = 0
+      this.waterfallAspectEpoch += 1
+    }, 16)
   }
 
   private enqueueWaterfallOriginal(entry: FileEntry, _index: number = 0,
     priority: boolean = true): void {
-    if (this.fileViewMode !== 'waterfall' || !this.isImage(entry)) {
+    if (this.fileViewMode !== 'waterfall' || !this.isImage(entry) ||
+      this.timelineScrubActive || this.fileContentScrolling) {
       return
     }
     const localPath = this.waterfallLocalPaths[entry.path]
@@ -8404,7 +8795,8 @@ struct Index {
   }
 
   private prefetchWaterfallRange(first: number, last: number): void {
-    if (this.fileViewMode !== 'waterfall' || this.waterfallEntries.length === 0) {
+    if (this.fileViewMode !== 'waterfall' || this.waterfallEntries.length === 0 ||
+      this.fileContentScrolling) {
       return
     }
     const start = Math.max(0, first)
@@ -8431,7 +8823,8 @@ struct Index {
   private enqueueWaterfallDecode(entry: FileEntry): void {
     if (this.fileViewMode !== 'waterfall' || this.waterfallVisiblePaths[entry.path] !== true ||
       this.waterfallDecodedPaths[entry.path] === true ||
-      this.waterfallActiveDecodePaths[entry.path] === true) {
+      this.waterfallActiveDecodePaths[entry.path] === true || this.timelineScrubActive ||
+      this.fileContentScrolling) {
       return
     }
     if (this.waterfallDecodeQueue.some((item: FileEntry): boolean => item.path === entry.path)) {
@@ -8465,7 +8858,7 @@ struct Index {
         this.waterfallSourceSize(entry))
       if (record === null || generation !== this.waterfallGeneration ||
         this.fileViewMode !== 'waterfall' || this.waterfallVisiblePaths[entry.path] !== true ||
-        this.imageVisualState(entry.path).userRotation !== rotation) {
+        this.imageVisualState(entry.path).userRotation !== rotation || this.fileContentScrolling) {
         if (record !== null) {
           await this.viewerBitmapStore.release(record)
         }
@@ -8533,6 +8926,12 @@ struct Index {
         return
       }
       this.waterfallLocalPaths[entry.path] = localPath
+      // Keep completed bytes for reuse, but do not publish geometry or start
+      // a PixelMap decode while the WaterFlow is moving. The settled visible
+      // window will pick this local path up in onScrollStop.
+      if (this.fileContentScrolling) {
+        return
+      }
       const geometry = await this.readViewerImageGeometry(localPath, entry.path)
       if (geometry !== null && generation === this.waterfallGeneration) {
         this.setWaterfallAspectRatio(entry.path, geometry.displayWidth, geometry.displayHeight)
@@ -9156,9 +9555,464 @@ struct Index {
     }
   }
 
+  private scheduleCurrentDirectoryIndex(forceNetwork: boolean = false): void {
+    if (this.screen !== 'files' || this.showSearch || this.currentPath.length === 0) {
+      this.directoryIndexRequestToken += 1
+      this.indexedDirectoryKey = ''
+      this.timelineIndexing = false
+      this.directoryTimeline = new DirectoryTimeline()
+      this.timelineFocusTime = 0
+      this.pendingDirectoryIndexSnapshot = null
+      this.indexedDirectoryContentSignature = ''
+      this.resetTimelineInteraction()
+      return
+    }
+    const path = this.currentPath
+    const rootType = this.currentRootType
+    const key = rootType.toString() + ':' + path
+    if (!forceNetwork && this.indexedDirectoryKey === key) {
+      return
+    }
+    if (this.indexedDirectoryKey.length > 0 && this.indexedDirectoryKey !== key) {
+      this.directoryTimeline = new DirectoryTimeline()
+      this.timelineFocusTime = 0
+      this.pendingDirectoryIndexSnapshot = null
+      this.indexedDirectoryContentSignature = ''
+      this.resetTimelineInteraction()
+    }
+    const token = this.directoryIndexRequestToken + 1
+    this.directoryIndexRequestToken = token
+    this.timelineIndexing = true
+    this.repository.ensureDirectoryIndex(path, rootType, forceNetwork)
+      .then((snapshot: DirectoryIndexedSnapshot): void => {
+        this.applyDirectoryIndexSnapshot(snapshot, key, token)
+      })
+      .catch((error: Error): void => {
+        if (token === this.directoryIndexRequestToken) {
+          this.timelineIndexing = false
+          console.warn('[UgreenTimeline] directory index failed: ' + JSON.stringify(error))
+        }
+      })
+  }
+
+  private applyDirectoryIndexSnapshot(snapshot: DirectoryIndexedSnapshot,
+    key: string, token: number): void {
+    const currentKey = this.currentRootType.toString() + ':' + this.currentPath
+    if (token !== this.directoryIndexRequestToken || key !== currentKey ||
+      this.screen !== 'files' || this.showSearch) {
+      return
+    }
+    // The metadata request may finish while the directory page is still
+    // moving. Keep fetching in parallel, then swap the full snapshot only
+    // after the transition releases its visual snapshot.
+    if (this.showPageTransition || this.isNavigating || this.fileContentScrolling) {
+      this.pendingDirectoryIndexSnapshot = snapshot
+      return
+    }
+    const contentSignature = snapshot.contentSignature.length > 0
+      ? snapshot.contentSignature : DirectoryTimelinePolicy.contentSignature(snapshot.entries)
+    const contentUnchanged = contentSignature === this.indexedDirectoryContentSignature &&
+      this.entries.length === snapshot.entries.length
+    this.pendingDirectoryIndexSnapshot = null
+    // A background freshness check must not replace the mounted lazy data
+    // source after a fling ends. ArkUI delivers the deferred result from
+    // onScrollStop; reloading thousands of keyed rows there invalidates the
+    // current scroll anchor and can expose the parent page for a frame. The
+    // repository has already persisted this newer snapshot, so keep the
+    // current directory session consistent and consume it on the next entry
+    // (or an explicit refresh) instead.
+    const mountedCompleteIndex = this.indexedDirectoryKey === key &&
+      this.indexedDirectoryContentSignature.length > 0
+    if (mountedCompleteIndex && !contentUnchanged) {
+      this.timelineIndexing = false
+      return
+    }
+    this.indexedDirectoryKey = key
+    this.indexedDirectoryContentSignature = contentSignature
+    this.directoryTimeline = snapshot.timeline
+    this.timelineIndexing = false
+    if (!snapshot.timeline.complete) {
+      this.timelineFocusTime = 0
+      this.resetTimelineInteraction()
+      return
+    }
+    if (contentUnchanged) {
+      // A stale refresh is common while a large directory is being viewed.
+      // The complete metadata signature proves that the mounted order and
+      // timeline inputs are unchanged, so do not sort or replace the lazy
+      // container again just to update an access timestamp.
+      this.setCurrentPageState(Math.max(1, Math.ceil(snapshot.entries.length / 200)), false)
+      this.updateDirectoryCount(this.currentPath,
+        snapshot.totalCount >= 0 ? snapshot.totalCount : snapshot.entries.length)
+      if (snapshot.timeline.eligible()) {
+        const earliest = DirectoryTimelinePolicy.localDayStart(snapshot.timeline.earliestTime)
+        const latest = DirectoryTimelinePolicy.localDayStart(snapshot.timeline.latestTime)
+        if (this.timelineFocusTime < earliest || this.timelineFocusTime > latest) {
+          this.timelineFocusTime = this.fileSortAscending ? earliest : latest
+        }
+      } else {
+        this.timelineFocusTime = 0
+      }
+      if (Date.now() - snapshot.fetchedAt > DIRECTORY_INDEX_STALE_MS) {
+        setTimeout((): void => {
+          if (key === this.currentRootType.toString() + ':' + this.currentPath) {
+            this.scheduleCurrentDirectoryIndex(true)
+          }
+        }, 0)
+      }
+      return
+    }
+    const query = new DirectoryQuery()
+    query.path = this.currentPath
+    query.rootType = this.currentRootType
+    query.sortKey = this.fileSortKey
+    query.ascending = this.fileSortAscending
+    const sorted = DirectoryTimelinePolicy.query(snapshot.entries, query)
+    this.setCurrentPageState(Math.max(1, Math.ceil(sorted.length / 200)), false)
+    this.replaceEntries(sorted, false, true)
+    this.updateDirectoryCount(this.currentPath,
+      snapshot.totalCount >= 0 ? snapshot.totalCount : sorted.length)
+    if (snapshot.timeline.eligible()) {
+      const earliest = DirectoryTimelinePolicy.localDayStart(snapshot.timeline.earliestTime)
+      const latest = DirectoryTimelinePolicy.localDayStart(snapshot.timeline.latestTime)
+      if (this.timelineFocusTime < earliest || this.timelineFocusTime > latest) {
+        this.timelineFocusTime = this.fileSortAscending ? earliest : latest
+      }
+    } else {
+      this.timelineFocusTime = 0
+    }
+    if (Date.now() - snapshot.fetchedAt > DIRECTORY_INDEX_STALE_MS) {
+      setTimeout((): void => {
+        if (key === this.currentRootType.toString() + ':' + this.currentPath) {
+          this.scheduleCurrentDirectoryIndex(true)
+        }
+      }, 0)
+    }
+  }
+
+  private updateTimelineFocusFromVisible(firstIndex: number, mode: FileViewMode): void {
+    if (!this.shouldShowTimeline() || this.timelineScrubActive || this.timelineFocusPinned) {
+      return
+    }
+    const source = mode === 'waterfall' ? this.waterfallEntries : this.entries
+    let index = mode === 'list' ? Math.max(0, firstIndex - 1) : Math.max(0, firstIndex)
+    while (index < source.length) {
+      const entry = source[index]
+      if (!entry.isDirectory && this.isImage(entry) && entry.modifiedTime > 0) {
+        const dayStart = DirectoryTimelinePolicy.localDayStart(entry.modifiedTime)
+        if (dayStart !== this.timelineFocusTime || this.timelineVisibleFocusPendingTime > 0) {
+          this.scheduleTimelineVisibleFocus(dayStart)
+        }
+        return
+      }
+      index += 1
+    }
+  }
+
+  private scheduleTimelineVisibleFocus(dayStart: number): void {
+    this.timelineVisibleFocusPendingTime = dayStart
+    if (this.timelineVisibleFocusTimer > 0) {
+      return
+    }
+    this.timelineVisibleFocusTimer = setTimeout((): void => {
+      this.timelineVisibleFocusTimer = 0
+      const pendingTime = this.timelineVisibleFocusPendingTime
+      this.timelineVisibleFocusPendingTime = 0
+      if (pendingTime > 0 && !this.timelineScrubActive && !this.timelineFocusPinned &&
+        pendingTime !== this.timelineFocusTime) {
+        this.timelineFocusTime = pendingTime
+      }
+    }, 48)
+  }
+
+  private flushTimelineVisibleFocus(): void {
+    if (this.timelineVisibleFocusTimer > 0) {
+      clearTimeout(this.timelineVisibleFocusTimer)
+      this.timelineVisibleFocusTimer = 0
+    }
+    const pendingTime = this.timelineVisibleFocusPendingTime
+    this.timelineVisibleFocusPendingTime = 0
+    if (pendingTime > 0 && !this.timelineScrubActive && !this.timelineFocusPinned &&
+      pendingTime !== this.timelineFocusTime) {
+      this.timelineFocusTime = pendingTime
+    }
+  }
+
+  private cancelTimelineVisibleFocus(): void {
+    if (this.timelineVisibleFocusTimer > 0) {
+      clearTimeout(this.timelineVisibleFocusTimer)
+      this.timelineVisibleFocusTimer = 0
+    }
+    this.timelineVisibleFocusPendingTime = 0
+  }
+
+  private resetTimelineInteraction(): void {
+    this.timelineInteractionToken += 1
+    this.timelineScrubActive = false
+    this.timelineFocusPinned = false
+    this.timelineIgnoreScrollStartUntil = 0
+    this.timelineScrubPendingTime = 0
+    this.timelineScrubLastScrollAt = 0
+    if (this.timelineScrubTimer > 0) {
+      clearTimeout(this.timelineScrubTimer)
+      this.timelineScrubTimer = 0
+    }
+    this.cancelTimelineVisibleFocus()
+    this.timelineEntryIndexByDay = {}
+    this.timelineWaterfallIndexByDay = {}
+    this.timelineLastJumpDay = 0
+    this.timelineLastJumpIndex = -1
+    this.timelineLastJumpPath = ''
+    this.timelineLastJumpMode = 'list'
+  }
+
+  private cancelPendingPreviewLoads(): void {
+    const cancelled = this.previewQueue.cancelPending()
+    for (const key of cancelled) {
+      const separator = key.indexOf('#preview:')
+      const path = separator > 0 ? key.substring(0, separator) : key
+      if (path.length > 0) {
+        this.previewRequests[path] = false
+      }
+    }
+  }
+
+  private onFileContentScrollStart(): void {
+    this.fileContentScrolling = true
+    this.cancelPendingPreviewLoads()
+    for (const entry of this.waterfallDownloadQueue) {
+      this.waterfallDownloadRequests[entry.path] = false
+    }
+    this.waterfallDownloadQueue = []
+    this.waterfallDecodeQueue = []
+    this.releaseTimelineFocusPinFromFileScroll()
+  }
+
+  private onFileContentScrollStop(): void {
+    this.fileContentScrolling = false
+    this.flushTimelineVisibleFocus()
+    const pending = this.pendingDirectoryIndexSnapshot
+    this.pendingDirectoryIndexSnapshot = null
+    if (pending !== null) {
+      const key = this.currentRootType.toString() + ':' + this.currentPath
+      this.applyDirectoryIndexSnapshot(pending, key, this.directoryIndexRequestToken)
+    }
+    this.warmTimelineVisibleEntries()
+    this.scheduleImageVisualPrune()
+  }
+
+  private releaseTimelineFocusPinFromFileScroll(): void {
+    // scrollToIndex() can synchronously emit onScrollStart. Keep that event
+    // from looking like a user gesture; the next real list gesture releases
+    // the selected timeline date and lets the rail follow visible content.
+    if (this.timelineScrubActive || Date.now() < this.timelineIgnoreScrollStartUntil) {
+      return
+    }
+    this.timelineFocusPinned = false
+  }
+
+  private rebuildTimelineIndexes(): void {
+    const entryIndexes: Record<string, number> = {}
+    for (let index = 0; index < this.entries.length; index++) {
+      const entry = this.entries[index]
+      if (entry.isDirectory || !this.isImage(entry) || entry.modifiedTime <= 0) {
+        continue
+      }
+      const key = DirectoryTimelinePolicy.localDayStart(entry.modifiedTime).toString()
+      if (entryIndexes[key] === undefined) {
+        entryIndexes[key] = index
+      }
+    }
+    const waterfallIndexes: Record<string, number> = {}
+    for (let index = 0; index < this.waterfallEntries.length; index++) {
+      const entry = this.waterfallEntries[index]
+      if (entry.modifiedTime <= 0) {
+        continue
+      }
+      const key = DirectoryTimelinePolicy.localDayStart(entry.modifiedTime).toString()
+      if (waterfallIndexes[key] === undefined) {
+        waterfallIndexes[key] = index
+      }
+    }
+    this.timelineEntryIndexByDay = entryIndexes
+    this.timelineWaterfallIndexByDay = waterfallIndexes
+  }
+
+  private scrollTimelineToDay(dayStart: number, updateFocus: boolean): void {
+    const key = dayStart.toString()
+    let targetIndex = -1
+    let childOffset = this.fileViewMode === 'list' ? 1 : 0
+    let scroller = this.fileListScroller
+    if (this.fileViewMode === 'waterfall') {
+      const waterfallIndex = this.timelineWaterfallIndexByDay[key]
+      targetIndex = waterfallIndex === undefined ? -1 : waterfallIndex
+      childOffset = 0
+      scroller = this.waterfallScroller
+    } else {
+      const entryIndex = this.timelineEntryIndexByDay[key]
+      targetIndex = entryIndex === undefined ? -1 : entryIndex
+    }
+    if (targetIndex < 0) {
+      return
+    }
+    if (updateFocus) {
+      this.timelineFocusTime = dayStart
+    }
+    // onTouch may publish several samples for the same physical position.
+    // During one interaction the list only needs one jump per resolved day.
+    if (this.timelineScrubActive && this.timelineLastJumpDay === dayStart &&
+      this.timelineLastJumpIndex === targetIndex && this.timelineLastJumpPath === this.currentPath &&
+      this.timelineLastJumpMode === this.fileViewMode) {
+      return
+    }
+    // Direct indexed jumps avoid a long inertial animation when the selected
+    // month or year is far away and make the file surface track scrubbing.
+    scroller.scrollToIndex(targetIndex + childOffset, false, ScrollAlign.CENTER)
+    this.timelineLastJumpDay = dayStart
+    this.timelineLastJumpIndex = targetIndex
+    this.timelineLastJumpPath = this.currentPath
+    this.timelineLastJumpMode = this.fileViewMode
+  }
+
+  private beginTimelineScrub(): void {
+    this.cancelTimelineVisibleFocus()
+    this.timelineInteractionToken += 1
+    this.timelineScrubActive = true
+    this.timelineFocusPinned = true
+    this.timelineIgnoreScrollStartUntil = Date.now() + 180
+    this.timelineScrubPendingTime = this.timelineFocusTime
+    this.timelineScrubLastScrollAt = 0
+    this.timelineLastJumpDay = 0
+    this.timelineLastJumpIndex = -1
+    this.timelineLastJumpPath = ''
+    this.timelineLastJumpMode = this.fileViewMode
+    if (this.timelineScrubTimer > 0) {
+      clearTimeout(this.timelineScrubTimer)
+      this.timelineScrubTimer = 0
+    }
+  }
+
+  private runTimelineScrubPreview(): void {
+    this.timelineScrubTimer = 0
+    if (!this.timelineScrubActive || this.timelineScrubPendingTime <= 0) {
+      return
+    }
+    const dayStart = DirectoryTimelinePolicy.closestDay(
+      this.directoryTimeline, this.timelineScrubPendingTime)
+    this.timelineScrubLastScrollAt = Date.now()
+    if (dayStart > 0) {
+      this.scrollTimelineToDay(dayStart, false)
+    }
+  }
+
+  private previewTimelineTime(time: number): void {
+    if (!this.timelineScrubActive || !this.shouldShowTimeline()) {
+      return
+    }
+    this.timelineScrubPendingTime = time
+    const elapsed = Date.now() - this.timelineScrubLastScrollAt
+    if (this.timelineScrubLastScrollAt === 0 || elapsed >= 32) {
+      this.runTimelineScrubPreview()
+      return
+    }
+    if (this.timelineScrubTimer === 0) {
+      this.timelineScrubTimer = setTimeout((): void => {
+        this.runTimelineScrubPreview()
+      }, Math.max(1, 32 - elapsed))
+    }
+  }
+
+  private releaseTimelineInteraction(): void {
+    const token = this.timelineInteractionToken
+    setTimeout((): void => {
+      if (token === this.timelineInteractionToken) {
+        this.timelineScrubActive = false
+        this.warmTimelineVisibleEntries()
+      }
+    }, 48)
+  }
+
+  private warmTimelineVisibleEntries(): void {
+    let source = this.entries
+    let start = this.fileVisibleStartIndex
+    let end = this.fileVisibleEndIndex
+    if (this.fileViewMode === 'waterfall') {
+      source = this.waterfallEntries
+      start = this.waterfallVisibleStartIndex
+      end = this.waterfallVisibleEndIndex
+    } else if (this.fileViewMode === 'list') {
+      // List index zero is the fixed top spacer.
+      start = Math.max(0, start - 1)
+      end = Math.max(start, end - 1)
+    }
+    if (source.length === 0) {
+      return
+    }
+    start = Math.max(0, start - 2)
+    end = Math.min(source.length - 1, Math.max(start, end + 2))
+    // A malformed/stale visible range must not turn a scrub release into
+    // another whole-directory warmup.
+    end = Math.min(end, start + 31)
+    for (let index = start; index <= end; index++) {
+      const entry = source[index]
+      this.resolveFileListImageRotation(entry)
+      if (this.fileViewMode === 'waterfall') {
+        this.enqueueWaterfallOriginal(entry, index, true)
+      } else {
+        this.loadEntryPreview(entry, index - start)
+      }
+    }
+  }
+
+  private finishTimelineScrub(time: number): void {
+    if (this.timelineScrubTimer > 0) {
+      clearTimeout(this.timelineScrubTimer)
+      this.timelineScrubTimer = 0
+    }
+    this.timelineScrubPendingTime = 0
+    this.timelineFocusPinned = true
+    this.timelineIgnoreScrollStartUntil = Date.now() + 180
+    const dayStart = DirectoryTimelinePolicy.closestDay(this.directoryTimeline, time)
+    if (dayStart > 0) {
+      this.scrollTimelineToDay(dayStart, true)
+    }
+    this.releaseTimelineInteraction()
+  }
+
+  private selectTimelinePeriod(time: number, period: TimelinePeriod): void {
+    if (this.timelineScrubTimer > 0) {
+      clearTimeout(this.timelineScrubTimer)
+      this.timelineScrubTimer = 0
+    }
+    this.timelineScrubPendingTime = 0
+    this.timelineFocusPinned = true
+    this.timelineIgnoreScrollStartUntil = Date.now() + 180
+    const dayStart = DirectoryTimelinePolicy.dayInPeriod(
+      this.directoryTimeline, time, period, this.fileSortAscending)
+    if (dayStart > 0) {
+      this.scrollTimelineToDay(dayStart, true)
+    }
+    this.releaseTimelineInteraction()
+  }
+
+  private schedulePhotosPreindex(homePath: string): void {
+    if (homePath.length === 0 || this.photosPreindexHomePath === homePath) {
+      return
+    }
+    this.photosPreindexHomePath = homePath
+    // Reuse/await the home index already requested by replaceEntries(), then
+    // warm likely folders below <home>/Photos serially.
+    this.repository.ensureDirectoryIndex(homePath, 3)
+      .then((): Promise<void> => this.repository.preindexPhotosDirectories(homePath))
+      .catch((error: Error): void => {
+        console.warn('[UgreenTimeline] Photos pre-index failed: ' + JSON.stringify(error))
+      })
+  }
+
   private async loadRoot(): Promise<void> {
     this.navigationRequestId += 1
     this.isNavigating = false
+    this.photosPreindexHomePath = ''
     const root = await this.repository.getRoot()
     this.directoryCounts = {}
     this.directoryCountRequests = {}
@@ -9202,6 +10056,7 @@ struct Index {
           ? personalPage.totalCount : personalPage.entries.length)
         this.resetPreviewState()
         this.statusText = '个人目录'
+        this.schedulePhotosPreindex(personalPath)
       } catch (_) {
         // 个人目录暂时不可读时仍停留在可用的个人根目录。
       }
@@ -9255,6 +10110,7 @@ struct Index {
         ? personalPage.totalCount : personalPage.entries.length)
       this.resetPreviewState()
       this.statusText = '个人目录'
+      this.schedulePhotosPreindex(personalPath)
     } catch (_) {
       // Keep the /home root visible when the personal directory is unavailable.
     } finally {
@@ -9317,7 +10173,17 @@ struct Index {
     const nextRootType = nextPath.length > 0 ? 3 :
       (entry.rootType > 0 ? entry.rootType : this.currentRootType)
     try {
-      const nextPage = await this.repository.listPage(nextPath, nextRootType, 1)
+      // Global sorting cannot be derived from the server's first page. Prefer
+      // the persisted complete index (or build it once) before mounting the
+      // directory, so the user never sees a temporary page order followed by
+      // a full-directory reorder.
+      const nextSnapshot = await this.repository.ensureDirectoryIndex(nextPath, nextRootType)
+      const query = new DirectoryQuery()
+      query.path = nextPath
+      query.rootType = nextRootType
+      query.sortKey = this.fileSortKey
+      query.ascending = this.fileSortAscending
+      const nextEntries = DirectoryTimelinePolicy.query(nextSnapshot.entries, query)
       if (requestId !== this.navigationRequestId) {
         return
       }
@@ -9325,7 +10191,7 @@ struct Index {
       // transition owns input until its finish callback releases isBusy.
       this.isNavigating = false
       const transitioned = await this.transitionFileContent(outgoingEntries, 'push',
-        this.fileTitle(nextPath), (): void => {
+        this.fileTitle(nextPath), outgoingViewState, (): void => {
         this.navigationStack = this.navigationStack.concat([this.currentPath])
         this.navigationEntryStack = this.navigationEntryStack.concat([this.entries.slice()])
         this.navigationRootTypeStack = this.navigationRootTypeStack.concat([this.currentRootType])
@@ -9335,17 +10201,36 @@ struct Index {
         this.navigationPageHasMoreStack = this.navigationPageHasMoreStack.concat([this.currentPageHasMore])
         this.currentPath = nextPath
         this.currentRootType = nextRootType
-        this.setCurrentPageState(nextPage.pageIndex, nextPage.hasMore)
-        this.replaceEntries(nextPage.entries)
+        this.indexedDirectoryKey = nextRootType.toString() + ':' + nextPath
+        this.indexedDirectoryContentSignature = nextSnapshot.contentSignature.length > 0
+          ? nextSnapshot.contentSignature : DirectoryTimelinePolicy.contentSignature(nextSnapshot.entries)
+        this.directoryTimeline = nextSnapshot.timeline
+        this.timelineIndexing = false
+        this.resetTimelineInteraction()
+        if (nextSnapshot.timeline.eligible()) {
+          const endpoint = this.fileSortAscending
+            ? nextSnapshot.timeline.earliestTime : nextSnapshot.timeline.latestTime
+          this.timelineFocusTime = DirectoryTimelinePolicy.localDayStart(endpoint)
+        } else {
+          this.timelineFocusTime = 0
+        }
+        this.setCurrentPageState(Math.max(1, Math.ceil(nextEntries.length / 200)), false)
+        this.replaceEntries(nextEntries, false, true)
         this.updateBottomBarVisibility(true)
-        this.updateDirectoryCount(nextPath, nextPage.totalCount >= 0
-          ? nextPage.totalCount : nextPage.entries.length)
-        this.resetPreviewState()
-      })
+        this.updateDirectoryCount(nextPath, nextSnapshot.totalCount >= 0
+          ? nextSnapshot.totalCount : nextEntries.length)
+      }, (): void => this.settleNewDirectoryAtTopForTransition(), true)
       if (!transitioned) {
         return
       }
-      this.statusText = nextPage.entries.length === 0 ? '目录读取成功（空目录）' : '目录读取成功'
+      this.statusText = nextEntries.length === 0 ? '目录读取成功（空目录）' : '目录读取成功'
+      if (Date.now() - nextSnapshot.fetchedAt > DIRECTORY_INDEX_STALE_MS) {
+        setTimeout((): void => {
+          if (nextPath === this.currentPath && nextRootType === this.currentRootType) {
+            this.scheduleCurrentDirectoryIndex(true)
+          }
+        }, 0)
+      }
     } catch (error) {
       if (requestId === this.navigationRequestId) {
         this.presentErrorMessage(readableUgreenError(error as Object) + '（路径：' + nextPath + '）', '目录读取失败')
@@ -10115,65 +11000,78 @@ struct Index {
   private refreshFileListImageRotations(entries: FileEntry[]): void {
     const generation = this.fileListRotationGeneration + 1
     this.fileListRotationGeneration = generation
+    this.fileListPersistedDisplayState = new ImageDisplayState()
+    this.fileListRotationReady = false
     if (entries.length === 0) {
+      this.fileListRotationReady = true
       return
     }
     const snapshot = entries.slice()
-    const pendingStates: Record<string, ImageVisualState> = {}
-    for (const key of Object.keys(this.imageVisualStates)) {
-      pendingStates[key] = this.imageVisualStates[key]
-    }
-    for (const entry of snapshot) {
-      if (!this.isImage(entry)) {
-        continue
-      }
-      const pending = this.copyImageVisualState(this.imageVisualStates[entry.path])
-      pending.rotationResolved = false
-      pendingStates[entry.path] = pending
-    }
-    this.imageVisualStates = pendingStates
     this.loadPersistedImageDisplayState(snapshot).then((state: ImageDisplayState): void => {
       if (generation !== this.fileListRotationGeneration) {
         return
       }
-      const nextStates: Record<string, ImageVisualState> = {}
-      for (const key of Object.keys(this.imageVisualStates)) {
-        nextStates[key] = this.imageVisualStates[key]
-      }
+      this.fileListPersistedDisplayState = state
+      this.fileListRotationReady = true
+      // Lazy containers only need display metadata for mounted images. The
+      // complete directory snapshot may contain thousands of files; creating
+      // one reactive ImageVisualState per file here makes every later
+      // onAppear update copy that entire table.
       for (const entry of snapshot) {
-        const next = this.copyImageVisualState(this.imageVisualStates[entry.path])
-        const rotation = state.rotations[entry.path]
-        const orientation = state.previewOrientations[entry.path]
-        next.userRotation = rotation === undefined ? 0 : rotation
-        next.rotationResolved = true
-        next.thumbnailOrientation = orientation === undefined
-          ? (this.previewCanonicalPaths[entry.path] === true
-            ? ImageRotateOrientation.UP : ImageRotateOrientation.AUTO) : orientation
-        nextStates[entry.path] = next
-      }
-      this.imageVisualStates = nextStates
-      for (const entry of snapshot) {
-        if (!this.isImage(entry)) {
-          continue
-        }
-        const rotation = this.imageVisualState(entry.path).userRotation
-        const thumbnail = this.fileThumbnailBitmaps[entry.path]
-        if (thumbnail !== undefined && thumbnail.userRotation !== rotation) {
-          this.releaseFileThumbnailBitmap(entry.path)
-        }
-        const waterfall = this.waterfallBitmaps[entry.path]
-        if (waterfall !== undefined && waterfall.userRotation !== rotation) {
-          this.releaseViewerBitmap(this.waterfallBitmaps, entry.path).catch((): void => {})
-          this.waterfallDecodedPaths[entry.path] = false
-        }
-        this.loadEntryPreview(entry)
-        if (this.fileViewMode === 'waterfall' && this.waterfallVisiblePaths[entry.path] === true) {
-          this.enqueueWaterfallDecode(entry)
+        if (this.imageVisualStates[entry.path] !== undefined) {
+          this.resolveFileListImageRotation(entry, true)
         }
       }
     }).catch((error: Error): void => {
+      if (generation === this.fileListRotationGeneration) {
+        this.fileListPersistedDisplayState = new ImageDisplayState()
+        this.fileListRotationReady = true
+        for (const entry of snapshot) {
+          if (this.imageVisualStates[entry.path] !== undefined) {
+            this.resolveFileListImageRotation(entry, true)
+          }
+        }
+      }
       console.warn('[UgreenImage] refresh file-list display metadata failed: ' + JSON.stringify(error))
     })
+  }
+
+  private resolveFileListImageRotation(entry: FileEntry, force: boolean = false): void {
+    if (!this.isImage(entry) || !this.fileListRotationReady) {
+      return
+    }
+    const previous = this.imageVisualState(entry.path)
+    if (!force && previous.rotationResolved) {
+      return
+    }
+    const storedRotation = this.fileListPersistedDisplayState.rotations[entry.path]
+    const storedOrientation =
+      this.fileListPersistedDisplayState.previewOrientations[entry.path]
+    const rotation = storedRotation === undefined ? 0 : storedRotation
+    const orientation = storedOrientation === undefined
+      ? (this.previewCanonicalPaths[entry.path] === true
+        ? ImageRotateOrientation.UP : ImageRotateOrientation.AUTO) : storedOrientation
+    if (!previous.rotationResolved || previous.userRotation !== rotation ||
+      previous.thumbnailOrientation !== orientation) {
+      this.updateImageVisualState(entry.path, (next: ImageVisualState): void => {
+        next.userRotation = rotation
+        next.rotationResolved = true
+        next.thumbnailOrientation = orientation
+      }, false)
+      this.scheduleImageVisualNotify()
+    }
+    const thumbnail = this.fileThumbnailBitmaps[entry.path]
+    if (thumbnail !== undefined && thumbnail.userRotation !== rotation) {
+      this.releaseFileThumbnailBitmap(entry.path)
+    }
+    const waterfall = this.waterfallBitmaps[entry.path]
+    if (waterfall !== undefined && waterfall.userRotation !== rotation) {
+      this.releaseViewerBitmap(this.waterfallBitmaps, entry.path).catch((): void => {})
+      this.waterfallDecodedPaths[entry.path] = false
+    }
+    if (this.fileViewMode === 'waterfall' && this.waterfallVisiblePaths[entry.path] === true) {
+      this.enqueueWaterfallDecode(entry)
+    }
   }
 
   private fileListImageBaseOrientation(entry: FileEntry): ImageRotateOrientation {
@@ -10195,7 +11093,8 @@ struct Index {
     }
     this.updateImageVisualState(path, (state: ImageVisualState): void => {
       state.thumbnailOrientation = orientation
-    })
+    }, false)
+    this.scheduleImageVisualNotify()
   }
 
   private persistPreviewOrientation(entry: FileEntry,
@@ -10311,6 +11210,7 @@ struct Index {
       nextStates[item.path] = next
     }
     this.imageVisualStates = nextStates
+    this.imageVisualEpoch += 1
   }
 
   private async openImageViewer(entry: FileEntry): Promise<void> {
@@ -10679,6 +11579,7 @@ struct Index {
       nextStates[entry.path] = next
     }
     this.imageVisualStates = nextStates
+    this.imageVisualEpoch += 1
   }
 
   private finishCloseImageViewer(shouldRestoreSearch: boolean): void {
@@ -12044,16 +12945,13 @@ struct Index {
     const oldPreview = this.viewerPreviewBitmaps[path]
     const oldPreviewAlias = this.viewerPreviewBitmapAliases[path] === true
     const oldOriginal = this.viewerOriginalBitmaps[path]
-    const oldFile = this.fileThumbnailBitmaps[path]
     const oldWaterfall = this.waterfallBitmaps[path]
     let nextPreview: ViewerBitmapRecord | null = null
     let nextOriginal: ViewerBitmapRecord | null = null
-    let nextFile: ViewerBitmapRecord | null = null
     let nextWaterfall: ViewerBitmapRecord | null = null
     let committed = false
     try {
       nextPreview = await this.viewerBitmapStore.decode(previewPath, 'viewerPreview', nextRotation)
-      nextFile = await this.viewerBitmapStore.decode(previewPath, 'list', nextRotation)
       if (typeof originalPath === 'string' && originalPath.length > 0 &&
         CacheManager.exists(originalPath)) {
         nextOriginal = await this.viewerBitmapStore.decode(originalPath, 'viewerZoom', nextRotation)
@@ -12065,7 +12963,7 @@ struct Index {
           'viewerPreview', nextRotation)
       }
       const visibleRecord = state.visibleLayer === 'original' ? nextOriginal : nextPreview
-      if (visibleRecord === null || nextPreview === null || nextFile === null ||
+      if (visibleRecord === null || nextPreview === null ||
         (oldOriginal !== undefined && nextOriginal === null)) {
         throw new Error('rotated PixelMap decode did not produce the active visual layer')
       }
@@ -12081,16 +12979,6 @@ struct Index {
       } else if (oldOriginal !== undefined) {
         this.removeViewerBitmap(this.viewerOriginalBitmaps, path)
       }
-      const nextFileMaps: Record<string, ViewerBitmapRecord> = {}
-      for (const key of Object.keys(this.fileThumbnailBitmaps)) {
-        if (key !== path) {
-          nextFileMaps[key] = this.fileThumbnailBitmaps[key]
-        }
-      }
-      nextFileMaps[path] = nextFile
-      this.fileThumbnailBitmaps = nextFileMaps
-      this.fileThumbnailDecodeKeys[path] = previewPath + '|' + this.previewSignature(entry) +
-        '|rotation=' + nextRotation.toString()
       if (nextWaterfall !== null) {
         this.installViewerBitmap(this.waterfallBitmaps, path, nextWaterfall)
         this.waterfallDecodedPaths[path] = true
@@ -12112,8 +13000,8 @@ struct Index {
         next.exifDisplayHeight = visibleRecord.exifDisplayHeight
         next.displayWidth = visibleRecord.displayWidth
         next.displayHeight = visibleRecord.displayHeight
-        next.thumbnailDisplayWidth = nextFile!.displayWidth
-        next.thumbnailDisplayHeight = nextFile!.displayHeight
+        next.thumbnailDisplayWidth = nextPreview!.displayWidth
+        next.thumbnailDisplayHeight = nextPreview!.displayHeight
         next.frameWidth = visibleRecord.displayWidth
         next.frameHeight = visibleRecord.displayHeight
         next.frameLocked = true
@@ -12130,9 +13018,6 @@ struct Index {
       if (oldOriginal !== undefined && oldOriginal !== nextOriginal) {
         await this.viewerBitmapStore.release(oldOriginal)
       }
-      if (oldFile !== undefined && oldFile !== nextFile) {
-        await this.viewerBitmapStore.release(oldFile)
-      }
       if (oldWaterfall !== undefined && oldWaterfall !== nextWaterfall) {
         await this.viewerBitmapStore.release(oldWaterfall)
       }
@@ -12146,7 +13031,6 @@ struct Index {
         })
         await this.viewerBitmapStore.release(nextPreview)
         await this.viewerBitmapStore.release(nextOriginal)
-        await this.viewerBitmapStore.release(nextFile)
         await this.viewerBitmapStore.release(nextWaterfall)
       }
       this.viewerTransitionActive = false
@@ -12259,6 +13143,7 @@ struct Index {
         }
       }
       this.imageVisualStates = nextStates
+      this.imageVisualEpoch += 1
       this.viewerLoadQueue = this.viewerLoadQueue.filter((item: FileEntry) => item.path !== entry.path)
       this.viewerLoadRequests[entry.path] = false
       this.resetImageTransform()
@@ -14719,7 +15604,23 @@ struct Index {
       this.fileSortAscending = key === 'name' || key === 'type'
     }
     this.closeFileSortMenu()
+    this.resetTimelineInteraction()
+    if (this.fileSortKey === 'time' && this.directoryTimeline.eligible()) {
+      const endpoint = this.fileSortAscending
+        ? this.directoryTimeline.earliestTime : this.directoryTimeline.latestTime
+      this.timelineFocusTime = DirectoryTimelinePolicy.localDayStart(endpoint)
+      // Replacing a lazy container can emit an intermediate visible-index
+      // callback before its offset is reset. Keep the selected endpoint stable
+      // until the next real list gesture.
+      this.timelineFocusPinned = true
+      this.timelineIgnoreScrollStartUntil = Date.now() + 180
+    }
+    // Re-apply the sort to the complete directory snapshot. Sorting only the
+    // pages already reached by the list would make both order and timeline wrong.
+    this.indexedDirectoryKey = ''
+    this.indexedDirectoryContentSignature = ''
     this.replaceEntries(this.entries)
+    this.resetFileListScroll()
   }
 
   private openCreateFolder(): void {
@@ -14883,6 +15784,8 @@ struct Index {
     }
     const visiblePageIndex = Math.max(1, this.currentPageIndex)
     this.navigationRequestId += 1
+    this.indexedDirectoryKey = ''
+    this.indexedDirectoryContentSignature = ''
     this.repository.invalidateDirectory(this.currentPath, this.currentRootType)
     const refreshed = await this.loadVisibleDirectoryPages(this.currentPath, this.currentRootType,
       visiblePageIndex, true)
@@ -14966,8 +15869,18 @@ struct Index {
 
   private previewUri(entry: FileEntry): string {
     const state = this.imageVisualState(entry.path)
-    return state.thumbnailUri.length > 0 &&
-      state.thumbnailSignature === this.previewSignature(entry) ? state.thumbnailUri : ''
+    const signature = this.previewSignature(entry)
+    if (state.thumbnailUri.length > 0 && state.thumbnailSignature === signature) {
+      return state.thumbnailUri
+    }
+    // Visual state is bounded independently from the URI LRU. Reconstruct a
+    // recently retained URI without a synchronous stat or a new publish pass.
+    const retainedPath = this.previewLocalPaths[entry.path]
+    if (typeof retainedPath === 'string' && retainedPath.length > 0 &&
+      this.previewLocalSignatures[entry.path] === signature) {
+      return fileUri.getUriFromPath(retainedPath)
+    }
+    return ''
   }
 
   private setPreviewUri(entry: FileEntry, uri: string, localPath: string = '',
@@ -15002,12 +15915,14 @@ struct Index {
       }
     }
     const nextLocalPaths: Record<string, string> = {}
+    const nextLocalSignatures: Record<string, string> = {}
     const nextCanonicalPaths: Record<string, boolean> = {}
     const signature = this.previewSignature(entry)
     for (const key of order) {
       if (key === path) {
         if (localPath.length > 0) {
           nextLocalPaths[key] = localPath
+          nextLocalSignatures[key] = signature
         }
         if (canonical) {
           nextCanonicalPaths[key] = true
@@ -15016,6 +15931,10 @@ struct Index {
         const existingLocalPath = this.previewLocalPaths[key]
         if (typeof existingLocalPath === 'string' && existingLocalPath.length > 0) {
           nextLocalPaths[key] = existingLocalPath
+          const existingSignature = this.previewLocalSignatures[key]
+          if (typeof existingSignature === 'string' && existingSignature.length > 0) {
+            nextLocalSignatures[key] = existingSignature
+          }
         }
         if (this.previewCanonicalPaths[key] === true) {
           nextCanonicalPaths[key] = true
@@ -15024,6 +15943,7 @@ struct Index {
     }
     this.previewUriOrder = order
     this.previewLocalPaths = nextLocalPaths
+    this.previewLocalSignatures = nextLocalSignatures
     this.previewCanonicalPaths = nextCanonicalPaths
     this.updateImageVisualState(path, (state: ImageVisualState): void => {
       if (state.thumbnailUri !== uri || state.thumbnailSignature !== signature) {
@@ -15033,7 +15953,7 @@ struct Index {
       state.thumbnailSignature = signature
       state.thumbnailOrientation = canonical
         ? ImageRotateOrientation.UP : ImageRotateOrientation.AUTO
-    })
+    }, false)
     for (const evictedPath of evictedPaths) {
       this.releaseFileThumbnailBitmap(evictedPath)
       this.updateImageVisualState(evictedPath, (state: ImageVisualState): void => {
@@ -15042,12 +15962,19 @@ struct Index {
         if (state.thumbnailVisibleRatio <= 0) {
           state.transitionThumbnailUri = ''
         }
-      })
+      }, false)
     }
+    this.scheduleImageVisualNotify()
   }
 
-  private replaceEntries(nextEntries: FileEntry[], appendWaterfall: boolean = false): void {
-    this.entries = this.sortEntriesForDisplay(nextEntries)
+  private replaceEntries(nextEntries: FileEntry[], appendWaterfall: boolean = false,
+    alreadySorted: boolean = false): void {
+    const sortedEntries = alreadySorted ? nextEntries.slice() : this.sortEntriesForDisplay(nextEntries)
+    if (this.sameFileEntryList(this.entries, sortedEntries)) {
+      this.scheduleCurrentDirectoryIndex()
+      return
+    }
+    this.entries = sortedEntries
     this.currentDirectoryHasImages = this.hasDirectImageFiles(this.entries)
     if (!this.currentDirectoryHasImages && this.fileViewMode === 'waterfall') {
       this.stopWaterfallPipeline()
@@ -15056,8 +15983,31 @@ struct Index {
     }
     this.fileEntryDataSource.replace(this.entries)
     this.syncWaterfallEntries(this.entries, appendWaterfall)
+    this.rebuildTimelineIndexes()
     this.refreshFileListImageRotations(this.entries)
     this.scheduleDirectoryVideoReconcile(this.entries)
+    this.scheduleCurrentDirectoryIndex()
+  }
+
+  private sameFileEntryList(left: FileEntry[], right: FileEntry[]): boolean {
+    if (left.length !== right.length) {
+      return false
+    }
+    for (let index = 0; index < left.length; index += 1) {
+      const previous = left[index]
+      const next = right[index]
+      if (previous.path !== next.path || previous.name !== next.name ||
+        previous.isDirectory !== next.isDirectory || previous.size !== next.size ||
+        previous.modifiedTime !== next.modifiedTime || previous.createdTime !== next.createdTime ||
+        previous.childCount !== next.childCount || previous.rootType !== next.rootType ||
+        previous.intranetShareId !== next.intranetShareId ||
+        previous.thumbnailUrl !== next.thumbnailUrl || previous.coverUrl !== next.coverUrl ||
+        previous.mimeType !== next.mimeType || previous.etag !== next.etag ||
+        previous.checksum !== next.checksum) {
+        return false
+      }
+    }
+    return true
   }
 
   private scheduleDirectoryVideoReconcile(entries: FileEntry[]): void {
@@ -15111,7 +16061,31 @@ struct Index {
     if (unique.length === 0) {
       return
     }
-    this.replaceEntries(this.entries.concat(unique), true)
+    const previousLength = this.entries.length
+    const sorted = this.sortEntriesForDisplay(this.entries.concat(unique))
+    let keepsExistingPrefix = sorted.length >= previousLength
+    if (keepsExistingPrefix) {
+      for (let index = 0; index < previousLength; index += 1) {
+        if (sorted[index].path !== this.entries[index].path) {
+          keepsExistingPrefix = false
+          break
+        }
+      }
+    }
+    if (!keepsExistingPrefix) {
+      this.replaceEntries(sorted, true, true)
+      return
+    }
+
+    const appended = sorted.slice(previousLength)
+    this.entries = sorted
+    this.currentDirectoryHasImages = this.hasDirectImageFiles(this.entries)
+    this.fileEntryDataSource.append(appended)
+    this.syncWaterfallEntries(this.entries, true)
+    this.rebuildTimelineIndexes()
+    this.refreshFileListImageRotations(this.entries)
+    this.scheduleDirectoryVideoReconcile(appended)
+    this.scheduleCurrentDirectoryIndex()
   }
 
   private syncWaterfallEntries(entries: FileEntry[], appendOnly: boolean): void {
@@ -15210,6 +16184,7 @@ struct Index {
     this.stopWaterfallPipeline()
     this.waterfallLocalPaths = {}
     this.waterfallAspectRatios = {}
+    this.waterfallAspectEpoch += 1
     this.waterfallAnchor = null
     this.waterfallVisibleStartIndex = 0
     this.waterfallVisibleEndIndex = 0
@@ -15224,6 +16199,10 @@ struct Index {
     // thumbnail immediately.
     this.previewRequests = {}
     this.previewQueue.cancelPending()
+    this.fileVisibleStartIndex = 0
+    this.fileVisibleEndIndex = 0
+    this.waterfallVisibleStartIndex = 0
+    this.waterfallVisibleEndIndex = 0
     this.directoryCountRequests = {}
     this.directoryCountTimers = {}
     this.resetWaterfallDirectoryState()
@@ -15242,18 +16221,42 @@ struct Index {
       const limit = this.networkPolicy.isMetered()
         ? (this.fileViewMode === 'grid' ? 8 : 6)
         : (this.fileViewMode === 'grid' ? 16 : 12)
+      let start = this.fileVisibleStartIndex
+      let end = this.fileVisibleEndIndex
+      if (end <= start) {
+        start = 0
+        end = Math.min(this.entries.length - 1, limit * 2 - 1)
+      } else if (this.fileViewMode === 'list') {
+        start = Math.max(0, start - 1)
+        end = Math.max(start, end - 1)
+      }
+      start = Math.max(0, start - 4)
+      end = Math.min(this.entries.length - 1, Math.max(start, end + 4))
+      end = Math.min(end, start + 31)
       let scheduled = 0
-      for (const entry of this.entries) {
+      for (let index = start; index <= end && index < this.entries.length; index += 1) {
+        const entry = this.entries[index]
         if (scheduled >= limit) {
           break
         }
         if (entry.isDirectory || (!this.isImage(entry) && !this.isVideo(entry) && !this.isAudio(entry))) {
           continue
         }
-        this.loadEntryPreview(entry, scheduled)
+        this.resolveFileListImageRotation(entry)
+        this.loadEntryPreview(entry, this.previewPriority(index, this.fileViewMode))
         scheduled += 1
       }
     }, 0)
+  }
+
+  private previewPriority(index: number, surface: ThumbnailSurfaceKind): number {
+    let visibleStart = this.fileVisibleStartIndex
+    if (surface === 'waterfall') {
+      visibleStart = this.waterfallVisibleStartIndex
+    } else if (surface === 'list') {
+      visibleStart = Math.max(0, visibleStart - 1)
+    }
+    return Math.abs(index - visibleStart)
   }
 
   private resetFileListScroll(): void {
@@ -15297,24 +16300,30 @@ struct Index {
     if (entry.isDirectory || (!this.isImage(entry) && !this.isVideo(entry) && !this.isAudio(entry))) {
       return
     }
-    if (this.isImage(entry)) {
-      const canonicalPath = this.mediaPreviewManager.cachedImagePreview(entry,
-        this.thumbnailDirectory)
-      if (canonicalPath.length > 0) {
-        this.publishImagePreview(entry, canonicalPath, true, this.previewGeneration)
-          .catch((): void => {})
-        return
-      }
-      const retainedPath = this.previewLocalPaths[entry.path]
-      if (typeof retainedPath === 'string' && retainedPath.length > 0 &&
-        CacheManager.exists(retainedPath)) {
-        this.publishImagePreview(entry, retainedPath,
-          this.previewCanonicalPaths[entry.path] === true, this.previewGeneration)
-          .catch((): void => {})
-        return
-      }
+    // The incoming directory is already visible during the push animation,
+    // but starting its cache stats, network work and decoders here can delay
+    // the JS cleanup of the outgoing snapshot. Warm the settled visible range
+    // from finishPreparedFileTransition instead.
+    if (this.showPageTransition && this.screen === 'files' && !this.showImageViewer) {
+      return
     }
+    // During timeline scrubbing, visible rows can change several times per
+    // frame. Cached pixels may render, but network/decode work starts only for
+    // the settled visible range after release.
+    if (this.timelineScrubActive && this.screen === 'files' && !this.showImageViewer) {
+      return
+    }
+    // A visible row may reappear many times while scrolling. Resolve the
+    // in-memory URI first so a cache hit does not synchronously stat/touch the
+    // thumbnail on every mount. The request flag also deduplicates the short
+    // gap before an async cache result is published.
     if (this.previewUri(entry).length > 0 || this.previewRequests[entry.path] === true) {
+      return
+    }
+    // LazyForEach mounts rows throughout an inertial scroll. Delay cache
+    // stats, persistent-index reads and new downloads until onScrollStop
+    // warms the final visible window.
+    if (this.fileContentScrolling && this.screen === 'files' && !this.showImageViewer) {
       return
     }
     const generation = this.previewGeneration
@@ -15345,6 +16354,13 @@ struct Index {
           this.thumbnailDirectory)
         if (canonicalPath.length > 0) {
           await this.publishImagePreview(entry, canonicalPath, true, generation)
+          return
+        }
+        const retainedPath = this.previewLocalPaths[entry.path]
+        if (typeof retainedPath === 'string' && retainedPath.length > 0 &&
+          CacheManager.exists(retainedPath)) {
+          await this.publishImagePreview(entry, retainedPath,
+            this.previewCanonicalPaths[entry.path] === true, generation)
           return
         }
       }

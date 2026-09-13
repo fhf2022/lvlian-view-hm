@@ -1,0 +1,273 @@
+import { uiMaterial } from '@kit.ArkUI'
+import {
+  DirectoryTimeline,
+  DirectoryTimelinePolicy,
+  TimelinePeriod
+} from '../model/DirectoryTimeline'
+import { ProximityLightReceiver } from './ProximityLightReceiver'
+
+class TimelineMarker {
+  id: string = ''
+  time: number = 0
+  y: number = 0
+  label: string = ''
+  kind: TimelinePeriod = 'day'
+  opacity: number = 1
+  length: number = 8
+  hasImages: boolean = false
+}
+
+@Component
+export struct FisheyeTimeline {
+  @Prop timeline: DirectoryTimeline = new DirectoryTimeline()
+  @Link focusTime: number
+  @Prop widthVp: number = 68
+  @Prop heightVp: number = 520
+  @Prop material: uiMaterial.ImmersiveMaterial = new uiMaterial.ImmersiveMaterial({
+    style: uiMaterial.ImmersiveStyle.THIN,
+    colorInvert: true,
+    applyShadow: true,
+    interactive: true
+  })
+  onScrubStart: () => void = () => {}
+  onScrub: (time: number) => void = () => {}
+  onScrubEnd: (time: number) => void = () => {}
+  onSelect: (time: number, period: TimelinePeriod) => void = () => {}
+  private touchActive: boolean = false
+  private touchMoved: boolean = false
+  private touchStartY: number = 0
+  private touchStartFocus: number = 0
+  private readonly moveThresholdVp: number = 5
+
+  private clampFocus(value: number): number {
+    const earliest = DirectoryTimelinePolicy.localDayStart(this.timeline.earliestTime)
+    const latest = DirectoryTimelinePolicy.localDayStart(this.timeline.latestTime)
+    return Math.max(earliest, Math.min(latest, value))
+  }
+
+  private addDays(value: number, amount: number): number {
+    const date = new Date(value)
+    date.setDate(date.getDate() + amount)
+    return date.getTime()
+  }
+
+  private addMonths(value: number, amount: number): number {
+    const date = new Date(value)
+    return new Date(date.getFullYear(), date.getMonth() + amount, 1).getTime()
+  }
+
+  private addYears(value: number, amount: number): number {
+    const date = new Date(value)
+    return new Date(date.getFullYear() + amount, 0, 1).getTime()
+  }
+
+  private periodHasImages(value: number, kind: TimelinePeriod): boolean {
+    let periodStart = DirectoryTimelinePolicy.localDayStart(value)
+    let periodEnd = this.addDays(periodStart, 1)
+    if (kind === 'month') {
+      periodStart = this.addMonths(value, 0)
+      periodEnd = this.addMonths(value, 1)
+    } else if (kind === 'year') {
+      const date = new Date(value)
+      periodStart = new Date(date.getFullYear(), 0, 1).getTime()
+      periodEnd = new Date(date.getFullYear() + 1, 0, 1).getTime()
+    }
+    let low = 0
+    let high = this.timeline.buckets.length
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2)
+      if (this.timeline.buckets[middle].dayStart < periodStart) {
+        low = middle + 1
+      } else {
+        high = middle
+      }
+    }
+    return low < this.timeline.buckets.length &&
+      this.timeline.buckets[low].dayStart < periodEnd
+  }
+
+  private marker(id: string, time: number, y: number, label: string,
+    kind: TimelinePeriod, opacity: number, length: number): TimelineMarker {
+    const marker = new TimelineMarker()
+    marker.id = id
+    marker.time = time
+    marker.y = y
+    marker.label = label
+    marker.kind = kind
+    marker.opacity = opacity
+    marker.length = length
+    marker.hasImages = this.periodHasImages(time, kind)
+    return marker
+  }
+
+  private markers(): TimelineMarker[] {
+    const result: TimelineMarker[] = []
+    const center = this.heightVp / 2
+    const focusDay = DirectoryTimelinePolicy.localDayStart(this.focusTime)
+    const nextDay = this.addDays(focusDay, 1)
+    const fraction = nextDay > focusDay ? (this.focusTime - focusDay) / (nextDay - focusDay) : 0
+    // Earlier dates stay below the focus point. Moving the rail upward brings
+    // those dates into focus, so the content follows the finger and time moves
+    // toward the past regardless of the file list's sort direction.
+    const direction = -1
+    const frameKey = Math.floor(this.focusTime / (15 * 60 * 1000)).toString()
+    const dayPitch = Math.max(24, Math.min(34, this.heightVp / 16))
+    for (let offset = -3; offset <= 3; offset++) {
+      const time = this.addDays(focusDay, offset)
+      const date = new Date(time)
+      const label = offset === 0 ? (date.getMonth() + 1).toString() + '/' +
+        date.getDate().toString() : (Math.abs(offset) === 1 ? date.getDate().toString() : '')
+      const temporalOffset = offset - fraction
+      result.push(this.marker('d' + offset.toString() + ':' + frameKey, time,
+        center + temporalOffset * dayPitch * direction, label, 'day',
+        offset === 0 ? 1 : 0.82 - Math.abs(offset) * 0.08, offset === 0 ? 17 : 11))
+    }
+
+    const dayExtent = dayPitch * 3
+    const monthBase = Math.max(dayExtent + 22, this.heightVp * 0.27)
+    const monthStep = Math.max(20, this.heightVp * 0.045)
+    for (let offset = 1; offset <= 3; offset++) {
+      const before = this.addMonths(focusDay, -offset)
+      const after = this.addMonths(focusDay, offset)
+      const distance = monthBase + (offset - 1) * monthStep
+      result.push(this.marker('mb' + offset.toString() + ':' + frameKey, before,
+        center - distance * direction, offset <= 2
+          ? (new Date(before).getMonth() + 1).toString() + '月' : '',
+        'month', 0.62 - offset * 0.07, 9))
+      result.push(this.marker('ma' + offset.toString() + ':' + frameKey, after,
+        center + distance * direction, offset <= 2
+          ? (new Date(after).getMonth() + 1).toString() + '月' : '',
+        'month', 0.62 - offset * 0.07, 9))
+    }
+
+    const yearBase = Math.max(monthBase + monthStep * 2 + 20, this.heightVp * 0.43)
+    const yearStep = Math.max(18, this.heightVp * 0.035)
+    for (let offset = 1; offset <= 2; offset++) {
+      const before = this.addYears(focusDay, -offset)
+      const after = this.addYears(focusDay, offset)
+      const distance = Math.min(this.heightVp / 2 - 12, yearBase + (offset - 1) * yearStep)
+      result.push(this.marker('yb' + offset.toString() + ':' + frameKey, before,
+        center - distance * direction, offset === 1
+          ? new Date(before).getFullYear().toString() : '', 'year', 0.36, 6))
+      result.push(this.marker('ya' + offset.toString() + ':' + frameKey, after,
+        center + distance * direction, offset === 1
+          ? new Date(after).getFullYear().toString() : '', 'year', 0.36, 6))
+    }
+    return result
+  }
+
+  private selectNearest(y: number): void {
+    const markers = this.markers()
+    let selected: TimelineMarker | null = null
+    let distance = Number.MAX_SAFE_INTEGER
+    for (const marker of markers) {
+      const markerDistance = Math.abs(marker.y - y)
+      if (markerDistance < distance) {
+        selected = marker
+        distance = markerDistance
+      }
+    }
+    if (selected !== null) {
+      this.onSelect(selected.time, selected.kind)
+    }
+  }
+
+  private handleTouch(event: TouchEvent): void {
+    const points = event.touches.length > 0 ? event.touches : event.changedTouches
+    const point = points.length > 0 ? points[0] : null
+    if (event.type === TouchType.Down && point !== null) {
+      this.touchActive = true
+      this.touchMoved = false
+      this.touchStartY = point.y
+      this.touchStartFocus = this.focusTime
+      this.onScrubStart()
+      return
+    }
+    if (event.type === TouchType.Move && this.touchActive && point !== null) {
+      const delta = point.y - this.touchStartY
+      // A real device keeps reporting tiny Move samples even during a tap.
+      // Do not turn those samples into synchronous long-list jumps; the tap
+      // is resolved once on Up by selectNearest().
+      if (!this.touchMoved && Math.abs(delta) <= this.moveThresholdVp) {
+        return
+      }
+      this.touchMoved = true
+      this.focusTime = this.clampFocus(this.touchStartFocus +
+        delta / 38 * DirectoryTimelinePolicy.DAY_MS)
+      this.onScrub(this.focusTime)
+      return
+    }
+    if ((event.type === TouchType.Up || event.type === TouchType.Cancel) && this.touchActive) {
+      const y = point === null ? this.touchStartY : point.y
+      this.touchActive = false
+      if (this.touchMoved) {
+        const snapped = DirectoryTimelinePolicy.closestDay(this.timeline, this.focusTime)
+        this.focusTime = this.clampFocus(snapped)
+        this.onScrubEnd(this.focusTime)
+      } else if (event.type === TouchType.Up) {
+        this.selectNearest(y)
+      } else {
+        this.onScrubEnd(this.focusTime)
+      }
+      this.touchMoved = false
+    }
+  }
+
+  build() {
+    Stack() {
+      Stack({ alignContent: Alignment.Center }) {
+        Row()
+          .width(56)
+          .height(50)
+          .borderRadius(25)
+          .backgroundColor('#18FFFFFF')
+
+        Row()
+          .width(1)
+          .height(Math.max(0, this.heightVp - 28))
+          .backgroundColor('#24FFFFFF')
+          .position({ x: 12, y: 14 })
+
+        ForEach(this.markers(), (marker: TimelineMarker) => {
+          Row({ space: 4 }) {
+            Row()
+              .width(marker.length)
+              .height(marker.hasImages ? 3 : 1)
+              .borderRadius(2)
+              .backgroundColor(marker.hasImages ? '#D92E6BFF' :
+                $r('sys.color.icon_secondary'))
+            Text(marker.label)
+              .fontSize(marker.kind === 'day' ? (marker.length > 12 ? 12 : 10) : 9)
+              .fontWeight(marker.length > 12 ? FontWeight.Medium : FontWeight.Regular)
+              .fontColor($r('sys.color.font_primary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+          }
+          .width(56)
+          .height(18)
+          .alignItems(VerticalAlign.Center)
+          .opacity(marker.opacity)
+          .position({ x: 8, y: marker.y - 9 })
+        }, (marker: TimelineMarker): string => marker.id)
+
+        ProximityLightReceiver()
+          .width('100%')
+          .height('100%')
+          .hitTestBehavior(HitTestMode.None)
+      }
+      .width('100%')
+      .height('100%')
+      .borderRadius(this.widthVp / 2)
+      .clip(true)
+    }
+    .width(this.widthVp)
+    .height(this.heightVp)
+    .borderRadius(this.widthVp / 2)
+    .systemMaterial(this.material)
+    .monopolizeEvents(true)
+    .hitTestBehavior(HitTestMode.Default)
+    .onTouch((event: TouchEvent): void => this.handleTouch(event))
+    .accessibilityText('图片时间轴')
+  }
+}

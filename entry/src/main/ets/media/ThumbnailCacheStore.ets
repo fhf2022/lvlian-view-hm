@@ -25,13 +25,19 @@ export class ThumbnailCacheStore {
   static readonly DEFAULT_LIMIT_BYTES: number = 512 * 1024 * 1024
   private static readonly DIRECTORY_NAME: string = 'ugreen-thumbnail-cache'
   private static readonly INDEX_FILE_NAME: string = 'ugreen-thumbnail-index.json'
-  private static readonly MAX_INDEX_ITEMS: number = 20000
+  // Each physical thumbnail can carry a route key plus a stable identity
+  // alias. Keep the original 20,000-file capacity rather than counting both
+  // references as separate cached images.
+  private static readonly MAX_INDEX_ITEMS: number = 40000
 
   private directory: string = ''
   private indexPath: string = ''
   private items: Record<string, ThumbnailCacheItem> = {}
   private initPromise: Promise<void> | null = null
   private writeQueue: Promise<void> = Promise.resolve()
+  private persistTimer: number = 0
+  private persistDirty: boolean = false
+  private itemCount: number = 0
 
   async initialize(context: Context): Promise<void> {
     if (this.initPromise === null) {
@@ -50,9 +56,10 @@ export class ThumbnailCacheStore {
     }
     const indexed = this.items[cacheKey]
     if (indexed !== undefined && CacheManager.exists(indexed.path)) {
-      this.touch(indexed.path)
+      // Keep logical access time in memory. A later cache write or limit
+      // maintenance persists it; a read hit must not serialize the complete
+      // index while the user is scrolling.
       indexed.lastAccessAt = Date.now()
-      await this.persist()
       return indexed.path
     }
 
@@ -81,13 +88,17 @@ export class ThumbnailCacheStore {
     } catch (_) {
       return
     }
+    const isNewKey = this.items[cacheKey] === undefined
     this.items[cacheKey] = {
       path: path,
       lastAccessAt: Date.now(),
       size: size
     }
+    if (isNewKey) {
+      this.itemCount += 1
+    }
     this.trimIndex()
-    await this.persist()
+    this.schedulePersist()
   }
 
   async enforceLimit(maxBytes: number): Promise<void> {
@@ -102,10 +113,10 @@ export class ThumbnailCacheStore {
         staleKeys.push(key)
       }
     }
-    for (const key of staleKeys) {
-      this.removeKeys([key])
+    if (staleKeys.length > 0) {
+      this.removeKeys(staleKeys)
     }
-    await this.persist()
+    await this.flushPersist()
   }
 
   async usage(): Promise<number> {
@@ -120,7 +131,8 @@ export class ThumbnailCacheStore {
       await CacheManager.clear(this.directory)
     }
     this.items = {}
-    await this.persist()
+    this.itemCount = 0
+    await this.flushPersist()
   }
 
   private async open(context: Context): Promise<void> {
@@ -149,39 +161,40 @@ export class ThumbnailCacheStore {
           size: this.numberValue(raw['size'], 0)
         }
       }
+      const migrated = this.promoteLegacyAliases()
+      this.itemCount = Object.keys(this.items).length
       this.trimIndex()
+      if (migrated) {
+        this.schedulePersist()
+      }
     } catch (_) {
       this.items = {}
-    }
-  }
-
-  private touch(path: string): void {
-    try {
-      // CacheManager's LRU is based on file mtime. Keep it aligned with the
-      // persistent index's logical access time.
-      fileIo.utimes(path, Date.now())
-    } catch (_) {
-      // A best-effort touch must never block displaying a cached thumbnail.
+      this.itemCount = 0
     }
   }
 
   private trimIndex(): void {
-    const keys = Object.keys(this.items)
-    if (keys.length <= ThumbnailCacheStore.MAX_INDEX_ITEMS) {
+    if (this.itemCount <= ThumbnailCacheStore.MAX_INDEX_ITEMS) {
       return
     }
+    const keys = Object.keys(this.items)
     keys.sort((left: string, right: string): number => {
       return this.items[left].lastAccessAt - this.items[right].lastAccessAt
     })
-    while (keys.length > ThumbnailCacheStore.MAX_INDEX_ITEMS) {
-      const oldest = keys.shift()
-      if (oldest === undefined) {
-        break
-      }
-      const oldPath = this.items[oldest].path
-      this.removeKeys([oldest])
-      if (!Object.keys(this.items).some((key: string): boolean => this.items[key].path === oldPath)) {
-        try { fileIo.unlinkSync(oldPath) } catch (_) {}
+    const removeCount = Math.max(0, keys.length - ThumbnailCacheStore.MAX_INDEX_ITEMS)
+    const removedPaths: Record<string, boolean> = {}
+    const removedKeys = keys.slice(0, removeCount)
+    for (const key of removedKeys) {
+      removedPaths[this.items[key].path] = true
+    }
+    this.removeKeys(removedKeys)
+    const retainedPaths: Record<string, boolean> = {}
+    for (const key of Object.keys(this.items)) {
+      retainedPaths[this.items[key].path] = true
+    }
+    for (const path of Object.keys(removedPaths)) {
+      if (retainedPaths[path] !== true) {
+        try { fileIo.unlinkSync(path) } catch (_) {}
       }
     }
   }
@@ -198,6 +211,52 @@ export class ThumbnailCacheStore {
       }
     }
     this.items = next
+    this.itemCount = Object.keys(next).length
+  }
+
+  private promoteLegacyAliases(): boolean {
+    let changed = false
+    for (const key of Object.keys(this.items)) {
+      const identityKey = this.identityAliasForLegacyKey(key)
+      if (identityKey.length > 0 && this.items[identityKey] === undefined) {
+        this.items[identityKey] = this.items[key]
+        changed = true
+      }
+    }
+    return changed
+  }
+
+  private identityAliasForLegacyKey(cacheKey: string): string {
+    const match = /^thumbnail-v3:([^:]+):([^:]+):(.+):([0-9]+):([0-9]+):(.+)$/.exec(cacheKey)
+    if (match === null || match.length < 7) {
+      return ''
+    }
+    return 'thumbnail-v4:' + match[1] + ':' + match[2] + ':' + match[3] + ':' +
+      match[4] + ':' + match[5]
+  }
+
+  private schedulePersist(): void {
+    this.persistDirty = true
+    if (this.persistTimer > 0) {
+      return
+    }
+    this.persistTimer = setTimeout((): void => {
+      this.persistTimer = 0
+      if (!this.persistDirty) {
+        return
+      }
+      this.persistDirty = false
+      this.persist().catch((): void => {})
+    }, 800)
+  }
+
+  private flushPersist(): Promise<void> {
+    if (this.persistTimer > 0) {
+      clearTimeout(this.persistTimer)
+      this.persistTimer = 0
+    }
+    this.persistDirty = false
+    return this.persist()
   }
 
   private persist(): Promise<void> {
