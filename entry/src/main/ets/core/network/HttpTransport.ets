@@ -68,7 +68,9 @@ export class HttpTransport {
       const responseHeaders = this.toHeaders(response.header)
       const status = Number(response.responseCode)
       if (status < 200 || status >= 300) {
-        throw new UgreenError(UgreenErrorKind.NETWORK, '网络请求失败（HTTP ' + status.toString() + '）', status)
+        const kind = status === 404 || status === 410
+          ? UgreenErrorKind.NOT_FOUND : UgreenErrorKind.NETWORK
+        throw new UgreenError(kind, '网络请求失败（HTTP ' + status.toString() + '）', status)
       }
       return new HttpResult<JsonObject>(parsed, status, responseHeaders)
     } catch (error) {

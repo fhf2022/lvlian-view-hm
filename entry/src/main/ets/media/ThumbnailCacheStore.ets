@@ -14,6 +14,13 @@ interface ThumbnailCacheDocument {
   items: Record<string, ThumbnailCacheItem>
 }
 
+interface ThumbnailPhysicalFile {
+  path: string
+  size: number
+  modifiedTime: number
+  lastAccessAt: number
+}
+
 /**
  * Persistent index and storage boundary for list thumbnails.
  *
@@ -37,6 +44,8 @@ export class ThumbnailCacheStore {
   private writeQueue: Promise<void> = Promise.resolve()
   private persistTimer: number = 0
   private persistDirty: boolean = false
+  private accessPersistTimer: number = 0
+  private accessPersistDirty: boolean = false
   private itemCount: number = 0
 
   async initialize(context: Context): Promise<void> {
@@ -50,6 +59,24 @@ export class ThumbnailCacheStore {
     return this.directory
   }
 
+  /**
+   * Hot-path lookup for rendering. The index is loaded and validated during
+   * initialize(), so this method does not stat files, read JSON, or await.
+   * That lets a recycled list item use a durable thumbnail URI in its first
+   * render pass instead of briefly entering the placeholder state.
+   */
+  findFast(cacheKey: string): string {
+    if (cacheKey.length === 0 || this.directory.length === 0) {
+      return ''
+    }
+    const indexed = this.items[cacheKey]
+    if (indexed === undefined) {
+      return ''
+    }
+    this.touchIndexedItem(indexed)
+    return indexed.path
+  }
+
   async find(cacheKey: string, fileName: string): Promise<string> {
     if (cacheKey.length === 0 || fileName.length === 0 || this.directory.length === 0) {
       return ''
@@ -59,7 +86,7 @@ export class ThumbnailCacheStore {
       // Keep logical access time in memory. A later cache write or limit
       // maintenance persists it; a read hit must not serialize the complete
       // index while the user is scrolling.
-      indexed.lastAccessAt = Date.now()
+      this.touchIndexedItem(indexed)
       return indexed.path
     }
 
@@ -105,17 +132,9 @@ export class ThumbnailCacheStore {
     if (this.directory.length === 0) {
       return
     }
-    await CacheManager.enforceLimit(this.directory, maxBytes)
-    const staleKeys: string[] = []
-    for (const key of Object.keys(this.items)) {
-      const item = this.items[key]
-      if (item === undefined || !CacheManager.exists(item.path)) {
-        staleKeys.push(key)
-      }
-    }
-    if (staleKeys.length > 0) {
-      this.removeKeys(staleKeys)
-    }
+    await CacheManager.runSerialized(async (): Promise<void> => {
+      await this.enforceLimitNow(maxBytes)
+    })
     await this.flushPersist()
   }
 
@@ -133,6 +152,108 @@ export class ThumbnailCacheStore {
     this.items = {}
     this.itemCount = 0
     await this.flushPersist()
+  }
+
+  private async enforceLimitNow(maxBytes: number): Promise<void> {
+    if (maxBytes <= 0) {
+      return
+    }
+    const staleKeys: string[] = []
+    const indexedAccess: Record<string, number> = {}
+    for (const key of Object.keys(this.items)) {
+      const item = this.items[key]
+      if (item === undefined || !CacheManager.exists(item.path)) {
+        staleKeys.push(key)
+        continue
+      }
+      const previous = indexedAccess[item.path]
+      indexedAccess[item.path] = previous === undefined
+        ? item.lastAccessAt : Math.max(previous, item.lastAccessAt)
+    }
+    if (staleKeys.length > 0) {
+      this.removeKeys(staleKeys)
+    }
+
+    const files = this.listPhysicalFiles()
+    let total = 0
+    for (const file of files) {
+      total += file.size
+      const indexed = indexedAccess[file.path]
+      file.lastAccessAt = indexed === undefined ? file.modifiedTime : indexed
+    }
+    files.sort((left: ThumbnailPhysicalFile, right: ThumbnailPhysicalFile): number => {
+      return left.lastAccessAt - right.lastAccessAt
+    })
+    for (const file of files) {
+      if (total <= maxBytes) {
+        break
+      }
+      try {
+        fileIo.unlinkSync(file.path)
+        total = Math.max(0, total - file.size)
+        this.removeKeysForPath(file.path)
+      } catch (_) {
+        // A single reclaimed or concurrently removed thumbnail must not stop
+        // the remaining LRU candidates from being considered.
+      }
+    }
+  }
+
+  private listPhysicalFiles(): ThumbnailPhysicalFile[] {
+    const result: ThumbnailPhysicalFile[] = []
+    let names: string[] = []
+    try {
+      names = fileIo.listFileSync(this.directory)
+    } catch (_) {
+      return result
+    }
+    for (const name of names) {
+      const path = this.directory + '/' + name
+      try {
+        const stat = fileIo.statSync(path)
+        if (stat.isFile()) {
+          result.push({
+            path: path,
+            size: stat.size,
+            modifiedTime: stat.mtime * 1000,
+            lastAccessAt: stat.mtime * 1000
+          })
+        }
+      } catch (_) {
+        // The file may disappear between listFileSync and statSync.
+      }
+    }
+    return result
+  }
+
+  private removeKeysForPath(path: string): void {
+    const keys: string[] = []
+    for (const key of Object.keys(this.items)) {
+      if (this.items[key].path === path) {
+        keys.push(key)
+      }
+    }
+    if (keys.length > 0) {
+      this.removeKeys(keys)
+    }
+  }
+
+  private touchIndexedItem(item: ThumbnailCacheItem): void {
+    const now = Date.now()
+    item.lastAccessAt = now
+    // Persist access order occasionally. Never write the whole index for
+    // every Image build; continuous scrolling should remain read-only.
+    this.accessPersistDirty = true
+    if (this.accessPersistTimer <= 0) {
+      this.accessPersistTimer = setTimeout((): void => {
+        this.accessPersistTimer = 0
+        if (!this.accessPersistDirty) {
+          return
+        }
+        this.accessPersistDirty = false
+        this.persist().catch((): void => {})
+      }, 5000)
+    }
   }
 
   private async open(context: Context): Promise<void> {
@@ -256,6 +377,11 @@ export class ThumbnailCacheStore {
       this.persistTimer = 0
     }
     this.persistDirty = false
+    if (this.accessPersistTimer > 0) {
+      clearTimeout(this.accessPersistTimer)
+      this.accessPersistTimer = 0
+    }
+    this.accessPersistDirty = false
     return this.persist()
   }
 

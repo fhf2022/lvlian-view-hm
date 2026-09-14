@@ -15,6 +15,7 @@ class TimelineMarker {
   opacity: number = 1
   length: number = 8
   hasImages: boolean = false
+  isFocus: boolean = false
 }
 
 @Component
@@ -22,11 +23,14 @@ export struct FisheyeTimeline {
   @Prop timeline: DirectoryTimeline = new DirectoryTimeline()
   @Link focusTime: number
   @Prop widthVp: number = 68
+  @Prop railWidthVp: number = 42
   @Prop heightVp: number = 520
+  /** Space owned by the TabBar renderer for native press deformation and shadow. */
+  @Prop verticalEffectInsetVp: number = 16
   @Prop material: uiMaterial.ImmersiveMaterial = new uiMaterial.ImmersiveMaterial({
     style: uiMaterial.ImmersiveStyle.THIN,
     colorInvert: true,
-    applyShadow: true,
+    applyShadow: false,
     interactive: true
   })
   onScrubStart: () => void = () => {}
@@ -38,6 +42,8 @@ export struct FisheyeTimeline {
   private touchStartY: number = 0
   private touchStartFocus: number = 0
   private readonly moveThresholdVp: number = 5
+  private readonly focusBubbleWidthVp: number = 58
+  private readonly focusBubbleHeightVp: number = 30
 
   private clampFocus(value: number): number {
     const earliest = DirectoryTimelinePolicy.localDayStart(this.timeline.earliestTime)
@@ -87,7 +93,7 @@ export struct FisheyeTimeline {
   }
 
   private marker(id: string, time: number, y: number, label: string,
-    kind: TimelinePeriod, opacity: number, length: number): TimelineMarker {
+    kind: TimelinePeriod, opacity: number, length: number, isFocus: boolean = false): TimelineMarker {
     const marker = new TimelineMarker()
     marker.id = id
     marker.time = time
@@ -97,7 +103,13 @@ export struct FisheyeTimeline {
     marker.opacity = opacity
     marker.length = length
     marker.hasImages = this.periodHasImages(time, kind)
+    marker.isFocus = isFocus
     return marker
+  }
+
+  private focusLabel(): string {
+    const date = new Date(this.focusTime)
+    return (date.getMonth() + 1).toString() + '月' + date.getDate().toString() + '日'
   }
 
   private markers(): TimelineMarker[] {
@@ -120,7 +132,8 @@ export struct FisheyeTimeline {
       const temporalOffset = offset - fraction
       result.push(this.marker('d' + offset.toString() + ':' + frameKey, time,
         center + temporalOffset * dayPitch * direction, label, 'day',
-        offset === 0 ? 1 : 0.82 - Math.abs(offset) * 0.08, offset === 0 ? 17 : 11))
+        offset === 0 ? 1 : 0.82 - Math.abs(offset) * 0.08, offset === 0 ? 17 : 11,
+        offset === 0))
     }
 
     const dayExtent = dayPitch * 3
@@ -157,11 +170,12 @@ export struct FisheyeTimeline {
   }
 
   private selectNearest(y: number): void {
+    const railY = y - this.verticalEffectInsetVp
     const markers = this.markers()
     let selected: TimelineMarker | null = null
     let distance = Number.MAX_SAFE_INTEGER
     for (const marker of markers) {
-      const markerDistance = Math.abs(marker.y - y)
+      const markerDistance = Math.abs(marker.y - railY)
       if (markerDistance < distance) {
         selected = marker
         distance = markerDistance
@@ -214,57 +228,91 @@ export struct FisheyeTimeline {
   }
 
   build() {
-    Stack() {
-      Stack({ alignContent: Alignment.Center }) {
-        Row()
-          .width(56)
-          .height(50)
-          .borderRadius(25)
-          .backgroundColor('#18FFFFFF')
+    Stack({ alignContent: Alignment.TopStart }) {
+      // Keep the material surface unclipped so its outer shadow can fade
+      // naturally. Clip only the marker content inside a same-size layer.
+      Stack() {
+        Stack({ alignContent: Alignment.Center }) {
+          Row()
+            .width(1)
+            .height(Math.max(0, this.heightVp - 28))
+            .backgroundColor('#24FFFFFF')
+            .position({ x: 8, y: 14 })
 
-        Row()
-          .width(1)
-          .height(Math.max(0, this.heightVp - 28))
-          .backgroundColor('#24FFFFFF')
-          .position({ x: 12, y: 14 })
+          ForEach(this.markers(), (marker: TimelineMarker) => {
+            if (!marker.isFocus) {
+              Row({ space: 3 }) {
+                Row()
+                  .width(marker.length)
+                  .height(marker.hasImages ? 3 : 1)
+                  .borderRadius(2)
+                  .backgroundColor(marker.hasImages ? '#D92E6BFF' :
+                    $r('sys.color.icon_secondary'))
+                Text(marker.label)
+                  .fontSize(marker.kind === 'day' ? 10 : 9)
+                  .fontWeight(FontWeight.Regular)
+                  .fontColor($r('sys.color.font_primary'))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .layoutWeight(1)
+              }
+              .width(Math.max(30, this.railWidthVp - 8))
+              .height(18)
+              .alignItems(VerticalAlign.Center)
+              .opacity(marker.opacity)
+              .position({ x: 4, y: marker.y - 9 })
+            }
+          }, (marker: TimelineMarker): string => marker.id)
 
-        ForEach(this.markers(), (marker: TimelineMarker) => {
-          Row({ space: 4 }) {
-            Row()
-              .width(marker.length)
-              .height(marker.hasImages ? 3 : 1)
-              .borderRadius(2)
-              .backgroundColor(marker.hasImages ? '#D92E6BFF' :
-                $r('sys.color.icon_secondary'))
-            Text(marker.label)
-              .fontSize(marker.kind === 'day' ? (marker.length > 12 ? 12 : 10) : 9)
-              .fontWeight(marker.length > 12 ? FontWeight.Medium : FontWeight.Regular)
-              .fontColor($r('sys.color.font_primary'))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .layoutWeight(1)
-          }
-          .width(56)
-          .height(18)
-          .alignItems(VerticalAlign.Center)
-          .opacity(marker.opacity)
-          .position({ x: 8, y: marker.y - 9 })
-        }, (marker: TimelineMarker): string => marker.id)
-
-        ProximityLightReceiver()
-          .width('100%')
-          .height('100%')
-          .hitTestBehavior(HitTestMode.None)
+          ProximityLightReceiver()
+            .width('100%')
+            .height('100%')
+            .hitTestBehavior(HitTestMode.None)
+        }
+        .width(this.railWidthVp)
+        .height('100%')
+        .borderRadius(this.railWidthVp / 2)
+        .clip(true)
       }
-      .width('100%')
-      .height('100%')
-      .borderRadius(this.widthVp / 2)
-      .clip(true)
+      .width(this.railWidthVp)
+      .height(this.heightVp)
+      .borderRadius(this.railWidthVp / 2)
+      .systemMaterial(this.material)
+      .shadow({
+        radius: 18,
+        color: '#20000000',
+        offsetX: 0,
+        offsetY: 2
+      })
+      .position({
+        x: Math.max(0, this.widthVp - this.railWidthVp),
+        y: this.verticalEffectInsetVp
+      })
+
+      Stack({ alignContent: Alignment.Center }) {
+        Text(this.focusLabel())
+          .fontSize(12)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('sys.color.font_primary'))
+          .maxLines(1)
+      }
+      .width(this.focusBubbleWidthVp)
+      .height(this.focusBubbleHeightVp)
+      .borderRadius(this.focusBubbleHeightVp / 2)
+      // This surface overlaps the rail, so it must not start a second
+      // material pass. A themed translucent fill keeps the selected date
+      // distinct without cutting the rail's continuous shadow.
+      .backgroundColor($r('app.color.card_glass_bg'))
+      .border({ width: 1, color: '#70FFFFFF' })
+      .position({
+        x: Math.max(0, this.widthVp - this.focusBubbleWidthVp),
+        y: this.verticalEffectInsetVp + this.heightVp / 2 - this.focusBubbleHeightVp / 2
+      })
+      .hitTestBehavior(HitTestMode.None)
     }
     .width(this.widthVp)
-    .height(this.heightVp)
-    .borderRadius(this.widthVp / 2)
-    .systemMaterial(this.material)
+    .height(this.heightVp + this.verticalEffectInsetVp * 2)
+    .clip(false)
     .monopolizeEvents(true)
     .hitTestBehavior(HitTestMode.Default)
     .onTouch((event: TouchEvent): void => this.handleTouch(event))

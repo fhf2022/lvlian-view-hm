@@ -742,11 +742,25 @@ export class UgreenRemoteClient {
     const code = this.numberValue(body['code'])
     if (code !== 200) {
       const message = this.stringValue(body['msg'], context)
-      const kind = this.isAuthenticationFailure(code, message)
-        ? UgreenErrorKind.AUTH_EXPIRED : UgreenErrorKind.UNKNOWN
+      let kind = UgreenErrorKind.UNKNOWN
+      if (this.isAuthenticationFailure(code, message)) {
+        kind = UgreenErrorKind.AUTH_EXPIRED
+      } else if (this.isNotFoundFailure(code, message)) {
+        kind = UgreenErrorKind.NOT_FOUND
+      }
       throw new UgreenError(kind, message, 0, code)
     }
     return this.asRecord(body['data'])
+  }
+
+  private isNotFoundFailure(code: number, message: string): boolean {
+    if (code === 404 || code === 410) {
+      return true
+    }
+    const normalized = message.toLowerCase()
+    return normalized.includes('not found') || normalized.includes('no such file') ||
+      normalized.includes('does not exist') || normalized.includes('不存在') ||
+      normalized.includes('找不到')
   }
 
   /**

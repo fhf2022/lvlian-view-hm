@@ -87,6 +87,19 @@ export class UgreenRemoteRepository {
     await this.thumbnailCacheStore.clear()
   }
 
+  /**
+   * Synchronous thumbnail lookup for the file-surface render hot path. The
+   * thumbnail store has already loaded and validated its index during cache
+   * initialization, so this path does not perform filesystem I/O or network
+   * work. A miss must fall through to prepareThumbnail().
+   */
+  cachedThumbnailFast(entry: FileEntry, profile: ThumbnailProfile = 'list'): string {
+    if (entry.path.length === 0) {
+      return ''
+    }
+    return this.thumbnailCacheStore.findFast(this.thumbnailIdentityKey(entry, profile))
+  }
+
   setMeteredBackgroundRefreshAllowed(allowed: boolean): void {
     this.meteredBackgroundRefreshAllowed = allowed
   }
@@ -406,10 +419,21 @@ export class UgreenRemoteRepository {
   invalidateDirectory(path: string, rootType: number): void {
     this.cacheGeneration += 1
     const key = this.directoryCacheKey(path, rootType)
+    const timer = this.backgroundRefreshTimers[key]
+    if (timer > 0) {
+      clearTimeout(timer)
+    }
+    this.backgroundRefreshTimers[key] = 0
     this.directoryCache.delete(key)
     this.directoryPageCache.delete(key)
     this.directoryRequests.delete(key)
     this.directoryRequestGenerations.delete(key)
+    const pendingPageKeys = Array.from(this.directoryPageRequests.keys())
+    for (const pageKey of pendingPageKeys) {
+      if (pageKey.indexOf(key + ':') === 0) {
+        this.directoryPageRequests.delete(pageKey)
+      }
+    }
     this.directoryIndexRequests.delete(key)
     this.directoryTimelines.delete(key)
     this.directoryTimelineFetchedAt.delete(key)
@@ -873,9 +897,12 @@ export class UgreenRemoteRepository {
     await this.client.removeUploadTemporary(dir, uuid)
   }
 
-  async trash(entry: FileEntry): Promise<void> {
+  async trash(entry: FileEntry, parentPath: string = '', rootType: number = 3): Promise<void> {
     await this.client.trash(entry.path)
-    await this.clearDirectoryMetadataAfterMutation()
+    // Deleting one entry only invalidates its parent directory. Clearing the
+    // complete account metadata database here made the UI wait for unrelated
+    // directories and was especially expensive for large photo libraries.
+    this.invalidateDirectory(parentPath, rootType)
   }
 
   private async clearDirectoryMetadataAfterMutation(): Promise<void> {

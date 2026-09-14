@@ -32,7 +32,7 @@ import { MediaPreviewManager } from '../media/MediaPreviewManager'
 import { ImageRotationRecord, ImageRotationStore } from '../media/ImageRotationStore'
 import { RemoteSearchScope, UgreenRemoteRepository } from '../repository/UgreenRemoteRepository'
 import { BinaryDownloadProgress, BinaryProgressListener } from '../core/network/HttpTransport'
-import { UgreenError, readableUgreenError } from '../ugreen/UgreenErrors'
+import { UgreenError, UgreenErrorKind, readableUgreenError } from '../ugreen/UgreenErrors'
 import { FileEntryDataSource } from '../model/FileEntryDataSource'
 import { PreviewLoadQueue } from '../media/PreviewLoadQueue'
 import { ThumbnailPolicy, ThumbnailSize } from '../media/ThumbnailPolicy'
@@ -57,6 +57,7 @@ type SearchReturnMode = 'none' | 'directory' | 'image' | 'audio' | 'video' | 'do
 type FileAction = 'share' | 'openWith' | 'quickView' | 'multiSelect' | 'download' |
   'saveGallery' | 'releaseCache' | 'rename' | 'details' | 'delete' | 'copy' | 'move'
 type DestinationOperation = 'copy' | 'move'
+type DeleteResolution = 'deleted' | 'failed' | 'unknown'
 
 // Shared-element transitions are deliberately separate from the 180 ms
 // Swiper animation.  The image should have enough time to travel from its
@@ -87,9 +88,16 @@ const FLOATING_BAR_MIN_GAP_VP: number = 8
 const FLOATING_BAR_MAX_GAP_VP: number = 16
 const FLOATING_BAR_CONTENT_EXTRA_VP: number = 32
 const FLOATING_TIMELINE_WIDTH_VP: number = 68
+const FLOATING_TIMELINE_RAIL_WIDTH_VP: number = 42
 const FLOATING_TIMELINE_GAP_VP: number = 8
+const FLOATING_TIMELINE_EFFECT_INSET_VP: number = 16
+const FLOATING_TIMELINE_UPWARD_SHIFT_VP: number = 8
 const DIRECTORY_INDEX_STALE_MS: number = 30 * 1000
 const FILE_TOOL_HEIGHT_VP: number = 40
+// Keep a small number of recently decoded WaterFlow rasters alive. The
+// durable thumbnail files are much cheaper and can cover the rest of the
+// directory; this budget only protects the hot back-scroll path.
+const WATERFALL_BITMAP_MEMORY_LIMIT_BYTES: number = 48 * 1024 * 1024
 // 底栏胶囊宽度随按钮数量自适应：每个页签 82vp，4 项 = 328vp（对齐示例里
 // "按钮少就收窄"的做法）。文件详情页中间的排序胶囊沿用原来的 140vp。
 const BOTTOM_BAR_ITEM_WIDTH_VP: number = 82
@@ -582,6 +590,9 @@ struct Index {
   private fileThumbnailBitmaps: Record<string, ViewerBitmapRecord> = {}
   private fileThumbnailDecodeKeys: Record<string, string> = {}
   private waterfallBitmaps: Record<string, ViewerBitmapRecord> = {}
+  private waterfallBitmapBytes: Record<string, number> = {}
+  private waterfallBitmapLastAccessAt: Record<string, number> = {}
+  private waterfallBitmapTotalBytes: number = 0
   private imageRotationStore: ImageRotationStore = new ImageRotationStore()
   private fileListPersistedDisplayState: ImageDisplayState = new ImageDisplayState()
   private fileListRotationReady: boolean = false
@@ -650,11 +661,14 @@ struct Index {
   private fileContentScrolling: boolean = false
   private pendingDirectoryIndexSnapshot: DirectoryIndexedSnapshot | null = null
   private indexedDirectoryContentSignature: string = ''
+  private locallyDeletedEntryPaths: Record<string, boolean> = {}
+  private pendingDeleteEntryPaths: Record<string, boolean> = {}
   private imageVisualStates: Record<string, ImageVisualState> = {}
   private imageVisualPruneTimer: number = 0
   private imageVisualNotifyTimer: number = 0
   private waterfallOriginalUris: Record<string, string> = {}
   private waterfallAspectRatios: Record<string, number> = {}
+  private waterfallAspectSignatures: Record<string, string> = {}
   private waterfallVisiblePaths: Record<string, boolean> = {}
   private waterfallSourceNotifyTimer: number = 0
   private waterfallAspectNotifyTimer: number = 0
@@ -665,7 +679,9 @@ struct Index {
   private waterfallEntries: FileEntry[] = []
   private waterfallDownloadQueue: FileEntry[] = []
   private waterfallDecodeQueue: FileEntry[] = []
+  private waterfallGeometryQueue: PreviewLoadQueue = new PreviewLoadQueue(2, 32)
   private waterfallLocalPaths: Record<string, string> = {}
+  private waterfallLocalSignatures: Record<string, string> = {}
   private waterfallDownloadRequests: Record<string, boolean> = {}
   private waterfallActiveDownloadPaths: Record<string, boolean> = {}
   private waterfallActiveDecodePaths: Record<string, boolean> = {}
@@ -781,6 +797,13 @@ struct Index {
     style: uiMaterial.ImmersiveStyle.THIN,
     colorInvert: true,
     applyShadow: true,
+    interactive: true,
+    lightEffect: { color: '#66FFFFFF' }
+  })
+  private timelineRailMaterial: uiMaterial.ImmersiveMaterial = new uiMaterial.ImmersiveMaterial({
+    style: uiMaterial.ImmersiveStyle.THIN,
+    colorInvert: true,
+    applyShadow: false,
     interactive: true,
     lightEffect: { color: '#66FFFFFF' }
   })
@@ -1919,10 +1942,14 @@ struct Index {
           this.DirectoryTimelineBar()
         }
         .width(FLOATING_TIMELINE_WIDTH_VP)
-        .height(this.floatingTimelineHeight())
+        .height(this.floatingTimelineHeight() + FLOATING_TIMELINE_EFFECT_INSET_VP * 2)
         .position({
           x: Math.max(0, this.effectivePageWidth() - FLOATING_TIMELINE_WIDTH_VP - 8),
-          y: this.fileContentTopInset() + FLOATING_TIMELINE_GAP_VP
+          // Move the visible rail upward while placing real renderer space
+          // above and below it. The TabBar may clip its own child, but that
+          // clip now lands in the reserved area instead of on the material.
+          y: this.fileContentTopInset() + FLOATING_TIMELINE_GAP_VP -
+            FLOATING_TIMELINE_EFFECT_INSET_VP - FLOATING_TIMELINE_UPWARD_SHIFT_VP
         })
         .translate({ x: 0, y: this.bottomBarOffsetY, z: 0 })
         .opacity(this.shouldShowTimeline() ? this.bottomBarOpacity : 0)
@@ -3014,6 +3041,46 @@ struct Index {
   }
 
   @Builder
+  WaterfallPreviewImage(entry: FileEntry, index: number): void {
+    if (this.waterfallAspectRatioReady(entry)) {
+      Image(this.fileImageSource(entry, 'waterfall'))
+        .width('100%')
+        .height('100%')
+        .sourceSize(this.waterfallSourceSize(entry))
+        .orientation(this.fileImageSourceOrientation(entry, 'waterfall'))
+        .objectFit(ImageFit.Contain)
+        .geometryTransition(this.fileImageTransitionId(entry, 'waterfall'))
+        .syncLoad(this.fileImageShouldSyncLoad(entry))
+        .opacity(1)
+        .onComplete((event?: ViewerImageCompleteEvent): void => {
+          this.recordThumbnailComplete(entry, this.thumbnailSurfaceUri(entry, 'waterfall'), index,
+            'waterfall', event)
+          this.completeWaterfallDecode(entry)
+        })
+        .onError(() => this.failWaterfallDecode(entry))
+    } else {
+      // Do not pass a provisional square sourceSize. ArkUI can reuse the
+      // decoded raster while WaterFlow is recycling the item, so the first
+      // decode must wait for Image Kit geometry instead of seeding a 1:1
+      // target that belongs to the temporary FlowItem.
+      Image(this.fileImageSource(entry, 'waterfall'))
+        .width('100%')
+        .height('100%')
+        .orientation(this.fileImageSourceOrientation(entry, 'waterfall'))
+        .objectFit(ImageFit.Contain)
+        .geometryTransition(this.fileImageTransitionId(entry, 'waterfall'))
+        .syncLoad(this.fileImageShouldSyncLoad(entry))
+        .opacity(0)
+        .onComplete((event?: ViewerImageCompleteEvent): void => {
+          this.recordThumbnailComplete(entry, this.thumbnailSurfaceUri(entry, 'waterfall'), index,
+            'waterfall', event)
+          this.completeWaterfallDecode(entry)
+        })
+        .onError(() => this.failWaterfallDecode(entry))
+    }
+  }
+
+  @Builder
   WaterfallFileList(): void {
     WaterFlow({
       scroller: this.waterfallScroller,
@@ -3030,21 +3097,10 @@ struct Index {
               Stack() {
                 Stack({ alignContent: Alignment.Center }) {
                   if (this.fileImageSourceAvailable(entry, 'waterfall')) {
-                    Image(this.fileImageSource(entry, 'waterfall'))
-                      .width('100%')
-                      .height('100%')
-                      .sourceSize(this.waterfallSourceSize(entry))
-                      .orientation(this.fileImageSourceOrientation(entry, 'waterfall'))
-                      .objectFit(ImageFit.Contain)
-                      .geometryTransition(this.fileImageTransitionId(entry, 'waterfall'))
-                      .syncLoad(this.fileImageShouldSyncLoad(entry))
-                      .onComplete((event?: ViewerImageCompleteEvent): void => {
-                        this.recordThumbnailComplete(entry, this.waterfallUri(entry), index,
-                          'waterfall', event)
-                        this.completeWaterfallDecode(entry)
-                      })
-                      .onError(() => this.failWaterfallDecode(entry))
-                  } else {
+                    this.WaterfallPreviewImage(entry, index)
+                  }
+                  if (!this.fileImageSourceAvailable(entry, 'waterfall') ||
+                    !this.waterfallAspectRatioReady(entry)) {
                     LoadingProgress()
                       .width(24)
                       .height(24)
@@ -3092,7 +3148,10 @@ struct Index {
         .onAppear(() => {
           this.resolveFileListImageRotation(entry)
           this.markWaterfallVisible(entry, true)
-          this.recordThumbnailMountedSource(entry, this.waterfallUri(entry), index, 'waterfall')
+          this.recordThumbnailMountedSource(entry, this.thumbnailSurfaceUri(entry, 'waterfall'), index,
+            'waterfall')
+          this.loadEntryPreview(entry, this.previewPriority(index, 'waterfall'))
+          this.enqueueWaterfallPreviewGeometry(entry, index)
           this.enqueueWaterfallOriginal(entry, index)
         })
         .onDisAppear(() => {
@@ -3940,11 +3999,11 @@ struct Index {
     .vertical(false)
     .scrollable(false)
     .barOverlap(true)
-    .barHeight(this.floatingTimelineHeight())
+    .barHeight(this.floatingTimelineHeight() + FLOATING_TIMELINE_EFFECT_INSET_VP * 2)
     .barBackgroundColor(Color.Transparent)
     .barBackgroundBlurStyle(BlurStyle.NONE)
     .width(FLOATING_TIMELINE_WIDTH_VP)
-    .height(this.floatingTimelineHeight())
+    .height(this.floatingTimelineHeight() + FLOATING_TIMELINE_EFFECT_INSET_VP * 2)
     .clip(false)
     .hitTestBehavior(HitTestMode.Default)
   }
@@ -3955,8 +4014,10 @@ struct Index {
       timeline: this.directoryTimeline,
       focusTime: $timelineFocusTime,
       widthVp: FLOATING_TIMELINE_WIDTH_VP,
+      railWidthVp: FLOATING_TIMELINE_RAIL_WIDTH_VP,
       heightVp: this.floatingTimelineHeight(),
-      material: this.bottomCapsuleMaterial,
+      verticalEffectInsetVp: FLOATING_TIMELINE_EFFECT_INSET_VP,
+      material: this.timelineRailMaterial,
       onScrubStart: (): void => { this.beginTimelineScrub() },
       onScrub: (time: number): void => { this.previewTimelineTime(time) },
       onScrubEnd: (time: number): void => { this.finishTimelineScrub(time) },
@@ -4640,8 +4701,8 @@ struct Index {
   /**
    * Native ContextMenu content.  Widths and section rhythm follow the Files
    * reference: a compact menu (224vp) below a wider selected-item card,
-   * with quick actions in the first group and destructive actions at the end.
-   */
+  * with quick actions in the first group and destructive actions at the end.
+  */
   @Builder
   ActionContextMenu(entry: FileEntry): void {
     Menu() {
@@ -5566,11 +5627,14 @@ struct Index {
     if (surface === 'waterfall') {
       const waterfallBitmap = this.waterfallBitmaps[entry.path]
       if (waterfallBitmap !== undefined) {
+        this.touchWaterfallBitmap(entry.path)
         return waterfallBitmap.pixelMap
       }
-      // 瀑布流只显示原图：图片要等原图解码完成，避免退回 256px 服务端缩略图
-      // 让人误以为瀑布流是压缩图；非图片条目（视频等）直接用本地原文件 URI。
-      return this.isImage(entry) ? '' : this.waterfallUri(entry)
+      // Use the durable list thumbnail as an immediate first frame. The
+      // waterfall pipeline can still replace it with the column-sized local
+      // original after the current scroll settles, without exposing a blank
+      // card while that decode is in flight.
+      return this.isImage(entry) ? this.previewUri(entry) : this.waterfallUri(entry)
     }
     if (this.isImage(entry)) {
       // The normal file surface is URI-backed. ArkUI owns the bounded
@@ -5635,6 +5699,22 @@ struct Index {
     let localPath = this.previewLocalPaths[entry.path]
     if (typeof localPath !== 'string' || localPath.length === 0 || !CacheManager.exists(localPath)) {
       localPath = this.waterfallLocalPaths[entry.path]
+    }
+    if (typeof localPath !== 'string' || localPath.length === 0 || !CacheManager.exists(localPath)) {
+      // previewUri() can now render directly from the persistent thumbnail
+      // index. That hot path intentionally avoids publishing UI state while a
+      // row is being recycled, but the shared-element transition still needs
+      // the local file so both surfaces can consume the same decoded raster.
+      // Recover that path only when entering/leaving the viewer; this keeps
+      // scrolling free of filesystem work and preserves the original
+      // transition contract.
+      const cachedPath = this.repository.cachedThumbnailFast(entry, 'list')
+      if (cachedPath.length > 0 && CacheManager.exists(cachedPath)) {
+        localPath = cachedPath
+        this.previewLocalPaths[entry.path] = cachedPath
+        this.previewLocalSignatures[entry.path] = this.previewSignature(entry)
+        this.previewCanonicalPaths[entry.path] = false
+      }
     }
     if (typeof localPath !== 'string' || localPath.length === 0 || !CacheManager.exists(localPath)) {
       return null
@@ -5731,6 +5811,9 @@ struct Index {
 
   private installViewerBitmap(target: Record<string, ViewerBitmapRecord>,
     path: string, record: ViewerBitmapRecord): void {
+    const isWaterfallTarget = target !== this.viewerPreviewBitmaps &&
+      target !== this.viewerOriginalBitmaps
+    const previous = target[path]
     const next: Record<string, ViewerBitmapRecord> = {}
     for (const key of Object.keys(target)) {
       next[key] = target[key]
@@ -5743,8 +5826,20 @@ struct Index {
       this.viewerOriginalBitmaps = next
     } else {
       this.waterfallBitmaps = next
+      if (previous !== undefined && previous !== record) {
+        const previousBytes = this.waterfallBitmapBytes[path]
+        this.waterfallBitmapTotalBytes = Math.max(0,
+          this.waterfallBitmapTotalBytes - (previousBytes === undefined ? 0 : previousBytes))
+      }
+      const bytes = this.waterfallBitmapSize(record)
+      this.waterfallBitmapBytes[path] = bytes
+      this.waterfallBitmapLastAccessAt[path] = Date.now()
+      this.waterfallBitmapTotalBytes += bytes
     }
     this.bumpViewerBitmapEpoch()
+    if (isWaterfallTarget) {
+      this.trimWaterfallBitmapCache()
+    }
   }
 
   private async installFileThumbnailBitmap(entry: FileEntry,
@@ -5803,6 +5898,62 @@ struct Index {
     return record
   }
 
+  private waterfallBitmapSize(record: ViewerBitmapRecord): number {
+    try {
+      return Math.max(1, record.pixelMap.getPixelBytesNumber())
+    } catch (_) {
+      return Math.max(1, record.decodeWidth * record.decodeHeight * 4)
+    }
+  }
+
+  private touchWaterfallBitmap(path: string): void {
+    if (this.waterfallBitmaps[path] !== undefined) {
+      this.waterfallBitmapLastAccessAt[path] = Date.now()
+    }
+  }
+
+  private removeWaterfallBitmapTracking(path: string): void {
+    const bytes = this.waterfallBitmapBytes[path]
+    if (bytes !== undefined) {
+      this.waterfallBitmapTotalBytes = Math.max(0, this.waterfallBitmapTotalBytes - bytes)
+    }
+    // ArkTS does not support delete on dynamic records. Zeroing the tracking
+    // entries is equivalent here because the authoritative bitmap map has
+    // already removed the PixelMap and the next install overwrites them.
+    this.waterfallBitmapBytes[path] = 0
+    this.waterfallBitmapLastAccessAt[path] = 0
+  }
+
+  private trimWaterfallBitmapCache(): void {
+    while (this.waterfallBitmapTotalBytes > WATERFALL_BITMAP_MEMORY_LIMIT_BYTES) {
+      let oldestPath = ''
+      let oldestAccess = Number.MAX_SAFE_INTEGER
+      for (const path of Object.keys(this.waterfallBitmaps)) {
+        if (this.waterfallVisiblePaths[path] === true ||
+          (this.viewerPreviewBitmapAliases[path] === true &&
+            this.viewerPreviewBitmaps[path] === this.waterfallBitmaps[path])) {
+          continue
+        }
+        const access = this.waterfallBitmapLastAccessAt[path] || 0
+        if (access < oldestAccess) {
+          oldestPath = path
+          oldestAccess = access
+        }
+      }
+      if (oldestPath.length === 0) {
+        return
+      }
+      const record = this.removeViewerBitmap(this.waterfallBitmaps, oldestPath)
+      if (record === null) {
+        continue
+      }
+      this.waterfallDecodedPaths[oldestPath] = false
+      this.waterfallOriginalUris[oldestPath] = ''
+      this.scheduleWaterfallSourceNotify()
+      this.viewerBitmapStore.release(record).catch((): void => {})
+    }
+  }
+
   private async publishImagePreview(entry: FileEntry, localPath: string,
     canonical: boolean, generation: number): Promise<void> {
     if (generation !== this.previewGeneration || localPath.length === 0) {
@@ -5812,6 +5963,9 @@ struct Index {
     // reserved for the selected viewer image and its shared-element handoff;
     // doing it here for every visible row was the main source of scroll jank.
     this.setPreviewUri(entry, fileUri.getUriFromPath(localPath), localPath, canonical)
+    if (this.fileViewMode === 'waterfall' && this.waterfallVisiblePaths[entry.path] === true) {
+      this.enqueueWaterfallPreviewGeometry(entry, this.waterfallVisibleStartIndex)
+    }
   }
 
   /**
@@ -5867,6 +6021,7 @@ struct Index {
       this.viewerOriginalBitmaps = next
     } else {
       this.waterfallBitmaps = next
+      this.removeWaterfallBitmapTracking(path)
     }
     this.bumpViewerBitmapEpoch()
     return existing
@@ -6029,7 +6184,8 @@ struct Index {
       return { width: state.displayWidth, height: state.displayHeight }
     }
     const waterfallRatio = this.waterfallAspectRatios[entry.path]
-    if (typeof waterfallRatio === 'number' && waterfallRatio > 0) {
+    if (typeof waterfallRatio === 'number' && waterfallRatio > 0 &&
+      this.waterfallAspectSignatures[entry.path] === this.waterfallEntrySignature(entry)) {
       return { width: waterfallRatio, height: 1 }
     }
     return null
@@ -6183,7 +6339,10 @@ struct Index {
   private thumbnailSurfaceUri(entry: FileEntry, surface: ThumbnailSurfaceKind): string {
     if (surface === 'waterfall') {
       const uri = this.waterfallOriginalUris[entry.path]
-      return typeof uri === 'string' ? uri : ''
+      if (typeof uri === 'string' && uri.length > 0) {
+        return uri
+      }
+      return this.previewUri(entry)
     }
     return this.previewUri(entry)
   }
@@ -6224,18 +6383,16 @@ struct Index {
       state.thumbnailSurface = surface
       state.transitionThumbnailUri = uri
       state.thumbnailDecodedUri = uri
-      state.thumbnailDisplayWidth = displayWidth
-      state.thumbnailDisplayHeight = displayHeight
-    }, false)
-    if (surface === 'waterfall' &&
-      (this.waterfallAspectRatios[entry.path] === undefined ||
-        this.waterfallAspectRatios[entry.path] <= 0)) {
-      const ratioWidth = displayWidth > 0 ? displayWidth : event.width
-      const ratioHeight = displayHeight > 0 ? displayHeight : event.height
-      if (ratioWidth > 0 && ratioHeight > 0) {
-        this.setWaterfallAspectRatio(entry.path, ratioWidth, ratioHeight)
+      // A URI-backed WaterFlow thumbnail may still be rendered with AUTO
+      // orientation. Its onComplete source axes are not authoritative for
+      // the visible card until Image Kit has resolved EXIF/user rotation.
+      // Keep those dimensions out of the viewer frame candidate; the
+      // rotation-aware geometry pipeline fills them in instead.
+      if (surface !== 'waterfall') {
+        state.thumbnailDisplayWidth = displayWidth
+        state.thumbnailDisplayHeight = displayHeight
       }
-    }
+    }, false)
     if (this.showImageViewer && this.viewerImageEntry !== null &&
       this.viewerImageEntry.path === entry.path) {
       this.logViewerDiagnostic('file-source-decoded', entry.path)
@@ -7811,6 +7968,7 @@ struct Index {
       // The app can still use the default limit if preferences are unavailable.
     }
     await this.refreshCacheUsage()
+    this.scheduleImageVisualNotify()
   }
 
   private ensureNetworkState(): Promise<void> {
@@ -8606,6 +8764,7 @@ struct Index {
 
   private prepareWaterfallPipeline(): void {
     this.waterfallGeneration += 1
+    this.waterfallGeometryQueue.cancelPending()
     this.waterfallDownloadQueue = []
     this.waterfallDecodeQueue = []
     this.waterfallDownloadRequests = {}
@@ -8623,6 +8782,7 @@ struct Index {
     // A generation change makes in-flight HTTP work self-cancel through its
     // continuation callback. Completed originals remain in the normal cache.
     this.waterfallGeneration += 1
+    this.waterfallGeometryQueue.cancelPending()
     this.waterfallDownloadQueue = []
     this.waterfallDecodeQueue = []
     this.waterfallDownloadRequests = {}
@@ -8636,6 +8796,9 @@ struct Index {
     this.waterfallSourceEpoch += 1
     const bitmaps = this.waterfallBitmaps
     this.waterfallBitmaps = {}
+    this.waterfallBitmapBytes = {}
+    this.waterfallBitmapLastAccessAt = {}
+    this.waterfallBitmapTotalBytes = 0
     this.bumpViewerBitmapEpoch()
     for (const key of Object.keys(bitmaps)) {
       if (this.viewerPreviewBitmapAliases[key] === true &&
@@ -8659,23 +8822,29 @@ struct Index {
     return typeof uri === 'string' ? uri : ''
   }
 
-  private waterfallAspectRatio(entry: FileEntry): number {
+  private resolvedWaterfallAspectRatio(entry: FileEntry): number {
     const aspectEpoch = this.waterfallAspectEpoch
     if (aspectEpoch < 0) {
-      return 1
+      return 0
     }
     const value = this.waterfallAspectRatios[entry.path]
     // This cache contains the final Image Kit raster ratio after EXIF and the
     // persisted user rotation. WaterFlow must measure the same axes that the
     // Image node renders.
-    if (typeof value === 'number' && value > 0) {
+    if (typeof value === 'number' && value > 0 &&
+      this.waterfallAspectSignatures[entry.path] === this.waterfallEntrySignature(entry)) {
       return value
     }
-    const state = this.imageVisualState(entry.path)
-    if (state.displayWidth > 0 && state.displayHeight > 0) {
-      return state.displayWidth / state.displayHeight
-    }
-    return 1
+    return 0
+  }
+
+  private waterfallAspectRatioReady(entry: FileEntry): boolean {
+    return this.resolvedWaterfallAspectRatio(entry) > 0
+  }
+
+  private waterfallAspectRatio(entry: FileEntry): number {
+    const ratio = this.resolvedWaterfallAspectRatio(entry)
+    return ratio > 0 ? ratio : 1
   }
 
   private waterfallSourceSize(entry: FileEntry): ThumbnailSize {
@@ -8712,6 +8881,16 @@ struct Index {
       return
     }
     if (!visible && !retainedForViewer) {
+      const cachedBitmap = this.waterfallBitmaps[entry.path]
+      if (cachedBitmap !== undefined) {
+        // Keep recently decoded rasters available for a reverse scroll. The
+        // bounded LRU, rather than every onDisAppear callback, decides when
+        // the PixelMap is safe to release.
+        this.touchWaterfallBitmap(entry.path)
+        this.waterfallDecodedPaths[entry.path] = true
+        this.trimWaterfallBitmapCache()
+        return
+      }
       this.releaseViewerBitmap(this.waterfallBitmaps, entry.path).catch((): void => {})
       this.waterfallOriginalUris[entry.path] = ''
       this.scheduleWaterfallSourceNotify()
@@ -8743,11 +8922,14 @@ struct Index {
     }, false)
   }
 
-  private setWaterfallAspectRatio(path: string, width: number, height: number): void {
-    if (path.length === 0 || width <= 0 || height <= 0) {
+  private setWaterfallAspectRatio(entry: FileEntry, width: number, height: number,
+    rotationOverride?: number): void {
+    if (entry.path.length === 0 || width <= 0 || height <= 0) {
       return
     }
-    this.waterfallAspectRatios[path] = width / height
+    this.waterfallAspectRatios[entry.path] = width / height
+    this.waterfallAspectSignatures[entry.path] = this.waterfallEntrySignature(entry,
+      rotationOverride)
     this.scheduleWaterfallAspectNotify()
   }
 
@@ -8771,6 +8953,86 @@ struct Index {
     }, 16)
   }
 
+  private enqueueWaterfallPreviewGeometry(entry: FileEntry, index: number = 0): void {
+    if (this.fileViewMode !== 'waterfall' || !this.isImage(entry) ||
+      !this.fileListRotationReady || this.waterfallAspectRatioReady(entry) ||
+      this.timelineScrubActive || this.fileContentScrolling ||
+      this.waterfallVisiblePaths[entry.path] !== true) {
+      return
+    }
+    const generation = this.waterfallGeneration
+    const queueKey = entry.path + '#waterfall-geometry:' + generation.toString()
+    this.waterfallGeometryQueue.enqueue(queueKey, this.previewPriority(index, 'waterfall'),
+      async (): Promise<void> => {
+        await this.loadWaterfallPreviewGeometry(entry, generation)
+      })
+  }
+
+  private async loadWaterfallPreviewGeometry(entry: FileEntry,
+    generation: number): Promise<void> {
+    await this.ensureCacheState()
+    if (generation !== this.waterfallGeneration || this.fileViewMode !== 'waterfall' ||
+      this.fileContentScrolling || this.timelineScrubActive ||
+      this.waterfallVisiblePaths[entry.path] !== true || this.waterfallAspectRatioReady(entry)) {
+      return
+    }
+
+    // Match the viewer's frame policy. An already cached original is
+    // authoritative; otherwise the persistent thumbnail supplies the same
+    // EXIF- and user-rotation-aware provisional geometry used on viewer entry.
+    let localPath = CacheManager.findExisting(this.cacheDirectory, entry.name,
+      this.originalCacheKey(entry))
+    let canonicalPreview = false
+    let usesPreview = false
+    if (localPath.length === 0) {
+      localPath = this.previewLocalPaths[entry.path]
+      canonicalPreview = this.previewCanonicalPaths[entry.path] === true
+      usesPreview = true
+      if (typeof localPath !== 'string' || localPath.length === 0 ||
+        this.previewLocalSignatures[entry.path] !== this.previewSignature(entry) ||
+        !CacheManager.exists(localPath)) {
+        localPath = this.repository.cachedThumbnailFast(entry, 'list')
+        canonicalPreview = false
+        if (localPath.length > 0 && CacheManager.exists(localPath)) {
+          this.previewLocalPaths[entry.path] = localPath
+          this.previewLocalSignatures[entry.path] = this.previewSignature(entry)
+          this.previewCanonicalPaths[entry.path] = false
+        }
+      }
+    }
+    if (typeof localPath !== 'string' || localPath.length === 0 || !CacheManager.exists(localPath)) {
+      return
+    }
+
+    const rotation = this.imageVisualState(entry.path).userRotation
+    const geometry = await this.readViewerImageGeometry(localPath, entry.path)
+    if (geometry === null || generation !== this.waterfallGeneration ||
+      this.fileViewMode !== 'waterfall' || this.fileContentScrolling ||
+      this.timelineScrubActive || this.waterfallVisiblePaths[entry.path] !== true ||
+      this.imageVisualState(entry.path).userRotation !== rotation) {
+      return
+    }
+    this.updateImageVisualState(entry.path, (state: ImageVisualState): void => {
+      state.physicalWidth = geometry.physicalWidth
+      state.physicalHeight = geometry.physicalHeight
+      state.exifDisplayWidth = geometry.exifDisplayWidth
+      state.exifDisplayHeight = geometry.exifDisplayHeight
+      state.displayWidth = geometry.displayWidth
+      state.displayHeight = geometry.displayHeight
+      state.thumbnailDisplayWidth = geometry.displayWidth
+      state.thumbnailDisplayHeight = geometry.displayHeight
+      if (!state.frameLocked) {
+        state.frameWidth = geometry.displayWidth
+        state.frameHeight = geometry.displayHeight
+      }
+      if (usesPreview) {
+        state.thumbnailOrientation = canonicalPreview
+          ? ImageRotateOrientation.UP : ImageRotateOrientation.AUTO
+      }
+    })
+    this.setWaterfallAspectRatio(entry, geometry.displayWidth, geometry.displayHeight)
+  }
+
   private enqueueWaterfallOriginal(entry: FileEntry, _index: number = 0,
     priority: boolean = true): void {
     if (this.fileViewMode !== 'waterfall' || !this.isImage(entry) ||
@@ -8778,10 +9040,14 @@ struct Index {
       return
     }
     const localPath = this.waterfallLocalPaths[entry.path]
-    if (typeof localPath === 'string' && localPath.length > 0) {
+    if (typeof localPath === 'string' && localPath.length > 0 &&
+      this.waterfallLocalSignatures[entry.path] === this.waterfallEntrySignature(entry) &&
+      CacheManager.exists(localPath)) {
       this.enqueueWaterfallDecode(entry)
       return
     }
+    this.waterfallLocalPaths[entry.path] = ''
+    this.waterfallLocalSignatures[entry.path] = ''
     if (this.waterfallDownloadRequests[entry.path] === true) {
       return
     }
@@ -8866,7 +9132,7 @@ struct Index {
       }
       this.installViewerBitmap(this.waterfallBitmaps, entry.path, record)
       this.applyDecodedBitmapGeometry(entry.path, record, false)
-      this.setWaterfallAspectRatio(entry.path, record.displayWidth, record.displayHeight)
+      this.setWaterfallAspectRatio(entry, record.displayWidth, record.displayHeight)
       this.setWaterfallOriginalUri(entry.path, fileUri.getUriFromPath(localPath))
       this.waterfallDecodedPaths[entry.path] = true
     } catch (error) {
@@ -8884,7 +9150,11 @@ struct Index {
   }
 
   private completeWaterfallDecode(entry: FileEntry): void {
-    if (this.waterfallActiveDecodePaths[entry.path] !== true) {
+    // A fallback list thumbnail also fires Image.onComplete while the
+    // column-sized PixelMap is being decoded. It must not consume that decode
+    // slot or mark the original raster complete before it is installed.
+    if (this.waterfallBitmaps[entry.path] === undefined ||
+      this.waterfallActiveDecodePaths[entry.path] !== true) {
       return
     }
     this.waterfallActiveDecodePaths[entry.path] = false
@@ -8926,6 +9196,7 @@ struct Index {
         return
       }
       this.waterfallLocalPaths[entry.path] = localPath
+      this.waterfallLocalSignatures[entry.path] = this.waterfallEntrySignature(entry)
       // Keep completed bytes for reuse, but do not publish geometry or start
       // a PixelMap decode while the WaterFlow is moving. The settled visible
       // window will pick this local path up in onScrollStop.
@@ -8934,7 +9205,7 @@ struct Index {
       }
       const geometry = await this.readViewerImageGeometry(localPath, entry.path)
       if (geometry !== null && generation === this.waterfallGeneration) {
-        this.setWaterfallAspectRatio(entry.path, geometry.displayWidth, geometry.displayHeight)
+        this.setWaterfallAspectRatio(entry, geometry.displayWidth, geometry.displayHeight)
       }
       if (this.waterfallVisiblePaths[entry.path] === true) {
         this.enqueueWaterfallDecode(entry)
@@ -9609,10 +9880,17 @@ struct Index {
       this.pendingDirectoryIndexSnapshot = snapshot
       return
     }
-    const contentSignature = snapshot.contentSignature.length > 0
-      ? snapshot.contentSignature : DirectoryTimelinePolicy.contentSignature(snapshot.entries)
+    const effectiveEntries = this.filterDeletedEntries(snapshot.entries, [])
+    const suppressedCount = snapshot.entries.length - effectiveEntries.length
+    const effectiveTimeline = suppressedCount > 0
+      ? DirectoryTimelinePolicy.build(effectiveEntries, snapshot.timeline.complete)
+      : snapshot.timeline
+    const contentSignature = suppressedCount > 0
+      ? DirectoryTimelinePolicy.contentSignature(effectiveEntries)
+      : (snapshot.contentSignature.length > 0
+        ? snapshot.contentSignature : DirectoryTimelinePolicy.contentSignature(snapshot.entries))
     const contentUnchanged = contentSignature === this.indexedDirectoryContentSignature &&
-      this.entries.length === snapshot.entries.length
+      this.entries.length === effectiveEntries.length
     this.pendingDirectoryIndexSnapshot = null
     // A background freshness check must not replace the mounted lazy data
     // source after a fling ends. ArkUI delivers the deferred result from
@@ -9629,9 +9907,9 @@ struct Index {
     }
     this.indexedDirectoryKey = key
     this.indexedDirectoryContentSignature = contentSignature
-    this.directoryTimeline = snapshot.timeline
+    this.directoryTimeline = effectiveTimeline
     this.timelineIndexing = false
-    if (!snapshot.timeline.complete) {
+    if (!effectiveTimeline.complete) {
       this.timelineFocusTime = 0
       this.resetTimelineInteraction()
       return
@@ -9641,12 +9919,13 @@ struct Index {
       // The complete metadata signature proves that the mounted order and
       // timeline inputs are unchanged, so do not sort or replace the lazy
       // container again just to update an access timestamp.
-      this.setCurrentPageState(Math.max(1, Math.ceil(snapshot.entries.length / 200)), false)
+      this.setCurrentPageState(Math.max(1, Math.ceil(effectiveEntries.length / 200)), false)
       this.updateDirectoryCount(this.currentPath,
-        snapshot.totalCount >= 0 ? snapshot.totalCount : snapshot.entries.length)
-      if (snapshot.timeline.eligible()) {
-        const earliest = DirectoryTimelinePolicy.localDayStart(snapshot.timeline.earliestTime)
-        const latest = DirectoryTimelinePolicy.localDayStart(snapshot.timeline.latestTime)
+        snapshot.totalCount >= 0
+          ? Math.max(0, snapshot.totalCount - suppressedCount) : effectiveEntries.length)
+      if (effectiveTimeline.eligible()) {
+        const earliest = DirectoryTimelinePolicy.localDayStart(effectiveTimeline.earliestTime)
+        const latest = DirectoryTimelinePolicy.localDayStart(effectiveTimeline.latestTime)
         if (this.timelineFocusTime < earliest || this.timelineFocusTime > latest) {
           this.timelineFocusTime = this.fileSortAscending ? earliest : latest
         }
@@ -9667,14 +9946,15 @@ struct Index {
     query.rootType = this.currentRootType
     query.sortKey = this.fileSortKey
     query.ascending = this.fileSortAscending
-    const sorted = DirectoryTimelinePolicy.query(snapshot.entries, query)
+    const sorted = DirectoryTimelinePolicy.query(effectiveEntries, query)
     this.setCurrentPageState(Math.max(1, Math.ceil(sorted.length / 200)), false)
     this.replaceEntries(sorted, false, true)
     this.updateDirectoryCount(this.currentPath,
-      snapshot.totalCount >= 0 ? snapshot.totalCount : sorted.length)
-    if (snapshot.timeline.eligible()) {
-      const earliest = DirectoryTimelinePolicy.localDayStart(snapshot.timeline.earliestTime)
-      const latest = DirectoryTimelinePolicy.localDayStart(snapshot.timeline.latestTime)
+      snapshot.totalCount >= 0
+        ? Math.max(0, snapshot.totalCount - suppressedCount) : sorted.length)
+    if (effectiveTimeline.eligible()) {
+      const earliest = DirectoryTimelinePolicy.localDayStart(effectiveTimeline.earliestTime)
+      const latest = DirectoryTimelinePolicy.localDayStart(effectiveTimeline.latestTime)
       if (this.timelineFocusTime < earliest || this.timelineFocusTime > latest) {
         this.timelineFocusTime = this.fileSortAscending ? earliest : latest
       }
@@ -9780,6 +10060,7 @@ struct Index {
   private onFileContentScrollStart(): void {
     this.fileContentScrolling = true
     this.cancelPendingPreviewLoads()
+    this.waterfallGeometryQueue.cancelPending()
     for (const entry of this.waterfallDownloadQueue) {
       this.waterfallDownloadRequests[entry.path] = false
     }
@@ -9957,6 +10238,8 @@ struct Index {
       const entry = source[index]
       this.resolveFileListImageRotation(entry)
       if (this.fileViewMode === 'waterfall') {
+        this.loadEntryPreview(entry, index - start)
+        this.enqueueWaterfallPreviewGeometry(entry, index)
         this.enqueueWaterfallOriginal(entry, index, true)
       } else {
         this.loadEntryPreview(entry, index - start)
@@ -10233,8 +10516,20 @@ struct Index {
       }
     } catch (error) {
       if (requestId === this.navigationRequestId) {
-        this.presentErrorMessage(readableUgreenError(error as Object) + '（路径：' + nextPath + '）', '目录读取失败')
-        this.statusText = '目录读取失败'
+        if (this.isMissingRemoteEntryError(error as Object)) {
+          try {
+            await this.refreshCurrentDirectory([entry.path])
+            this.statusText = '文件夹已不存在，目录已刷新'
+            this.showImmersiveToast('文件夹已不存在，已从目录移除')
+          } catch (refreshError) {
+            this.presentErrorMessage(readableUgreenError(refreshError as Object) +
+              '（路径：' + nextPath + '）', '目录读取失败')
+            this.statusText = '目录读取失败'
+          }
+        } else {
+          this.presentErrorMessage(readableUgreenError(error as Object) + '（路径：' + nextPath + '）', '目录读取失败')
+          this.statusText = '目录读取失败'
+        }
       }
     } finally {
       if (requestId === this.navigationRequestId) {
@@ -11070,6 +11365,7 @@ struct Index {
       this.waterfallDecodedPaths[entry.path] = false
     }
     if (this.fileViewMode === 'waterfall' && this.waterfallVisiblePaths[entry.path] === true) {
+      this.enqueueWaterfallPreviewGeometry(entry)
       this.enqueueWaterfallDecode(entry)
     }
   }
@@ -12015,6 +12311,15 @@ struct Index {
     return imageEntries
   }
 
+  private viewerContainsPath(path: string): boolean {
+    for (const entry of this.viewerImages) {
+      if (entry.path === path) {
+        return true
+      }
+    }
+    return false
+  }
+
   private replaceViewerImages(nextImages: FileEntry[]): void {
     this.viewerImages = nextImages.slice()
     this.viewerImageDataSource.replace(this.viewerImages)
@@ -12249,7 +12554,8 @@ struct Index {
   private async loadViewerCachedOnly(entry: FileEntry, generation: number): Promise<void> {
     try {
       await this.ensureCacheState()
-      if (!this.showImageViewer || generation !== this.viewerGeneration) {
+      if (!this.showImageViewer || generation !== this.viewerGeneration ||
+        !this.viewerContainsPath(entry.path)) {
         return
       }
       const existingPath = CacheManager.findExisting(this.cacheDirectory, entry.name,
@@ -12259,7 +12565,8 @@ struct Index {
       }
       this.markViewerOriginalLoading(entry.path)
       const record = await this.decodeViewerOriginalBitmap(entry, existingPath)
-      if (record === null || !this.showImageViewer || generation !== this.viewerGeneration) {
+      if (record === null || !this.showImageViewer || generation !== this.viewerGeneration ||
+        !this.viewerContainsPath(entry.path)) {
         this.finishViewerOriginalLoading(entry.path, false)
         return
       }
@@ -12274,7 +12581,8 @@ struct Index {
   private async primeCachedViewerOriginal(entry: FileEntry, generation: number): Promise<void> {
     try {
       await this.ensureCacheState()
-      if (generation !== this.viewerGeneration) {
+      if (generation !== this.viewerGeneration || !this.showImageViewer ||
+        !this.viewerContainsPath(entry.path)) {
         return
       }
       const existingPath = CacheManager.findExisting(this.cacheDirectory, entry.name,
@@ -12284,7 +12592,8 @@ struct Index {
       }
       this.markViewerOriginalLoading(entry.path)
       const record = await this.decodeViewerOriginalBitmap(entry, existingPath)
-      if (record === null || generation !== this.viewerGeneration || !this.showImageViewer) {
+      if (record === null || generation !== this.viewerGeneration || !this.showImageViewer ||
+        !this.viewerContainsPath(entry.path)) {
         this.finishViewerOriginalLoading(entry.path, false)
         return
       }
@@ -12306,6 +12615,16 @@ struct Index {
       if (typeof waterfallPath === 'string' && waterfallPath.length > 0) {
         localPath = waterfallPath
         canonical = false
+      }
+    }
+    if (typeof localPath !== 'string' || localPath.length === 0 || !CacheManager.exists(localPath)) {
+      const cachedPath = this.repository.cachedThumbnailFast(entry, 'list')
+      if (cachedPath.length > 0 && CacheManager.exists(cachedPath)) {
+        localPath = cachedPath
+        canonical = false
+        this.previewLocalPaths[entry.path] = cachedPath
+        this.previewLocalSignatures[entry.path] = this.previewSignature(entry)
+        this.previewCanonicalPaths[entry.path] = false
       }
     }
     await this.primeViewerPreviewGeometryAtPath(entry, localPath, canonical)
@@ -12434,14 +12753,16 @@ struct Index {
         : (): boolean => this.showImageViewer && this.shouldAutoLoadViewerOriginal()
       const localPath = existingPath.length > 0
         ? existingPath : await this.ensureCachedFile(entry, progressListener, continueDownload)
-      if (!this.showImageViewer || generation !== this.viewerGeneration) {
+      if (!this.showImageViewer || generation !== this.viewerGeneration ||
+        !this.viewerContainsPath(entry.path)) {
         return
       }
       if (existingPath.length > 0) {
         this.setViewerDownloadProgress(entry.path, 95, true, true)
       }
       const record = await this.decodeViewerOriginalBitmap(entry, localPath)
-      if (record === null || !this.showImageViewer || generation !== this.viewerGeneration) {
+      if (record === null || !this.showImageViewer || generation !== this.viewerGeneration ||
+        !this.viewerContainsPath(entry.path)) {
         return
       }
       this.applyDecodedBitmapGeometry(entry.path, record, true)
@@ -12982,14 +13303,15 @@ struct Index {
       if (nextWaterfall !== null) {
         this.installViewerBitmap(this.waterfallBitmaps, path, nextWaterfall)
         this.waterfallDecodedPaths[path] = true
-        this.setWaterfallAspectRatio(path, nextWaterfall.displayWidth,
-          nextWaterfall.displayHeight)
+        this.setWaterfallAspectRatio(entry, nextWaterfall.displayWidth,
+          nextWaterfall.displayHeight, nextRotation)
       } else {
         if (oldWaterfall !== undefined) {
           this.removeViewerBitmap(this.waterfallBitmaps, path)
           this.waterfallDecodedPaths[path] = false
         }
-        this.setWaterfallAspectRatio(path, visibleRecord.displayWidth, visibleRecord.displayHeight)
+        this.setWaterfallAspectRatio(entry, visibleRecord.displayWidth,
+          visibleRecord.displayHeight, nextRotation)
       }
       this.updateImageVisualState(path, (next: ImageVisualState): void => {
         next.userRotation = nextRotation
@@ -13087,7 +13409,8 @@ struct Index {
   }
 
   private async deleteViewerImage(entry: FileEntry): Promise<void> {
-    if (this.isBusy || !this.showImageViewer) {
+    if (this.isBusy || !this.showImageViewer ||
+      this.isDeletePending(entry.path, this.currentRootType)) {
       return
     }
     const deletedIndex = this.viewerImages.findIndex((item: FileEntry): boolean => {
@@ -13112,56 +13435,50 @@ struct Index {
       return
     }
 
+    const parentPath = this.currentPath
+    const rootType = this.currentRootType
+    if (!this.beginDeleteOperation([entry], rootType)) {
+      return
+    }
+    const originalViewerImages = this.viewerImages.slice()
+    const originalViewerIndex = deletedIndex
     this.isBusy = true
     this.errorText = ''
     this.statusText = '正在移入云盘回收站…'
+    let resolution: DeleteResolution = 'failed'
     try {
-      await this.repository.trash(entry)
-      await this.removePersistedViewerRotation(entry)
-      await this.refreshCurrentDirectory()
-      const remainingImages = this.imageEntriesInCurrentDirectory()
-      if (remainingImages.length === 0) {
-        this.closeImageViewer()
-        this.statusText = '已移入回收站'
-        this.showImmersiveToast('已移入云盘回收站')
-        return
-      }
+      this.applyOptimisticDelete([entry], parentPath, rootType)
+      this.advanceViewerAfterOptimisticDelete(originalViewerImages, deletedIndex, preferredDirection, entry.path)
+      // The visible list/viewer is already consistent. Do not keep the whole
+      // page in the busy state while the NAS confirms the mutation.
+      this.isBusy = false
+      resolution = await this.resolveRemoteDelete(entry, parentPath, rootType)
+    } catch (error) {
+      this.isBusy = false
+      this.reportError(error as Object, '删除失败')
+    }
 
-      const targetIndex = preferredDirection > 0
-        ? (deletedIndex < remainingImages.length ? deletedIndex : remainingImages.length - 1)
-        : (deletedIndex > 0 ? deletedIndex - 1 : 0)
-      const boundedIndex = Math.min(remainingImages.length - 1, Math.max(0, targetIndex))
-      this.replaceViewerImages(remainingImages)
-      this.viewerImageIndex = boundedIndex
-      this.viewerImageEntry = remainingImages[boundedIndex]
-      this.viewerHeaderTitle = remainingImages[boundedIndex].name
-      this.viewerOverlayEntry = null
-      const nextStates: Record<string, ImageVisualState> = {}
-      for (const key of Object.keys(this.imageVisualStates)) {
-        if (key !== entry.path) {
-          nextStates[key] = this.imageVisualStates[key]
-        }
+    this.finishDeleteOperation(entry, rootType, resolution === 'deleted')
+    if (resolution === 'deleted') {
+      this.removePersistedViewerRotation(entry).catch((): void => {})
+      if (originalViewerImages.length > 1) {
+        this.discardDeletedViewerState(entry.path)
+      } else if (this.showImageViewer) {
+        this.closeImageViewer()
       }
-      this.imageVisualStates = nextStates
-      this.imageVisualEpoch += 1
-      this.viewerLoadQueue = this.viewerLoadQueue.filter((item: FileEntry) => item.path !== entry.path)
-      this.viewerLoadRequests[entry.path] = false
-      this.resetImageTransform()
-      if (boundedIndex > deletedIndex) {
-        this.viewerLastNavigationDirection = 1
-      } else if (boundedIndex < deletedIndex) {
-        this.viewerLastNavigationDirection = -1
-      }
-      this.ensureViewerImageFrame(remainingImages[boundedIndex])
-      this.prefetchViewerImages(boundedIndex)
-      this.prepareViewerReturnSource(remainingImages[boundedIndex]).catch((): void => {})
       this.statusText = '已移入回收站'
       this.showImmersiveToast('已移入云盘回收站')
-    } catch (error) {
-      this.reportError(error as Object, '删除失败')
+      return
+    }
+
+    this.restoreOptimisticDelete([entry], parentPath, rootType)
+    this.restoreViewerAfterDelete(entry, originalViewerImages, originalViewerIndex)
+    if (resolution === 'unknown') {
+      this.statusText = '无法确认删除结果，文件已恢复显示'
+      this.showImmersiveToast('无法确认删除结果，已恢复显示')
+    } else {
       this.statusText = '删除失败'
-    } finally {
-      this.isBusy = false
+      this.showImmersiveToast('删除失败，文件已恢复显示')
     }
   }
 
@@ -15441,7 +15758,8 @@ struct Index {
   }
 
   private async deleteSelectedEntries(): Promise<void> {
-    const entries = this.selectedEntriesInCurrentDirectory()
+    const entries = this.selectedEntriesInCurrentDirectory().filter((entry: FileEntry): boolean =>
+      !this.isDeletePending(entry.path, this.currentRootType))
     if (entries.length === 0 || this.isBusy) {
       return
     }
@@ -15458,22 +15776,63 @@ struct Index {
     if (response.index !== 1) {
       return
     }
+    const parentPath = this.currentPath
+    const rootType = this.currentRootType
+    if (!this.beginDeleteOperation(entries, rootType)) {
+      return
+    }
     this.isBusy = true
     this.errorText = ''
     this.statusText = '正在移入云盘回收站…'
+    let resolutions: DeleteResolution[] = []
     try {
-      for (const entry of entries) {
-        await this.repository.trash(entry)
-      }
-      await this.refreshCurrentDirectory()
+      this.applyOptimisticDelete(entries, parentPath, rootType)
       this.exitSelectionMode()
+      this.isBusy = false
+      // Independent trash requests can run together. The list has already
+      // been updated optimistically, so network latency no longer blocks it.
+      resolutions = await Promise.all(entries.map(async (entry: FileEntry): Promise<DeleteResolution> =>
+        await this.resolveRemoteDelete(entry, parentPath, rootType)))
+    } catch (error) {
+      this.isBusy = false
+      this.reportError(error as Object, '删除失败')
+      resolutions = entries.map((): DeleteResolution => 'failed')
+    }
+
+    const failedEntries: FileEntry[] = []
+    let successCount = 0
+    let unknownCount = 0
+    for (let index = 0; index < entries.length; index += 1) {
+      const resolution = resolutions[index] === undefined ? 'failed' : resolutions[index]
+      this.finishDeleteOperation(entries[index], rootType, resolution === 'deleted')
+      if (resolution === 'deleted') {
+        successCount += 1
+        this.removePersistedViewerRotation(entries[index]).catch((): void => {})
+      } else {
+        failedEntries.push(entries[index])
+        if (resolution === 'unknown') {
+          unknownCount += 1
+        }
+      }
+    }
+    if (failedEntries.length > 0) {
+      this.restoreOptimisticDelete(failedEntries, parentPath, rootType)
+    }
+    if (failedEntries.length === 0) {
       this.statusText = '已移入回收站'
       this.showImmersiveToast('已移入云盘回收站')
-    } catch (error) {
-      this.reportError(error as Object, '删除失败')
+    } else if (successCount > 0) {
+      this.statusText = '已删除 ' + successCount.toString() + ' 项，' +
+        '有 ' + failedEntries.length.toString() + ' 项未删除'
+      this.showImmersiveToast(unknownCount > 0
+        ? '部分删除状态无法确认，未确认项目已恢复'
+        : '部分删除失败，未删除项目已恢复')
+    } else if (unknownCount > 0) {
+      this.statusText = '无法确认删除结果，项目已恢复显示'
+      this.showImmersiveToast('无法确认删除结果，项目已恢复显示')
+    } else {
       this.statusText = '删除失败'
-    } finally {
-      this.isBusy = false
+      this.showImmersiveToast('删除失败，项目已恢复显示')
     }
   }
 
@@ -15738,7 +16097,7 @@ struct Index {
   }
 
   private async deleteEntry(entry: FileEntry): Promise<void> {
-    if (this.isBusy) {
+    if (this.isBusy || this.isDeletePending(entry.path, this.currentRootType)) {
       return
     }
     this.closeActionMenu()
@@ -15754,29 +16113,338 @@ struct Index {
     if (response.index !== 1) {
       return
     }
+    const parentPath = this.currentPath
+    const rootType = this.currentRootType
+    if (!this.beginDeleteOperation([entry], rootType)) {
+      return
+    }
     this.isBusy = true
     this.errorText = ''
     this.statusText = '正在移入云盘回收站…'
+    let resolution: DeleteResolution = 'failed'
     try {
-      await this.repository.trash(entry)
-      await this.removePersistedViewerRotation(entry)
-      await this.refreshCurrentDirectory()
+      this.applyOptimisticDelete([entry], parentPath, rootType)
+      this.isBusy = false
+      resolution = await this.resolveRemoteDelete(entry, parentPath, rootType)
+    } catch (error) {
+      this.isBusy = false
+      this.reportError(error as Object, '删除失败')
+    }
+
+    this.finishDeleteOperation(entry, rootType, resolution === 'deleted')
+    if (resolution === 'deleted') {
+      this.removePersistedViewerRotation(entry).catch((): void => {})
       this.statusText = '已移入回收站'
       this.showImmersiveToast('已移入云盘回收站')
-    } catch (error) {
-      this.reportError(error as Object, '删除失败')
+      return
+    }
+
+    this.restoreOptimisticDelete([entry], parentPath, rootType)
+    if (resolution === 'unknown') {
+      this.statusText = '无法确认删除结果，文件已恢复显示'
+      this.showImmersiveToast('无法确认删除结果，已恢复显示')
+    } else {
       this.statusText = '删除失败'
-    } finally {
+      this.showImmersiveToast('删除失败，文件已恢复显示')
+    }
+    if (this.isBusy) {
       this.isBusy = false
     }
   }
 
-  private async refreshCurrentDirectory(): Promise<void> {
+  private beginDeleteOperation(entries: FileEntry[], rootType: number): boolean {
+    for (const entry of entries) {
+      if (this.isDeletePending(entry.path, rootType)) {
+        return false
+      }
+    }
+    for (const entry of entries) {
+      this.pendingDeleteEntryPaths[this.directoryEntryKey(entry.path, rootType)] = true
+    }
+    return true
+  }
+
+  private finishDeleteOperation(entry: FileEntry, rootType: number, deleted: boolean): void {
+    const key = this.directoryEntryKey(entry.path, rootType)
+    this.pendingDeleteEntryPaths[key] = false
+    this.locallyDeletedEntryPaths[key] = deleted
+  }
+
+  private isDeletePending(path: string, rootType: number): boolean {
+    return this.pendingDeleteEntryPaths[this.directoryEntryKey(path, rootType)] === true
+  }
+
+  private async resolveRemoteDelete(entry: FileEntry, parentPath: string,
+    rootType: number): Promise<DeleteResolution> {
+    try {
+      await this.repository.trash(entry, parentPath, rootType)
+      return 'deleted'
+    } catch (error) {
+      const failure = error as Object
+      // Deleting an already missing object has reached the desired final
+      // state. Invalidate the parent so a stale cached row cannot return.
+      if (this.isMissingRemoteEntryError(failure)) {
+        this.repository.invalidateDirectory(parentPath, rootType)
+        return 'deleted'
+      }
+      if (!this.isAmbiguousDeleteError(failure)) {
+        return 'failed'
+      }
+
+      // A timeout or gateway error may happen after NAS has committed the
+      // trash operation. Verify only this exceptional path; normal deletes do
+      // not pay for a second directory scan.
+      const present = await this.remoteEntryPresence(entry, parentPath, rootType)
+      if (present === false) {
+        this.repository.invalidateDirectory(parentPath, rootType)
+        return 'deleted'
+      }
+      return present === null ? 'unknown' : 'failed'
+    }
+  }
+
+  private isAmbiguousDeleteError(error: Object): boolean {
+    if (!(error instanceof UgreenError)) {
+      return true
+    }
+    return error.kind === UgreenErrorKind.NETWORK || error.status === 0 ||
+      error.status === 408 || error.status === 429 || error.status >= 500 ||
+      error.apiCode >= 500
+  }
+
+  private async remoteEntryPresence(entry: FileEntry, parentPath: string,
+    rootType: number): Promise<boolean | null> {
+    try {
+      const remoteEntries = await this.repository.list(parentPath, rootType, true)
+      for (const remoteEntry of remoteEntries) {
+        if (remoteEntry.path === entry.path) {
+          return true
+        }
+      }
+      return false
+    } catch (error) {
+      console.warn('[UgreenDelete] unable to verify delete result: ' + JSON.stringify(error))
+      return null
+    }
+  }
+
+  private applyOptimisticDelete(entries: FileEntry[], parentPath: string, rootType: number): void {
+    const paths: Record<string, boolean> = {}
+    for (const entry of entries) {
+      paths[entry.path] = true
+    }
+    const nextEntries = this.removeEntriesByPathSet(this.entries, paths)
+    const removedCount = this.entries.length - nextEntries.length
+    if (removedCount > 0) {
+      this.replaceEntries(nextEntries, false, true)
+      if (parentPath === this.currentPath && rootType === this.currentRootType) {
+        const knownCount = this.directoryCounts[parentPath]
+        if (typeof knownCount === 'number' && knownCount >= 0) {
+          this.updateDirectoryCount(parentPath, Math.max(0, knownCount - removedCount))
+        }
+      }
+    }
+    if (parentPath.length === 0) {
+      if (rootType === 4) {
+        this.personalRoots = this.removeEntriesByPathSet(this.personalRoots, paths)
+      } else if (rootType === 3) {
+        this.sharedRoots = this.removeEntriesByPathSet(this.sharedRoots, paths)
+      }
+    }
+    const nextSelectedPaths = this.selectedPaths.filter((path: string): boolean => paths[path] !== true)
+    this.selectedPaths = nextSelectedPaths
+    this.selectedEntryCount = nextSelectedPaths.length
+  }
+
+  private restoreOptimisticDelete(entries: FileEntry[], parentPath: string, rootType: number): void {
+    if (parentPath !== this.currentPath || rootType !== this.currentRootType) {
+      return
+    }
+    const existing: Record<string, boolean> = {}
+    for (const entry of this.entries) {
+      existing[entry.path] = true
+    }
+    const restored = this.entries.slice()
+    let restoredCount = 0
+    for (const entry of entries) {
+      if (existing[entry.path] === true) {
+        continue
+      }
+      existing[entry.path] = true
+      restored.push(entry)
+      restoredCount += 1
+    }
+    if (restoredCount > 0) {
+      this.replaceEntries(this.sortEntriesForDisplay(restored), false, true)
+      if (parentPath.length > 0) {
+        const knownCount = this.directoryCounts[parentPath]
+        if (typeof knownCount === 'number' && knownCount >= 0) {
+          this.updateDirectoryCount(parentPath, knownCount + restoredCount)
+        }
+      }
+    }
+    if (parentPath.length === 0) {
+      if (rootType === 4) {
+        this.personalRoots = this.restoreMissingEntries(this.personalRoots, entries)
+      } else if (rootType === 3) {
+        this.sharedRoots = this.restoreMissingEntries(this.sharedRoots, entries)
+      }
+    }
+  }
+
+  private removeEntriesByPathSet(entries: FileEntry[], paths: Record<string, boolean>): FileEntry[] {
+    const result: FileEntry[] = []
+    for (const entry of entries) {
+      if (paths[entry.path] === true) {
+        continue
+      }
+      result.push(entry)
+    }
+    return result
+  }
+
+  private restoreMissingEntries(existingEntries: FileEntry[], additions: FileEntry[]): FileEntry[] {
+    const known: Record<string, boolean> = {}
+    const result = existingEntries.slice()
+    for (const entry of result) {
+      known[entry.path] = true
+    }
+    for (const entry of additions) {
+      if (known[entry.path] === true) {
+        continue
+      }
+      known[entry.path] = true
+      result.push(entry)
+    }
+    return this.sortEntriesForDisplay(result)
+  }
+
+  private advanceViewerAfterOptimisticDelete(originalImages: FileEntry[], deletedIndex: number,
+    preferredDirection: number, deletedPath: string): void {
+    const remainingImages: FileEntry[] = []
+    for (const image of originalImages) {
+      if (image.path !== deletedPath) {
+        remainingImages.push(image)
+      }
+    }
+    if (remainingImages.length === 0) {
+      // Keep the last image mounted until the remote outcome is known. A
+      // failed delete can then be rolled back without reopening the viewer.
+      return
+    }
+    const targetIndex = preferredDirection > 0
+      ? (deletedIndex < remainingImages.length ? deletedIndex : remainingImages.length - 1)
+      : (deletedIndex > 0 ? deletedIndex - 1 : 0)
+    const boundedIndex = Math.min(remainingImages.length - 1, Math.max(0, targetIndex))
+    this.replaceViewerImages(remainingImages)
+    this.viewerImageIndex = boundedIndex
+    this.viewerImageEntry = remainingImages[boundedIndex]
+    this.viewerHeaderTitle = remainingImages[boundedIndex].name
+    this.viewerOverlayEntry = null
+    this.viewerLoadQueue = this.viewerLoadQueue.filter((item: FileEntry): boolean => item.path !== deletedPath)
+    this.viewerLoadRequests[deletedPath] = false
+    this.viewerManualLoadPaths[deletedPath] = false
+    this.resetImageTransform()
+    if (boundedIndex > deletedIndex) {
+      this.viewerLastNavigationDirection = 1
+    } else if (boundedIndex < deletedIndex) {
+      this.viewerLastNavigationDirection = -1
+    }
+    this.ensureViewerImageFrame(remainingImages[boundedIndex])
+    this.prefetchViewerImages(boundedIndex)
+    this.prepareViewerReturnSource(remainingImages[boundedIndex]).catch((): void => {})
+  }
+
+  private restoreViewerAfterDelete(entry: FileEntry, originalImages: FileEntry[],
+    originalIndex: number): void {
+    if (!this.showImageViewer) {
+      return
+    }
+    const currentPath = this.viewerImageEntry === null ? '' : this.viewerImageEntry.path
+    let containsDeleted = false
+    for (const image of this.viewerImages) {
+      if (image.path === entry.path) {
+        containsDeleted = true
+        break
+      }
+    }
+    if (!containsDeleted) {
+      const insertIndex = Math.min(Math.max(0, originalIndex), this.viewerImages.length)
+      const restored: FileEntry[] = []
+      for (let index = 0; index <= this.viewerImages.length; index += 1) {
+        if (index === insertIndex) {
+          restored.push(entry)
+        }
+        if (index < this.viewerImages.length) {
+          restored.push(this.viewerImages[index])
+        }
+      }
+      this.replaceViewerImages(restored)
+    }
+    let targetPath = currentPath
+    if (targetPath.length === 0) {
+      targetPath = entry.path
+    }
+    const targetIndex = this.viewerImages.findIndex((image: FileEntry): boolean => image.path === targetPath)
+    if (targetIndex >= 0) {
+      this.viewerImageIndex = targetIndex
+      this.viewerImageEntry = this.viewerImages[targetIndex]
+      this.viewerHeaderTitle = this.viewerImages[targetIndex].name
+      if (targetPath === entry.path) {
+        this.ensureViewerImageFrame(entry)
+        this.resetImageTransform()
+      }
+    } else if (originalImages.length > 0) {
+      const fallbackIndex = Math.min(Math.max(0, originalIndex), this.viewerImages.length - 1)
+      if (fallbackIndex >= 0) {
+        this.viewerImageIndex = fallbackIndex
+        this.viewerImageEntry = this.viewerImages[fallbackIndex]
+        this.viewerHeaderTitle = this.viewerImages[fallbackIndex].name
+      }
+    }
+  }
+
+  private discardDeletedViewerState(path: string): void {
+    const nextStates: Record<string, ImageVisualState> = {}
+    for (const key of Object.keys(this.imageVisualStates)) {
+      if (key !== path) {
+        nextStates[key] = this.imageVisualStates[key]
+      }
+    }
+    this.imageVisualStates = nextStates
+    this.imageVisualEpoch += 1
+    this.viewerLoadRequests[path] = false
+    this.viewerManualLoadPaths[path] = false
+    this.viewerProgressLastUpdateAt[path] = 0
+    const previewAlias = this.viewerPreviewBitmapAliases[path] === true
+    const preview = this.removeViewerBitmap(this.viewerPreviewBitmaps, path)
+    const original = this.removeViewerBitmap(this.viewerOriginalBitmaps, path)
+    this.viewerOriginalLocalPaths[path] = ''
+    this.viewerPreviewBitmapAliases[path] = false
+    this.postRenderFrame((): void => {
+      if (preview !== null && !previewAlias) {
+        this.viewerBitmapStore.release(preview).catch((): void => {})
+      }
+      if (original !== null) {
+        this.viewerBitmapStore.release(original).catch((): void => {})
+      }
+    })
+  }
+
+  private async refreshCurrentDirectory(excludedPaths: string[] = []): Promise<void> {
+    // A full index may have been fetched from the old directory snapshot and
+    // deferred while the list was scrolling. It must not be allowed to apply
+    // after a mutation refresh, otherwise a deleted row can reappear.
+    this.directoryIndexRequestToken += 1
+    this.pendingDirectoryIndexSnapshot = null
+    this.timelineIndexing = false
     if (this.currentPath.length === 0) {
       this.repository.clearDirectoryCache()
       const root = await this.repository.getRootWithCache(true)
-      this.personalRoots = root.personal
-      this.sharedRoots = root.shared
+      this.clearConfirmedDeletedPaths(root.personal, excludedPaths, 4)
+      this.clearConfirmedDeletedPaths(root.shared, excludedPaths, 3)
+      this.personalRoots = this.filterDeletedEntries(root.personal, excludedPaths, 4)
+      this.sharedRoots = this.filterDeletedEntries(root.shared, excludedPaths, 3)
       this.setCurrentPageState(1, false)
       this.replaceEntries(this.rootKind === 'personal' ? this.personalRoots : this.sharedRoots)
       this.resetPreviewState()
@@ -15789,11 +16457,73 @@ struct Index {
     this.repository.invalidateDirectory(this.currentPath, this.currentRootType)
     const refreshed = await this.loadVisibleDirectoryPages(this.currentPath, this.currentRootType,
       visiblePageIndex, true)
+    this.clearConfirmedDeletedPaths(refreshed.entries, excludedPaths, this.currentRootType)
+    const refreshedEntries = this.filterDeletedEntries(refreshed.entries, excludedPaths)
     this.setCurrentPageState(refreshed.pageIndex, refreshed.hasMore)
-    this.replaceEntries(refreshed.entries)
+    this.replaceEntries(refreshedEntries)
     this.updateDirectoryCount(this.currentPath, refreshed.totalCount >= 0
-      ? refreshed.totalCount : refreshed.entries.length)
+      ? Math.max(0, refreshed.totalCount - (refreshed.entries.length - refreshedEntries.length))
+      : refreshedEntries.length)
     this.resetPreviewState()
+  }
+
+  private directoryEntryKey(path: string, rootType: number = this.currentRootType): string {
+    return rootType.toString() + ':' + path
+  }
+
+  private filterDeletedEntries(entries: FileEntry[], excludedPaths: string[],
+    rootType: number = this.currentRootType): FileEntry[] {
+    const excluded: Record<string, boolean> = {}
+    for (const path of excludedPaths) {
+      if (path.length > 0) {
+        excluded[path] = true
+      }
+    }
+    const result: FileEntry[] = []
+    for (const entry of entries) {
+      if (excluded[entry.path] === true ||
+        this.locallyDeletedEntryPaths[this.directoryEntryKey(entry.path, rootType)] === true ||
+        this.pendingDeleteEntryPaths[this.directoryEntryKey(entry.path, rootType)] === true) {
+        continue
+      }
+      result.push(entry)
+    }
+    return result
+  }
+
+  private clearConfirmedDeletedPaths(entries: FileEntry[], paths: string[], rootType: number): void {
+    for (const path of paths) {
+      if (path.length === 0) {
+        continue
+      }
+      let present = false
+      for (const entry of entries) {
+        if (entry.path === path) {
+          present = true
+          break
+        }
+      }
+      if (!present) {
+        this.locallyDeletedEntryPaths[rootType.toString() + ':' + path] = false
+      }
+    }
+  }
+
+  private isMissingRemoteEntryError(error: Object): boolean {
+    if (error instanceof UgreenError) {
+      if (error.kind === UgreenErrorKind.NOT_FOUND || error.status === 404 ||
+        error.status === 410 || error.apiCode === 404 || error.apiCode === 410) {
+        return true
+      }
+      const errorMessage = error.message.toLowerCase()
+      return errorMessage.includes('not found') || errorMessage.includes('no such file') ||
+        errorMessage.includes('does not exist') || errorMessage.includes('不存在') ||
+        errorMessage.includes('找不到')
+    }
+    const message = String(error).toLowerCase()
+    return message.includes('not found') || message.includes('no such file') ||
+      message.includes('does not exist') || message.includes('不存在') ||
+      message.includes('找不到')
   }
 
   private async loadVisibleDirectoryPages(path: string, rootType: number,
@@ -15867,6 +16597,13 @@ struct Index {
     return entry.modifiedTime.toString() + ':' + entry.size.toString()
   }
 
+  private waterfallEntrySignature(entry: FileEntry, rotationOverride?: number): string {
+    const rotation = rotationOverride === undefined
+      ? this.imageVisualState(entry.path).userRotation : rotationOverride
+    return entry.modifiedTime.toString() + ':' + entry.size.toString() + ':' +
+      entry.etag + ':' + entry.checksum + ':' + rotation.toString()
+  }
+
   private previewUri(entry: FileEntry): string {
     const state = this.imageVisualState(entry.path)
     const signature = this.previewSignature(entry)
@@ -15879,6 +16616,14 @@ struct Index {
     if (typeof retainedPath === 'string' && retainedPath.length > 0 &&
       this.previewLocalSignatures[entry.path] === signature) {
       return fileUri.getUriFromPath(retainedPath)
+    }
+    // The persistent thumbnail index is loaded before the directory is
+    // rendered. Resolve it synchronously from memory so a recycled item can
+    // use its local URI on the first render pass, including while scrolling.
+    // This does not scan the directory or touch the filesystem.
+    const cachedPath = this.repository.cachedThumbnailFast(entry, 'list')
+    if (cachedPath.length > 0) {
+      return fileUri.getUriFromPath(cachedPath)
     }
     return ''
   }
@@ -16052,7 +16797,9 @@ struct Index {
     }
     const unique: FileEntry[] = []
     for (const item of nextEntries) {
-      if (item.path.length === 0 || existing[item.path] === true) {
+      if (item.path.length === 0 || existing[item.path] === true ||
+        this.locallyDeletedEntryPaths[this.directoryEntryKey(item.path)] === true ||
+        this.pendingDeleteEntryPaths[this.directoryEntryKey(item.path)] === true) {
         continue
       }
       existing[item.path] = true
@@ -16099,7 +16846,7 @@ struct Index {
     if (appendOnly && nextImages.length >= previous.length) {
       let keepsPrefix = true
       for (let index = 0; index < previous.length; index++) {
-        if (nextImages[index].path !== previous[index].path) {
+        if (!this.sameWaterfallEntry(nextImages[index], previous[index])) {
           keepsPrefix = false
           break
         }
@@ -16113,16 +16860,32 @@ struct Index {
     let unchanged = previous.length === nextImages.length
     if (unchanged) {
       for (let index = 0; index < previous.length; index++) {
-        if (previous[index].path !== nextImages[index].path) {
+        if (!this.sameWaterfallEntry(previous[index], nextImages[index])) {
           unchanged = false
           break
         }
       }
     }
     if (!unchanged) {
+      // WaterFlow and its PixelMap cache are keyed by path, but a NAS refresh
+      // can replace the file at the same path. Drop the complete waterfall
+      // pipeline before replacing the data source so an old aspect ratio or
+      // decoded bitmap cannot be attached to the new file.
+      this.resetWaterfallDirectoryState()
       this.waterfallEntries = nextImages
       this.waterfallDataSource.replace(nextImages)
     }
+  }
+
+  private sameWaterfallEntry(left: FileEntry, right: FileEntry): boolean {
+    return left.path === right.path && left.name === right.name &&
+      left.isDirectory === right.isDirectory && left.size === right.size &&
+      left.modifiedTime === right.modifiedTime && left.createdTime === right.createdTime &&
+      left.childCount === right.childCount && left.rootType === right.rootType &&
+      left.intranetShareId === right.intranetShareId &&
+      left.thumbnailUrl === right.thumbnailUrl && left.coverUrl === right.coverUrl &&
+      left.mimeType === right.mimeType && left.etag === right.etag &&
+      left.checksum === right.checksum
   }
 
   private hasDirectImageFiles(entries: FileEntry[]): boolean {
@@ -16183,7 +16946,9 @@ struct Index {
   private resetWaterfallDirectoryState(): void {
     this.stopWaterfallPipeline()
     this.waterfallLocalPaths = {}
+    this.waterfallLocalSignatures = {}
     this.waterfallAspectRatios = {}
+    this.waterfallAspectSignatures = {}
     this.waterfallAspectEpoch += 1
     this.waterfallAnchor = null
     this.waterfallVisibleStartIndex = 0

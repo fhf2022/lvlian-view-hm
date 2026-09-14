@@ -22,6 +22,17 @@ export class CacheManager {
   static readonly LIMIT_5_GB: number = 5 * 1024 * 1024 * 1024
   private static writeQueue: Promise<void> = Promise.resolve()
 
+  /**
+   * Run cache maintenance in the same serialized lane as cache writes.
+   * Specialized stores can apply their own eviction policy without racing a
+   * file that is still being written by save().
+   */
+  static async runSerialized(operation: () => Promise<void>): Promise<void> {
+    const next = CacheManager.writeQueue.then(operation)
+    CacheManager.writeQueue = next.catch((): void => {})
+    await next
+  }
+
   static async save(bytes: Uint8Array, directory: string, fileName: string, maxBytes: number,
     cacheKey: string = ''): Promise<string> {
     const targetPath = CacheManager.cachePath(directory, fileName, cacheKey)
