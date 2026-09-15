@@ -611,6 +611,13 @@ struct Index {
   private destinationTreeRequestToken: number = 0
   private destinationPickerCloseToken: number = 0
   private pendingContextAction: (() => void) | null = null
+  /**
+   * Transparent margin kept around the long-press menu surface. It must stay 0:
+   * the native menu paints its own stroke around the whole content box, so any
+   * transparent ring here exposes that stroke as a second, outer frame next to
+   * the surface's own edge. The anchor offset below tracks this value.
+   */
+  private actionMenuSafeMargin: number = 0
   private fileEntryDataSource: FileEntryDataSource = new FileEntryDataSource()
   private waterfallDataSource: FileEntryDataSource = new FileEntryDataSource()
   private viewerImageDataSource: FileEntryDataSource = new FileEntryDataSource()
@@ -2047,6 +2054,10 @@ struct Index {
     .height('100%')
     .backgroundColor($r('app.color.page_background'))
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+    // While the long-press menu is up, swallow page touches so the tap that
+    // dismisses the menu cannot also activate the file list underneath
+    // (official bindContextMenu event-passthrough guidance).
+    .hitTestBehavior(this.contextMenuEntry !== null ? HitTestMode.Block : HitTestMode.Default)
   }
 
   @Builder
@@ -4641,7 +4652,12 @@ struct Index {
     Column() {}
       .width(Math.min(324, this.effectivePageWidth() - 52))
       .height(58)
-      .position({ x: 26, y: this.contextMenuSourceY })
+      // Offset by the menu's transparent safe margin so the visible surface
+      // still lands exactly where it used to.
+      .position({
+        x: 26 - this.actionMenuSafeMargin,
+        y: this.contextMenuSourceY - this.actionMenuSafeMargin
+      })
       .hitTestBehavior(HitTestMode.None)
       .bindContextMenu(this.contextMenuVisible, this.NativeActionMenuContent, {
         preview: this.NativeActionMenuPreview,
@@ -4649,7 +4665,26 @@ struct Index {
         placement: Placement.BottomLeft,
         borderRadius: 22,
         transition: this.actionMenuSurfaceTransition(),
-        systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
+        // The immersive material must NOT live on the menu panel here.
+        // `ContextMenuOptions.systemMaterial` paints the system subwindow's own
+        // panel, which is a passive container that never enters a press state, so
+        // its lightEffect (press point-light) can never fire - that is exactly
+        // why the menu had no light while the preview card above it did (the card
+        // is hosted in a Navigation title bar, which IS an interactive node).
+        // So the panel is made fully invisible and the material moves onto the
+        // menu content itself (see ActionContextMenu), where the press light
+        // works just like on the card.
+        systemMaterial: uiMaterial.Material.empty,
+        backgroundColor: Color.Transparent,
+        backgroundBlurStyle: BlurStyle.NONE,
+        // Belt and braces for the panel's own edge. The visible stray hairline
+        // turned out to be the panel's bounds, not its outline: cancelling the
+        // panel's content inset (see ActionContextMenu) is what actually removes
+        // it. These two stay because they cost nothing and pin the outline shut
+        // on builds/themes where it is honoured - outlineColor's documented
+        // default ('#19ffffff') is the exact colour that hairline sampled as.
+        outlineWidth: 0,
+        outlineColor: Color.Transparent,
         onWillDisappear: () => { this.contextMenuVisible = false },
         onDidDisappear: () => this.finishActionMenuDismiss()
       })
@@ -4696,93 +4731,154 @@ struct Index {
     .padding({ left: 12, right: 12 })
     .borderRadius(20)
     .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, false))
+    // Tapping the title card must not dismiss the menu. By default the native
+    // menu treats a tap anywhere inside as "close"; blocking here keeps the
+    // card - and the menu - alive until a real action is actually picked.
+    .hitTestBehavior(HitTestMode.Block)
   }
 
   /**
-   * Native ContextMenu content.  Widths and section rhythm follow the Files
+   * Native ContextMenu content. Widths and section rhythm follow the Files
    * reference: a compact menu (224vp) below a wider selected-item card,
-  * with quick actions in the first group and destructive actions at the end.
-  */
+   * with quick actions in the first group and destructive actions at the end.
+   *
+   * The menu needs its own immersive surface, because the native panel is made
+   * fully transparent (see ActionMenuOverlay). An immersive material only renders
+   * - and only gets its press point-light - inside a supported scope, and a plain
+   * container is not one. A Navigation title bar is, and that is exactly how the
+   * preview card above gets both its material and its press light, so the whole
+   * menu is hosted there as ONE surface that lights up wherever it is pressed
+   * (centre, edge or corner).
+   */
   @Builder
   ActionContextMenu(entry: FileEntry): void {
-    Menu() {
-      MenuItem() {
-        Scroll() {
-          Column() {
-            Row() {
-              if (entry.isDirectory) {
-                this.ActionQuickButton($r('sys.symbol.doc_text_on_doc_text'), '复制',
-                  () => this.beginDestinationPicker('copy', entry))
-                this.ActionQuickButton($r('sys.symbol.move'), '移动',
-                  () => this.beginDestinationPicker('move', entry))
-              } else {
-                if (this.actionSupportsShare(entry)) {
-                  this.ActionQuickButton($r('sys.symbol.share'), '分享',
-                    () => this.shareViewerImage(entry))
-                }
-                this.ActionQuickButton($r('sys.symbol.doc_text_on_doc_text'), '复制',
-                  () => this.beginDestinationPicker('copy', entry))
-                this.ActionQuickButton($r('sys.symbol.move'), '移动',
-                  () => this.beginDestinationPicker('move', entry))
-              }
-            }
-            .width('100%')
-            .height(58)
+    Navigation() {}
+      .mode(NavigationMode.Stack)
+      .hideBackButton(true)
+      .hideToolBar(true)
+      .title({
+        builder: this.ActionContextMenuSurface.bind(this, entry),
+        height: this.actionMenuHeight(entry)
+      }, {
+        barStyle: BarStyle.STACK,
+        paddingStart: LengthMetrics.vp(0),
+        paddingEnd: LengthMetrics.vp(0),
+        backgroundColor: Color.Transparent
+      })
+      .width(Math.min(224, this.effectivePageWidth() - 52))
+      .height(this.actionMenuHeight(entry))
+      .backgroundColor(Color.Transparent)
+      .clip(false)
+      // Cancel the native menu's 4vp content inset. ArkUI lays menu content out
+      // 4vp inside the panel (a fixed gutter, same on all four sides), so the
+      // panel's own edge - a 1px light hairline tracing the panel's rounded rect
+      // - was left visible 4vp OUTSIDE this surface and read as a second frame
+      // around the menu. No option removes that edge: outlineWidth: 0 /
+      // outlineColor: Transparent do not touch it, mask: false does not, and
+      // neither Material.empty nor a real ImmersiveMaterial on the panel does.
+      // Pulling the content out by exactly the gutter instead makes the panel
+      // collapse onto this surface (verified on device: panel and Navigation
+      // both become [91,934][875,2082], gutter 0px on all sides), so the only
+      // remaining edge is this surface's own material rim - which is what the
+      // preview card has too, and the menu now lines up flush with that card.
+      .margin({ left: -4, top: -4, right: -4, bottom: -4 })
+      // Claim drags inside the menu. The native context menu dismisses on any
+      // touch it receives that no child consumed, so sliding on the panel used to
+      // read as an outside tap and closed the menu.
+      .gesture(
+        PanGesture({ direction: PanDirection.All, distance: 4 })
+          .onActionStart((event: GestureEvent) => {})
+          .onActionUpdate((event: GestureEvent) => {})
+          .onActionEnd((event: GestureEvent) => {})
+      )
+  }
 
-            this.ActionSectionGap()
-
-            if (!entry.isDirectory && this.actionSupportsOpenWith(entry)) {
-              this.ActionMenuRow($r('sys.symbol.rectangle_and_arrowshape_turn_up_right'), '其他应用打开',
-                () => this.openWithOtherApp(entry), false, true)
-              this.ActionSectionGap()
+  /**
+   * The menu surface: one immersive-material container holding every row, hosted
+   * in ActionContextMenu's Navigation title bar. No Menu()/MenuItem() wrapper -
+   * those paint the stock row highlight, which turned the whole menu uniformly
+   * grey on press.
+   */
+  @Builder
+  ActionContextMenuSurface(entry: FileEntry): void {
+    Column() {
+        Row() {
+          if (entry.isDirectory) {
+            this.ActionQuickButton($r('sys.symbol.doc_text_on_doc_text'), '复制',
+              () => this.beginDestinationPicker('copy', entry))
+            this.ActionQuickButton($r('sys.symbol.move'), '移动',
+              () => this.beginDestinationPicker('move', entry))
+          } else {
+            if (this.actionSupportsShare(entry)) {
+              this.ActionQuickButton($r('sys.symbol.share'), '分享',
+                () => this.shareViewerImage(entry))
             }
-
-            if (!entry.isDirectory && this.actionSupportsQuickView(entry)) {
-              this.ActionMenuRow($r('sys.symbol.play'), '快速查看',
-                () => this.quickView(entry), false, false)
-            }
-            this.ActionMenuRow($r('sys.symbol.list_bullet_square'), '多选',
-              () => this.enterSelection(entry), false, false)
-            this.ActionMenuRow($r('sys.symbol.download'), '下载',
-              () => this.downloadEntryFromMenu(entry), false, false)
-            if (!entry.isDirectory && this.isMedia(entry)) {
-              this.ActionMenuRow($r('sys.symbol.picture_badge_arrow_down'), '保存图库',
-                () => this.saveToGallery(entry), false, !this.actionHasLocalCache(entry))
-            }
-            if (!entry.isDirectory && this.actionHasLocalCache(entry)) {
-              this.ActionMenuRow($r('sys.symbol.arrow_down'), '释放缓存',
-                () => this.releaseCache(entry), false, false)
-            }
-            this.ActionMenuRow($r('sys.symbol.rename'), '重命名',
-              () => this.openRename(entry), false, true)
-
-            this.ActionSectionGap()
-
-            this.ActionMenuRow($r('sys.symbol.info_circle'), '详情',
-              () => this.showEntryDetails(entry), false, false)
-            this.ActionMenuRow($r('sys.symbol.trash'), '删除',
-              () => this.deleteEntry(entry), true, true)
+            this.ActionQuickButton($r('sys.symbol.doc_text_on_doc_text'), '复制',
+              () => this.beginDestinationPicker('copy', entry))
+            this.ActionQuickButton($r('sys.symbol.move'), '移动',
+              () => this.beginDestinationPicker('move', entry))
           }
-          .width('100%')
         }
-        .width(Math.min(224, this.effectivePageWidth() - 52))
-        .height(this.actionMenuHeight(entry))
-        .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
-        .borderRadius(22)
-        .clip(true)
-      }
-      .padding(0)
+        .width('100%')
+        .height(58)
+
+        this.ActionSectionGap()
+
+        if (!entry.isDirectory && this.actionSupportsOpenWith(entry)) {
+          this.ActionMenuRow($r('sys.symbol.rectangle_and_arrowshape_turn_up_right'), '其他应用打开',
+            () => this.openWithOtherApp(entry), false, true)
+          this.ActionSectionGap()
+        }
+
+        if (!entry.isDirectory && this.actionSupportsQuickView(entry)) {
+          this.ActionMenuRow($r('sys.symbol.play'), '快速查看',
+            () => this.quickView(entry), false, false)
+        }
+        this.ActionMenuRow($r('sys.symbol.list_bullet_square'), '多选',
+          () => this.enterSelection(entry), false, false)
+        this.ActionMenuRow($r('sys.symbol.download'), '下载',
+          () => this.downloadEntryFromMenu(entry), false, false)
+        if (!entry.isDirectory && this.isMedia(entry)) {
+          this.ActionMenuRow($r('sys.symbol.picture_badge_arrow_down'), '保存图库',
+            () => this.saveToGallery(entry), false, !this.actionHasLocalCache(entry))
+        }
+        if (!entry.isDirectory && this.actionHasLocalCache(entry)) {
+          this.ActionMenuRow($r('sys.symbol.arrow_down'), '释放缓存',
+            () => this.releaseCache(entry), false, false)
+        }
+        this.ActionMenuRow($r('sys.symbol.rename'), '重命名',
+          () => this.openRename(entry), false, true)
+
+        this.ActionSectionGap()
+
+        this.ActionMenuRow($r('sys.symbol.info_circle'), '详情',
+          () => this.showEntryDetails(entry), false, false)
+        this.ActionMenuRow($r('sys.symbol.trash'), '删除',
+          () => this.deleteEntry(entry), true, true)
     }
-    .width(Math.min(224, this.effectivePageWidth() - 52))
-    .padding(0)
+    .width('100%')
+    .height('100%')
+    .borderRadius(22)
+    .clip(true)
+    // Same material as the preview card above, inside a supported scope, so the
+    // material's own press point-light fires here.
+    //
+    // Shadow off, unlike every other material in the app: this surface now fills
+    // its panel exactly (see ActionContextMenu), so a shadow would spill outside
+    // the panel and be hard-cut at its edge, tracing the very outline we just
+    // removed. Measured on device, the material's own rim highlight is unaffected
+    // by this flag, so the menu keeps its glass edge.
+    .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, false, '', false))
   }
 
   @Builder
   ActionSectionGap(): void {
+    // Spacing only. The old translucent band was the "black box" that showed
+    // through the menu's immersive surface.
     Row()
       .width('100%')
       .height(8)
-      .backgroundColor(this.isDarkTheme ? '#18FFFFFF' : '#12000000')
+      .backgroundColor(Color.Transparent)
   }
 
   @Builder
@@ -7838,12 +7934,19 @@ struct Index {
       .padding({ left: 8, right: 8, top: 8, bottom: 8 })
   }
 
+  /**
+   * The app's standard immersive material.
+   *
+   * `applyShadow: false` is only for a surface that fills its container edge to
+   * edge - a shadow there spills outside and gets hard-cut, drawing an outline.
+   * The long-press menu uses it; everything else keeps the shadow.
+   */
   private immersiveMaterial(style: uiMaterial.ImmersiveStyle, interactive: boolean = true,
-    materialColor: string = ''): uiMaterial.Material {
+    materialColor: string = '', applyShadow: boolean = true): uiMaterial.Material {
     const options: uiMaterial.ImmersiveOptions = {
       style: style,
       interactive: interactive,
-      applyShadow: true,
+      applyShadow: applyShadow,
       lightEffect: { color: '#FFFFFFFF' }
     }
     if (materialColor.length > 0) {
