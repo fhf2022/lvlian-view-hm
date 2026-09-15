@@ -257,6 +257,19 @@ interface DirectoryViewState {
   anchor: FileViewAnchor | null
 }
 
+// Single argument object for the round buttons in the file tools bar.
+//
+// This is not style: ArkUI only refreshes the UI inside a @Builder when a
+// state-derived value reaches it as ONE object literal passed by reference.
+// Passing the icon as its own (second, by-value) parameter silently disables
+// that refresh, which is exactly why the view-mode glyph used to freeze at its
+// first-frame value no matter how often the mode changed. Keep every
+// state-dependent circle button on this single-object form.
+interface FileToolCircleButtonOptions {
+  icon: Resource
+  action: () => void
+}
+
 // The file surface underneath a video is kept as the PiP restore destination.
 // A user may browse other tabs/directories while PiP is active; restoring must
 // therefore put the player back over the directory that launched it, rather
@@ -4141,7 +4154,10 @@ struct Index {
   FileToolsBarContent(): void {
     Stack({ alignContent: Alignment.TopStart }) {
       Row() {
-        this.FileToolCircleButton($r('sys.symbol.folder_badge_plus'), () => this.openCreateFolder())
+        this.FileToolCircleButton({
+          icon: $r('sys.symbol.folder_badge_plus'),
+          action: () => this.openCreateFolder()
+        })
 
         Button() {
           Row({ space: 6 }) {
@@ -4182,7 +4198,14 @@ struct Index {
           }
         })
 
-        this.FileToolCircleButton(this.fileViewModeIcon(), () => this.toggleFileViewMode())
+        // The glyph is the mode this tap will switch TO, so the icon and the
+        // next tap always correspond one-to-one. It only repaints because the
+        // whole button is handed over as one object literal (see
+        // FileToolCircleButtonOptions).
+        this.FileToolCircleButton({
+          icon: this.fileViewModeIcon(),
+          action: () => this.toggleFileViewMode()
+        })
       }
       .width('100%')
       .height(FLOATING_BAR_HEIGHT_VP)
@@ -4370,9 +4393,9 @@ struct Index {
   }
 
   @Builder
-  FileToolCircleButton(icon: Resource, action: () => void): void {
+  FileToolCircleButton(options: FileToolCircleButtonOptions): void {
     Button() {
-      SymbolGlyph(icon)
+      SymbolGlyph(options.icon)
         .fontSize(24)
         .fontColor([$r('sys.color.icon_primary')])
     }
@@ -4384,7 +4407,7 @@ struct Index {
     .systemMaterial(this.bottomCapsuleMaterial)
     .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
     .monopolizeEvents(this.bottomBarMode() === 'tools')
-    .onClick(action)
+    .onClick(options.action)
   }
 
   @Builder
@@ -17000,6 +17023,20 @@ struct Index {
     return false
   }
 
+  /**
+   * Glyph for the view-mode button. It deliberately shows the mode the NEXT tap
+   * switches TO, not the mode currently on screen, so the icon names its own
+   * outcome and 点哪个就切到哪个:
+   *
+   *   list            -> grid icon        (tap -> grid)
+   *   grid  + images  -> waterfall icon   (tap -> waterfall)
+   *   grid  no images -> list icon        (tap -> list)
+   *   waterfall       -> list icon        (tap -> list)
+   *
+   * Each mode therefore maps to exactly one glyph, and no glyph ever appears in
+   * a mode it does not lead to. This mirrors the branch in toggleFileViewMode(),
+   * which owns the same decision - change both together.
+   */
   private fileViewModeIcon(): Resource {
     if (this.fileViewMode === 'list') {
       return $r('sys.symbol.square_grid_2x2')
