@@ -289,6 +289,15 @@ export class UgreenRemoteClient {
       entry.checksum = this.firstString(raw, [
         'checksum', 'hash', 'md5', 'sha256', 'content_hash', 'contentHash'
       ])
+      // `dtime` is the only field that distinguishes a recycled entry from a
+      // live one; `recycle_in_path` confirms it came out of `#recycle`. The
+      // server leaves `remaining_del_time` at 0 on this deployment, so it is
+      // deliberately not surfaced as a retention countdown.
+      entry.deletedTime = this.firstNumber(raw, [
+        'dtime', 'deleted_time', 'delete_time', 'deletedTime', 'remove_time'
+      ])
+      entry.recycleInPath = this.booleanValue(raw['recycle_in_path']) ||
+        this.booleanValue(raw['recycleInPath'])
       result.push(entry)
     }
     this.sortEntries(result)
@@ -603,6 +612,29 @@ export class UgreenRemoteClient {
       const body: JsonObject = {}
       body['paths'] = [path]
       body['forever'] = false
+      const response = await this.transport.requestJson(urls.deletePaths(), http.RequestMethod.POST, body, headers)
+      this.successData(response.body, '文件删除失败')
+    })
+  }
+
+  /**
+   * Permanently removes entries, bypassing the recycle bin.
+   *
+   * This is the same endpoint as {@link trash}; only `forever` differs. It is
+   * used to empty a recycle bin, where the items are already deleted and a
+   * second soft delete would be a no-op. Callers are responsible for
+   * confirming with the user first — there is no undo after this returns.
+   */
+  async deleteForever(paths: string[]): Promise<void> {
+    if (paths.length === 0) {
+      return
+    }
+    await this.withReconnect(async (): Promise<void> => {
+      const urls = this.requireEndpoints()
+      const headers = this.withHeaders(await this.authHeaders(), 'content-type', 'application/json')
+      const body: JsonObject = {}
+      body['paths'] = paths
+      body['forever'] = true
       const response = await this.transport.requestJson(urls.deletePaths(), http.RequestMethod.POST, body, headers)
       this.successData(response.body, '文件删除失败')
     })

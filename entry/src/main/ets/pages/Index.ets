@@ -349,6 +349,10 @@ struct Index {
   @State contextMenuVisible: boolean = false
   @State contextMenuEntry: FileEntry | null = null
   @State contextMenuSourceY: number = 0
+  // Which surface supplied the entry the menu is showing. The long-press menu
+  // shell (anchor, preview, lifecycle) is shared with the file manager; only
+  // the row list inside it differs, so this decides which rows are rendered.
+  @State contextMenuContext: string = 'files'
   @State showDestinationPicker: boolean = false
   @State destinationOperation: DestinationOperation = 'copy'
   @State destinationPath: string = ''
@@ -372,6 +376,23 @@ struct Index {
   @State showStorageSettings: boolean = false
   @State showNetworkSettings: boolean = false
   @State showPlaybackSettings: boolean = false
+  @State showRecycleBinSettings: boolean = false
+  // UGOS keeps one recycle repository per first-level folder, so the signed-in
+  // user's own folder and the shared folders are genuinely disjoint sets with
+  // different permission rules — a shared folder's bin is the administrator's
+  // unless that was turned off. They are two scopes of one page rather than a
+  // single merged list, because merging them would hide which rule applied.
+  @State recycleScope: string = 'personal'
+  @State recycleEntries: FileEntry[] = []
+  @State recycleLoading: boolean = false
+  // Full recycle paths the user has drilled into, e.g.
+  // `/home/fhf/#recycle/Photos`. An empty stack means the top level, which
+  // lists each share's `#recycle` direct children.
+  @State recycleStack: string[] = []
+  // Folders whose bin exists but could not be read (usually a permission wall
+  // on a shared folder). Kept so a partial result can be explained.
+  @State recycleBlockedShares: string[] = []
+  private recycleRequestToken: number = 0
   @State showImageViewer: boolean = false
   @State viewerImageEntry: FileEntry | null = null
   @State viewerHeaderTitle: string = ''
@@ -1348,7 +1369,8 @@ struct Index {
       return true
     }
     if (this.screen === 'settings') {
-      return !this.showStorageSettings && !this.showPlaybackSettings && !this.showNetworkSettings
+      return !this.showStorageSettings && !this.showPlaybackSettings &&
+        !this.showNetworkSettings && !this.showRecycleBinSettings
     }
     if (this.screen !== 'files') {
       return false
@@ -1885,6 +1907,10 @@ struct Index {
         this.closeNetworkSettings()
         return true
       }
+      if (this.showRecycleBinSettings) {
+        this.recycleBackAction()
+        return true
+      }
       this.openHome()
       return true
     }
@@ -2131,6 +2157,8 @@ struct Index {
               this.closePlaybackSettings()
             } else if (this.showNetworkSettings) {
               this.closeNetworkSettings()
+            } else if (this.showRecycleBinSettings) {
+              this.recycleBackAction()
             } else {
               this.openHome()
             }
@@ -3436,7 +3464,8 @@ struct Index {
               this.FileHeaderLeadingControl()
             }
           } else if ((this.screen === 'settings' &&
-            (this.showStorageSettings || this.showPlaybackSettings || this.showNetworkSettings))) {
+            (this.showStorageSettings || this.showPlaybackSettings || this.showNetworkSettings ||
+              this.showRecycleBinSettings))) {
             this.OfficialBackButton(() => {
               if (this.showStorageSettings) {
                 this.closeStorageSettings()
@@ -3444,6 +3473,10 @@ struct Index {
                 this.closePlaybackSettings()
               } else if (this.showNetworkSettings) {
                 this.closeNetworkSettings()
+              } else if (this.showRecycleBinSettings) {
+                // Pops one recycle level before it closes the page, so the
+                // header button and the system back key behave identically.
+                this.recycleBackAction()
               } else {
                 this.openHome()
               }
@@ -3460,8 +3493,9 @@ struct Index {
             (this.screen === 'settings' && this.showStorageSettings ? '缓存与存储' :
             (this.screen === 'settings' && this.showPlaybackSettings ? '播放与控制' :
             (this.screen === 'settings' && this.showNetworkSettings ? '网络与流量' :
+            (this.screen === 'settings' && this.showRecycleBinSettings ? this.topTitle :
             (this.screen === 'settings' ? '设置' :
-              (this.screen === 'downloads' ? '传输' : this.topTitle))))))
+              (this.screen === 'downloads' ? '传输' : this.topTitle)))))))
             .fontSize(this.selectionMode ? 22 : 17)
             .fontWeight(FontWeight.Bold)
             .fontColor($r('app.color.text_primary'))
@@ -3477,6 +3511,10 @@ struct Index {
 
           if (this.screen === 'files') {
             this.FileTopActionCluster()
+          } else if (this.showRecycleBinSettings) {
+            // Mirrors the back button's 40vp slot on the left so the title stays
+            // centred; the switcher itself lives in RecycleScopeToggle.
+            this.RecycleScopeToggle()
           } else {
             Blank().width(this.screen === 'downloads' ? 86 : 40)
           }
@@ -3600,6 +3638,8 @@ struct Index {
       this.PlaybackSettingsContent()
     } else if (this.showNetworkSettings) {
       this.NetworkSettingsContent()
+    } else if (this.showRecycleBinSettings) {
+      this.RecycleBinSettingsContent()
     } else {
       Scroll() {
         Column({ space: 16 }) {
@@ -3617,6 +3657,11 @@ struct Index {
             this.SettingsGroupDivider()
             this.SettingsEntryRow($r('sys.symbol.wifi'), '#0FA47F', '网络与流量',
               '管理移动网络下的加载、刷新和下载策略', () => this.openNetworkSettings(), false)
+            this.SettingsGroupDivider()
+            // Deliberately the last row in the card: the recycle bin is a place
+            // you go looking for, not one that should compete for attention.
+            this.SettingsEntryRow($r('sys.symbol.trash'), '#5F6B7A', '回收站',
+              '查看并还原已删除的文件', () => this.openRecycleBinSettings(), false)
           }
           .width('100%')
           .alignItems(HorizontalAlign.Start)
@@ -3709,6 +3754,206 @@ struct Index {
       .strokeWidth(0.5)
       .color($r('app.color.divider'))
       .margin({ left: 68 })
+  }
+
+  // ── Recycle bin page ─────────────────────────────────────────────────────
+
+  /**
+   * The personal/shared switch, pinned to the top-right corner as the mirror of
+   * the back button on the left: same 40vp glass circle, same material, same
+   * light overlay. It carries a single character rather than an icon because a
+   * glyph for "which half of the NAS am I looking at" would need a legend,
+   * while the character is self-evident at a glance.
+   */
+  @Builder
+  RecycleScopeToggle(): void {
+    Button() {
+      Text(this.recycleScope === 'personal' ? '个' : '共')
+        .fontSize(16)
+        .fontWeight(FontWeight.Bold)
+        .fontColor($r('sys.color.icon_primary'))
+    }
+    .type(ButtonType.Normal)
+    .width(40)
+    .height(40)
+    .borderRadius(20)
+    .backgroundColor(Color.Transparent)
+    .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN))
+    .overlay(this.ImportLightOverlay, { align: Alignment.Center })
+    .hitTestBehavior(HitTestMode.Default)
+    .monopolizeEvents(true)
+    .onClick(() => this.selectRecycleScope(this.recycleScope === 'personal' ? 'shared' : 'personal'))
+  }
+
+  /**
+   * The caveats that apply to the current list, in both the empty and the
+   * populated state. A bin that silently omits folders would look identical to
+   * an empty one, which is exactly the wrong impression.
+   */
+  @Builder
+  RecycleNotices(): void {
+    if (this.recycleBlockedShares.length > 0) {
+      Text('无法读取：' + this.recycleBlockedShares.join('、') + '（可能是权限限制）')
+        .fontSize(12)
+        .fontColor($r('app.color.text_tertiary'))
+        .lineHeight(18)
+        .width('100%')
+    }
+  }
+
+  /**
+   * One recycled item, built to match the file manager's list row exactly: no
+   * card surface, no radius, 58vp tall, the same 40x34 leading visual, the same
+   * 16/12 type ramp and the same chevron — which only a folder gets, because
+   * only a folder can be entered.
+   *
+   * The leading visual is reused as-is. It falls back to a folder/file icon
+   * whenever no thumbnail URI resolves, and for a `#recycle` path none ever
+   * does, which is precisely the "placeholder instead of loading a cover"
+   * behaviour this page wants — with no extra code and no cover requests.
+   */
+  @Builder
+  RecycleRow(entry: FileEntry, index: number): void {
+    Column() {
+      Row() {
+        Row() {
+          this.FileLeadingVisual(entry)
+        }
+        .margin({ right: 8 })
+
+        Column() {
+          Text(entry.name)
+            .fontSize(16)
+            .fontColor($r('app.color.text_primary'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          if (this.recycleEntryInfo(entry).length > 0) {
+            Text(this.recycleEntryInfo(entry))
+              .fontSize(12)
+              .fontColor($r('app.color.text_muted'))
+              .margin({ top: 4 })
+          }
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        if (entry.isDirectory) {
+          this.FileRowChevron()
+        }
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+      .padding({ left: 8, right: 8, top: 12, bottom: 12 })
+
+      if (index < this.recycleEntries.length - 1) {
+        Divider()
+          .width('calc(100% - 16vp)')
+          .strokeWidth(0.5)
+          .color($r('app.color.divider'))
+      }
+    }
+    .width('100%')
+    .onClick(() => this.onRecycleEntryClick(entry))
+    .priorityGesture(
+      LongPressGesture({ repeat: false })
+        .onAction((event: GestureEvent): void => {
+          this.showActionMenu(entry, event)
+        })
+    )
+  }
+
+  /**
+   * The recycle bin page: one directory level at a time.
+   *
+   * The top level lists the folders that have something deleted inside them, so
+   * tapping one drills in the same way the file manager does. Emptying is
+   * scoped to the level on screen, which is why its control sits directly below
+   * the list instead of in the header — the count next to it is exactly what
+   * would be deleted.
+   */
+  @Builder
+  RecycleBinSettingsContent(): void {
+    Column() {
+      if (this.recycleLoading) {
+        Column({ space: 10 }) {
+          LoadingProgress()
+            .width(30)
+            .height(30)
+            .color('#2E6BFF')
+          Text('正在读取回收站…')
+            .fontSize(13)
+            .fontColor($r('app.color.text_tertiary'))
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .justifyContent(FlexAlign.Center)
+      } else if (this.recycleEntries.length === 0) {
+        Column({ space: 8 }) {
+          SymbolGlyph($r('sys.symbol.trash'))
+            .fontSize(34)
+            .fontColor([$r('app.color.text_tertiary')])
+          Text(this.recycleScope === 'shared' ? '共享回收站是空的' : '个人回收站是空的')
+            .fontSize(14)
+            .fontColor($r('app.color.text_tertiary'))
+          this.RecycleNotices()
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .padding({ left: 20, right: 20 })
+        .justifyContent(FlexAlign.Center)
+      } else {
+        List({ space: 0 }) {
+          // The file manager keeps its top breathing room in a blank first item
+          // so its content origin sits below the gradient header. Matching that
+          // here puts the first row at the same height on both pages.
+          ListItem() {
+            Row()
+              .width('100%')
+              .height(this.fileContentTopInset())
+          }
+          .width('100%')
+
+          ForEach(this.recycleEntries, (entry: FileEntry, index: number) => {
+            ListItem() {
+              this.RecycleRow(entry, index)
+            }
+          }, (entry: FileEntry): string => entry.path)
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .cachedCount(4)
+        .padding({ left: 0, right: 0 })
+        .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
+
+        Column({ space: 6 }) {
+          this.RecycleNotices()
+          Text('清空当前目录的 ' + this.recycleEntries.length.toString() + ' 项')
+            .fontSize(14)
+            .fontColor('#D34D5C')
+            .width('100%')
+            .textAlign(TextAlign.Center)
+            .onClick(() => {
+              if (!this.isBusy) {
+                this.purgeCurrentRecycleLayer()
+              }
+            })
+        }
+        .width('100%')
+        .padding({ left: 20, right: 20, top: 16, bottom: this.bottomSafeInset() + 16 })
+      }
+
+      if (this.statusText.length > 0) {
+        Text(this.statusText)
+          .fontSize(12)
+          .fontColor($r('app.color.text_secondary'))
+          .width('100%')
+          .padding({ left: 20, right: 20, top: 8, bottom: this.bottomSafeInset() + 8 })
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+    }
+    .width('100%')
+    .height('100%')
   }
 
   @Builder
@@ -4788,6 +5033,48 @@ struct Index {
    * menu is hosted there as ONE surface that lights up wherever it is pressed
    * (centre, edge or corner).
    */
+  /**
+   * Chooses which set of rows the shared long-press menu renders.
+   *
+   * The menu shell — anchor, preview card, material host, dismissal lifecycle —
+   * is deliberately common to the file manager and the recycle bin so a long
+   * press behaves and looks the same in both. Only the rows differ, and this is
+   * the single place that decides.
+   */
+  @Builder
+  ActionMenuSurfaceFor(entry: FileEntry): void {
+    if (this.contextMenuContext === 'recycle') {
+      this.RecycleActionMenuSurface(entry)
+    } else {
+      this.ActionContextMenuSurface(entry)
+    }
+  }
+
+  /**
+   * The only two things you can do with something that is already deleted.
+   * Restore leads and is not destructive; permanent deletion follows in the
+   * warning colour, the same way the file manager marks 删除.
+   *
+   * No section gap between them, unlike the file menu: that gap exists to
+   * separate groups, and with just two peer actions it reads as uneven
+   * spacing — the distance between the rows came out ~50% wider than the
+   * panel's top and bottom margins.
+   */
+  @Builder
+  RecycleActionMenuSurface(entry: FileEntry): void {
+    Column() {
+      this.ActionMenuRow($r('sys.symbol.arrow_counterclockwise'), '还原',
+        () => { this.runContextAction(() => { this.restoreRecycleEntry(entry) }) }, false, false)
+      this.ActionMenuRow($r('sys.symbol.trash'), '永久删除',
+        () => { this.runContextAction(() => { this.purgeRecycleEntry(entry) }) }, true, true)
+    }
+    .width('100%')
+    .height('100%')
+    .borderRadius(22)
+    .clip(true)
+    .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, false, '', false))
+  }
+
   @Builder
   ActionContextMenu(entry: FileEntry): void {
     Navigation() {}
@@ -4795,7 +5082,7 @@ struct Index {
       .hideBackButton(true)
       .hideToolBar(true)
       .title({
-        builder: this.ActionContextMenuSurface.bind(this, entry),
+        builder: this.ActionMenuSurfaceFor.bind(this, entry),
         height: this.actionMenuHeight(entry)
       }, {
         barStyle: BarStyle.STACK,
@@ -9642,6 +9929,7 @@ struct Index {
     this.showStorageSettings = false
     this.showNetworkSettings = false
     this.showPlaybackSettings = false
+    this.leaveRecycleBinIfOpen()
     this.errorText = ''
     // statusText 是全局的操作状态文案：文件页浏览时会写入“个人目录”“正在读取目录…”
     // 等消息，而设置页的二级页面底部也渲染它。进入设置页时先清空，避免这些
@@ -9728,6 +10016,403 @@ struct Index {
     this.updateBottomBarVisibility(true)
   }
 
+  // ── Recycle bin ──────────────────────────────────────────────────────────
+
+  private openRecycleBinSettings(): void {
+    if (this.isBusy || this.screen !== 'settings') {
+      return
+    }
+    this.showStorageSettings = false
+    this.showPlaybackSettings = false
+    this.showNetworkSettings = false
+    this.showRecycleBinSettings = true
+    this.errorText = ''
+    this.statusText = ''
+    this.recycleScope = 'personal'
+    this.recycleEntries = []
+    this.recycleStack = []
+    this.recycleBlockedShares = []
+    this.updateTopTitle('回收站', true)
+    this.updateBottomBarVisibility(true)
+    this.reloadRecycleEntries()
+  }
+
+  private closeRecycleBinSettings(): void {
+    if (this.screen !== 'settings' || !this.showRecycleBinSettings) {
+      return
+    }
+    // Bump the token so a walk still in flight cannot write into a page the
+    // user has already left.
+    this.recycleRequestToken += 1
+    this.showRecycleBinSettings = false
+    this.showStorageSettings = false
+    this.showPlaybackSettings = false
+    this.showNetworkSettings = false
+    this.recycleEntries = []
+    this.recycleLoading = false
+    this.recycleStack = []
+    this.recycleBlockedShares = []
+    this.errorText = ''
+    this.statusText = ''
+    this.updateTopTitle('设置', true)
+    this.updateBottomBarVisibility(true)
+  }
+
+  /**
+   * Drops the recycle page state without the title/bar work that
+   * closeRecycleBinSettings() does, for when another tab takes over the
+   * screen. Bumping the token keeps an in-flight walk from resurrecting the
+   * list behind the new page.
+   */
+  private leaveRecycleBinIfOpen(): void {
+    if (!this.showRecycleBinSettings) {
+      return
+    }
+    this.recycleRequestToken += 1
+    this.showRecycleBinSettings = false
+    this.recycleEntries = []
+    this.recycleLoading = false
+    this.recycleStack = []
+    this.recycleBlockedShares = []
+  }
+
+  private selectRecycleScope(scope: string): void {
+    if (this.recycleScope === scope && !this.recycleLoading) {
+      return
+    }
+    this.recycleScope = scope
+    // Switching scope always lands on the top level: a stack left over from the
+    // other scope holds paths belonging to shares this scope does not have.
+    this.recycleStack = []
+    this.updateRecycleTitle()
+    this.reloadRecycleEntries()
+  }
+
+  /**
+   * The first-level folders whose recycle bin the current scope covers.
+   *
+   * "Personal" is the signed-in account's own folder — the same `/home/<user>`
+   * the Home tab opens, deliberately not the whole `/home` collection that
+   * also lists other accounts. "Shared" is every shared folder; each has its
+   * own repository and its own permission story.
+   */
+  private recycleSharesForScope(): string[] {
+    if (this.recycleScope === 'shared') {
+      const shares: string[] = []
+      for (const entry of this.sharedRoots) {
+        if (entry.isDirectory && entry.path.length > 0) {
+          shares.push(entry.path)
+        }
+      }
+      return shares
+    }
+    const account = this.username.trim().replace(/^\/+|\/+$/g, '')
+    return account.length > 0 ? ['/home/' + account] : []
+  }
+
+  /**
+   * Loads one level of the recycle bin for the active scope.
+   *
+   * Each folder's bin is read independently: a shared folder whose bin is
+   * administrator-only would otherwise abort the whole page, and a refusal
+   * there is an expected outcome rather than a failure. Refusals are collected
+   * so the page can explain why the list is shorter than expected.
+   */
+  private async reloadRecycleEntries(): Promise<void> {
+    if (!this.showRecycleBinSettings) {
+      return
+    }
+    this.recycleRequestToken += 1
+    const token = this.recycleRequestToken
+    const shares = this.recycleSharesForScope()
+    this.recycleLoading = true
+    this.recycleEntries = []
+    this.recycleBlockedShares = []
+    this.errorText = ''
+    this.statusText = ''
+    if (shares.length === 0) {
+      this.recycleLoading = false
+      this.statusText = this.recycleScope === 'shared'
+        ? '当前账号没有可访问的共享文件夹'
+        : '无法确定个人目录，请重新登录后重试'
+      return
+    }
+    const current = this.recycleCurrentPath()
+    const collected: FileEntry[] = []
+    const blocked: string[] = []
+    if (current.length === 0) {
+      // Top level: merge the `#recycle` direct children of every share in scope.
+      for (const share of shares) {
+        try {
+          const items = await this.repository.listRecycleChildren(
+            share, UgreenRemoteRepository.recycleRepositoryPath(share))
+          for (const item of items) {
+            collected.push(item)
+          }
+        } catch (_) {
+          blocked.push(share)
+        }
+      }
+    } else {
+      // Below the top level a path can only belong to one share.
+      const share = this.recycleShareOfPath(current)
+      try {
+        const items = await this.repository.listRecycleChildren(share, current)
+        for (const item of items) {
+          collected.push(item)
+        }
+      } catch (_) {
+        blocked.push(share)
+      }
+    }
+    if (token !== this.recycleRequestToken || !this.showRecycleBinSettings) {
+      return
+    }
+    // Folders first, then newest deletion first inside each group. Folders lead
+    // because they are the only rows that can be entered, and mixing them into
+    // a date order made the drill-down hard to spot.
+    collected.sort((left: FileEntry, right: FileEntry): number => {
+      if (left.isDirectory !== right.isDirectory) {
+        return left.isDirectory ? -1 : 1
+      }
+      return right.deletedTime - left.deletedTime
+    })
+    this.recycleEntries = collected
+    this.recycleBlockedShares = blocked
+    this.recycleLoading = false
+  }
+
+  /** The recycle directory currently being shown; empty means the top level. */
+  private recycleCurrentPath(): string {
+    return this.recycleStack.length > 0 ? this.recycleStack[this.recycleStack.length - 1] : ''
+  }
+
+  /** Which share a recycle path belongs to, for reading the right repository. */
+  private recycleShareOfPath(directoryPath: string): string {
+    for (const share of this.recycleSharesForScope()) {
+      const repository = UgreenRemoteRepository.recycleRepositoryPath(share)
+      if (repository.length > 0 &&
+        (directoryPath === repository || directoryPath.startsWith(repository + '/'))) {
+        return share
+      }
+    }
+    return ''
+  }
+
+  private enterRecycleDirectory(entry: FileEntry): void {
+    if (!entry.isDirectory || this.recycleLoading) {
+      return
+    }
+    this.recycleStack = this.recycleStack.concat([entry.path])
+    this.recycleEntries = []
+    this.updateRecycleTitle()
+    this.reloadRecycleEntries()
+  }
+
+  /**
+   * Pops one level. Returns false when already at the top, letting the caller
+   * decide to close the page instead.
+   */
+  private leaveRecycleLayer(): boolean {
+    // A level must be left even while a read is in flight — waiting it out
+    // makes Back feel dead. Invalidate the pending read first so its result
+    // cannot land on the level we are about to show.
+    this.recycleRequestToken += 1
+    this.recycleLoading = false
+    if (this.recycleStack.length === 0) {
+      return false
+    }
+    this.recycleStack = this.recycleStack.slice(0, -1)
+    this.recycleEntries = []
+    this.updateRecycleTitle()
+    this.reloadRecycleEntries()
+    return true
+  }
+
+  /** Single entry point for both the header button and the system back key. */
+  private recycleBackAction(): void {
+    if (this.leaveRecycleLayer()) {
+      return
+    }
+    this.closeRecycleBinSettings()
+  }
+
+  private onRecycleEntryClick(entry: FileEntry): void {
+    // Mirrors handleFileEntryClick: while the long-press menu owns the screen,
+    // the tap that dismisses it must not also act on the row underneath.
+    if (this.contextMenuVisible || this.contextMenuEntry !== null) {
+      return
+    }
+    if (entry.isDirectory) {
+      this.enterRecycleDirectory(entry)
+    }
+    // Files have no tap action — they carry no chevron and every operation on
+    // them lives in the long-press menu, matching the file manager.
+  }
+
+  /**
+   * The row subtitle. A folder reports when its contents were deleted; a file
+   * also reports its size, which is what makes a 90GB item obvious before it is
+   * restored or purged.
+   */
+  private recycleEntryInfo(entry: FileEntry): string {
+    const time = this.formatRecycleDeletedAt(entry.deletedTime)
+    if (entry.isDirectory) {
+      return time
+    }
+    const size = entry.size > 0 ? this.formatStorageSize(entry.size) : ''
+    return size.length > 0 ? size + ' · ' + time : time
+  }
+
+  /**
+   * Keeps the title in step with the drill-down through the existing
+   * updateTopTitle(), so the fade animation and its token stay in charge.
+   */
+  private updateRecycleTitle(): void {
+    const current = this.recycleCurrentPath()
+    if (current.length === 0) {
+      this.updateTopTitle('回收站', true)
+      return
+    }
+    const repository = UgreenRemoteRepository.recycleRepositoryPath(this.recycleShareOfPath(current))
+    const prefix = repository.length > 0 ? repository + '/' : ''
+    let relative = current.startsWith(prefix) ? current.slice(prefix.length) : current
+    relative = relative.replace(/^\/+|\/+$/g, '')
+    this.updateTopTitle(relative.length > 0
+      ? '回收站 · ' + relative.split('/').join(' / ') : '回收站', true)
+  }
+
+  /** The folder a recycled item was deleted from, for the row's subtitle. */
+  private recycleOriginDirectory(entry: FileEntry): string {
+    const original = UgreenRemoteRepository.originalPathOfRecycledItem(entry.path, entry.recycleSharePath)
+    const trimmed = original.replace(/\/+$/, '')
+    const separator = trimmed.lastIndexOf('/')
+    if (separator > 0) {
+      return trimmed.slice(0, separator)
+    }
+    return entry.recycleSharePath.length > 0 ? entry.recycleSharePath : '未知位置'
+  }
+
+  /**
+   * `dtime` is unix seconds. The date alone is not enough here — "deleted ten
+   * minutes ago" and "deleted last Tuesday" are very different situations to
+   * be looking at, so the time of day is included.
+   */
+  private formatRecycleDeletedAt(seconds: number): string {
+    if (seconds <= 0) {
+      return '删除时间未知'
+    }
+    const date = new Date(seconds * 1000)
+    const hours = date.getHours().toString().padStart(2, '0')
+    const minutes = date.getMinutes().toString().padStart(2, '0')
+    return this.formatTime(seconds) + ' ' + hours + ':' + minutes
+  }
+
+  private async restoreRecycleEntry(entry: FileEntry): Promise<void> {
+    if (this.isBusy) {
+      return
+    }
+    this.isBusy = true
+    this.errorText = ''
+    const origin = this.recycleOriginDirectory(entry)
+    this.statusText = '正在还原…'
+    try {
+      await this.repository.restoreFromRecycle(entry, entry.recycleSharePath)
+      this.removeRecycleEntry(entry.path)
+      this.statusText = '已还原到 ' + origin
+      this.showImmersiveToast('已还原：' + entry.name)
+    } catch (error) {
+      this.reportError(error as Object, '还原失败')
+      this.statusText = '还原失败'
+    } finally {
+      this.isBusy = false
+    }
+  }
+
+  private async purgeRecycleEntry(entry: FileEntry): Promise<void> {
+    if (this.isBusy) {
+      return
+    }
+    const response = await promptAction.showDialog({
+      title: '永久删除？',
+      message: '「' + entry.name + '」会被永久删除，之后无法恢复。',
+      buttons: [
+        { text: '取消', color: this.isDarkTheme ? '#FFFFFFFF' : '#536174' },
+        { text: '永久删除', color: '#D34D5C' }
+      ],
+      systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THICK, false)
+    })
+    if (response.index !== 1) {
+      return
+    }
+    await this.purgeRecyclePaths([entry.path], '已永久删除 ' + entry.name)
+  }
+
+  /**
+   * Permanently deletes everything currently listed — i.e. this one level.
+   *
+   * Scoping it to the visible level is what makes the confirmation honest: the
+   * count in the dialog is exactly the count on screen. Deleting a folder row
+   * here takes the deleted content nested beneath it along with it, which is
+   * the same thing emptying that folder would do.
+   */
+  private async purgeCurrentRecycleLayer(): Promise<void> {
+    const entries = this.recycleEntries
+    if (entries.length === 0 || this.isBusy || this.recycleLoading) {
+      return
+    }
+    const response = await promptAction.showDialog({
+      title: '清空当前目录？',
+      message: this.recycleEntries.length.toString() + ' 项会被永久删除，之后无法恢复。',
+      buttons: [
+        { text: '取消', color: this.isDarkTheme ? '#FFFFFFFF' : '#536174' },
+        { text: '全部删除', color: '#D34D5C' }
+      ],
+      systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THICK, false)
+    })
+    if (response.index !== 1) {
+      return
+    }
+    const paths: string[] = []
+    for (const entry of entries) {
+      paths.push(entry.path)
+    }
+    await this.purgeRecyclePaths(paths, '已清空当前目录')
+  }
+
+  private async purgeRecyclePaths(paths: string[], successMessage: string): Promise<void> {
+    if (paths.length === 0 || this.isBusy) {
+      return
+    }
+    this.isBusy = true
+    this.errorText = ''
+    this.statusText = '正在删除…'
+    try {
+      await this.repository.purgeRecycle(paths)
+      this.statusText = successMessage
+      this.showImmersiveToast(successMessage)
+      // Purging removes items from the repository itself, so the flattened
+      // list has to be rebuilt rather than filtered — parent folders that only
+      // existed to hold the deleted content disappear with them.
+      await this.reloadRecycleEntries()
+    } catch (error) {
+      this.reportError(error as Object, '删除失败')
+      this.statusText = '删除失败'
+    } finally {
+      this.isBusy = false
+    }
+  }
+
+  private removeRecycleEntry(path: string): void {
+    const remaining: FileEntry[] = []
+    for (const entry of this.recycleEntries) {
+      if (entry.path !== path) {
+        remaining.push(entry)
+      }
+    }
+    this.recycleEntries = remaining
+  }
+
   private openHome(): void {
     // Directory reads and the short page transition are safe to cancel when
     // the user explicitly taps Home. Keep destructive/storage operations
@@ -9744,6 +10429,7 @@ struct Index {
     this.showStorageSettings = false
     this.showPlaybackSettings = false
     this.showNetworkSettings = false
+    this.leaveRecycleBinIfOpen()
     this.selectedBottomTab = 'home'
     this.screen = 'files'
     this.showRoot('personal')
@@ -9761,6 +10447,7 @@ struct Index {
     this.showStorageSettings = false
     this.showPlaybackSettings = false
     this.showNetworkSettings = false
+    this.leaveRecycleBinIfOpen()
     this.selectedBottomTab = 'shared'
     this.screen = 'files'
     this.showRoot('shared')
@@ -9779,6 +10466,7 @@ struct Index {
     this.showStorageSettings = false
     this.showPlaybackSettings = false
     this.showNetworkSettings = false
+    this.leaveRecycleBinIfOpen()
     this.selectionMode = false
     this.selectedPaths = []
     this.selectedEntryCount = 0
@@ -10834,12 +11522,20 @@ struct Index {
   }
 
   private showActionMenu(entry: FileEntry, event: GestureEvent): void {
-    if (this.screen !== 'files' || this.showSearch || this.selectionMode ||
-      this.showDestinationPicker || this.showRenameDialog || this.showCreateFolderDialog ||
-      this.showImageViewer || this.showAudioPlayer || this.videoPlaybackUiVisible() ||
-      this.showPageTransition || this.contextMenuEntry !== null) {
+    // The file manager and the recycle bin share this one menu shell — the
+    // anchor, the preview and the dismissal lifecycle — because a long press
+    // should feel identical in both places. Only the rows inside differ, and
+    // `contextMenuContext` records which set to render.
+    const inFiles = this.screen === 'files' && !this.showSearch && !this.selectionMode &&
+      !this.showDestinationPicker && !this.showRenameDialog && !this.showCreateFolderDialog &&
+      !this.showImageViewer && !this.showAudioPlayer && !this.videoPlaybackUiVisible() &&
+      !this.showPageTransition && this.contextMenuEntry === null
+    const inRecycle = this.showRecycleBinSettings && !this.recycleLoading &&
+      this.contextMenuEntry === null
+    if (!inFiles && !inRecycle) {
       return
     }
+    this.contextMenuContext = inRecycle ? 'recycle' : 'files'
 
     this.pendingContextAction = null
     this.contextMenuSourceY = Math.max(this.topSafeInset(),
@@ -10896,6 +11592,15 @@ struct Index {
   }
 
   private actionMenuHeight(entry: FileEntry): number {
+    if (this.contextMenuContext === 'recycle') {
+      // Two rows, no section gap — the rows are peers, so they sit flush and
+      // the panel is exactly as tall as they are. Nothing here depends on the
+      // entry: restore and permanent deletion apply to folders and files
+      // alike, and a recycled entry has no quick actions, no open-with and no
+      // cache state.
+      return Math.min(540, 2 * 51,
+        Math.max(120, this.pageHeightVp - this.topSafeInset() - this.bottomSafeInset() - 114))
+    }
     // Match the compact Files menu while retaining enough room for the
     // longest media menu. Scroll takes over if a future action is added.
     let height = 58 + 8 // quick actions + section gap
@@ -17626,6 +18331,15 @@ struct Index {
     this.navigationRequestId += 1
     this.isNavigating = false
     this.screen = 'login'
+    // A signed-out session must not leave another account's recycle listing
+    // reachable through the back stack.
+    this.recycleRequestToken += 1
+    this.showRecycleBinSettings = false
+    this.recycleEntries = []
+    this.recycleLoading = false
+    this.recycleStack = []
+    this.recycleBlockedShares = []
+    this.recycleScope = 'personal'
     this.showStorageSettings = false
     this.showPlaybackSettings = false
     this.showNetworkSettings = false

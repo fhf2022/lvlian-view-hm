@@ -36,6 +36,10 @@ interface SearchDirectory {
 export class UgreenRemoteRepository {
   private static readonly DIRECTORY_CACHE_TTL_MS: number = 30 * 1000
   private static readonly DIRECTORY_CACHE_MAX_ENTRIES: number = 16
+  // The recycle repository lives below a first-level folder, so listing it is
+  // always an ordinary path traversal. Concrete paths must use root_type 3;
+  // with 4 the server ignores the path and re-returns the root collection.
+  private static readonly RECYCLE_ROOT_TYPE: number = 3
   private transport: HttpTransport = new HttpTransport()
   private client: UgreenRemoteClient = new UgreenRemoteClient(this.transport)
   private downloadManager: DownloadManager = new DownloadManager(this.transport)
@@ -903,6 +907,134 @@ export class UgreenRemoteRepository {
     // complete account metadata database here made the UI wait for unrelated
     // directories and was especially expensive for large photo libraries.
     this.invalidateDirectory(parentPath, rootType)
+  }
+
+  // ── Recycle bin ──────────────────────────────────────────────────────────
+  //
+  // UGOS keeps deleted items in a hidden `<folder>/#recycle` repository, one
+  // per first-level folder — Samba's standard repository name, not a
+  // localised one. The repository mirrors the original tree, so a recycled
+  // item's path is `<share>/#recycle/<relative path>` and its original
+  // location is recovered by dropping that single segment. Names and sizes
+  // survive verbatim (measured against a live NAS), which is what makes a
+  // restore possible without keeping a side table of our own.
+  //
+  // The repository is absent from ordinary listings, so nothing else in the
+  // app can stumble into it; it is only ever reached by explicit path.
+
+  /** `<share>/#recycle`, or an empty string when there is no share to qualify. */
+  static recycleRepositoryPath(sharePath: string): string {
+    const clean = sharePath.replace(/\/+$/, '')
+    return clean.length > 0 ? clean + '/#recycle' : ''
+  }
+
+  /**
+   * Where a recycled item came from, or an empty string when `itemPath` is not
+   * inside `sharePath`'s repository.
+   */
+  static originalPathOfRecycledItem(itemPath: string, sharePath: string): string {
+    const repository = UgreenRemoteRepository.recycleRepositoryPath(sharePath)
+    if (repository.length === 0) {
+      return ''
+    }
+    const prefix = repository + '/'
+    if (!itemPath.startsWith(prefix)) {
+      return ''
+    }
+    return sharePath.replace(/\/+$/, '') + '/' + itemPath.slice(prefix.length)
+  }
+
+  /**
+   * Lists one level of a share's recycle bin — the direct children of
+   * `directoryPath`, which is itself a path inside `<share>/#recycle`.
+   *
+   * It deliberately never walks the mirror tree. An earlier version flattened
+   * the whole tree into one leaf list, which answered "what did I delete"
+   * directly but read as a second, structureless file browser. The page layers
+   * directory navigation on top of repeated single-level reads instead, so the
+   * user gets the same drill-down they already know from the file manager.
+   *
+   * Top level: `listRecycleChildren(share, recycleRepositoryPath(share))`.
+   * A sub-folder: `listRecycleChildren(share, <entry>.path)`.
+   *
+   * Failures propagate on purpose. A shared folder whose bin is
+   * administrator-only answers `Access not allowed`, and whether that deserves
+   * a "could not read" note or just an empty state depends on which level is
+   * being shown — a decision only the caller can make.
+   */
+  async listRecycleChildren(sharePath: string, directoryPath: string): Promise<FileEntry[]> {
+    const share = sharePath.replace(/\/+$/, '')
+    const children = await this.client.list(directoryPath, UgreenRemoteRepository.RECYCLE_ROOT_TYPE)
+    for (const child of children) {
+      // Stamped once here so restore/purge can strip the repository segment
+      // and rebuild the original location without another lookup.
+      child.recycleSharePath = share
+    }
+    return children
+  }
+
+  /**
+   * Moves one recycled item back to where it was deleted from.
+   *
+   * The fast path is a single move — the directory it came from almost always
+   * still exists. Only when that fails do we rebuild the directory chain
+   * inside the share and retry, so the common case stays one request while
+   * items whose parent folder was itself deleted are still recoverable.
+   */
+  async restoreFromRecycle(item: FileEntry, sharePath: string): Promise<void> {
+    const original = UgreenRemoteRepository.originalPathOfRecycledItem(item.path, sharePath)
+    const trimmed = original.replace(/\/+$/, '')
+    const separator = trimmed.lastIndexOf('/')
+    if (original.length === 0 || separator <= 0) {
+      throw new Error('无法确定该项目的原始位置')
+    }
+    const targetDirectory = trimmed.slice(0, separator)
+    try {
+      await this.client.move([item.path], targetDirectory)
+    } catch (_) {
+      await this.ensureShareDirectoryChain(sharePath, targetDirectory)
+      await this.client.move([item.path], targetDirectory)
+    }
+    await this.clearDirectoryMetadataAfterMutation()
+    this.invalidateDirectory(sharePath, UgreenRemoteRepository.RECYCLE_ROOT_TYPE)
+  }
+
+  /** Permanently deletes recycled items. There is no undo. */
+  async purgeRecycle(paths: string[]): Promise<void> {
+    if (paths.length === 0) {
+      return
+    }
+    await this.client.deleteForever(paths)
+    await this.clearDirectoryMetadataAfterMutation()
+  }
+
+  /**
+   * Creates `targetDirectory` and any missing ancestors below `sharePath`.
+   *
+   * "Already exists" is an expected outcome while rebuilding a chain, so those
+   * failures are swallowed on purpose — the follow-up move in the caller is
+   * the real test of whether the directory is usable.
+   */
+  private async ensureShareDirectoryChain(sharePath: string, targetDirectory: string): Promise<void> {
+    const share = sharePath.replace(/\/+$/, '')
+    const target = targetDirectory.replace(/\/+$/, '')
+    if (share.length === 0 || !target.startsWith(share + '/')) {
+      // Never create anything outside the share the item belongs to.
+      return
+    }
+    const relative = target.slice(share.length + 1)
+    let current = share
+    for (const segment of relative.split('/')) {
+      if (segment.length === 0) {
+        continue
+      }
+      current = current + '/' + segment
+      try {
+        await this.client.createFolder(current)
+      } catch (_) {
+        // Already present, or created concurrently. Keep walking.
+      }
+    }
   }
 
   private async clearDirectoryMetadataAfterMutation(): Promise<void> {

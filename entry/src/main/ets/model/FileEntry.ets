@@ -18,6 +18,17 @@ export class FileEntry {
   // these fields, so callers must still be able to fall back to size/mtime.
   etag: string = ''
   checksum: string = ''
+  // Recycle-bin bookkeeping. UGOS keeps deleted items in a hidden
+  // `<folder>/#recycle` repository that mirrors the original tree, so an item
+  // found there still carries its own name and size; only the deletion time
+  // cannot be derived from the path and has to come from the server.
+  // Both stay at their defaults for ordinary directory entries.
+  deletedTime: number = 0
+  recycleInPath: boolean = false
+  // Absolute path of the share whose `#recycle` folder produced this entry.
+  // Restoring needs it to strip the repository segment and rebuild the
+  // original location; it is empty for entries that are not recycled.
+  recycleSharePath: string = ''
 }
 
 export class RootDirectory {
