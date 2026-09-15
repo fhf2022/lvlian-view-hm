@@ -406,6 +406,14 @@ struct Index {
   // horizontal Swiper navigation keep their existing state machine.
   @State imageDismissScale: number = 1
   @State imageDismissOffsetY: number = 0
+  // The dismiss pull follows the finger on BOTH axes, like the system gallery.
+  // This cannot come from the dismiss recognizer: that one is deliberately
+  // locked to PanDirection.Vertical so a horizontal drag stays with the Swiper,
+  // and by the time it wins the arbitration the Swiper is already out of the
+  // touch sequence, so the horizontal component would have no consumer at all.
+  // It is fed from the raw touch stream instead, which is not subject to
+  // gesture arbitration.
+  @State imageDismissOffsetX: number = 0
   @State imageDismissBackdropOpacity: number = 1
   @State viewerSurfaceOpacity: number = 1
   // The entry animation is limited to the image that was tapped. The normal
@@ -737,6 +745,13 @@ struct Index {
   private imageTouchMoved: boolean = false
   private imageTouchStartX: number = 0
   private imageTouchStartY: number = 0
+  // Latest raw touch X, refreshed on every Move. The dismiss pull is anchored
+  // HERE rather than at touch-down: the recognizer only fires after 5vp of
+  // vertical travel, so anchoring at touch-down would make the image jump
+  // sideways by however far the finger had already drifted horizontally
+  // before the pull was recognised.
+  private imageTouchLastX: number = 0
+  private imageDismissAnchorX: number = 0
   private imageDismissDragging: boolean = false
   private imageDismissChromeWasVisible: boolean = true
   private viewerSwiperController: SwiperController = new SwiperController()
@@ -6335,7 +6350,10 @@ struct Index {
   }
 
   private viewerPageOffsetX(index: number): number {
-    return index === this.viewerImageIndex ? this.imageOffsetX : 0
+    // Symmetric with viewerPageOffsetY: the zoom drag and the pull-to-dismiss
+    // drag are separate machines that both translate the same page.
+    return index === this.viewerImageIndex
+      ? this.imageOffsetX + this.imageDismissOffsetX : 0
   }
 
   private viewerPageOffsetY(index: number): number {
@@ -12188,10 +12206,19 @@ struct Index {
       if (point !== null) {
         this.imageTouchStartX = point.x
         this.imageTouchStartY = point.y
+        this.imageTouchLastX = point.x
       }
       return
     }
     if (event.type === TouchType.Move && this.imageTouchActive && point !== null) {
+      this.imageTouchLastX = point.x
+      // Once the pull is running, the raw touch stream is the only place the
+      // horizontal component still exists: the dismiss recognizer is
+      // vertical-only and the Swiper has already lost this touch sequence.
+      // TouchObject.x and translate() are both vp, so the delta maps 1:1.
+      if (this.imageDismissDragging) {
+        this.imageDismissOffsetX = point.x - this.imageDismissAnchorX
+      }
       const movedX = Math.abs(point.x - this.imageTouchStartX)
       const movedY = Math.abs(point.y - this.imageTouchStartY)
       if (movedX > 8 || movedY > 8) {
@@ -12238,6 +12265,8 @@ struct Index {
     this.imageDismissDragging = false
     this.imageDismissScale = 1
     this.imageDismissOffsetY = 0
+    this.imageDismissOffsetX = 0
+    this.imageDismissAnchorX = 0
     this.imageDismissBackdropOpacity = 1
   }
 
@@ -12250,6 +12279,10 @@ struct Index {
     if (this.viewerClosePending || !this.showImageViewer) {
       return
     }
+    // imageDismissOffsetX/Y and imageDismissScale are deliberately left as they
+    // are: the geometry transition flies the image from whatever 2-D pose the
+    // finger left it in, so clearing either offset here would break the single
+    // continuous motion into the thumbnail.
     this.imageDismissDragging = false
     this.imageTouchMoved = true
     // Do not calculate a second destination from screen coordinates. The
@@ -12266,6 +12299,12 @@ struct Index {
     }
     this.imageDismissChromeWasVisible = this.imageChromeVisible
     this.setImageChromeVisible(false, false)
+    // Take the horizontal origin from the finger's CURRENT position, not from
+    // touch-down, so the pull starts from zero sideways instead of snapping to
+    // however far the finger had already drifted before the vertical threshold
+    // was crossed.
+    this.imageDismissAnchorX = this.imageTouchLastX
+    this.imageDismissOffsetX = 0
     this.imageDismissDragging = true
     this.imageTouchMoved = true
   }
@@ -12298,7 +12337,12 @@ struct Index {
         this.flushDeferredViewerVisualCommits()
       }
     }, () => {
+      // The horizontal offset MUST be cleared inside this same closure. It has
+      // to travel back to the centre on the very same spring as the vertical
+      // offset and the scale; clearing it outside the animation would snap the
+      // image sideways on release.
       this.imageDismissOffsetY = 0
+      this.imageDismissOffsetX = 0
       this.imageDismissScale = 1
       this.imageDismissBackdropOpacity = 1
     })
