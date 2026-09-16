@@ -5,6 +5,7 @@ import {
   TimelinePeriod
 } from '../model/DirectoryTimeline'
 import { ProximityLightReceiver } from './ProximityLightReceiver'
+import { HapticFeedback } from '../core/haptic/HapticFeedback'
 
 class TimelineMarker {
   id: string = ''
@@ -206,8 +207,16 @@ export struct FisheyeTimeline {
         return
       }
       this.touchMoved = true
+      const previousDay = Math.floor(this.focusTime / DirectoryTimelinePolicy.DAY_MS)
       this.focusTime = this.clampFocus(this.touchStartFocus +
         delta / 38 * DirectoryTimelinePolicy.DAY_MS)
+      // One tick per day crossed. The list itself only moves in coarse jumps
+      // while scrubbing, so this is the only feedback that says how far the
+      // finger has travelled — but a fling crosses many days, which is why the
+      // cue is throttled in HapticFeedback rather than here.
+      if (Math.floor(this.focusTime / DirectoryTimelinePolicy.DAY_MS) !== previousDay) {
+        HapticFeedback.tick()
+      }
       this.onScrub(this.focusTime)
       return
     }

@@ -37,6 +37,12 @@
           ],
           "when": "always"
         }
+      },
+      {
+        // Gesture confirmation and warning feedback. Normal-level, granted at
+        // install; the haptic itself is still governed by the system's
+        // haptics switch because every call is made with usage 'touch'.
+        "name": "ohos.permission.VIBRATE"
       }
     ],
     "pages": "$profile:main_pages",

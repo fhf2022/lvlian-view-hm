@@ -39,6 +39,7 @@ import { ThumbnailPolicy, ThumbnailSize } from '../media/ThumbnailPolicy'
 import { ThumbnailCacheStore } from '../media/ThumbnailCacheStore'
 import { ViewerBitmapRecord, ViewerBitmapStore } from '../media/ViewerBitmapStore'
 import { NetworkClass, NetworkPolicy } from '../core/network/NetworkPolicy'
+import { HapticFeedback } from '../core/haptic/HapticFeedback'
 import {
   DirectoryIndexedSnapshot,
   DirectoryQuery,
@@ -775,6 +776,9 @@ struct Index {
   private imageDismissAnchorX: number = 0
   private imageDismissDragging: boolean = false
   private imageDismissChromeWasVisible: boolean = true
+  // Whether the current pull has already crossed the release-to-close
+  // distance, so the threshold cue fires once per pull rather than per sample.
+  private imageDismissPastThreshold: boolean = false
   private viewerSwiperController: SwiperController = new SwiperController()
   private viewerLoadQueue: FileEntry[] = []
   private viewerLoadRequests: Record<string, boolean> = {}
@@ -864,6 +868,9 @@ struct Index {
     lightEffect: { color: '#66FFFFFF' }
   })
   aboutToAppear(): void {
+    // Ask the motor which presets it has before the first cue needs one, so
+    // the very first long press does not fall back unnecessarily.
+    HapticFeedback.prepare()
     this.statusText = ''
     this.configureImageAnalyzer()
     this.ensureCacheState()
@@ -2910,7 +2917,7 @@ struct Index {
       }
       if (uris.length === 0) { return }
       // Reading starts after the system picker has returned and the user confirms the destination.
-      const confirmation = await promptAction.showDialog({ title: '上传 ' + uris.length + ' 个文件',
+      const confirmation = await this.getUIContext().getPromptAction().showDialog({ title: '上传 ' + uris.length + ' 个文件',
         message: '上传到：' + target + '\n保留原文件，同名文件跳过。',
         buttons: [{ text: '取消', color: '#536174' }, { text: '上传', color: '#2E6BFF' }],
         systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THICK, false) })
@@ -2918,9 +2925,15 @@ struct Index {
       // Opening a system picker does not depend on the transfer queues. Wait
       // for them only after the user has selected files and confirmed upload.
       await this.ensureDownloadState()
+      // Record the direction so 传输 opens on the uploads tab when the user
+      // goes there, but stay put. The files were picked in THIS directory, and
+      // dragging the user off to the transfer page for something that runs in
+      // the background loses their place for no reason.
       this.transferDirection = 'upload'
-      this.openDownloads()
       for (const uri of uris) { await this.uploadQueue.enqueue(uri, target, scope) }
+      // The file page does not render statusText, so without this the upload
+      // would start with nothing on screen to say so.
+      this.showImmersiveToast('已加入上传：' + uris.length.toString() + ' 个文件')
     } catch (error) { this.reportError(error as Object, '文件导入失败') }
     finally { this.importSelecting = false }
   }
@@ -4439,7 +4452,10 @@ struct Index {
         .systemMaterial(this.bottomCapsuleMaterial)
         .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
         .monopolizeEvents(this.bottomBarMode() === 'tools')
-        .onClick(() => this.toggleFileSortMenu())
+        .onClick(() => {
+          HapticFeedback.confirm()
+          this.toggleFileSortMenu()
+        })
         .bindPopup(this.showFileSortMenu, {
           builder: this.FileSortPopup,
           placement: Placement.Top,
@@ -4531,7 +4547,10 @@ struct Index {
     .enabled(this.selectionActionEnabled(title))
     .hitTestBehavior(this.bottomBarMode() === 'selection' ? HitTestMode.Default : HitTestMode.None)
     .monopolizeEvents(this.bottomBarMode() === 'selection')
-    .onClick(() => action())
+    .onClick(() => {
+      HapticFeedback.confirm()
+      action()
+    })
   }
 
   @Builder
@@ -4558,7 +4577,10 @@ struct Index {
     .enabled(this.selectedEntryCount > 0)
     .hitTestBehavior(this.bottomBarMode() === 'selection' ? HitTestMode.Default : HitTestMode.None)
     .monopolizeEvents(this.bottomBarMode() === 'selection')
-    .onClick(() => this.toggleSelectionMoreMenu())
+    .onClick(() => {
+      HapticFeedback.confirm()
+      this.toggleSelectionMoreMenu()
+    })
     .bindPopup(this.showSelectionMoreMenu, {
       builder: this.SelectionMorePopup,
       placement: Placement.Top,
@@ -4667,7 +4689,10 @@ struct Index {
     .systemMaterial(this.bottomCapsuleMaterial)
     .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
     .monopolizeEvents(this.bottomBarMode() === 'tools')
-    .onClick(options.action)
+    .onClick(() => {
+      HapticFeedback.confirm()
+      options.action()
+    })
   }
 
   @Builder
@@ -4817,7 +4842,10 @@ struct Index {
     // 否则 monopolizeEvents 会越过父级 HitTestMode.None 挡住可见层。
     .hitTestBehavior(this.bottomBarMode() === 'home' ? HitTestMode.Default : HitTestMode.None)
     .monopolizeEvents(this.bottomBarMode() === 'home')
-    .onClick(action)
+    .onClick(() => {
+      HapticFeedback.confirm()
+      action()
+    })
   }
 
   @Builder
@@ -8304,7 +8332,11 @@ struct Index {
   }
 
   private showImmersiveToast(message: string): void {
-    promptAction.showToast({
+    // The page's own UIContext, not the module-level promptAction: the global
+    // one resolves against whichever context is current, which is wrong (and
+    // fails outright) when the call comes from a dismissing subwindow such as
+    // the long-press menu.
+    this.getUIContext().getPromptAction().showToast({
       message: message,
       systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THIN)
     })
@@ -8320,13 +8352,17 @@ struct Index {
     if (this.errorDialogShowing) {
       return
     }
+    // Every failure in the app funnels through here, so this is the whole
+    // failure cue: one place, and only for a dialog that is actually going to
+    // be shown (the guard above already folded away repeats).
+    HapticFeedback.failure()
     this.errorDialogShowing = true
     this.showErrorDialog(normalized, title)
   }
 
   private async showErrorDialog(message: string, title: string): Promise<void> {
     try {
-      await promptAction.showDialog({
+      await this.getUIContext().getPromptAction().showDialog({
         title: title,
         message: message,
         buttons: [
@@ -10320,6 +10356,7 @@ struct Index {
       await this.repository.restoreFromRecycle(entry, entry.recycleSharePath)
       this.removeRecycleEntry(entry.path)
       this.statusText = '已还原到 ' + origin
+      HapticFeedback.success()
       this.showImmersiveToast('已还原：' + entry.name)
     } catch (error) {
       this.reportError(error as Object, '还原失败')
@@ -10333,7 +10370,8 @@ struct Index {
     if (this.isBusy) {
       return
     }
-    const response = await promptAction.showDialog({
+    HapticFeedback.warn()
+    const response = await this.getUIContext().getPromptAction().showDialog({
       title: '永久删除？',
       message: '「' + entry.name + '」会被永久删除，之后无法恢复。',
       buttons: [
@@ -10361,7 +10399,8 @@ struct Index {
     if (entries.length === 0 || this.isBusy || this.recycleLoading) {
       return
     }
-    const response = await promptAction.showDialog({
+    HapticFeedback.warn()
+    const response = await this.getUIContext().getPromptAction().showDialog({
       title: '清空当前目录？',
       message: this.recycleEntries.length.toString() + ' 项会被永久删除，之后无法恢复。',
       buttons: [
@@ -10390,6 +10429,7 @@ struct Index {
     try {
       await this.repository.purgeRecycle(paths)
       this.statusText = successMessage
+      HapticFeedback.success()
       this.showImmersiveToast(successMessage)
       // Purging removes items from the repository itself, so the flattened
       // list has to be rebuilt rather than filtered — parent folders that only
@@ -11537,6 +11577,13 @@ struct Index {
     }
     this.contextMenuContext = inRecycle ? 'recycle' : 'files'
 
+    // The one haptic on this whole interaction, and the reason haptics are
+    // worth having at all: the finger is still on the row, so the menu
+    // appearing is partly under the hand. Fired here rather than at each of
+    // the four long-press call sites, and only once the guards above have
+    // passed so a swallowed long press stays silent.
+    HapticFeedback.longPress()
+
     this.pendingContextAction = null
     this.contextMenuSourceY = Math.max(this.topSafeInset(),
       (event.fingerList.length > 0 ? event.fingerList[0].globalY -
@@ -11559,21 +11606,22 @@ struct Index {
   }
 
   private runContextAction(action: () => void): void {
-    this.pendingContextAction = action
-    this.dismissActionMenu()
-  }
-
-  private runPendingContextAction(): void {
-    const action = this.pendingContextAction
+    // Run the chosen action in the SAME tick as the dismiss request, rather
+    // than waiting for onDidDisappear.
+    //
+    // Waiting looks tidier but breaks every row that opens a dialog. By the
+    // time onDidDisappear fires, the menu's subwindow is already being torn
+    // down, and the window manager refuses the dialog its own new window:
+    //     WMS: SetWindowType: permission denied!
+    //     WMSLife: Create: context is nullptr
+    //     Window: CreateWindowWithSession: error: 15
+    //     AceSubWindow: [(-1:100000:singleton)] init toast dialog window failed
+    // The menu closes, no dialog appears, and 详情 / 删除 read as dead rows.
+    // Asking while the menu is still up keeps a valid window context; the
+    // dialog simply covers the menu, which closes underneath it.
     this.pendingContextAction = null
-    if (action !== null) {
-      action()
-    }
-  }
-
-  private closeActionMenu(): void {
-    this.pendingContextAction = null
     this.dismissActionMenu()
+    action()
   }
 
   private dismissActionMenu(): void {
@@ -11586,9 +11634,17 @@ struct Index {
     }
     // Keep the preview data and the bottom bar's visibility stable until the
     // native menu AND preview have completed their exit animation.
+    //
+    // The action itself already ran in runContextAction, which is why nothing
+    // is dispatched from here.
     this.contextMenuVisible = false
     this.contextMenuEntry = null
-    this.runPendingContextAction()
+    this.pendingContextAction = null
+  }
+
+  private closeActionMenu(): void {
+    this.pendingContextAction = null
+    this.dismissActionMenu()
   }
 
   private actionMenuHeight(entry: FileEntry): number {
@@ -11783,7 +11839,7 @@ struct Index {
     if (entry.isDirectory && entry.childCount >= 0) {
       lines.splice(1, 0, '项目：' + entry.childCount.toString() + ' 项')
     }
-    await promptAction.showDialog({
+    await this.getUIContext().getPromptAction().showDialog({
       title: entry.name,
       message: lines.join('\n'),
       buttons: [{ text: '知道了', color: this.isDarkTheme ? '#FFFFFFFF' : '#536174' }],
@@ -12307,6 +12363,7 @@ struct Index {
       }
       await this.refreshCurrentDirectory()
       this.statusText = this.destinationOperation === 'copy' ? '已复制到云盘' : '已移动到云盘'
+      HapticFeedback.success()
       this.showImmersiveToast(this.statusText)
       this.destinationLoading = false
       this.closeDestinationPicker()
@@ -13011,6 +13068,7 @@ struct Index {
     this.imageDismissAnchorX = this.imageTouchLastX
     this.imageDismissOffsetX = 0
     this.imageDismissDragging = true
+    this.imageDismissPastThreshold = false
     this.imageTouchMoved = true
   }
 
@@ -13030,6 +13088,19 @@ struct Index {
     this.imageDismissOffsetY = effectiveOffsetY
     this.imageDismissScale = 1 - progress * IMAGE_DISMISS_MAX_SCALE_REDUCTION
     this.imageDismissBackdropOpacity = Math.max(0, 1 - progress * 1.25)
+
+    // Tell the user the pull has gone far enough that releasing now closes the
+    // viewer. The rule is invisible — the backdrop just keeps fading — so
+    // without this the only way to learn it is to overshoot and hope. Fired on
+    // the crossing only, and re-armed if the finger retreats back under it.
+    const triggerDistance = Math.max(120, this.imageViewportHeightVp * IMAGE_DISMISS_TRIGGER_RATIO)
+    const pastThreshold = effectiveOffsetY >= triggerDistance
+    if (pastThreshold && !this.imageDismissPastThreshold) {
+      this.imageDismissPastThreshold = true
+      HapticFeedback.threshold()
+    } else if (!pastThreshold) {
+      this.imageDismissPastThreshold = false
+    }
   }
 
   private animateImageDismissBack(): void {
@@ -14297,7 +14368,8 @@ struct Index {
     const preferredDirection = this.viewerLastNavigationDirection >= 0 ? 1 : -1
     this.closeImageMoreMenu()
     this.closeImageDetails()
-    const response = await promptAction.showDialog({
+    HapticFeedback.warn()
+    const response = await this.getUIContext().getPromptAction().showDialog({
       title: '删除图片？',
       message: '图片会移入云盘回收站，可在云盘中恢复。',
       buttons: [
@@ -14342,6 +14414,7 @@ struct Index {
         this.closeImageViewer()
       }
       this.statusText = '已移入回收站'
+      HapticFeedback.success()
       this.showImmersiveToast('已移入云盘回收站')
       return
     }
@@ -15572,6 +15645,9 @@ struct Index {
     }
     if (this.videoPlaybackManager.setPlaybackRate(2)) {
       this.videoFastPlaybackActive = true
+      // The "2x" badge is small and the finger is over the video, so the long
+      // press gets the same recognition cue every other long press gets.
+      HapticFeedback.longPress()
     }
   }
 
@@ -16331,7 +16407,7 @@ struct Index {
       return true
     }
     const sizeText = entry.size > 0 ? this.formatSize(entry.size) : '大小未知'
-    const response = await promptAction.showDialog({
+    const response = await this.getUIContext().getPromptAction().showDialog({
       title: '使用移动网络下载？',
       message: entry.name + ' · ' + sizeText,
       buttons: [
@@ -16399,6 +16475,7 @@ struct Index {
       const context = getContext(this) as Context
       await UserFileManager.saveToGallery(context, localPath, entry.name, this.isVideo(entry))
       this.statusText = '已保存到图库'
+      HapticFeedback.success()
       this.showImmersiveToast('已保存到图库：' + entry.name)
     } catch (error) {
       this.reportError(error as Object, '保存到图库失败')
@@ -16577,7 +16654,7 @@ struct Index {
     if (this.networkClass === 'offline') {
       return false
     }
-    const response = await promptAction.showDialog({
+    const response = await this.getUIContext().getPromptAction().showDialog({
       title: '使用移动网络分享？',
       message: entries.length.toString() + ' 个文件需要先缓存到本机',
       buttons: [
@@ -16639,7 +16716,8 @@ struct Index {
       return
     }
     this.closeSelectionMoreMenu()
-    const response = await promptAction.showDialog({
+    HapticFeedback.warn()
+    const response = await this.getUIContext().getPromptAction().showDialog({
       title: '删除 ' + entries.length.toString() + ' 项？',
       message: '所选项目会移入云盘回收站，可在云盘中恢复。',
       buttons: [
@@ -16695,6 +16773,7 @@ struct Index {
     }
     if (failedEntries.length === 0) {
       this.statusText = '已移入回收站'
+      HapticFeedback.success()
       this.showImmersiveToast('已移入云盘回收站')
     } else if (successCount > 0) {
       this.statusText = '已删除 ' + successCount.toString() + ' 项，' +
@@ -16976,7 +17055,8 @@ struct Index {
       return
     }
     this.closeActionMenu()
-    const response = await promptAction.showDialog({
+    HapticFeedback.warn()
+    const response = await this.getUIContext().getPromptAction().showDialog({
       title: '删除文件？',
       message: '文件会移入云盘回收站，可在云盘中恢复。',
       buttons: [
@@ -17010,6 +17090,7 @@ struct Index {
     if (resolution === 'deleted') {
       this.removePersistedViewerRotation(entry).catch((): void => {})
       this.statusText = '已移入回收站'
+      HapticFeedback.success()
       this.showImmersiveToast('已移入云盘回收站')
       return
     }
@@ -18073,7 +18154,8 @@ struct Index {
 
   private async confirmRemoveDownloadTask(task: DownloadTaskRecord): Promise<void> {
     if (task.id.startsWith('upload:')) {
-      const response = await promptAction.showDialog({ title: '移除上传记录？',
+      HapticFeedback.warn()
+      const response = await this.getUIContext().getPromptAction().showDialog({ title: '移除上传记录？',
         message: task.status === 'completed' ? '只移除记录，保留云盘中的文件。' :
           '清理此次上传的本地暂存与云盘断点；原文件不受影响。',
         buttons: [{ text: '取消', color: '#536174' }, { text: '移除', color: '#D34D5C' }],
@@ -18087,7 +18169,8 @@ struct Index {
     const message = task.status === 'completed'
       ? '只移除下载记录，不会删除系统下载目录中的文件。'
       : '会删除当前未完成的临时文件，已下载的部分不能保留。'
-    const response = await promptAction.showDialog({
+    HapticFeedback.warn()
+    const response = await this.getUIContext().getPromptAction().showDialog({
       title: '移除下载记录？',
       message: message,
       buttons: [
@@ -18295,7 +18378,8 @@ struct Index {
     if (this.isBusy) {
       return
     }
-    const response = await promptAction.showDialog({
+    HapticFeedback.warn()
+    const response = await this.getUIContext().getPromptAction().showDialog({
       title: '退出账号？',
       message: '退出后将清除当前登录会话，自动登录也会关闭。',
       buttons: [
