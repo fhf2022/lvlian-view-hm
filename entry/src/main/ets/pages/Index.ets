@@ -326,6 +326,7 @@ struct Index {
   @State isBusy: boolean = false
   @State trustDevice: boolean = false
   @State autoLogin: boolean = false
+  @State rememberAddress: boolean = false
   @State rememberPassword: boolean = false
   @State silentAutoLogin: boolean = false
   @State rootKind: RootKind = 'personal'
@@ -2249,7 +2250,7 @@ struct Index {
 
       Row({ space: 12 }) {
         this.LoginOptionButton('自动登录', this.autoLogin, () => this.toggleAutoLogin())
-        this.LoginOptionButton('记住密码', this.rememberPassword, () => this.toggleRememberPassword())
+        this.LoginOptionButton('记住地址', this.rememberAddress, () => this.toggleRememberAddress())
       }
       .width('100%')
 
@@ -2283,18 +2284,18 @@ struct Index {
     Row({ space: 6 }) {
       if (active) {
         SymbolGlyph($r('sys.symbol.checkmark'))
-          .fontSize(13)
-          .fontColor(['#2E6BFF'])
+          .fontSize(14)
+          .fontColor([Color.White])
       }
       Text(title)
         .fontSize(14)
-        .fontColor(active ? '#2E6BFF' : $r('app.color.text_secondary'))
+        .fontColor(active ? Color.White : $r('app.color.text_secondary'))
     }
     .justifyContent(FlexAlign.Center)
     .layoutWeight(1)
     .height(44)
     .borderRadius(22)
-    .backgroundColor(active ? $r('app.color.surface_selected') : $r('app.color.surface_input'))
+    .backgroundColor(active ? '#2E6BFF' : $r('app.color.surface_input'))
     .onClick(action)
   }
 
@@ -8618,6 +8619,7 @@ struct Index {
       const storedUsername = await this.loginPreferences.get('cloud_username', '')
       const storedPassword = await this.loginPreferences.get('cloud_password', '')
       const storedRemember = await this.loginPreferences.get('remember_password', false)
+      const storedAddress = await this.loginPreferences.get('remember_address', false)
       const storedAuto = await this.loginPreferences.get('auto_login', false)
       if (typeof storedLinkId === 'string' && storedLinkId.length > 0) {
         this.linkId = storedLinkId
@@ -8627,6 +8629,9 @@ struct Index {
       }
       if (typeof storedRemember === 'boolean') {
         this.rememberPassword = storedRemember
+      }
+      if (typeof storedAddress === 'boolean') {
+        this.rememberAddress = storedAddress
       }
       if (typeof storedAuto === 'boolean') {
         this.autoLogin = storedAuto
@@ -8655,6 +8660,9 @@ struct Index {
         } finally {
           this.silentAutoLogin = false
         }
+      } else if (this.autoLogin && this.linkId.length > 0) {
+        // 还没有保存的凭据时，先把记住的地址解析好（凭据由系统密码保险箱填充）
+        await this.handleResolve()
       }
     } catch (_) {
       // Login remains available with empty fields if local preferences are unavailable.
@@ -8673,6 +8681,7 @@ struct Index {
       await this.loginPreferences.put('cloud_username', this.username)
       await this.loginPreferences.put('cloud_password', this.rememberPassword ? this.password : '')
       await this.loginPreferences.put('remember_password', this.rememberPassword)
+      await this.loginPreferences.put('remember_address', this.rememberAddress)
       await this.loginPreferences.put('auto_login', this.autoLogin)
       await this.loginPreferences.flush()
     } catch (_) {
@@ -9949,21 +9958,42 @@ struct Index {
       return
     }
     this.autoLogin = !this.autoLogin
-    if (this.autoLogin) {
-      this.rememberPassword = true
-    }
+    // 开启自动登录即自动保存：静默登录与会话内自动重连都依赖本地保存的凭据。
+    this.rememberPassword = this.autoLogin
     await this.persistLoginPreferences()
   }
 
-  private async toggleRememberPassword(): Promise<void> {
+  // 「记住地址」只在解析成功后可点：记住的是设备地址，不是凭据。
+  // 记住成功后胶囊变色；再点一次视为取消记住。
+  private async toggleRememberAddress(): Promise<void> {
     if (this.isBusy) {
       return
     }
-    this.rememberPassword = !this.rememberPassword
-    if (!this.rememberPassword) {
-      this.autoLogin = false
+    if (this.baseUrl.length === 0) {
+      this.showImmersiveToast('请先解析设备，再记住地址')
+      return
     }
-    await this.persistLoginPreferences()
+    if (this.rememberAddress) {
+      this.rememberAddress = false
+      await this.persistLoginPreferences()
+      this.showImmersiveToast('已取消记住设备地址')
+      return
+    }
+    try {
+      if (this.loginPreferences === null) {
+        await this.ensureLoginState()
+      }
+      if (this.loginPreferences === null) {
+        return
+      }
+      await this.loginPreferences.put('cloud_link_id', this.linkId)
+      await this.loginPreferences.put('remember_address', true)
+      await this.loginPreferences.flush()
+      this.rememberAddress = true
+      this.showImmersiveToast('已记住设备地址')
+    } catch (_) {
+      this.showImmersiveToast('地址没有保存成功，请再试一次')
+    }
   }
 
   private openSettings(): void {
