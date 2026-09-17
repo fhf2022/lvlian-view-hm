@@ -316,7 +316,7 @@ class ImageDisplayState {
 @Component
 struct Index {
   @State screen: RemoteScreen = 'login'
-  @State linkId: string = 'dxp4800-0a6c'
+  @State linkId: string = ''
   @State username: string = ''
   @State password: string = ''
   @State otpCode: string = ''
@@ -2178,115 +2178,124 @@ struct Index {
 
   @Builder
   LoginContent(): void {
-    Column() {
-      Column({ space: 18 }) {
-        Column({ space: 6 }) {
-          Text('我的云盘')
-            .fontSize(28)
-            .fontWeight(FontWeight.Bold)
-            .fontColor($r('app.color.text_primary'))
-          Text('登录')
-            .fontSize(14)
-            .fontColor($r('app.color.text_tertiary'))
-        }
-        .alignItems(HorizontalAlign.Start)
-        .width('100%')
+    Column({ space: 26 }) {
+      Column({ space: 12 }) {
+        Image($r('app.media.private_cloud'))
+          .width(76)
+          .height(76)
+        Text('联文件')
+          .fontSize(26)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+        Text('登录你的私有云盘')
+          .fontSize(14)
+          .fontColor($r('app.color.text_tertiary'))
+      }
+      .alignItems(HorizontalAlign.Center)
+      .width('100%')
 
-        Column({ space: 10 }) {
-          TextInput({ placeholder: '云盘 ID', text: this.linkId })
-            .height(52)
+      Column({ space: 12 }) {
+        // 云盘 ID。解析是这个字段自己的动作，放进字段尾部而不是和登录并排
+        Row({ space: 12 }) {
+          TextInput({ placeholder: '当前仅支持绿联 NAS', text: this.linkId })
+            .layoutWeight(1)
+            .height(46)
             .fontSize(16)
             .fontColor($r('app.color.text_primary'))
+            .placeholderColor($r('app.color.text_faint'))
             .backgroundColor(Color.Transparent)
-            .borderRadius(14)
-            .padding({ left: 16, right: 16 })
-            .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true))
+            .padding({ left: 0, right: 0 })
             .onChange((value: string) => this.linkId = value)
-          TextInput({ placeholder: '云盘账号', text: this.username })
-            .height(52)
-            .fontSize(16)
-            .fontColor($r('app.color.text_primary'))
-            .backgroundColor(Color.Transparent)
-            .borderRadius(14)
-            .padding({ left: 16, right: 16 })
-            .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true))
-            .onChange((value: string) => this.username = value)
-          TextInput({ placeholder: '云盘密码', text: this.password })
-            .type(InputType.Password)
-            .height(52)
-            .fontSize(16)
-            .fontColor($r('app.color.text_primary'))
-            .backgroundColor(Color.Transparent)
-            .borderRadius(14)
-            .padding({ left: 16, right: 16 })
-            .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true))
-            .onChange((value: string) => this.password = value)
-        }
-        .width('100%')
-
-        Row({ space: 10 }) {
-          this.LoginOptionButton('自动登录', this.autoLogin, () => this.toggleAutoLogin())
-          this.LoginOptionButton('记住密码', this.rememberPassword, () => this.toggleRememberPassword())
-        }
-        .width('100%')
-
-        Row({ space: 10 }) {
-          Button('登录')
-            .layoutWeight(1)
-            .height(50)
-            .fontSize(16)
-            .fontWeight(FontWeight.Medium)
-            .fontColor(Color.White)
-            .backgroundColor(Color.Transparent)
-            .borderRadius(16)
-            .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.REGULAR, true, '#552E6BFF'))
-            .enabled(!this.isBusy)
-            .onClick(() => this.handleLogin())
           Button('解析')
-            .layoutWeight(1)
-            .height(50)
-            .fontSize(16)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.control_text'))
-            .backgroundColor(Color.Transparent)
-            .borderRadius(16)
-            .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.REGULAR, true))
+            .height(34)
+            .padding({ left: 14, right: 14 })
+            .fontSize(13)
+            .fontColor('#2E6BFF')
+            .backgroundColor($r('app.color.surface_selected'))
+            .borderRadius(17)
             .enabled(!this.isBusy)
             .onClick(() => this.handleResolve())
         }
         .width('100%')
+        .height(58)
+        .padding({ left: 16, right: 8 })
+        .backgroundColor($r('app.color.surface_input'))
+        .borderRadius(14)
 
-        if (this.statusText.length > 0) {
-          Text(this.statusText)
-            .fontSize(13)
-            .fontColor($r('app.color.text_secondary'))
-            .width('100%')
-            .textAlign(TextAlign.Center)
-        }
+        TextInput({ placeholder: '云盘账号', text: this.username })
+          .type(InputType.USER_NAME)
+          .height(52)
+          .fontSize(16)
+          .fontColor($r('app.color.text_primary'))
+          .placeholderColor($r('app.color.text_faint'))
+          .backgroundColor($r('app.color.surface_input'))
+          .borderRadius(14)
+          .padding({ left: 16, right: 16 })
+          .onChange((value: string) => this.username = value)
+
+        TextInput({ placeholder: '云盘密码', text: this.password })
+          .type(InputType.Password)
+          .showPasswordIcon(true)
+          .height(52)
+          .fontSize(16)
+          .fontColor($r('app.color.text_primary'))
+          .placeholderColor($r('app.color.text_faint'))
+          .backgroundColor($r('app.color.surface_input'))
+          .borderRadius(14)
+          .padding({ left: 16, right: 16 })
+          .onChange((value: string) => this.password = value)
       }
-      .width('92%')
-      .padding(24)
-      .borderRadius(28)
-      .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.REGULAR, false))
+      .width('100%')
+
+      Row({ space: 12 }) {
+        this.LoginOptionButton('自动登录', this.autoLogin, () => this.toggleAutoLogin())
+        this.LoginOptionButton('记住密码', this.rememberPassword, () => this.toggleRememberPassword())
+      }
+      .width('100%')
+
+      Button(this.isBusy ? '登录中…' : '登录')
+        .width('100%')
+        .height(52)
+        .fontSize(16)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(Color.White)
+        .backgroundColor('#2E6BFF')
+        .borderRadius(16)
+        .enabled(!this.isBusy)
+        .onClick(() => this.handleLogin())
+
+      if (this.statusText.length > 0) {
+        Text(this.statusText)
+          .fontSize(13)
+          .fontColor($r('app.color.text_secondary'))
+          .width('100%')
+          .textAlign(TextAlign.Center)
+      }
     }
     .width('100%')
+    .padding({ left: 30, right: 30 })
     .layoutWeight(1)
     .justifyContent(FlexAlign.Center)
   }
 
   @Builder
   LoginOptionButton(title: string, active: boolean, action: () => void): void {
-    Button(title)
-      .layoutWeight(1)
-      .height(44)
-      .fontSize(14)
-      .fontColor(active ? Color.White : $r('app.color.text_secondary'))
-      .backgroundColor(Color.Transparent)
-      .borderRadius(15)
-      .systemMaterial(active
-        ? this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true, '#552E6BFF')
-        : this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THIN, true))
-      .onClick(action)
+    Row({ space: 6 }) {
+      if (active) {
+        SymbolGlyph($r('sys.symbol.checkmark'))
+          .fontSize(13)
+          .fontColor(['#2E6BFF'])
+      }
+      Text(title)
+        .fontSize(14)
+        .fontColor(active ? '#2E6BFF' : $r('app.color.text_secondary'))
+    }
+    .justifyContent(FlexAlign.Center)
+    .layoutWeight(1)
+    .height(44)
+    .borderRadius(22)
+    .backgroundColor(active ? $r('app.color.surface_selected') : $r('app.color.surface_input'))
+    .onClick(action)
   }
 
   @Builder
