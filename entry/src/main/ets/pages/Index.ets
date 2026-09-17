@@ -2,7 +2,7 @@ import { StorageBudget } from '../download/StorageBudget'
 import { DownloadDestination } from '../download/DownloadDestination'
 import { promptAction, uiMaterial, curves, window, LengthMetrics, FrameCallback, PiPWindow } from '@kit.ArkUI'
 import { systemShare, harmonyShare } from '@kit.ShareKit'
-import { Context, Want, common, wantConstant } from '@kit.AbilityKit'
+import { Context, Want, common, wantConstant, autoFillManager } from '@kit.AbilityKit'
 import { fileIo, fileUri, picker } from '@kit.CoreFileKit'
 import { photoAccessHelper } from '@kit.MediaLibraryKit'
 import { FloatingImportControl } from '../components/FloatingImportControl'
@@ -2248,9 +2248,43 @@ struct Index {
       }
       .width('100%')
 
+      // 选项胶囊必须内联：@Builder 按值传参不会随状态重渲染，
+      // 写成 this.LoginOptionButton(active) 时 active 是值拷贝，
+      // 点开关只会改状态、颜色永远停在初始值。
       Row({ space: 12 }) {
-        this.LoginOptionButton('自动登录', this.autoLogin, () => this.toggleAutoLogin())
-        this.LoginOptionButton('记住地址', this.rememberAddress, () => this.toggleRememberAddress())
+        Row({ space: 6 }) {
+          if (this.autoLogin) {
+            SymbolGlyph($r('sys.symbol.checkmark'))
+              .fontSize(14)
+              .fontColor([Color.White])
+          }
+          Text('自动登录')
+            .fontSize(14)
+            .fontColor(this.autoLogin ? Color.White : $r('app.color.text_secondary'))
+        }
+        .justifyContent(FlexAlign.Center)
+        .layoutWeight(1)
+        .height(44)
+        .borderRadius(22)
+        .backgroundColor(this.autoLogin ? '#2E6BFF' : $r('app.color.surface_input'))
+        .onClick(() => this.toggleAutoLogin())
+
+        Row({ space: 6 }) {
+          if (this.rememberAddress) {
+            SymbolGlyph($r('sys.symbol.checkmark'))
+              .fontSize(14)
+              .fontColor([Color.White])
+          }
+          Text('记住地址')
+            .fontSize(14)
+            .fontColor(this.rememberAddress ? Color.White : $r('app.color.text_secondary'))
+        }
+        .justifyContent(FlexAlign.Center)
+        .layoutWeight(1)
+        .height(44)
+        .borderRadius(22)
+        .backgroundColor(this.rememberAddress ? '#2E6BFF' : $r('app.color.surface_input'))
+        .onClick(() => this.toggleRememberAddress())
       }
       .width('100%')
 
@@ -2277,26 +2311,6 @@ struct Index {
     .padding({ left: 30, right: 30 })
     .layoutWeight(1)
     .justifyContent(FlexAlign.Center)
-  }
-
-  @Builder
-  LoginOptionButton(title: string, active: boolean, action: () => void): void {
-    Row({ space: 6 }) {
-      if (active) {
-        SymbolGlyph($r('sys.symbol.checkmark'))
-          .fontSize(14)
-          .fontColor([Color.White])
-      }
-      Text(title)
-        .fontSize(14)
-        .fontColor(active ? Color.White : $r('app.color.text_secondary'))
-    }
-    .justifyContent(FlexAlign.Center)
-    .layoutWeight(1)
-    .height(44)
-    .borderRadius(22)
-    .backgroundColor(active ? '#2E6BFF' : $r('app.color.surface_input'))
-    .onClick(action)
   }
 
   @Builder
@@ -10627,6 +10641,26 @@ struct Index {
     }
   }
 
+  // 密码保险箱的系统保存是在"页面跳转"时触发的，而本应用的登录是同一页内的状态切换
+  // （screen: 'login' -> 'files'），跳转事件从不发生，保险箱里也就一直没有这条凭据，
+  // 登录页自然填不出东西。这里显式请求一次保存。
+  //
+  // 必须在登录字段还在树上时调用：系统是在请求那一刻去读当前页面的可填充节点的，
+  // 所以调用点放在 this.screen = 'files' 之前。
+  //
+  // 用的是两参数版本（SDK 只导出了这个）；文档里带 SaveRequest/viewData 的三参数版本
+  // 是 API 26 新增的，当前 SDK 声明文件里还没有。
+  private requestVaultSave(): void {
+    if (this.username.length === 0 || this.password.length === 0) {
+      return
+    }
+    try {
+      autoFillManager.requestAutoSave(this.getUIContext())
+    } catch (_) {
+      // 写不进密码保险箱不能影响登录本身。
+    }
+  }
+
   private async handleLogin(silent: boolean = false): Promise<void> {
     if (this.isBusy) {
       return
@@ -10656,6 +10690,11 @@ struct Index {
       await this.ensureDownloadState()
       await this.downloadQueue.setReady(true)
       await this.uploadQueue.setReady(true)
+      if (!silent) {
+        // 只有用户亲手登录才请求保存（自动登录每次进来都弹保存提示会很烦），
+        // 且必须赶在切换页面之前，系统要读登录字段。
+        this.requestVaultSave()
+      }
       this.screen = 'files'
       this.updateBottomBarVisibility(false)
       this.statusText = silent ? '' : '登录成功'
@@ -10684,6 +10723,7 @@ struct Index {
       await this.ensureDownloadState()
       await this.downloadQueue.setReady(true)
       await this.uploadQueue.setReady(true)
+      this.requestVaultSave()
       this.screen = 'files'
       this.updateBottomBarVisibility(false)
       this.statusText = result.message
