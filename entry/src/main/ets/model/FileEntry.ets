@@ -34,6 +34,12 @@ export class FileEntry {
 export class RootDirectory {
   personal: FileEntry[] = []
   shared: FileEntry[] = []
+  // 个人空间用哪个 root_type 取到的。管理员是 4，普通账号是 2
+  // （普通账号读 root_type=4 会返回 1301 Access not allowed）。
+  // 根列表按这个值取到之后，在根这一层列目录必须继续用同一个值。
+  personalRootType: number = 4
+  // 共享空间固定是 3。
+  sharedRootType: number = 3
 }
 
 export class LoginResult {

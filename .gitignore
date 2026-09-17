@@ -15,6 +15,18 @@
 /signing/
 /build-profile.json5
 
+# Signing material, wherever it ends up. The release keystore holds the private
+# key and cannot be regenerated - losing it means the certificate has to be
+# revoked and reissued, and a leaked one lets anyone produce installable
+# packages. These patterns are a backstop so that a file dropped outside
+# /signing/ still cannot be committed by accident.
+*.p12
+*.csr
+*.cer
+*.p7b
+*.keystore
+*.jks
+
 # Generated packages, logs, and temporary inspection files
 *.hap
 *.log

@@ -33,7 +33,26 @@ interface SearchDirectory {
   rootType: number
 }
 
+// 读取一个根集合的结果：条目 + 实际生效的 root_type。
+// 普通账号与管理员的个人空间 root_type 不同，把这个值带出去，
+// 后续在根这一层列目录才能用对参数。
+class RootListing {
+  entries: FileEntry[] = []
+  rootType: number = 4
+
+  constructor(entries: FileEntry[], rootType: number) {
+    this.entries = entries
+    this.rootType = rootType
+  }
+}
+
 export class UgreenRemoteRepository {
+  // 个人空间：管理员/拥有者是 4，普通账号是 2。普通账号读 4 会返回
+  // 1301 Access not allowed，所以按顺序试，用第一个能读到的。
+  private static readonly PERSONAL_ROOT_TYPES: number[] = [4, 2]
+  // 共享空间固定是 3。
+  private static readonly SHARED_ROOT_TYPES: number[] = [3]
+
   private static readonly DIRECTORY_CACHE_TTL_MS: number = 30 * 1000
   private static readonly DIRECTORY_CACHE_MAX_ENTRIES: number = 16
   // The recycle repository lives below a first-level folder, so listing it is
@@ -159,13 +178,33 @@ export class UgreenRemoteRepository {
 
   async getRootWithCache(forceNetwork: boolean = false): Promise<RootDirectory> {
     const root = new RootDirectory()
-    const result = await Promise.all([
-      this.list('', 4, forceNetwork),
-      this.list('', 3, forceNetwork)
-    ])
-    root.personal = result[0].filter((item: FileEntry) => item.isDirectory)
-    root.shared = result[1].filter((item: FileEntry) => item.isDirectory)
+    // 两个根各自独立取。这里以前用 Promise.all：普通账号读不到个人空间时，
+    // 整个登录流程会跟着抛错，报错还会被显示成"登录失败"——可实际上登录是
+    // 成功的，只是这一个根没权限。一边失败不该拖垮另一边。
+    const personal = await this.listFirstAvailableRoot(
+      UgreenRemoteRepository.PERSONAL_ROOT_TYPES, forceNetwork)
+    const shared = await this.listFirstAvailableRoot(
+      UgreenRemoteRepository.SHARED_ROOT_TYPES, forceNetwork)
+    root.personal = personal.entries
+    root.personalRootType = personal.rootType
+    root.shared = shared.entries
+    root.sharedRootType = shared.rootType
     return root
+  }
+
+  // 依次尝试若干个 root_type，返回第一个能读到的。都读不到就返回空列表，
+  // 并保留首选值——后续在根这一层列目录会用到。
+  private async listFirstAvailableRoot(rootTypes: number[],
+    forceNetwork: boolean): Promise<RootListing> {
+    for (const rootType of rootTypes) {
+      try {
+        const entries = await this.list('', rootType, forceNetwork)
+        return new RootListing(entries.filter((item: FileEntry) => item.isDirectory), rootType)
+      } catch (_) {
+        // 该 root_type 对当前账号不可用（普通账号没有 root_type=4），试下一个。
+      }
+    }
+    return new RootListing([], rootTypes[0])
   }
 
   async list(path: string, rootType: number, forceNetwork: boolean = false): Promise<FileEntry[]> {

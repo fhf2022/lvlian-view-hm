@@ -13,10 +13,6 @@
       "value": "联文件"
     },
     {
-      "name": "download_permission_reason",
-      "value": "用于把下载完成的文件保存到系统下载目录"
-    },
-    {
       "name": "background_playback_reason",
       "value": "用于视频播放时在后台持续播放"
     }

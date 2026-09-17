@@ -312,6 +312,19 @@ class ImageDisplayState {
   previewOrientations: Record<string, ImageRotateOrientation> = {}
 }
 
+// 一行在屏幕上的矩形（globalPosition，px），用于长按拖动扩选时的命中测试。
+// 必须记「整行」而不是缩略图——行高 58vp、缩略图只有 40×34vp，
+// 按缩略图的框去命中会小一大圈，滑过去点不中。
+class RowHitArea {
+  entry: FileEntry | null = null
+  surface: string = ''
+  index: number = -1
+  x: number = 0
+  y: number = 0
+  width: number = 0
+  height: number = 0
+}
+
 @Entry
 @Component
 struct Index {
@@ -2765,12 +2778,32 @@ struct Index {
               }
             }
             .width('100%')
+            .onAreaChange((_, area) => this.recordRowHitArea(entry, index, 'list', area))
             .onClick(() => this.handleFileEntryClick(entry))
+            // 序列组：必须先长按成功，后面的 Pan 才会被识别。所以普通滑动
+            // 碰不到它、列表照常滚动；只有长按之后再拖，才是滑动多选。
             .priorityGesture(
-              LongPressGesture({ repeat: false })
-                .onAction((event: GestureEvent): void => {
-                  this.showActionMenu(entry, event)
-                })
+              GestureGroup(GestureMode.Sequence,
+                // duration 比默认的 500ms 短一点，拖选起手更跟手。
+                LongPressGesture({ repeat: false, duration: 380 })
+                  .onAction((event: GestureEvent): void => {
+                    if (this.selectionMode) {
+                      this.beginDragSelection(entry, index)
+                    } else {
+                      this.showActionMenu(entry, event)
+                    }
+                  }),
+                PanGesture({ direction: PanDirection.All, distance: 8 })
+                  .onActionUpdate((event: GestureEvent): void => {
+                    this.extendDragSelection(event)
+                  })
+                  .onActionEnd((): void => {
+                    this.endDragSelection()
+                  })
+                  .onActionCancel((): void => {
+                    this.endDragSelection()
+                  })
+              )
             )
           }
           .onAppear(() => {
@@ -4894,36 +4927,40 @@ struct Index {
   @Builder
   FileHeaderLeadingControl(): void {
     Stack({ alignContent: Alignment.Center }) {
-      Button() {
-        Stack({ alignContent: Alignment.Center }) {
-          // Keep one glyph node and replace its symbol directly. Cross-fading
-          // two stacked glyphs produced a bright/blank frame during selection.
-          SymbolGlyph(this.selectionMode
-            ? $r('sys.symbol.xmark') : $r('sys.symbol.chevron_backward'))
-            .fontSize(24)
-            .fontColor([$r('sys.color.icon_primary')])
-            .opacity(this.fileHeaderLeadingVisible() ? 1 : 0)
+      // 只有存在返回目标（进入了子目录）或多选态时才画这个圆形按钮。
+      // 以前是无条件画、靠把图标 opacity 设成 0 来“隐藏”，但按钮的沉浸材质
+      // 仍会画出一个空的圆盘——深色模式下就是标题栏左上角那个看着像黑点的圆圈。
+      // 要隐藏就整个不渲染，别留底色。外层 Stack 的宽度不变，布局不受影响。
+      if (this.fileHeaderLeadingVisible()) {
+        Button() {
+          Stack({ alignContent: Alignment.Center }) {
+            // Keep one glyph node and replace its symbol directly. Cross-fading
+            // two stacked glyphs produced a bright/blank frame during selection.
+            SymbolGlyph(this.selectionMode
+              ? $r('sys.symbol.xmark') : $r('sys.symbol.chevron_backward'))
+              .fontSize(24)
+              .fontColor([$r('sys.color.icon_primary')])
+          }
+          .width('100%')
+          .height('100%')
         }
-        .width('100%')
-        .height('100%')
+        .type(ButtonType.Normal)
+        .width(40)
+        .height(40)
+        .borderRadius(20)
+        .backgroundColor(Color.Transparent)
+        .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN))
+        .overlay(this.ImportLightOverlay, { align: Alignment.Center })
+        .hitTestBehavior(HitTestMode.Default)
+        .monopolizeEvents(true)
+        .onClick(() => {
+          if (this.selectionMode) {
+            this.exitSelectionMode()
+          } else if (this.currentPath.length > 0) {
+            this.goBack()
+          }
+        })
       }
-      .type(ButtonType.Normal)
-      .width(40)
-      .height(40)
-      .borderRadius(20)
-      .backgroundColor(Color.Transparent)
-      .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN))
-      .enabled(this.fileHeaderLeadingVisible())
-      .overlay(this.ImportLightOverlay, { align: Alignment.Center })
-      .hitTestBehavior(this.fileHeaderLeadingVisible() ? HitTestMode.Default : HitTestMode.None)
-      .monopolizeEvents(true)
-      .onClick(() => {
-        if (this.selectionMode) {
-          this.exitSelectionMode()
-        } else if (this.currentPath.length > 0) {
-          this.goBack()
-        }
-      })
     }
     .width(this.fileHeaderLeadingWidth())
     .height(40)
@@ -11254,7 +11291,9 @@ struct Index {
     this.sharedRoots = root.shared
     this.rootKind = 'personal'
     this.selectedBottomTab = 'home'
-    this.currentRootType = 4
+    // 个人空间的 root_type 随账号角色不同（管理员 4、普通账号 2），
+    // 用根列表实际取到的那个值，别写死 4——否则普通账号在根这一层列目录会 1301。
+    this.currentRootType = root.personalRootType
     this.currentPath = ''
     this.updateTopTitle('个人空间', false)
     this.navigationStack = []
@@ -16562,6 +16601,118 @@ struct Index {
     } finally {
       this.isBusy = false
     }
+  }
+
+  // ── 长按滑动多选 ────────────────────────────────────────────────
+  // 三种手势要分清，靠的是 GestureGroup(GestureMode.Sequence)：
+  //   ① 快速滑动（没长按到）→ 序列组不成立，Pan 根本不参与 → 列表正常滚动
+  //   ② 长按不动松手        → 非多选弹菜单 / 多选无动作
+  //   ③ 长按后拖动          → 长按成功后才轮到这个 Pan → 连续选中
+  // 所以千万别在列表上挂裸 PanGesture 或裸 onTouch，那会直接抢走滚动。
+  private rowHitAreas: Map<string, RowHitArea> = new Map<string, RowHitArea>()
+  @State private dragSelectionActive: boolean = false
+  // 记录「最初按压的点」和「手指当前的点」，这两点之间的条目统一翻转；
+  // 离开范围的条目恢复原状 —— 所以上下来回滑能收缩，一趟来回回到原状。
+  private dragAnchorIndex: number = -1
+  private dragSnapshotPaths: string[] = []
+  private lastHitIndex: number = -1
+
+  private recordRowHitArea(entry: FileEntry, index: number, surface: string, area: Area): void {
+    const position = area.globalPosition
+    if (typeof position.x !== 'number' || typeof position.y !== 'number') {
+      return
+    }
+    const record = new RowHitArea()
+    record.entry = entry
+    record.surface = surface
+    record.index = index
+    record.x = position.x as number
+    record.y = position.y as number
+    record.width = area.width as number
+    record.height = area.height as number
+    this.rowHitAreas.set(surface + ':' + entry.path, record)
+  }
+
+  // 长按成功：多选态下开始拖选。起点已选中 → 这一趟是「取消」，否则是「选中」。
+  // 震动只在进出各来一下（最轻的 SOFT），拖动过程中不再震。
+  private beginDragSelection(entry: FileEntry, index: number): void {
+    this.dragSelectionActive = true
+    this.dragSnapshotPaths = this.selectedPaths.slice()
+    this.dragAnchorIndex = index
+    this.lastHitIndex = index
+    HapticFeedback.threshold()
+    this.applyDragRange(index)
+  }
+
+  private endDragSelection(): void {
+    if (this.dragSelectionActive) {
+      HapticFeedback.threshold()
+    }
+    this.dragSelectionActive = false
+    this.dragAnchorIndex = -1
+    this.lastHitIndex = -1
+    this.dragSnapshotPaths = []
+  }
+
+  private extendDragSelection(event: GestureEvent): void {
+    if (!this.dragSelectionActive) {
+      return
+    }
+    const fingers = event.fingerList
+    if (fingers === undefined || fingers.length === 0) {
+      return
+    }
+    const x = fingers[0].globalX
+    const y = fingers[0].globalY
+    let hit: RowHitArea | null = null
+    this.rowHitAreas.forEach((record: RowHitArea): void => {
+      if (hit !== null || record.surface !== 'list') {
+        return
+      }
+      if (x >= record.x && x <= record.x + record.width &&
+        y >= record.y && y <= record.y + record.height) {
+        hit = record
+      }
+    })
+    if (hit === null) {
+      return
+    }
+    const target = hit as RowHitArea
+    if (target.index < 0 || target.index === this.lastHitIndex) {
+      return
+    }
+    this.lastHitIndex = target.index
+    this.applyDragRange(target.index)
+  }
+
+  // 把「起点 → 当前点」这一段统一设成拖选的目标状态，其余条目一律回滚到
+  // 拖选开始前的快照。回滚是上下来回滑能收缩的关键。
+  private applyDragRange(targetIndex: number): void {
+    if (this.dragAnchorIndex < 0) {
+      return
+    }
+    const from = Math.min(this.dragAnchorIndex, targetIndex)
+    const to = Math.max(this.dragAnchorIndex, targetIndex)
+    // 范围内的每一条各自翻转：拖选前没选中的 → 选中；已经选中的 → 取消。
+    // 所以划过已选中的条目会把它取消掉，而不是保持选中。
+    const rangePaths: string[] = []
+    for (let i = from; i <= to; i++) {
+      const entry = this.entries[i]
+      if (entry !== undefined) {
+        rangePaths.push(entry.path)
+      }
+    }
+    // 范围外的一律保持拖选前的样子。
+    const next: string[] = this.dragSnapshotPaths.filter((path: string): boolean => {
+      return rangePaths.indexOf(path) < 0
+    })
+    for (const path of rangePaths) {
+      if (this.dragSnapshotPaths.indexOf(path) < 0) {
+        next.push(path)
+      }
+    }
+    this.selectedPaths = next
+    this.selectedEntryCount = next.length
   }
 
   private enterSelectionMode(): void {
