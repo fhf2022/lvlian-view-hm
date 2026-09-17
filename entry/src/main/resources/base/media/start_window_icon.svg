@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Deliberately invisible.
+
+  The launch page's job here is to hand the user straight to the first frame of
+  the app with nothing in between. Drawing the app icon on it would mean the
+  icon appears, then 200ms later fades out - the system's launch transition is
+  fixed and cannot be customised, so that fade is all the platform ever gives
+  us. Combined with a background that already matches the app's own, an empty
+  icon makes the cold start read as one continuous surface rather than a splash
+  followed by the app.
+
+  If a branded launch is ever wanted instead, point startWindowIcon at the
+  icon's foreground layer (transparent, white motif only) and set
+  start_window_background to the colour at the centre of the icon tile, so the
+  tile appears to expand to fill the screen. Never do both this and a
+  hand-written splash page - the platform documents that as an icon that
+  visibly scales.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect x="0" y="0" width="1024" height="1024" fill="#000000" fill-opacity="0"/>
+</svg>

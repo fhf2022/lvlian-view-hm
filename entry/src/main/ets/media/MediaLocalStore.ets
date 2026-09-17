@@ -60,7 +60,7 @@ export type MediaLocalListener = (records: MediaLocalRecord[]) => void
 
 /**
  * Small account-scoped index for cache and Download routing. The files remain
- * in the existing cacheDir or public Download/UGREENlink directory; only the
+ * in the existing cacheDir or system Download directory; only the
  * mapping is persisted here. This lets a completed file survive removal of a
  * visible download task.
  */

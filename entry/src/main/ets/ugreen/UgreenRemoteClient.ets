@@ -85,12 +85,12 @@ export class UgreenRemoteClient {
   async resolve(ugreenLinkId: string): Promise<string> {
     const alias = ugreenLinkId.trim()
     if (alias.length === 0) {
-      throw new UgreenError(UgreenErrorKind.API_CHANGED, '请输入 UGREENlink ID')
+      throw new UgreenError(UgreenErrorKind.API_CHANGED, '请输入云盘 ID')
     }
     const resolveBody: JsonObject = {}
     resolveBody['alias'] = alias
     const response = await this.transport.requestJson(UGREENLINK_RESOLVE_URL, http.RequestMethod.POST, resolveBody)
-    const data = this.successData(response.body, 'UGREENlink 解析失败')
+    const data = this.successData(response.body, '云盘解析失败')
     const relayDomain = this.stringValue(data['relayDomain'])
     if (relayDomain.length === 0) {
       throw new UgreenError(UgreenErrorKind.API_CHANGED, '解析结果缺少远程域名')
@@ -708,7 +708,7 @@ export class UgreenRemoteClient {
   // Protocol matches the UGOS web client's createUploadData/uploadWebFileStream.
   async prepareUpload(dir: string, name: string, uuid: string, size: number,
     changed: number): Promise<boolean> {
-    const boundary = 'UGREENlink' + uuid.replace(/[^a-zA-Z0-9]/g, '')
+    const boundary = 'LinkFiles' + uuid.replace(/[^a-zA-Z0-9]/g, '')
     const fields: Record<string, string> = { 'uuid': uuid, 'dir': dir, 'filename': name,
       'action_type': '0', 'size': String(size), 'begin_size': '0', 'current_size': '0',
       'change_time': String(changed), 'resume': 'true', 'first_request': 'true' }
@@ -765,7 +765,7 @@ export class UgreenRemoteClient {
   private requireEndpoints(): UgreenEndpoints {
     const value = this.endpoints
     if (value === null) {
-      throw new UgreenError(UgreenErrorKind.API_CHANGED, '请先解析 UGREENlink ID')
+      throw new UgreenError(UgreenErrorKind.API_CHANGED, '请先解析云盘 ID')
     }
     return value
   }

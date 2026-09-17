@@ -5501,7 +5501,7 @@ struct Index {
 
   @Builder
   DestinationStorageVisual(): void {
-    Image($r('app.media.ugreen_cloud'))
+    Image($r('app.media.private_cloud'))
       .width(38)
       .height(38)
       .objectFit(ImageFit.Contain)
@@ -5514,7 +5514,7 @@ struct Index {
         Blank()
           .width('7.4%')
         this.DestinationStorageVisual()
-        Text('我的绿联')
+        Text('我的云盘')
           .fontSize(20)
           .fontColor($r('app.color.text_primary'))
           .layoutWeight(1)
@@ -11748,7 +11748,7 @@ struct Index {
       if (this.isVideo(entry)) {
         // Video transfers use the MediaKit range/cache coordinator so an
         // earlier stream is promoted instead of starting a second full-file
-        // download. The route remains the same UGREENlink directory.
+        // download. The route remains the same system download directory.
         await this.refreshVideoManager()
         this.videoTransferManager.requestDownload(entry, destinationRoot, relativePath).catch((): void => {})
       } else {
@@ -12141,7 +12141,7 @@ struct Index {
 
   private destinationDisplayName(): string {
     if (this.destinationPath.length === 0 || this.destinationPath === this.destinationUserRootPath()) {
-      return '我的绿联'
+      return '我的云盘'
     }
     const normalized = this.destinationPath.replace(/[\\/]$/, '')
     const separator = normalized.lastIndexOf('/')
@@ -16353,7 +16353,7 @@ struct Index {
         return videoLocal
       }
       // Explicit actions such as Save/Share/Open-with are allowed to promote
-      // the resumable stream into the user Download/UGREENlink directory.
+      // the resumable stream into the user system download directory.
       await this.videoTransferManager.requestCachedFile(entry)
       const downloaded = await this.videoTransferManager.resolveLocal(entry)
       if (downloaded.length === 0) {

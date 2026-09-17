@@ -30,7 +30,7 @@ export class ThumbnailNormalizer {
       outputPath = await CacheManager.save(bytes, cacheDirectory,
         sourceName, cacheLimitBytes, cacheKey)
 
-      // The authoritative UGREEN size_type=1 route already returns a bounded
+      // The authoritative NAS size_type=1 route already returns a bounded
       // list thumbnail (the device sample is 400 x 672, about 1 MiB decoded).
       // ArkUI Image renders these files correctly while ImageSource's metadata
       // decoder rejects this NAS encoding. Keep the server thumbnail as-is;
@@ -113,7 +113,7 @@ export class ThumbnailNormalizer {
       console.error('[UgreenThumbnail] normalize failed: bytes=' + bytes.byteLength.toString() +
         ', magic=' + this.magic(bytes) + ', source=' + sourceName + ', profile=' + profile + ': ' +
         JSON.stringify(error))
-      // UGREEN's thumbnail service can return JPEG/WebP variants that the
+      // The NAS thumbnail service can return JPEG/WebP variants that the
       // synchronous ImageSource metadata decoder rejects even though ArkUI's
       // Image component renders them. Do not turn that compatibility issue
       // into an empty list preview: retain only payloads with a real image

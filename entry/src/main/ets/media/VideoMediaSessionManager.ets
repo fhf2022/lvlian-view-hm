@@ -178,7 +178,7 @@ export class VideoMediaSessionManager {
       const metadata: avSession.AVMetadata = {
         assetId: entry.path,
         title: entry.name,
-        subtitle: 'UGREENlink 视频',
+        subtitle: '联文件 视频',
         filter: avSession.ProtocolType.TYPE_CAST_PLUS_STREAM | avSession.ProtocolType.TYPE_DLNA
       }
       if (snapshot.durationMs > 0) {
@@ -205,7 +205,7 @@ export class VideoMediaSessionManager {
           description: this.mediaDescription(nextEntry)
         })
       }
-      await session.setAVQueueTitle('UGREENlink 视频')
+      await session.setAVQueueTitle('联文件 视频')
       await session.setAVQueueItems(queue)
       await this.writePlaybackState(session, snapshot)
       console.info('[UgreenAVSession] playback state published asset=' + entry.path +
@@ -292,13 +292,13 @@ export class VideoMediaSessionManager {
       description: {
         assetId: entry.path,
         title: entry.name,
-        subtitle: 'UGREENlink 视频',
+        subtitle: '联文件 视频',
         mediaUri: mediaUri,
         mediaType: 'VIDEO',
         mediaSize: entry.size,
         startPosition: Math.max(0, Math.floor(positionMs)),
         duration: Math.max(0, Math.floor(durationMs)),
-        appName: 'UGREENlink'
+        appName: '联文件'
       }
     }
     await controller.prepare(item)
@@ -334,7 +334,7 @@ export class VideoMediaSessionManager {
       return this.createPromise
     }
 
-    const promise = avSession.createAVSession(context, 'UGREENlinkVideo', 'video')
+    const promise = avSession.createAVSession(context, 'LinkFilesVideo', 'video')
       .then((session: avSession.AVSession): avSession.AVSession | null => {
         if (!this.wantsActive) {
           session.destroy().catch((error: Error): void => {

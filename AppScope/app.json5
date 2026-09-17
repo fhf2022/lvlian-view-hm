@@ -1,6 +1,6 @@
 {
   "app": {
-    "bundleName": "com.example.ugreenlink",
+    "bundleName": "cn.fhf.linkfiles",
     "vendor": "example",
     "versionCode": 1000000,
     "versionName": "1.0.0",

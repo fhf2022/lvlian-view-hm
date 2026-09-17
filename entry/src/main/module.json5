@@ -53,7 +53,11 @@
         "description": "$string:EntryAbility_desc",
         "icon": "$media:layered_image",
         "label": "$string:EntryAbility_label",
-        "startWindowIcon": "$media:startIcon",
+        // Invisible on purpose - see the comment in start_window_icon.svg.
+        // The launch page exists only to cover the gap before the app's own
+        // first frame, and a background that already matches it makes the cold
+        // start continuous.
+        "startWindowIcon": "$media:start_window_icon",
         "startWindowBackground": "$color:start_window_background",
         "exported": true,
         "backgroundModes": [

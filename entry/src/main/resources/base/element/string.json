@@ -2,19 +2,19 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "module description"
+      "value": "联文件 —— 远程管理你的私有云盘"
     },
     {
       "name": "EntryAbility_desc",
-      "value": "description"
+      "value": "联文件 —— 远程管理你的私有云盘"
     },
     {
       "name": "EntryAbility_label",
-      "value": "label"
+      "value": "联文件"
     },
     {
       "name": "download_permission_reason",
-      "value": "用于将下载完成的文件保存到系统 Download/UGREENlink 文件夹"
+      "value": "用于把下载完成的文件保存到系统下载目录"
     },
     {
       "name": "background_playback_reason",

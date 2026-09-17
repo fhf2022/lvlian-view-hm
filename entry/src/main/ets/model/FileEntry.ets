@@ -96,7 +96,7 @@ export class DownloadTaskRecord {
   stagingPath: string = ''
   finalPath: string = ''
   // Absolute local directory selected by the user. Empty keeps the default
-  // public Download/UGREENlink destination used by normal downloads.
+  // public system download destination used by normal downloads.
   destinationRoot: string = ''
   // Relative path below destinationRoot. It lets folder copies preserve the
   // remote directory tree while still using the same resumable queue.
