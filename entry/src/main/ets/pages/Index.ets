@@ -11841,6 +11841,10 @@ struct Index {
         }
         this.setCurrentPageState(Math.max(1, Math.ceil(nextEntries.length / 200)), false)
         this.replaceEntries(nextEntries, false, true)
+        // 进入新目录：按设置里的默认视图落地。放这里是因为 replaceEntries 刚把
+        // currentDirectoryHasImages 更新好，而且这个回调每次进入只跑一次 ——
+        // 不能放进 replaceEntries 本身（加载/排序/刷新/翻页都会跑，会拖垮加载）。
+        this.applyPreferredViewMode()
         this.updateBottomBarVisibility(true)
         this.updateDirectoryCount(nextPath, nextSnapshot.totalCount >= 0
           ? nextSnapshot.totalCount : nextEntries.length)
