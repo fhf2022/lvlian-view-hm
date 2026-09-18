@@ -2090,7 +2090,9 @@ struct Index {
           safeTop: this.topSafeInset() + 64, safeBottom: this.floatingBarContentInset(8),
           expanded: $importExpanded, onSelect: (source: string): void => { this.selectImportSource(source) } })
           .position({ x: 0, y: 0 })
-          .zIndex(this.viewerClosePending ? 8 : 25)
+          // 选取页的层级是 20；悬浮球平时是 25，会一直压在选取页上面（显示逻辑不对）。
+          // 选取页打开时把它降到 8，正好被盖在底下。
+          .zIndex(this.showDestinationPicker || this.viewerClosePending ? 8 : 25)
           // The overlay is a full page sized host whose only interactive part is
           // the ball itself. Keeping the host out of the touch test lets taps
           // reach the file list under it.
