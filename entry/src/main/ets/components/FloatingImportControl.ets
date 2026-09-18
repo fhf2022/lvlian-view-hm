@@ -2,9 +2,16 @@ import { uiMaterial, LengthMetrics } from '@kit.ArkUI'
 import { preferences } from '@kit.ArkData'
 import { ImportLightState } from './ProximityLighting'
 
-/** Diameter of the printed highlight, vp. The ball itself is 56vp. */
-const HALO: number = 84
-const HALF_HALO: number = HALO / 2
+/**
+ * 光晕半径 / 直径，vp（球本体 56vp）。
+ *
+ * 别较真用 ProximityLighting.RANGE 对齐：那是"光够得着的距离"（超出就不画了），
+ * 不是光斑的半径。别处画的是材质边缘上的一圈细高光，视觉上很小；这里是从中心
+ * 向外辐射的实心光斑，同样的数值会大得离谱（试过 140 半径 = 280 直径，明显过大）。
+ * 就按球本身的尺度给：半径 56（比原来的 42 略大一点）。
+ */
+const HALF_HALO: number = 56
+const HALO: number = HALF_HALO * 2
 /** How far the finger has to travel before the drag takes over, vp. */
 const DRAG_SLOP: number = 10
 
@@ -38,6 +45,8 @@ export struct FloatingImportControl {
   private startGlobalY: number = 0
   private startLocalX: number = 28
   private startLocalY: number = 28
+  // 展开菜单里「按下 A、滑到 B 松手 → 执行 B」用：记住按下时落在哪一项。
+  private slidePressSource: string = ''
   private prefs: preferences.Preferences | null = null
   private hostWindowX: number = 0
   private hostWindowY: number = 0
@@ -121,9 +130,28 @@ export struct FloatingImportControl {
     }
     context.animateTo({ duration: 220, curve: Curve.EaseInOut }, () => { this.expanded = true })
   }
+  // 展开菜单的 onTouch 和条目的 onClick 都会走到这里（容器触摸会截断点击，
+  // 两条路都可能触发），加一道时间去重，避免 onSelect 被执行两次。
+  private lastChooseAt: number = 0
+
   private choose(source: string): void {
+    const now = Date.now()
+    if (now - this.lastChooseAt < 350) {
+      return
+    }
+    this.lastChooseAt = now
     this.changeExpanded(false)
     this.onSelect(source)
+  }
+
+  /** 展开菜单里 y 落在第几项（三项等高 48vp，容器上下各 8vp 内边距）。 */
+  private sourceAt(y: number): string {
+    const index = Math.floor((y - 8) / 48)
+    if (index < 0 || index > 2) {
+      return ''
+    }
+    const sources: string[] = ['files', 'gallery', 'folder']
+    return sources[index]
   }
   private async dock(): Promise<void> {
     this.publishLight(false)
@@ -234,12 +262,14 @@ export struct FloatingImportControl {
         .radialGradient({
           center: ['50%', '50%'],
           radius: HALF_HALO,
+          // 和 ProximityLightReceiver 画边缘高光用的是同一组色标
+          // （235,250,255 冷白；0.95 / 0.82 / 0.35 / 0 的透明度），只是这里
+          // 从中心向外辐射 —— 两处的观感才对得上。
           colors: [
-            ['#F2FFFFFF', 0.0],
-            ['#CCFFFFFF', 0.18],
-            ['#66FFFFFF', 0.45],
-            ['#26FFFFFF', 0.75],
-            ['#00FFFFFF', 1.0]
+            ['#F2EBFAFF', 0.0],
+            ['#D1EBFAFF', 0.30],
+            ['#59EBFAFF', 0.65],
+            ['#00EBFAFF', 1.0]
           ]
         })
         .position({ x: this.lightX - HALF_HALO, y: this.lightY - HALF_HALO })
@@ -334,6 +364,42 @@ export struct FloatingImportControl {
       .opacity(this.expanded ? 1 : 0)
       .animation({ duration: this.expanded ? 120 : 70, curve: Curve.EaseOut })
       .hitTestBehavior(this.expanded ? HitTestMode.Default : HitTestMode.BLOCK_DESCENDANTS)
+      // 「按下 A、滑到 B 松手 → 执行 B」。三项等高 48vp、容器上下各 8vp 内边距，
+      // 所以按 y 直接算索引即可。松手仍落在按下的那一项上时不处理——交给 onClick，
+      // 两者互补，不会重复执行。
+      .onTouch((event: TouchEvent) => {
+        if (!this.expanded) {
+          return
+        }
+        const points = event.touches
+        if (points.length === 0) {
+          return
+        }
+        // 展开时光感没人发布（CollapsedBall 在 expanded 时直接 return），
+        // 由这里接手，光才能跟着手指走。
+        this.lightX = points[0].x
+        this.lightY = points[0].y
+        if (event.type === TouchType.Down) {
+          this.pressed = true
+          this.publishLight(true)
+          this.slidePressSource = this.sourceAt(points[0].y)
+          return
+        }
+        if (event.type === TouchType.Move) {
+          return
+        }
+        // Up / Cancel：一律按「松手时落在哪一项」执行（choose 内部有 350ms 去重，
+        // 不会和条目的 onClick 重复执行）；落在菜单外就只收起菜单。
+        this.pressed = false
+        this.publishLight(false)
+        const released = this.sourceAt(points[0].y)
+        this.slidePressSource = ''
+        if (released.length === 0) {
+          this.changeExpanded(false)
+          return
+        }
+        this.choose(released)
+      })
     }
     .backgroundColor(Color.Transparent)
     .width(this.surfaceWidth()).height(this.surfaceHeight())

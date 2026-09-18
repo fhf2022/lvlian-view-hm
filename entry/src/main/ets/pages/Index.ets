@@ -269,6 +269,11 @@ interface DirectoryViewState {
 interface FileToolCircleButtonOptions {
   icon: Resource
   action: () => void
+  // 「一排按钮上滑动」用：按下 A、滑到 B 松手 → 触发 B。
+  // slideBar 区分是哪一排（各排重叠在同一位置，必须分组命中）；
+  // slideKey 是该按钮在这排里的标识。
+  slideBar: string
+  slideKey: string
 }
 
 // The file surface underneath a video is kept as the PiP restore destination.
@@ -315,6 +320,18 @@ class ImageDisplayState {
 // 一行在屏幕上的矩形（globalPosition，px），用于长按拖动扩选时的命中测试。
 // 必须记「整行」而不是缩略图——行高 58vp、缩略图只有 40×34vp，
 // 按缩略图的框去命中会小一大圈，滑过去点不中。
+// ── 一排按钮上的滑动：按下 A、滑到 B 松手 → 触发 B ────────────────────
+// 光感跟随手指由 ProximityLightReceiver 负责，这里只解决"松手判定用谁"。
+// 注意不能把 onTouch 挂在容器上：子按钮 monopolizeEvents(true) 会独占事件，
+// 父级收不到。所以挂在每个按钮上，用「自己的矩形 + 触摸相对偏移」换算全局
+// 坐标，再去命中整排里的其它按钮。
+class SlideActionItem {
+  x: number = 0
+  y: number = 0
+  width: number = 0
+  height: number = 0
+  action: (() => void) | null = null
+}
 class RowHitArea {
   entry: FileEntry | null = null
   surface: string = ''
@@ -4486,7 +4503,9 @@ struct Index {
       Row() {
         this.FileToolCircleButton({
           icon: $r('sys.symbol.folder_badge_plus'),
-          action: () => this.openCreateFolder()
+          action: () => this.openCreateFolder(),
+          slideBar: 'tools',
+          slideKey: '新建'
         })
 
         Button() {
@@ -4537,7 +4556,9 @@ struct Index {
         // FileToolCircleButtonOptions).
         this.FileToolCircleButton({
           icon: this.fileViewModeIcon(),
-          action: () => this.toggleFileViewMode()
+          action: () => this.toggleFileViewMode(),
+          slideBar: 'tools',
+          slideKey: '视图'
         })
       }
       .width('100%')
@@ -4604,6 +4625,8 @@ struct Index {
     .enabled(this.selectionActionEnabled(title))
     .hitTestBehavior(this.bottomBarMode() === 'selection' ? HitTestMode.Default : HitTestMode.None)
     .monopolizeEvents(this.bottomBarMode() === 'selection')
+    .onAreaChange((_, area) => this.registerSlideItem('selection', title, area, action))
+    .onTouch((event: TouchEvent) => this.slideItemTouch('selection', title, event))
     .onClick(() => {
       HapticFeedback.confirm()
       action()
@@ -4634,6 +4657,9 @@ struct Index {
     .enabled(this.selectedEntryCount > 0)
     .hitTestBehavior(this.bottomBarMode() === 'selection' ? HitTestMode.Default : HitTestMode.None)
     .monopolizeEvents(this.bottomBarMode() === 'selection')
+    .onAreaChange((_, area) =>
+      this.registerSlideItem('selection', '更多', area, () => this.toggleSelectionMoreMenu()))
+    .onTouch((event: TouchEvent) => this.slideItemTouch('selection', '更多', event))
     .onClick(() => {
       HapticFeedback.confirm()
       this.toggleSelectionMoreMenu()
@@ -4688,11 +4714,11 @@ struct Index {
           this.SelectionMoreRow($r('sys.symbol.rename'), '重命名',
             () => this.renameSelectedEntry(this.selectedSingleEntry() as FileEntry))
           this.SelectionMoreRow($r('sys.symbol.info_circle'), '详情',
-            () => this.showEntryDetailsSelected(this.selectedSingleEntry() as FileEntry))
+            () => this.showEntryDetailsSelected(this.selectedSingleEntry() as FileEntry), false)
         }
       } else if (this.selectedCachedEntries().length > 0) {
         this.SelectionMoreRow($r('sys.symbol.arrow_down'), '释放缓存',
-          () => this.releaseSelectedCaches())
+          () => this.releaseSelectedCaches(), false)
       }
     }
     .width(228)
@@ -4702,7 +4728,8 @@ struct Index {
   }
 
   @Builder
-  SelectionMoreRow(icon: Resource, title: string, action: () => void): void {
+  SelectionMoreRow(icon: Resource, title: string, action: () => void,
+    showDivider: boolean = true): void {
     Row() {
       Text(title)
         .fontSize(16)
@@ -4718,10 +4745,23 @@ struct Index {
     .padding({ left: 10, right: 8 })
     .borderRadius(14)
     .backgroundColor(Color.Transparent)
+    // 和其它菜单一致：按下 A、滑到 B 松手 → 执行 B（并同样收起菜单）。
+    .onAreaChange((_, area) => this.registerSlideItem('selmore', title, area, () => {
+      this.showSelectionMoreMenu = false
+      action()
+    }))
+    .onTouch((event: TouchEvent) => this.slideItemTouch('selmore', title, event))
     .onClick(() => {
       this.showSelectionMoreMenu = false
       action()
     })
+
+    if (showDivider) {
+      Divider()
+        .strokeWidth(0.5)
+        .color($r('sys.color.comp_divider'))
+        .margin({ left: 10, right: 10 })
+    }
   }
 
   @Builder
@@ -4899,6 +4939,8 @@ struct Index {
     // 否则 monopolizeEvents 会越过父级 HitTestMode.None 挡住可见层。
     .hitTestBehavior(this.bottomBarMode() === 'home' ? HitTestMode.Default : HitTestMode.None)
     .monopolizeEvents(this.bottomBarMode() === 'home')
+    .onAreaChange((_, area) => this.registerSlideItem('home', tab, area, action))
+    .onTouch((event: TouchEvent) => this.slideItemTouch('home', tab, event))
     .onClick(() => {
       HapticFeedback.confirm()
       action()
@@ -5287,12 +5329,13 @@ struct Index {
 
   @Builder
   ActionSectionGap(): void {
-    // Spacing only. The old translucent band was the "black box" that showed
-    // through the menu's immersive surface.
+    // 系统文件管理的菜单里，功能区之间有一条灰色分隔带，这里对齐它。
+    // 注意：之前这里用过半透明黑，在沉浸材质上看起来像一块黑砖，所以被拿掉了。
+    // 现在按主题给浅色（浅灰 / 低透明白），既有分隔带又不会发黑。
     Row()
       .width('100%')
       .height(8)
-      .backgroundColor(Color.Transparent)
+      .backgroundColor(this.isDarkTheme ? '#1FFFFFFF' : '#F2F3F5')
   }
 
   @Builder
@@ -5312,6 +5355,9 @@ struct Index {
     .justifyContent(FlexAlign.Center)
     .backgroundColor(Color.Transparent)
     .borderRadius(14)
+    .onAreaChange((_, area) =>
+      this.registerSlideItem('ctxmenu', title, area, () => this.runContextAction(action)))
+    .onTouch((event: TouchEvent) => this.slideItemTouch('ctxmenu', title, event))
     .onClick(() => this.runContextAction(action))
   }
 
@@ -5333,14 +5379,22 @@ struct Index {
       .height(50)
       .padding({ left: 16, right: 10 })
       if (!last) {
+        // 用 100% 宽 + 左右 margin，别用 calc：菜单这种嵌套结构里
+        // calc(100% - 24vp) 有时量出 0 宽，线就整条不见了。
         Divider()
-          .width('calc(100% - 24vp)')
+          .width('100%')
           .strokeWidth(0.5)
           .color($r('app.color.divider'))
+          .margin({ left: 12, right: 12 })
       }
     }
     .width('100%')
     .backgroundColor(Color.Transparent)
+    // 菜单里也要「按下 A、滑到 B 松手 → 执行 B」。菜单虽然挂在原生
+    // bindContextMenu 上，但条目是自绘的，所以能收到触摸事件。
+    .onAreaChange((_, area) =>
+      this.registerSlideItem('ctxmenu', title, area, () => this.runContextAction(action)))
+    .onTouch((event: TouchEvent) => this.slideItemTouch('ctxmenu', title, event))
     .onClick(() => this.runContextAction(action))
   }
 
@@ -7636,6 +7690,9 @@ struct Index {
       .height('100%')
       .hitTestBehavior(HitTestMode.Default)
       .monopolizeEvents(true)
+      .onAreaChange((_, area) => this.registerSlideItem('viewer', '进度', area,
+        () => this.loadCommittedViewerOriginalManually()))
+      .onTouch((event: TouchEvent) => this.slideItemTouch('viewer', '进度', event))
       .onClick(() => this.loadCommittedViewerOriginalManually())
       this.ImageViewerActionItem($r('sys.symbol.trash'), '删除',
         () => this.deleteCommittedViewerImage())
@@ -7676,6 +7733,9 @@ struct Index {
     .justifyContent(FlexAlign.Center)
     .hitTestBehavior(HitTestMode.Default)
     .monopolizeEvents(true)
+    // 一排按钮上滑动：按下 A、滑到 B 松手 → 触发 B。
+    .onAreaChange((_, area) => this.registerSlideItem('viewer', title, area, action))
+    .onTouch((event: TouchEvent) => this.slideItemTouch('viewer', title, event))
     .onClick(action)
   }
 
@@ -7804,6 +7864,10 @@ struct Index {
       .borderRadius(14)
       .backgroundColor(Color.Transparent)
       .stateEffect(true)
+      // 和其它菜单一样：按下 A、滑到 B 松手 → 执行 B。
+      .onAreaChange((_, area) =>
+        this.registerSlideItem('viewermenu', title, area, action))
+      .onTouch((event: TouchEvent) => this.slideItemTouch('viewermenu', title, event))
       .onClick(action)
 
       if (showDivider) {
@@ -16713,6 +16777,72 @@ struct Index {
     }
     this.selectedPaths = next
     this.selectedEntryCount = next.length
+  }
+
+
+
+  private slideItems: Map<string, SlideActionItem> = new Map<string, SlideActionItem>()
+  private slidePressKey: string = ''
+
+  private registerSlideItem(barId: string, key: string, area: Area, action: () => void): void {
+    const position = area.globalPosition
+    if (typeof position.x !== 'number' || typeof position.y !== 'number') {
+      return
+    }
+    const item = new SlideActionItem()
+    item.x = position.x as number
+    item.y = position.y as number
+    item.width = area.width as number
+    item.height = area.height as number
+    item.action = action
+    this.slideItems.set(barId + ':' + key, item)
+  }
+
+  private hitSlideItem(barId: string, x: number, y: number): string {
+    let found = ''
+    const prefix = barId + ':'
+    this.slideItems.forEach((item: SlideActionItem, key: string): void => {
+      if (found.length > 0 || key.indexOf(prefix) !== 0) {
+        return
+      }
+      if (x >= item.x && x <= item.x + item.width &&
+        y >= item.y && y <= item.y + item.height) {
+        found = key.substring(prefix.length)
+      }
+    })
+    return found
+  }
+
+  // 挂在每个按钮上。松手落在哪个按钮上就执行哪个；若松手仍在按下的那个上，
+  // 这里不处理——onClick 会正常触发，避免重复执行。
+  private slideItemTouch(barId: string, selfKey: string, event: TouchEvent): void {
+    const self = this.slideItems.get(barId + ':' + selfKey)
+    const touches = event.touches
+    if (self === undefined || touches.length === 0) {
+      return
+    }
+    const pointX = self.x + touches[0].x
+    const pointY = self.y + touches[0].y
+    const hit = this.hitSlideItem(barId, pointX, pointY)
+    if (event.type === TouchType.Down) {
+      this.slidePressKey = hit
+      return
+    }
+    if (event.type !== TouchType.Up) {
+      return
+    }
+    const pressed = this.slidePressKey
+    this.slidePressKey = ''
+    if (hit.length === 0 || hit === pressed || hit === selfKey) {
+      return
+    }
+    const item = this.slideItems.get(barId + ':' + hit)
+    if (item === undefined || item.action === null) {
+      return
+    }
+    HapticFeedback.confirm()
+    const run = item.action as () => void
+    run()
   }
 
   private enterSelectionMode(): void {
