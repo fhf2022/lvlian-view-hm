@@ -18343,8 +18343,14 @@ struct Index {
     }
     this.entries = sortedEntries
     this.currentDirectoryHasImages = this.hasDirectImageFiles(this.entries)
-    // 方案 A：每次进目录都按设置里的默认视图（工具栏的手动切换只在本次停留期间有效）。
-    this.applyPreferredViewMode()
+    // 这里只做「无图目录不能停在瀑布流」的兜底。默认视图的下发只在进/回目录时
+    // （restore/settleDirectoryViewState）—— 绝不能放这里：replaceEntries 在加载、
+    // 排序、刷新、分页追加时都会跑，在这里改模式会反复启停瀑布流管线、拖垮加载。
+    if (!this.currentDirectoryHasImages && this.fileViewMode === 'waterfall') {
+      this.stopWaterfallPipeline()
+      this.fileViewMode = 'list'
+      this.waterfallAnchor = null
+    }
     this.fileEntryDataSource.replace(this.entries)
     this.syncWaterfallEntries(this.entries, appendWaterfall)
     this.rebuildTimelineIndexes()
