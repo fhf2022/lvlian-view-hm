@@ -2009,9 +2009,10 @@ struct Index {
         }
       })
 
+      // 同样不排除 showDestinationPicker：底栏若被卸载，从选取页返回时要重建，
+      // 观感上就是闪一下/白一下。
       if ((this.screen === 'files' || this.screen === 'downloads' || this.screen === 'settings') &&
         this.contextMenuEntry === null && !this.showRenameDialog &&
-        !this.showDestinationPicker &&
         !this.showAudioPlayer && !this.videoPlaybackUiVisible()) {
         // 三种底栏形态共用这一个常驻外壳，内部按 bottomBarMode() 交叉淡化；
         // 显隐仍由 bottomBarOffsetY/bottomBarOpacity 控制。
@@ -2070,9 +2071,10 @@ struct Index {
         this.TransferDirectionControl()
       }
 
+      // 同上：选取页打开时这一层也保持挂载，返回时不必重建。
       if (this.screen === 'files' && this.currentPath.length > 0 && !this.showSearch &&
         !this.selectionMode && this.contextMenuEntry === null &&
-        !this.showRenameDialog && !this.showDestinationPicker &&
+        !this.showRenameDialog &&
         !this.showAudioPlayer && !this.videoPlaybackUiVisible()) {
         if (this.importExpanded) {
           Row().width('100%').height('100%').backgroundColor(Color.Transparent).zIndex(24)
@@ -2098,8 +2100,10 @@ struct Index {
               ? HitTestMode.BLOCK_DESCENDANTS : HitTestMode.None))
       }
 
+      // 这里刻意不排除 showDestinationPicker：标题栏一旦被卸载，从选取页返回时
+      // 会重新挂载，看起来就是"要等页面重新加载"。让它一直留在树上，选取页用更高
+      // 的 zIndex 压在它上面（见下方 DestinationPickerOverlay 的包裹 Stack）。
       if ((this.screen === 'files' || this.screen === 'downloads' || this.screen === 'settings') &&
-        !this.showDestinationPicker &&
         !this.showAudioPlayer && !this.videoPlaybackUiVisible()) {
         Stack({ alignContent: Alignment.TopStart }) {
           this.NativeFileHeader()
@@ -2114,7 +2118,14 @@ struct Index {
       this.ActionMenuOverlay()
 
       if (this.showDestinationPicker) {
-        this.DestinationPickerOverlay()
+        // 包一层给足 zIndex：标题栏现在一直挂在树上（zIndex 10），选取页必须压在它
+        // 上面，否则会被标题栏盖住。
+        Stack() {
+          this.DestinationPickerOverlay()
+        }
+        .width('100%')
+        .height('100%')
+        .zIndex(20)
       }
       if ((this.showImageViewer || this.viewerEntryTransitionActive ||
         this.viewerFallbackEntryActive || this.viewerClosePending) &&
@@ -5404,6 +5415,9 @@ struct Index {
       // Restore the original sheet backdrop. The status-bar area remains
       // dimmed/blurred while the file-management surface starts below the
       // top safe area with rounded top corners.
+      // 关闭时必须跟着淡出：面板是瞬间消失的，若遮罩原地不动，剩下的 Thick 强模糊
+      // 盖在浅色文件页上就是一片奶白（用户看到的"白屏"），而且会僵持到 260ms 后才
+      // 突然消失。
       Column()
         .width('100%')
         .height('100%')
@@ -5412,6 +5426,8 @@ struct Index {
           colorMode: ThemeColorMode.SYSTEM,
           adaptiveColor: AdaptiveColor.DEFAULT
         })
+        .opacity(this.destinationPickerClosing ? 0 : 1)
+        .animation({ duration: 180, curve: Curve.EaseOut })
         .hitTestBehavior(HitTestMode.None)
 
       Button() {
@@ -12081,7 +12097,8 @@ struct Index {
       this.destinationRootExpanded = true
       this.destinationSelectedEntries = []
       this.destinationFolderText = ''
-    }, 260)
+      // 与遮罩淡出（180ms）对齐，别让空等拖出一截白。
+    }, 200)
   }
 
 
