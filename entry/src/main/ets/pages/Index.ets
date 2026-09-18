@@ -3149,12 +3149,16 @@ struct Index {
    * 网格列数按可用宽度算：目标格子约 94vp（和系统相册一个量级）。
    * 手机 376vp -> 4 列；平板会自动变多，窄屏也不会挤出半格。
    */
-  private fileGridColumns(): string {
+  private fileGridColumnCount(): number {
     const width = this.pageWidthVp
     if (!(width > 0)) {
-      return '1fr 1fr'
+      return 2
     }
-    const count = Math.max(2, Math.min(8, Math.floor(width / 94)))
+    return Math.max(2, Math.min(8, Math.floor(width / 94)))
+  }
+
+  private fileGridColumns(): string {
+    const count = this.fileGridColumnCount()
     let template = ''
     for (let i = 0; i < count; i++) {
       template += (i === 0 ? '' : ' ') + '1fr'
@@ -3269,7 +3273,9 @@ struct Index {
     .columnsTemplate(this.fileGridColumns())
     .columnsGap(1)
     .rowsGap(1)
-    .cachedCount(8)
+    // 8 只够两行缓冲，往上滑时顶部条目会被过早销毁、重新解码期间露出空白。
+    // 放大到 32（约 8 行），上下回滑时顶部图片不会提前消失。
+    .cachedCount(32)
     .onScrollIndex((first: number, last: number): void => {
       this.fileVisibleStartIndex = Math.max(0, first)
       this.fileVisibleEndIndex = Math.max(this.fileVisibleStartIndex, last)
@@ -3281,9 +3287,7 @@ struct Index {
     .width('100%')
     .layoutWeight(1)
     .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
-    // 图片网格紧贴侧边（系统相册就是这么做的）。
-    .padding({ left: 0, right: 0, top: this.fileContentTopInset(),
-      bottom: 0 })
+    .padding({ left: 0, right: 0, top: 0, bottom: 0 })
   }
 
   @Builder
@@ -3492,7 +3496,7 @@ struct Index {
         .rowsGap(2)
         .width('100%')
         .layoutWeight(1)
-        .padding({ left: 0, right: 0, top: this.fileContentTopInset(), bottom: 0 })
+        .padding({ left: 0, right: 0, top: 0, bottom: 0 })
       } else {
         List({ space: 0, scroller: this.transitionScroller }) {
         ListItem() {
@@ -3564,7 +3568,11 @@ struct Index {
       // 标题栏的高度就是它的裁切边界。搜索时下面还要挂「本级/跨级」那排 chip
       // （位于 safeTop + 76、高 36vp，伸到 safeTop + 112），原来固定 + 94 会把
       // 它们下半截齐齐裁掉。搜索时给它留够。
-      .title({ builder: this.TopFileOverlay, height: this.topSafeInset() + 136 }, {
+      .title({
+        builder: this.TopFileOverlay,
+        height: this.topSafeInset() +
+          (this.showSearch && this.searchQuery.trim().length > 0 ? 136 : 94)
+      }, {
         barStyle: BarStyle.STACK,
         paddingStart: LengthMetrics.vp(0),
         paddingEnd: LengthMetrics.vp(0),
@@ -3572,10 +3580,11 @@ struct Index {
       })
       .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
       .width('100%')
-      // 这层 Navigation 的高度就是标题区的裁切边界。搜索时下面还要挂「本级/跨级」
-      // 那排 chip（safeTop + 76、高 36vp，伸到 +112），固定 + 94 会把它们下半截裁掉。
-      // 注意：只改 .title({height}) 没用——它被这里的高度卡着。
-      .height(this.topSafeInset() + 136)
+      // 这层 Navigation 的高度就是标题区的裁切边界，同时决定内容区从哪里开始 ——
+      // 一直给 136 会把内容整体推低、可视区变矮（滑一点顶上的图就钻进头部底下了）。
+      // 只在搜索时（下面要挂「本级/跨级」那排 chip，伸到 +112）才需要 136。
+      .height(this.topSafeInset() +
+        (this.showSearch && this.searchQuery.trim().length > 0 ? 136 : 94))
       .backgroundColor(Color.Transparent)
       .hitTestBehavior(HitTestMode.Transparent)
   }
@@ -3729,9 +3738,9 @@ struct Index {
     // The blur/gradient child always keeps the file-page height (94vp).
     // Search controls may extend the overlay's transparent hit-test area,
     // but must never stretch the gradient background itself.
-    // 这层的高度就是「本级/跨级」那排 chip 的裁切边界。chip 位于 safeTop + 76、
-    // 高 36vp（伸到 +112），所以这层必须比它高，否则下半截会被裁掉。
-    .height(this.topSafeInset() + 136)
+    // 同 Navigation：只在搜索时才需要 136（容纳那排 chip），平时回到 94。
+    .height(this.topSafeInset() +
+      (this.showSearch && this.searchQuery.trim().length > 0 ? 136 : 94))
     .backgroundColor(Color.Transparent)
     .clip(false)
     // The gradient is visual only. The root must not pass a touch started on
@@ -6278,7 +6287,10 @@ struct Index {
       visibleStart = Math.max(0, visibleStart - 1)
       visibleEnd = Math.max(visibleStart, visibleEnd - 1)
     }
-    keepEntries(visibleItems, visibleStart - 8, visibleEnd + 8)
+    // 这个窗口是按【条目索引】算的。网格一行有 N 列，8 个条目只够 2 行 ✗，
+    // 顶部几行的视觉状态会被过早裁掉、往回滑就露出空白。按列数放大。
+    const prunePadding = 8 * (this.fileViewMode === 'grid' ? this.fileGridColumnCount() : 1)
+    keepEntries(visibleItems, visibleStart - prunePadding, visibleEnd + prunePadding)
 
     // The bounded URI LRU is the source used when a recycled row is mounted
     // again. Keep its state record so a return to a recently visited window
