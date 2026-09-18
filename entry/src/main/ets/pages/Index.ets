@@ -3235,6 +3235,11 @@ struct Index {
                 .margin({ bottom: 6, right: 6 })
             }
           }
+          // 顶部留白，照抄瀑布流的做法：加在【条目】的 margin 上，不是容器的 padding。
+          // 容器的 padding 会变成一条裁切线（图滚到那儿就整块消失 ✗）；
+          // margin 属于内容本身，会跟着一起滚走 ✓ —— 刚打开时首行落在标题下方能点到，
+          // 往上滑时又仍能钻进页头底下继续露一截。
+          .margin({ top: index < this.fileGridColumnCount() ? this.fileContentTopInset() : 0 })
           .onClick(() => this.handleFileEntryClick(entry))
           // 与文件列表同一套：序列组要求先长按成功，后面的 Pan 才参与，
           // 普通滑动仍然是网格滚动；长按后拖动才是连续多选。
