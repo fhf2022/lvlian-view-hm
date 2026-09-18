@@ -2567,6 +2567,9 @@ struct Index {
   SearchScopeButton(title: string, scope: RemoteSearchScope): void {
     Button(title)
       .height(36)
+      // 光有 .height() 实测被压成 18vp（带 label 的 Button 会按 label 量），
+      // 这里再钉一个最小高度，保证胶囊是完整的 36vp。
+      .constraintSize({ minHeight: 36 })
       .fontSize(14)
       .fontColor(this.searchScope === scope ? Color.White : $r('app.color.text_secondary'))
       .backgroundColor(Color.Transparent)
@@ -3482,7 +3485,10 @@ struct Index {
       .mode(NavigationMode.Stack)
       .hideBackButton(true)
       .hideToolBar(true)
-      .title({ builder: this.TopFileOverlay, height: this.topSafeInset() + 94 }, {
+      // 标题栏的高度就是它的裁切边界。搜索时下面还要挂「本级/跨级」那排 chip
+      // （位于 safeTop + 76、高 36vp，伸到 safeTop + 112），原来固定 + 94 会把
+      // 它们下半截齐齐裁掉。搜索时给它留够。
+      .title({ builder: this.TopFileOverlay, height: this.topSafeInset() + 136 }, {
         barStyle: BarStyle.STACK,
         paddingStart: LengthMetrics.vp(0),
         paddingEnd: LengthMetrics.vp(0),
@@ -3490,7 +3496,10 @@ struct Index {
       })
       .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
       .width('100%')
-      .height(this.topSafeInset() + 94)
+      // 这层 Navigation 的高度就是标题区的裁切边界。搜索时下面还要挂「本级/跨级」
+      // 那排 chip（safeTop + 76、高 36vp，伸到 +112），固定 + 94 会把它们下半截裁掉。
+      // 注意：只改 .title({height}) 没用——它被这里的高度卡着。
+      .height(this.topSafeInset() + 136)
       .backgroundColor(Color.Transparent)
       .hitTestBehavior(HitTestMode.Transparent)
   }
@@ -3632,9 +3641,9 @@ struct Index {
           this.SearchScopeButton('跨级', 'descendants')
         }
         .width('100%')
-        .height(36)
         .padding({ left: 16, right: 16 })
-        .position({ x: 0, y: this.topSafeInset() + 76 })
+        .margin({ top: this.topSafeInset() + 76 })
+        .alignSelf(ItemAlign.Start)
         .backgroundColor(Color.Transparent)
         .zIndex(3)
         .hitTestBehavior(HitTestMode.Default)
@@ -3644,8 +3653,9 @@ struct Index {
     // The blur/gradient child always keeps the file-page height (94vp).
     // Search controls may extend the overlay's transparent hit-test area,
     // but must never stretch the gradient background itself.
-    .height(this.topSafeInset() +
-      (this.showSearch && this.searchQuery.trim().length > 0 ? 124 : 94))
+    // 这层的高度就是「本级/跨级」那排 chip 的裁切边界。chip 位于 safeTop + 76、
+    // 高 36vp（伸到 +112），所以这层必须比它高，否则下半截会被裁掉。
+    .height(this.topSafeInset() + 136)
     .backgroundColor(Color.Transparent)
     .clip(false)
     // The gradient is visual only. The root must not pass a touch started on
