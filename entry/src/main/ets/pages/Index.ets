@@ -3107,25 +3107,42 @@ struct Index {
     .hitTestBehavior(HitTestMode.None)
   }
 
+  /**
+   * 网格列数按可用宽度算：目标格子约 94vp（和系统相册一个量级）。
+   * 手机 376vp -> 4 列；平板会自动变多，窄屏也不会挤出半格。
+   */
+  private fileGridColumns(): string {
+    const width = this.pageWidthVp
+    if (!(width > 0)) {
+      return '1fr 1fr'
+    }
+    const count = Math.max(2, Math.min(8, Math.floor(width / 94)))
+    let template = ''
+    for (let i = 0; i < count; i++) {
+      template += (i === 0 ? '' : ' ') + '1fr'
+    }
+    return template
+  }
+
   @Builder
   GridFileList(): void {
     Grid(this.fileListScroller) {
       LazyForEach(this.fileEntryDataSource, (entry: FileEntry, index: number) => {
         GridItem() {
-          Stack({ alignContent: Alignment.TopEnd }) {
-            Column({ space: 6 }) {
+          // 勾选角标放右下角（多选态）。
+          Stack({ alignContent: Alignment.BottomEnd }) {
+            Column({ space: 0 }) {
               Stack({ alignContent: Alignment.Center }) {
                 if (this.shouldReplaceViewerTransitionSource(entry)) {
                   Blank()
                     .width('100%')
-                    .height(82)
+                    .height('100%')
                 } else if (this.fileImageSourceAvailable(entry, 'grid')) {
                   Image(this.fileImageSource(entry, 'grid'))
                       .width('100%')
-                      .height(82)
+                      .height('100%')
                       .orientation(this.fileImageSourceOrientation(entry, 'grid'))
                       .objectFit(ImageFit.Cover)
-                      .borderRadius(10)
                       .geometryTransition(this.fileImageTransitionId(entry, 'grid'))
                       .syncLoad(this.fileImageShouldSyncLoad(entry))
                       .onComplete((event?: ViewerImageCompleteEvent): void =>
@@ -3141,45 +3158,65 @@ struct Index {
                 }
               }
               .width('100%')
-              .height(82)
-              .borderRadius(10)
+              // 固定 1:1，和系统相册一致：不论屏幕多宽，格子永远是正方形。
+              .aspectRatio(1)
+              .borderRadius(0)
               .clip(true)
-              .onAreaChange((_, area) => this.recordThumbnailArea(entry, index, 'grid', area))
+              .onAreaChange((_, area) => {
+                this.recordThumbnailArea(entry, index, 'grid', area)
+                this.recordRowHitArea(entry, index, 'grid', area)
+              })
               .onVisibleAreaChange([0.0, 0.999],
                 (_isExpanding: boolean, ratio: number): void =>
                   this.recordThumbnailVisibility(entry, index, 'grid', ratio))
 
-              Text(entry.name)
-                .fontSize(14)
-                .fontColor($r('app.color.text_primary'))
-                .maxLines(1)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
-                .width('100%')
-                .textAlign(TextAlign.Center)
-              if (entry.isDirectory && this.entryInfo(entry).length > 0) {
-                Text(this.entryInfo(entry))
+              // 图片/视频不再占文字位（紧凑方块才好看）；文件夹仍保留名字，
+              // 否则网格里分不出哪个是文件夹。
+              if (entry.isDirectory) {
+                Text(entry.name)
                   .fontSize(11)
-                  .fontColor($r('app.color.text_muted'))
+                  .fontColor($r('app.color.text_primary'))
                   .maxLines(1)
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .width('100%')
+                  .textAlign(TextAlign.Center)
+                  .margin({ top: 2 })
               }
             }
             .width('100%')
-            .padding({ left: 6, right: 6, top: 8, bottom: 8 })
+            .padding(1)
             this.VideoTransferIndicator(entry)
             if (this.selectionMode) {
               Row() {
                 this.SelectionCheckbox(entry)
               }
-                .margin({ top: 8, right: 8 })
+                .margin({ bottom: 6, right: 6 })
             }
           }
           .onClick(() => this.handleFileEntryClick(entry))
+          // 与文件列表同一套：序列组要求先长按成功，后面的 Pan 才参与，
+          // 普通滑动仍然是网格滚动；长按后拖动才是连续多选。
           .priorityGesture(
-            LongPressGesture({ repeat: false })
-              .onAction((event: GestureEvent): void => {
-                this.showActionMenu(entry, event)
-              })
+            GestureGroup(GestureMode.Sequence,
+              LongPressGesture({ repeat: false, duration: 380 })
+                .onAction((event: GestureEvent): void => {
+                  if (this.selectionMode) {
+                    this.beginDragSelection(entry, index)
+                  } else {
+                    this.showActionMenu(entry, event)
+                  }
+                }),
+              PanGesture({ direction: PanDirection.All, distance: 8 })
+                .onActionUpdate((event: GestureEvent): void => {
+                  this.extendDragSelection(event)
+                })
+                .onActionEnd((): void => {
+                  this.endDragSelection()
+                })
+                .onActionCancel((): void => {
+                  this.endDragSelection()
+                })
+            )
           )
         }
         .onAppear(() => {
@@ -3191,9 +3228,9 @@ struct Index {
         .onDisAppear(() => this.recordThumbnailVisibility(entry, index, 'grid', 0))
       }, (entry: FileEntry) => entry.path)
     }
-    .columnsTemplate('1fr 1fr')
-    .columnsGap(8)
-    .rowsGap(8)
+    .columnsTemplate(this.fileGridColumns())
+    .columnsGap(1)
+    .rowsGap(1)
     .cachedCount(8)
     .onScrollIndex((first: number, last: number): void => {
       this.fileVisibleStartIndex = Math.max(0, first)
@@ -3206,7 +3243,8 @@ struct Index {
     .width('100%')
     .layoutWeight(1)
     .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
-    .padding({ left: 10, right: 10, top: this.fileContentTopInset(),
+    // 图片网格紧贴侧边（系统相册就是这么做的）。
+    .padding({ left: 0, right: 0, top: this.fileContentTopInset(),
       bottom: 0 })
   }
 
@@ -3373,10 +3411,10 @@ struct Index {
                   if (this.fileImageSourceAvailable(entry, 'grid')) {
                     Image(this.fileImageSource(entry, 'grid'))
                       .width('100%')
-                      .height(82)
+                      .height('100%')
                       .orientation(this.fileImageSourceOrientation(entry, 'grid'))
                       .objectFit(ImageFit.Cover)
-                      .borderRadius(10)
+                      .borderRadius(0)
                   } else if (entry.isDirectory) {
                     this.FolderIcon(44)
                   } else {
@@ -3387,8 +3425,8 @@ struct Index {
                   }
                 }
                 .width('100%')
-                .height(82)
-                .borderRadius(10)
+                .height('100%')
+                .aspectRatio(1)
                 .clip(true)
 
                 Text(entry.name)
@@ -3407,16 +3445,16 @@ struct Index {
                 }
               }
               .width('100%')
-              .padding({ left: 6, right: 6, top: 8, bottom: 8 })
+              .padding(1)
             }
           }, (entry: FileEntry) => entry.path)
         }
-        .columnsTemplate('1fr 1fr')
-        .columnsGap(8)
-        .rowsGap(8)
+        .columnsTemplate(this.fileGridColumns())
+        .columnsGap(2)
+        .rowsGap(2)
         .width('100%')
         .layoutWeight(1)
-        .padding({ left: 10, right: 10, top: this.fileContentTopInset(), bottom: 0 })
+        .padding({ left: 0, right: 0, top: this.fileContentTopInset(), bottom: 0 })
       } else {
         List({ space: 0, scroller: this.transitionScroller }) {
         ListItem() {
@@ -16708,7 +16746,22 @@ struct Index {
   // 离开范围的条目恢复原状 —— 所以上下来回滑能收缩，一趟来回回到原状。
   private dragAnchorIndex: number = -1
   private dragSnapshotPaths: string[] = []
+  // 拖选开始时锁定「当前是哪一种列表表面」。rowHitAreas 是累积的（列表/网格的
+  // 矩形都躺在同一个表里，且从不清理），不过滤就会命中另一种视图的旧矩形，
+  // 算出来的落点索引是错的 —— 表现就是「怎么拖都只选中一个」。
+  private dragSurface: string = ''
   private lastHitIndex: number = -1
+
+  /** 当前实际渲染的是哪种表面（和 FileContent 的分支保持一致）。 */
+  private activeListSurface(): string {
+    if (this.fileViewMode === 'grid') {
+      return 'grid'
+    }
+    if (this.fileViewMode === 'waterfall' && this.currentDirectoryHasImages) {
+      return 'waterfall'
+    }
+    return 'list'
+  }
 
   private recordRowHitArea(entry: FileEntry, index: number, surface: string, area: Area): void {
     const position = area.globalPosition
@@ -16732,6 +16785,7 @@ struct Index {
     this.dragSelectionActive = true
     this.dragSnapshotPaths = this.selectedPaths.slice()
     this.dragAnchorIndex = index
+    this.dragSurface = this.activeListSurface()
     this.lastHitIndex = index
     HapticFeedback.threshold()
     this.applyDragRange(index)
@@ -16745,6 +16799,7 @@ struct Index {
     this.dragAnchorIndex = -1
     this.lastHitIndex = -1
     this.dragSnapshotPaths = []
+    this.dragSurface = ''
   }
 
   private extendDragSelection(event: GestureEvent): void {
@@ -16759,7 +16814,7 @@ struct Index {
     const y = fingers[0].globalY
     let hit: RowHitArea | null = null
     this.rowHitAreas.forEach((record: RowHitArea): void => {
-      if (hit !== null || record.surface !== 'list') {
+      if (hit !== null || record.surface !== this.dragSurface) {
         return
       }
       if (x >= record.x && x <= record.x + record.width &&
