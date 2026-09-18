@@ -408,6 +408,7 @@ struct Index {
   @State showStorageSettings: boolean = false
   @State showNetworkSettings: boolean = false
   @State showPlaybackSettings: boolean = false
+  @State showViewSettings: boolean = false
   @State showRecycleBinSettings: boolean = false
   // UGOS keeps one recycle repository per first-level folder, so the signed-in
   // user's own folder and the shared folders are genuinely disjoint sets with
@@ -569,6 +570,10 @@ struct Index {
   @State searchHistory: string[] = []
   @State searchHistoryExpanded: boolean = false
   @State fileViewMode: FileViewMode = 'list'
+  // 设置里的默认视图（方案 A：每次进目录都按默认，工具栏的手动切换不记录）。
+  // 无图目录只有 列表/网格；有图目录多一个 瀑布流。
+  @State defaultFileViewMode: FileViewMode = 'list'
+  @State defaultPhotoViewMode: FileViewMode = 'grid'
   // This is derived from the metadata already loaded for the current
   // directory. It deliberately does not trigger a second directory scan.
   @State currentDirectoryHasImages: boolean = false
@@ -840,6 +845,7 @@ struct Index {
   private cachePreferences: preferences.Preferences | null = null
   private networkPreferences: preferences.Preferences | null = null
   private playbackPreferences: preferences.Preferences | null = null
+  private viewPreferences: preferences.Preferences | null = null
   private loginPreferences: preferences.Preferences | null = null
   private searchPreferences: preferences.Preferences | null = null
   private cacheDirectory: string = ''
@@ -908,6 +914,7 @@ struct Index {
     this.ensureNetworkState()
     this.ensureDownloadState()
     this.ensurePlaybackState()
+    this.ensureViewState()
     this.ensureVideoState()
     this.loginStatePromise = this.loadLoginPreferences()
     this.searchStatePromise = this.loadSearchPreferences()
@@ -1941,6 +1948,10 @@ struct Index {
         this.closePlaybackSettings()
         return true
       }
+      if (this.showViewSettings) {
+        this.closeViewSettings()
+        return true
+      }
       if (this.showNetworkSettings) {
         this.closeNetworkSettings()
         return true
@@ -2084,6 +2095,31 @@ struct Index {
               })
             })
         }
+        // 进目录的等待反馈：大目录首次打开要建索引，可能停在本页好几秒。
+        // 期间用户停在上一层，必须给一个居中的明确提示，否则像卡死。
+        if (this.isBusy && this.isNavigating && this.screen === 'files') {
+          Stack() {
+            Column({ space: 10 }) {
+              LoadingProgress()
+                .width(26)
+                .height(26)
+                .color('#2E6BFF')
+              Text('正在打开，目录较大时首次需要等待…')
+                .fontSize(14)
+                .fontColor($r('app.color.text_primary'))
+            }
+            .alignItems(HorizontalAlign.Center)
+            .justifyContent(FlexAlign.Center)
+            .padding({ left: 24, right: 24, top: 20, bottom: 20 })
+            .borderRadius(16)
+            .backgroundColor($r('app.color.surface_card'))
+          }
+          .width('100%')
+          .height('100%')
+          .alignContent(Alignment.Center)
+          .hitTestBehavior(HitTestMode.None)
+          .zIndex(18)
+        }
         FloatingImportControl({ viewportWidth: this.pageWidthVp, viewportHeight: this.pageHeightVp,
           // The title controls end at topSafeInset + 56vp. Keep only an 8vp
           // clearance instead of treating the 30vp gradient tail as a blocker.
@@ -2208,6 +2244,8 @@ struct Index {
               this.closePlaybackSettings()
             } else if (this.showNetworkSettings) {
               this.closeNetworkSettings()
+            } else if (this.showViewSettings) {
+              this.closeViewSettings()
             } else if (this.showRecycleBinSettings) {
               this.recycleBackAction()
             } else {
@@ -3786,6 +3824,8 @@ struct Index {
       this.PlaybackSettingsContent()
     } else if (this.showNetworkSettings) {
       this.NetworkSettingsContent()
+    } else if (this.showViewSettings) {
+      this.ViewSettingsContent()
     } else if (this.showRecycleBinSettings) {
       this.RecycleBinSettingsContent()
     } else {
@@ -3802,6 +3842,9 @@ struct Index {
             this.SettingsGroupDivider()
             this.SettingsEntryRow($r('sys.symbol.play'), '#7A5AF8', '播放与控制',
               '管理自动播放、后台播放和视频小窗', () => this.openPlaybackSettings(), false)
+            this.SettingsGroupDivider()
+            this.SettingsEntryRow($r('sys.symbol.list_bullet_square'), '#2E6BFF', '默认视图',
+              '设置文件与图片分别用哪种显示方式', () => this.openViewSettings(), false)
             this.SettingsGroupDivider()
             this.SettingsEntryRow($r('sys.symbol.wifi'), '#0FA47F', '网络与流量',
               '管理移动网络下的加载、刷新和下载策略', () => this.openNetworkSettings(), false)
@@ -4196,6 +4239,95 @@ struct Index {
     .align(Alignment.TopStart)
     .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
     .scrollBar(BarState.Auto)
+  }
+
+  private fileViewModeOptions(): FileViewMode[] {
+    return ['list', 'grid']
+  }
+
+  private photoViewModeOptions(): FileViewMode[] {
+    return ['list', 'grid', 'waterfall']
+  }
+
+  /** 一个分段选择器：当前值高亮。 */
+  @Builder
+  ViewModeSegment(photo: boolean) {
+    // 注意：当前值必须在 builder 内部读（this.xxx），不能当参数传进来 ——
+    // @Builder 的值传参在状态变化时不会重建，高亮会停在旧值上。
+    Row({ space: 8 }) {
+      ForEach(photo ? this.photoViewModeOptions() : this.fileViewModeOptions(),
+        (mode: FileViewMode) => {
+        Text(mode === 'list' ? '列表' : (mode === 'grid' ? '网格' : '瀑布流'))
+          .fontSize(14)
+          .fontColor((photo ? this.defaultPhotoViewMode : this.defaultFileViewMode) === mode
+            ? Color.White : $r('app.color.text_secondary'))
+          .textAlign(TextAlign.Center)
+          .layoutWeight(1)
+          .height(34)
+          .borderRadius(17)
+          .backgroundColor((photo ? this.defaultPhotoViewMode : this.defaultFileViewMode) === mode
+            ? '#2E6BFF' : $r('app.color.surface_card'))
+          .onClick(() => { this.setDefaultViewMode(photo, mode) })
+      }, (mode: FileViewMode) => mode)
+    }
+    .width('100%')
+  }
+
+  @Builder
+  ViewSettingsContent(): void {
+    Scroll() {
+      Column({ space: 16 }) {
+        Text('选好之后，每次进入目录都按这里的设置显示；工具栏上的临时切换不会改掉它。')
+          .fontSize(14)
+          .fontColor($r('app.color.text_tertiary'))
+          .lineHeight(22)
+          .width('100%')
+
+        Column({ space: 10 }) {
+          Text('文件夹的默认视图')
+            .fontSize(15)
+            .fontColor($r('app.color.text_primary'))
+            .width('100%')
+          Text('没有图片的目录用这个')
+            .fontSize(12)
+            .fontColor($r('app.color.text_tertiary'))
+            .width('100%')
+          this.ViewModeSegment(false)
+        }
+        .width('100%')
+        .padding(14)
+        .borderRadius(16)
+        .backgroundColor($r('app.color.surface_card'))
+
+        Column({ space: 10 }) {
+          Text('图片目录的默认视图')
+            .fontSize(15)
+            .fontColor($r('app.color.text_primary'))
+            .width('100%')
+          Text('有图片的目录用这个，多一个瀑布流')
+            .fontSize(12)
+            .fontColor($r('app.color.text_tertiary'))
+            .width('100%')
+          this.ViewModeSegment(true)
+        }
+        .width('100%')
+        .padding(14)
+        .borderRadius(16)
+        .backgroundColor($r('app.color.surface_card'))
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Start)
+      .justifyContent(FlexAlign.Start)
+    }
+    .width('100%')
+    .layoutWeight(1)
+    // 内边距必须在 Scroll 上、且 top 要加 topSafeInset()，否则内容会顶进标题栏底下
+    // （工程里其它设置子页都是这么写的，这里照抄）。
+    .padding({ left: 20, right: 20, top: this.topSafeInset() + 76,
+      bottom: this.bottomSafeInset() + 112 })
+    .align(Alignment.TopStart)
+    .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
+    .scrollBar(BarState.Off)
   }
 
   @Builder
@@ -9189,17 +9321,81 @@ struct Index {
     }
   }
 
+  /** 设置里的默认视图：有图目录用「图片默认」，否则用「文件默认」。 */
+  private preferredViewMode(): FileViewMode {
+    return this.currentDirectoryHasImages ? this.defaultPhotoViewMode : this.defaultFileViewMode
+  }
+
+  private async ensureViewState(): Promise<void> {
+    if (this.viewPreferences !== null) {
+      return
+    }
+    try {
+      this.viewPreferences = await preferences.getPreferences(getContext(this), 'ugreen-view-settings')
+      const storedFile = await this.viewPreferences.get('default_file_mode', 'list')
+      const storedPhoto = await this.viewPreferences.get('default_photo_mode', 'grid')
+      if (storedFile === 'list' || storedFile === 'grid') {
+        this.defaultFileViewMode = storedFile
+      }
+      if (storedPhoto === 'list' || storedPhoto === 'grid' || storedPhoto === 'waterfall') {
+        this.defaultPhotoViewMode = storedPhoto
+      }
+      this.applyPreferredViewMode()
+    } catch (error) {
+      console.warn('[UgreenView] load preferences failed: ' + JSON.stringify(error))
+    }
+  }
+
+  private async setDefaultViewMode(photo: boolean, mode: FileViewMode): Promise<void> {
+    if (photo) {
+      this.defaultPhotoViewMode = mode
+    } else {
+      this.defaultFileViewMode = mode
+    }
+    this.applyPreferredViewMode()
+    try {
+      await this.ensureViewState()
+      if (this.viewPreferences === null) {
+        return
+      }
+      await this.viewPreferences.put(photo ? 'default_photo_mode' : 'default_file_mode', mode)
+      await this.viewPreferences.flush()
+    } catch (error) {
+      console.warn('[UgreenView] save preferences failed: ' + JSON.stringify(error))
+    }
+  }
+
+  /** 把设置里的默认落到当前视图（方案 A：手动切换只在本次停留期间有效）。 */
+  private applyPreferredViewMode(): void {
+    if (this.screen !== 'files' || this.showSearch) {
+      return
+    }
+    const preferred = this.preferredViewMode()
+    if (this.fileViewMode === preferred) {
+      return
+    }
+    if (this.fileViewMode === 'waterfall') {
+      this.stopWaterfallPipeline()
+    }
+    if (preferred === 'waterfall') {
+      this.prepareWaterfallPipeline()
+    }
+    this.fileViewMode = preferred
+    this.waterfallAnchor = null
+  }
+
   private restoreDirectoryViewState(state: DirectoryViewState | null): void {
     if (state === null || this.screen !== 'files' || this.showSearch) {
       return
     }
     // A directory can change while its snapshot is suspended. Do not force an
     // invalid WaterFlow mode on a directory that no longer contains images.
-    if (state.mode === 'waterfall' && !this.currentDirectoryHasImages) {
-      this.fileViewMode = 'list'
+    // 方案 A：视图模式由设置决定，不再恢复各目录自己的模式；
+    // 位置只在「当初存的就是同一个模式」时才恢复，否则偏移量对不上。
+    this.applyPreferredViewMode()
+    if (state.mode !== this.fileViewMode) {
       return
     }
-    this.fileViewMode = state.mode
     this.waterfallAnchorRestoreToken += 1
     const token = this.waterfallAnchorRestoreToken
     setTimeout((): void => {
@@ -9211,11 +9407,11 @@ struct Index {
     if (state === null || this.screen !== 'files' || this.showSearch) {
       return
     }
-    if (state.mode === 'waterfall' && !this.currentDirectoryHasImages) {
-      this.fileViewMode = 'list'
+    // 同上：模式来自设置，位置只在模式一致时恢复。
+    this.applyPreferredViewMode()
+    if (state.mode !== this.fileViewMode) {
       return
     }
-    this.fileViewMode = state.mode
     this.waterfallAnchorRestoreToken += 1
     const token = this.waterfallAnchorRestoreToken
     // The incoming container has already completed its first layout frame.
@@ -10210,6 +10406,31 @@ struct Index {
     this.updateBottomBarVisibility(true)
   }
 
+  private openViewSettings(): void {
+    if (this.isBusy || this.screen !== 'settings') {
+      return
+    }
+    this.showStorageSettings = false
+    this.showPlaybackSettings = false
+    this.showNetworkSettings = false
+    this.showRecycleBinSettings = false
+    this.showViewSettings = true
+    this.ensureViewState()
+    this.errorText = ''
+    this.updateTopTitle('默认视图', true)
+    this.updateBottomBarVisibility(true)
+  }
+
+  private closeViewSettings(): void {
+    if (this.screen !== 'settings' || !this.showViewSettings) {
+      return
+    }
+    this.showViewSettings = false
+    this.errorText = ''
+    this.updateTopTitle('设置', true)
+    this.updateBottomBarVisibility(true)
+  }
+
   private openPlaybackSettings(): void {
     if (this.isBusy || this.screen !== 'settings') {
       return
@@ -10217,6 +10438,7 @@ struct Index {
     this.showStorageSettings = false
     this.showPlaybackSettings = true
     this.showNetworkSettings = false
+    this.showViewSettings = false
     this.ensurePlaybackState()
     this.errorText = ''
     this.updateTopTitle('播放与控制', true)
@@ -18121,11 +18343,8 @@ struct Index {
     }
     this.entries = sortedEntries
     this.currentDirectoryHasImages = this.hasDirectImageFiles(this.entries)
-    if (!this.currentDirectoryHasImages && this.fileViewMode === 'waterfall') {
-      this.stopWaterfallPipeline()
-      this.fileViewMode = 'list'
-      this.waterfallAnchor = null
-    }
+    // 方案 A：每次进目录都按设置里的默认视图（工具栏的手动切换只在本次停留期间有效）。
+    this.applyPreferredViewMode()
     this.fileEntryDataSource.replace(this.entries)
     this.syncWaterfallEntries(this.entries, appendWaterfall)
     this.rebuildTimelineIndexes()
