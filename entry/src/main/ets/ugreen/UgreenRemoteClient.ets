@@ -223,11 +223,13 @@ export class UgreenRemoteClient {
     return pages
   }
 
-  async listPage(path: string, rootType: number, pageIndex: number): Promise<UgreenDirectoryPage> {
-    return await this.withReconnect(() => this.listPageOnce(path, rootType, pageIndex))
+  async listPage(path: string, rootType: number, pageIndex: number,
+    limit: number = 0): Promise<UgreenDirectoryPage> {
+    return await this.withReconnect(() => this.listPageOnce(path, rootType, pageIndex, limit))
   }
 
-  private async listPageOnce(path: string, rootType: number, pageIndex: number): Promise<UgreenDirectoryPage> {
+  private async listPageOnce(path: string, rootType: number, pageIndex: number,
+    limit: number = 0): Promise<UgreenDirectoryPage> {
     const urls = this.requireEndpoints()
     const headers = await this.authHeaders()
     const requestPath = this.normalizePath(path)
@@ -237,7 +239,8 @@ export class UgreenRemoteClient {
     const effectiveRootType = requestPath.length > 0 ? 3 : rootType
     const listBody: JsonObject = {}
     listBody['path'] = requestPath
-    listBody['limit'] = UgreenRemoteClient.DIRECTORY_PAGE_SIZE
+    // limit=1 时服务端只回 1 条，但响应里的 total 仍是该目录的总项数 —— 用它低成本问数量。
+    listBody['limit'] = limit > 0 ? limit : UgreenRemoteClient.DIRECTORY_PAGE_SIZE
     listBody['page'] = pageIndex
     listBody['is_shield_recycle'] = false
     listBody['data_type'] = 0

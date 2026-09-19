@@ -37,6 +37,8 @@ export struct FisheyeTimeline {
   onScrubStart: () => void = () => {}
   onScrub: (time: number) => void = () => {}
   onScrubEnd: (time: number) => void = () => {}
+  // 纯点击（没有拖动）时回调，交给外层做"展开/收起"。定位只由拖动触发。
+  onTap: () => void = () => {}
   onSelect: (time: number, period: TimelinePeriod) => void = () => {}
   private touchActive: boolean = false
   private touchMoved: boolean = false
@@ -227,10 +229,10 @@ export struct FisheyeTimeline {
         const snapped = DirectoryTimelinePolicy.closestDay(this.timeline, this.focusTime)
         this.focusTime = this.clampFocus(snapped)
         this.onScrubEnd(this.focusTime)
-      } else if (event.type === TouchType.Up) {
-        this.selectNearest(y)
       } else {
-        this.onScrubEnd(this.focusTime)
+        // 没有拖动的「点击」= 展开/收起，绝不能顺带定位（否则列表会自己滚走）。
+        // 由组件自己回调外层，避免和外层容器的 onClick 重复触发导致"看起来没反应"。
+        this.onTap()
       }
       this.touchMoved = false
     }

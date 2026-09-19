@@ -97,6 +97,8 @@ const FLOATING_TIMELINE_PEEK_VP: number = 28
 const FLOATING_TIMELINE_EFFECT_INSET_VP: number = 16
 const FLOATING_TIMELINE_UPWARD_SHIFT_VP: number = 8
 const DIRECTORY_INDEX_STALE_MS: number = 30 * 1000
+// 进目录的等待提示只在【预计项数 >= 这个值】时才显示（小目录不打扰）。
+const DIRECTORY_OPENING_HINT_MIN_ITEMS: number = 500
 const FILE_TOOL_HEIGHT_VP: number = 40
 // Keep a small number of recently decoded WaterFlow rasters alive. The
 // durable thumbnail files are much cheaper and can cover the rest of the
@@ -401,7 +403,8 @@ struct Index {
   @State destinationSelectedEntries: FileEntry[] = []
   @State destinationFolderDialog: boolean = false
   @State destinationFolderText: string = ''
-  @State selectionMode: boolean = false
+  // 选择态/查看器一变就重新评估隔空传送的注册（见 onGestureShareStateChanged）
+  @State @Watch('onGestureShareStateChanged') selectionMode: boolean = false
   @State selectedPaths: string[] = []
   @State selectedEntryCount: number = 0
   @State showSelectionMoreMenu: boolean = false
@@ -429,8 +432,8 @@ struct Index {
   // on a shared folder). Kept so a partial result can be explained.
   @State recycleBlockedShares: string[] = []
   private recycleRequestToken: number = 0
-  @State showImageViewer: boolean = false
-  @State viewerImageEntry: FileEntry | null = null
+  @State @Watch('onGestureShareStateChanged') showImageViewer: boolean = false
+  @State @Watch('onGestureShareStateChanged') viewerImageEntry: FileEntry | null = null
   @State viewerHeaderTitle: string = ''
   @State viewerImages: FileEntry[] = []
   @State viewerImageIndex: number = 0
@@ -552,6 +555,9 @@ struct Index {
   @State waterfallAspectEpoch: number = 0
   @State waterfallColumnWidthVp: number = 0
   @State directoryCounts: Record<string, number> = {}
+  // 进目录的等待提示是否该显示（按目录项数判断，见 armDirectoryOpeningHint）
+  @State directoryOpeningHintVisible: boolean = false
+  private directoryOpeningHintToken: number = 0
   @State pageOffsetX: number = 0
   @State outgoingPageOffsetX: number = 0
   @State transitionSnapshotOnTop: boolean = false
@@ -579,7 +585,11 @@ struct Index {
   @State defaultPhotoViewMode: FileViewMode = 'grid'
   // This is derived from the metadata already loaded for the current
   // directory. It deliberately does not trigger a second directory scan.
-  @State currentDirectoryHasImages: boolean = false
+  // 当前目录是不是「图片目录」（全部都是图片/视频才为真）——决定用哪套呈现方式
+  @State currentDirectoryIsPhotoAlbum: boolean = false
+  // 每个目录【本次运行期间】临时切过的视图模式（右下角按钮切的）。
+  // 只存内存：进子目录再返回仍然保持，重启应用就回到设置里的默认值。
+  private directoryViewModeOverrides: Record<string, FileViewMode> = {}
   @State fileSortKey: FileSortKey = 'time'
   @State fileSortAscending: boolean = false
   @State directoryTimeline: DirectoryTimeline = new DirectoryTimeline()
@@ -924,7 +934,8 @@ struct Index {
     this.loginStatePromise = this.loadLoginPreferences()
     this.searchStatePromise = this.loadSearchPreferences()
     this.ensureImageRotationState()
-    this.enableGestureShare()
+    // 不再无条件注册：由 syncGestureShareRegistration 按"当前有没有可分享内容"决定。
+    this.syncGestureShareRegistration()
   }
 
   aboutToDisappear(): void {
@@ -1112,6 +1123,35 @@ struct Index {
     return []
   }
 
+  /**
+   * 当前界面到底有没有可分享的内容（只读状态 + 过滤数组，没有 I/O，可以高频调）。
+   * 隔空传送的注册必须跟着它走：无条件注册会让系统把这个手势一直派给本应用，
+   * 于是"没有内容的界面"上截屏手势也被吃掉、还会弹"无可分享内容"。
+   */
+  private hasGestureShareContent(): boolean {
+    return this.gestureShareCandidates().length > 0
+  }
+
+  private onGestureShareStateChanged(): void {
+    this.syncGestureShareRegistration()
+  }
+
+  /** 有内容才注册、没内容就注销（幂等，可重复调用）。 */
+  /** 时间轴展开/收起（唯一的切换入口：由轴条的点击回调触发）。 */
+  private toggleTimelineCollapsed(): void {
+    this.getUIContext().animateTo({ duration: 200, curve: Curve.FastOutSlowIn }, () => {
+      this.timelineCollapsed = !this.timelineCollapsed
+    })
+  }
+
+  private syncGestureShareRegistration(): void {
+    if (this.hasGestureShareContent()) {
+      this.enableGestureShare()
+    } else {
+      this.disableGestureShare()
+    }
+  }
+
   private async rejectGestureShare(target: harmonyShare.SharableTarget,
     code: harmonyShare.SharableErrorCode): Promise<void> {
     try {
@@ -1214,7 +1254,13 @@ struct Index {
     let shareRequested = false
     try {
       const candidates = this.gestureShareCandidates()
-      if (this.isBusy || candidates.length === 0) {
+      if (this.isBusy) {
+        // 忙和"没有内容"是两回事：一律报"无可分享内容"会让人以为功能坏了。
+        this.showImmersiveToast('正在处理中，请稍后重试')
+        await this.rejectGestureShare(target, harmonyShare.SharableErrorCode.DOWNLOAD_ERROR)
+        return
+      }
+      if (candidates.length === 0) {
         await this.rejectGestureShare(target, harmonyShare.SharableErrorCode.NO_CONTENT_ERROR)
         return
       }
@@ -2073,12 +2119,6 @@ struct Index {
             ? FLOATING_TIMELINE_WIDTH_VP - FLOATING_TIMELINE_PEEK_VP : 0,
           y: this.bottomBarOffsetY, z: 0
         })
-        .onClick(() => {
-          // 展开态下点轴条本身也能收起；拖动不会触发 onClick，不影响拖动定位。
-          this.getUIContext().animateTo({ duration: 200, curve: Curve.FastOutSlowIn }, () => {
-            this.timelineCollapsed = !this.timelineCollapsed
-          })
-        })
         .opacity(this.shouldShowTimeline() ? this.bottomBarOpacity : 0)
         // Opacity alone does not reliably suppress the native material and
         // Canvas sublayers during a directory transaction. Hidden preserves
@@ -2090,7 +2130,7 @@ struct Index {
         // 展开态：必须用 Default —— None 是「自身不响应」，挂在整层上的 onClick 永远收不到 ✗；
         // Default 是「自身响应 + 子节点照常响应」，轴条的拖动定位不受影响。
         .hitTestBehavior(this.shouldShowTimeline() && !this.viewerOwnsParentInteraction()
-          ? (this.timelineCollapsed ? HitTestMode.Block : HitTestMode.Default)
+          ? HitTestMode.Default
           : HitTestMode.BLOCK_DESCENDANTS)
       }
 
@@ -2117,7 +2157,8 @@ struct Index {
         }
         // 进目录的等待反馈：大目录首次打开要建索引，可能停在本页好几秒。
         // 期间用户停在上一层，必须给一个居中的明确提示，否则像卡死。
-        if (this.isBusy && this.isNavigating && this.screen === 'files') {
+        if (this.isBusy && this.isNavigating && this.screen === 'files' &&
+          this.directoryOpeningHintVisible) {
           Stack() {
             Column({ space: 10 }) {
               LoadingProgress()
@@ -2813,7 +2854,7 @@ struct Index {
     Column({ space: 12 }) {
       if (this.fileViewMode === 'grid') {
         this.GridFileList()
-      } else if (this.fileViewMode === 'waterfall' && this.currentDirectoryHasImages) {
+      } else if (this.fileViewMode === 'waterfall' && this.currentDirectoryIsPhotoAlbum) {
         this.WaterfallFileList()
       } else {
       List({ space: 0, scroller: this.fileListScroller }) {
@@ -3494,9 +3535,10 @@ struct Index {
     Column() {
       if (snapshotMode === 'grid') {
         Grid(this.transitionScroller) {
-          LazyForEach(this.transitionFileEntryDataSource, (entry: FileEntry) => {
+          LazyForEach(this.transitionFileEntryDataSource, (entry: FileEntry, index: number) => {
             GridItem() {
-              Column({ space: 6 }) {
+              // 与真实网格条目的 Column({ space: 0 }) 对齐（名字靠 margin top:2 定位 ✗ 不用 space）
+              Column({ space: 0 }) {
                 Stack({ alignContent: Alignment.Center }) {
                   if (this.fileImageSourceAvailable(entry, 'grid')) {
                     Image(this.fileImageSource(entry, 'grid'))
@@ -3519,29 +3561,32 @@ struct Index {
                 .aspectRatio(1)
                 .clip(true)
 
-                Text(entry.name)
-                  .fontSize(14)
-                  .fontColor($r('app.color.text_primary'))
-                  .maxLines(1)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  .width('100%')
-                  .textAlign(TextAlign.Center)
-                if (entry.isDirectory && this.entryInfo(entry).length > 0) {
-                  Text(this.entryInfo(entry))
+                // 与真实网格（GridFileList）逐字对齐：只有文件夹显示名字、11 号、top 2。
+                // 之前这里对所有条目都显示名字且是 14 号，转场时字会跳一下 ✗
+                if (entry.isDirectory) {
+                  Text(entry.name)
                     .fontSize(11)
-                    .fontColor($r('app.color.text_muted'))
+                    .fontColor($r('app.color.text_primary'))
                     .maxLines(1)
                     .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    .width('100%')
+                    .textAlign(TextAlign.Center)
+                    .margin({ top: 2 })
                 }
               }
               .width('100%')
               .padding(1)
             }
-          }, (entry: FileEntry) => entry.path)
+            // 与真实网格（GridFileList）保持完全一样的顶部留白。缺了它，转场快照会
+            // 整体偏高约一个内容顶距，动画看起来就是"内容先往上跳一下再打开"。
+            .margin({ top: index < this.fileGridColumnCount() ? this.fileContentTopInset() : 0 })
+          }, (entry: FileEntry, _index: number) => entry.path)
         }
+        // 与真实网格（GridFileList 的 .columnsGap(1)/.rowsGap(1)）保持一致。
+        // 之前这里是 2，每个格子差 1vp、四列累积后整体几何不同，转场会挪一下 ✗
         .columnsTemplate(this.fileGridColumns())
-        .columnsGap(2)
-        .rowsGap(2)
+        .columnsGap(1)
+        .rowsGap(1)
         .width('100%')
         .layoutWeight(1)
         .padding({ left: 0, right: 0, top: 0, bottom: 0 })
@@ -4642,6 +4687,7 @@ struct Index {
       onScrubStart: (): void => { this.beginTimelineScrub() },
       onScrub: (time: number): void => { this.previewTimelineTime(time) },
       onScrubEnd: (time: number): void => { this.finishTimelineScrub(time) },
+      onTap: (): void => { this.toggleTimelineCollapsed() },
       onSelect: (time: number, period: TimelinePeriod): void => {
         this.selectTimelinePeriod(time, period)
         // 选完日期顺手收起：用户「点一下出来、再点一下收回」的直觉就是这个。
@@ -8865,7 +8911,10 @@ struct Index {
       const context = getContext(this) as Context
       await this.downloadQueue.initialize(context, this.repository, this.networkPolicy)
       await this.uploadQueue.initialize(context, this.repository, this.networkPolicy,
-        (tasks: UploadTaskRecord[]): void => { this.uploadTasks = tasks.slice() })
+        (tasks: UploadTaskRecord[]): void => {
+          this.uploadTasks = tasks.slice()
+          this.syncImportedUploads(tasks)
+        })
       this.downloadQueue.onChange(this.downloadStateListener)
       this.downloadTasks = this.downloadQueue.snapshot().concat(this.videoTransferManager.snapshotTasks())
       this.downloadSpeedBytesPerSecond = this.downloadQueue.speed()
@@ -9392,7 +9441,7 @@ struct Index {
 
   /** 设置里的默认视图：有图目录用「图片默认」，否则用「文件默认」。 */
   private preferredViewMode(): FileViewMode {
-    return this.currentDirectoryHasImages ? this.defaultPhotoViewMode : this.defaultFileViewMode
+    return this.currentDirectoryIsPhotoAlbum ? this.defaultPhotoViewMode : this.defaultFileViewMode
   }
 
   private async ensureViewState(): Promise<void> {
@@ -9435,11 +9484,34 @@ struct Index {
   }
 
   /** 把设置里的默认落到当前视图（方案 A：手动切换只在本次停留期间有效）。 */
+  /**
+   * 根级界面：用户空间主界面、共享主界面、根目录。
+   * 这三个地方【强制列表模式】——不管设置里的默认视图是什么，也不允许右下角切换。
+   * 判据：路径为空（根）或导航深度 <= 1（主界面就在第一层）。
+   */
+  private isRootListing(): boolean {
+    return this.currentPath.length === 0 || this.navigationStack.length <= 1
+  }
+
   private applyPreferredViewMode(): void {
     if (this.screen !== 'files' || this.showSearch) {
       return
     }
-    const preferred = this.preferredViewMode()
+    // 根级界面（用户空间主界面 / 共享主界面 / 根目录）强制列表，不看设置也不看记录。
+    if (this.isRootListing()) {
+      if (this.fileViewMode !== 'list') {
+        if (this.fileViewMode === 'waterfall') {
+          this.stopWaterfallPipeline()
+        }
+        this.fileViewMode = 'list'
+        this.waterfallAnchor = null
+      }
+      return
+    }
+    // 该目录本次运行期间被手动切过 → 保持那个模式；否则用设置里的默认视图。
+    const recorded = this.directoryViewModeOverrides[
+      this.currentRootType.toString() + ':' + this.currentPath]
+    const preferred = recorded !== undefined ? recorded : this.preferredViewMode()
     if (this.fileViewMode === preferred) {
       return
     }
@@ -9507,13 +9579,17 @@ struct Index {
     if (this.isBusy || this.showSearch) {
       return
     }
+    // 根级界面强制列表，不给切（避免出现"主界面变成网格"）
+    if (this.isRootListing()) {
+      return
+    }
     const sourceMode = this.fileViewMode
     const anchor = this.captureFileViewAnchor()
     const sourceOffset = this.captureFileViewOffset(sourceMode)
     // Ordinary folders still keep the existing list/grid switch. The
     // waterfall mode is only a valid target after an image has appeared in
     // the already-loaded metadata for this directory.
-    const nextMode: FileViewMode = this.currentDirectoryHasImages
+    const nextMode: FileViewMode = this.currentDirectoryIsPhotoAlbum
       ? (this.fileViewMode === 'list'
         ? 'grid' : (this.fileViewMode === 'grid' ? 'waterfall' : 'list'))
       : (this.fileViewMode === 'list' ? 'grid' : 'list')
@@ -9524,6 +9600,8 @@ struct Index {
       this.prepareWaterfallPipeline()
     }
     this.fileViewMode = nextMode
+    // 记住"这个目录被手动切到过哪种模式"，返回时保持（本次运行期间有效）。
+    this.directoryViewModeOverrides[this.currentRootType.toString() + ':' + this.currentPath] = nextMode
     this.waterfallAnchor = anchor
     this.waterfallAnchorRestoreToken += 1
     const token = this.waterfallAnchorRestoreToken
@@ -11772,6 +11850,35 @@ struct Index {
     return null
   }
 
+  /**
+   * 进目录的等待提示只在【确实是大目录】时才显示。判断来源（都很快）：
+   *   ① directoryCounts[path] —— 本次会话真的拉过它时记下的（见 updateDirectoryCount）
+   *   ② entry.childCount      —— 父目录列表里就带着（DirectoryMetadataStore 解析服务端
+   *                              childCount，-1 = 服务端没给 = 未知）
+   *   ③ 都未知 → 用 limit=1 的轻请求问 total（UgreenRemoteRepository.countDirectory）
+   * 未知且结果还没回来时【不显示】——宁可晚一点出现，也不要"什么都不知道就弹"。
+   */
+  private async armDirectoryOpeningHint(entry: FileEntry): Promise<void> {
+    this.directoryOpeningHintVisible = false
+    const token = this.directoryOpeningHintToken + 1
+    this.directoryOpeningHintToken = token
+    const recorded = this.directoryCounts[entry.path]
+    const estimate = typeof recorded === 'number' ? recorded : entry.childCount
+    if (estimate >= 0) {
+      this.directoryOpeningHintVisible = estimate >= DIRECTORY_OPENING_HINT_MIN_ITEMS
+      return
+    }
+    try {
+      const total = await this.repository.countDirectory(entry.path, entry.rootType)
+      if (token !== this.directoryOpeningHintToken) {
+        return
+      }
+      this.directoryOpeningHintVisible = total >= DIRECTORY_OPENING_HINT_MIN_ITEMS
+    } catch (error) {
+      console.warn('[UgreenDirectory] count failed: ' + JSON.stringify(error))
+    }
+  }
+
   private async openDefaultPersonalDirectory(): Promise<void> {
     const defaultDirectory = this.findDefaultPersonalDirectory()
     if (defaultDirectory === null) {
@@ -11783,6 +11890,7 @@ struct Index {
     const requestId = this.navigationRequestId
     this.isBusy = true
     this.isNavigating = true
+    this.armDirectoryOpeningHint(defaultDirectory).catch((): void => {})
     try {
       const personalPage = await this.repository.listPage(personalPath, 3, 1)
       if (requestId !== this.navigationRequestId) {
@@ -11798,6 +11906,8 @@ struct Index {
       this.currentRootType = 3
       this.setCurrentPageState(personalPage.pageIndex, personalPage.hasMore)
       this.replaceEntries(personalPage.entries)
+      // 首页这条加载路径以前不下发默认视图 ✗ → 默认设了网格也要"进二级目录再返回"才生效 ✓
+      this.applyPreferredViewMode()
       this.updateTopTitle(this.fileTitle(personalPath), false)
       this.updateBottomBarVisibility(true)
       this.updateDirectoryCount(personalPath, personalPage.totalCount >= 0
@@ -11829,6 +11939,8 @@ struct Index {
     this.navigationPageHasMoreStack = []
     this.setCurrentPageState(1, false)
     this.replaceEntries(kind === 'personal' ? this.personalRoots : this.sharedRoots)
+    // 首页/共享这两个根目录也走这里 —— 以前这条路径不下发默认视图 ✗ 所以永远是列表 ✓
+    this.applyPreferredViewMode()
     this.updateTopTitle(this.fileTitle('', kind), true)
     this.updateBottomBarVisibility(true)
     this.resetPreviewState()
@@ -11859,6 +11971,11 @@ struct Index {
     const outgoingViewState = this.captureDirectoryViewState()
     this.isBusy = true
     this.isNavigating = true
+    this.armDirectoryOpeningHint(entry).catch((): void => {})
+    // 目录要换了：可见范围还是上一个目录留下的值，会让时间轴的资格判断误判通过，
+    // 于是"闪出来一下又闪没"。这里先清零，等新目录渲染后的滚动回调再填真实值。
+    this.fileVisibleStartIndex = 0
+    this.fileVisibleEndIndex = 0
     const requestId = this.navigationRequestId + 1
     this.navigationRequestId = requestId
     this.errorText = ''
@@ -11911,7 +12028,7 @@ struct Index {
         this.setCurrentPageState(Math.max(1, Math.ceil(nextEntries.length / 200)), false)
         this.replaceEntries(nextEntries, false, true)
         // 进入新目录：按设置里的默认视图落地。放这里是因为 replaceEntries 刚把
-        // currentDirectoryHasImages 更新好，而且这个回调每次进入只跑一次 ——
+        // currentDirectoryIsPhotoAlbum 更新好，而且这个回调每次进入只跑一次 ——
         // 不能放进 replaceEntries 本身（加载/排序/刷新/翻页都会跑，会拖垮加载）。
         this.applyPreferredViewMode()
         this.updateBottomBarVisibility(true)
@@ -11957,6 +12074,9 @@ struct Index {
   }
 
   private async goBack(): Promise<void> {
+    // 返回父目录时同样先清掉当前目录留下的可见范围（时间轴资格判断要用干净的值）
+    this.fileVisibleStartIndex = 0
+    this.fileVisibleEndIndex = 0
     if (this.isNavigating) {
       // The current page is still visible while a child directory is loading.
       // Cancel the pending commit so Back remains responsive; the underlying
@@ -17052,7 +17172,7 @@ struct Index {
     if (this.fileViewMode === 'grid') {
       return 'grid'
     }
-    if (this.fileViewMode === 'waterfall' && this.currentDirectoryHasImages) {
+    if (this.fileViewMode === 'waterfall' && this.currentDirectoryIsPhotoAlbum) {
       return 'waterfall'
     }
     return 'list'
@@ -17249,6 +17369,8 @@ struct Index {
   }
 
   private toggleSelection(entry: FileEntry): void {
+    // 选择集可能变空 → 顺带重新评估隔空传送是否还该注册（幂等，代价极小）
+    this.syncGestureShareRegistration()
     let nextPaths: string[] = []
     if (this.isSelected(entry)) {
       nextPaths = this.selectedPaths.filter((path: string) => path !== entry.path)
@@ -18415,11 +18537,11 @@ struct Index {
       return
     }
     this.entries = sortedEntries
-    this.currentDirectoryHasImages = this.hasDirectImageFiles(this.entries)
+    this.currentDirectoryIsPhotoAlbum = this.isPhotoAlbumDirectory(this.entries)
     // 这里只做「无图目录不能停在瀑布流」的兜底。默认视图的下发只在进/回目录时
     // （restore/settleDirectoryViewState）—— 绝不能放这里：replaceEntries 在加载、
     // 排序、刷新、分页追加时都会跑，在这里改模式会反复启停瀑布流管线、拖垮加载。
-    if (!this.currentDirectoryHasImages && this.fileViewMode === 'waterfall') {
+    if (!this.currentDirectoryIsPhotoAlbum && this.fileViewMode === 'waterfall') {
       this.stopWaterfallPipeline()
       this.fileViewMode = 'list'
       this.waterfallAnchor = null
@@ -18485,6 +18607,87 @@ struct Index {
     })
   }
 
+  // 已经处理过的上传任务 id（避免每次任务列表 publish 都重复插入）
+  private syncedUploadTaskIds: string[] = []
+
+  /**
+   * 导入（上传）完成一个文件，就把它【增量插入】当前目录列表。
+   * 用的是 LazyForEach 的精准通知（onDataAdd）：
+   *   - 不重拉目录、不 replace  → 已有条目不重建 → 不闪烁、不上下位移
+   *   - 每完成一个插一个        → 需求要的「逐渐弹出新增文件」
+   * 边界：
+   *   - 只处理【刚变成 completed】的（用 id 去重，publish 会多次回调）
+   *   - 同名跳过（skipped）不插：服务器上本来就有，列表里也已经有
+   *   - 目标目录 ≠ 当前目录不插；不在文件页/正在搜索不插
+   *   - 同一 path 已在列表里不重复插
+   */
+  private syncImportedUploads(tasks: UploadTaskRecord[]): void {
+    const aliveIds: string[] = []
+    for (const task of tasks) {
+      if (this.syncedUploadTaskIds.indexOf(task.id) >= 0) {
+        aliveIds.push(task.id)
+        continue
+      }
+      if (task.status !== 'completed') {
+        continue
+      }
+      aliveIds.push(task.id)
+      if (task.skipped === true) {
+        continue
+      }
+      if (this.screen !== 'files' || this.showSearch) {
+        continue
+      }
+      if (task.destinationRoot.replace(/\/$/, '') !== this.currentPath.replace(/\/$/, '')) {
+        continue
+      }
+      this.insertImportedEntry(this.importedFileEntry(task))
+    }
+    this.syncedUploadTaskIds = aliveIds
+  }
+
+  private importedFileEntry(task: UploadTaskRecord): FileEntry {
+    const entry = new FileEntry()
+    entry.name = task.name
+    entry.path = task.remotePath
+    entry.isDirectory = false
+    entry.size = task.size
+    // 任务创建时间约等于文件落盘时间；下一次目录索引刷新会被真实值覆盖。
+    entry.modifiedTime = task.createdAt
+    entry.createdTime = task.createdAt
+    entry.rootType = this.currentRootType
+    entry.mimeType = task.mimeType
+    return entry
+  }
+
+  private insertImportedEntry(entry: FileEntry): void {
+    if (entry.path.length === 0) {
+      return
+    }
+    for (const item of this.entries) {
+      if (item.path === entry.path) {
+        return
+      }
+    }
+    // 用工程自己的排序函数定位，避免出现第二套排序规则
+    const next = this.sortEntriesForDisplay(this.entries.concat([entry]))
+    let index = -1
+    for (let i = 0; i < next.length; i++) {
+      if (next[i].path === entry.path) {
+        index = i
+        break
+      }
+    }
+    if (index < 0) {
+      return
+    }
+    this.entries = next
+    this.fileEntryDataSource.insertAt(index, entry)
+    this.syncWaterfallEntries(this.entries, false)
+    this.rebuildTimelineIndexes()
+    this.scheduleDirectoryVideoReconcile([entry])
+  }
+
   private appendEntries(nextEntries: FileEntry[]): void {
     if (nextEntries.length === 0) {
       return
@@ -18524,7 +18727,7 @@ struct Index {
 
     const appended = sorted.slice(previousLength)
     this.entries = sorted
-    this.currentDirectoryHasImages = this.hasDirectImageFiles(this.entries)
+    this.currentDirectoryIsPhotoAlbum = this.isPhotoAlbumDirectory(this.entries)
     this.fileEntryDataSource.append(appended)
     this.syncWaterfallEntries(this.entries, true)
     this.rebuildTimelineIndexes()
@@ -18586,13 +18789,26 @@ struct Index {
       left.checksum === right.checksum
   }
 
-  private hasDirectImageFiles(entries: FileEntry[]): boolean {
+  /**
+   * 这个目录算不算「图片目录」——用【图片目录的呈现方式】（默认视图、网格/瀑布流那套）。
+   *
+   * 规则（用户定）：目录里【全部】都是图片或视频才算图片目录（且至少有一条）；
+   * 只要有任何一个别的文件、或者子目录，就算【文件目录】，用文件目录的呈现方式。
+   * 注意：这不是"怎么画每条内容"——单条要不要显示缩略图由 isImage(entry) 各自决定。
+   */
+  private isPhotoAlbumDirectory(entries: FileEntry[]): boolean {
+    if (entries.length === 0) {
+      return false
+    }
     for (const entry of entries) {
-      if (!entry.isDirectory && this.isImage(entry)) {
-        return true
+      if (entry.isDirectory) {
+        return false
+      }
+      if (!this.isImage(entry) && !this.isVideo(entry)) {
+        return false
       }
     }
-    return false
+    return true
   }
 
   /**
@@ -18613,7 +18829,7 @@ struct Index {
     if (this.fileViewMode === 'list') {
       return $r('sys.symbol.square_grid_2x2')
     }
-    if (this.fileViewMode === 'grid' && this.currentDirectoryHasImages) {
+    if (this.fileViewMode === 'grid' && this.currentDirectoryIsPhotoAlbum) {
       // Official ArkUI system symbol for the waterfall target mode.
       return $r('sys.symbol.waterfall')
     }

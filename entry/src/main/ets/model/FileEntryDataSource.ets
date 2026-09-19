@@ -75,6 +75,19 @@ export class FileEntryDataSource implements IDataSource {
     }
   }
 
+  /**
+   * 在指定位置插入一条，并且【只通知这一个索引】（onDataAdd）。
+   * 不要用 replace() 来做插入：新文件会改变 path 顺序 → replace 会退化成
+   * onDataReloaded() 全量重载 → 所有已挂载行被销毁重建（闪烁 + 上下位移）。
+   */
+  insertAt(index: number, item: FileEntry): void {
+    const target = Math.max(0, Math.min(index, this.items.length))
+    this.items.splice(target, 0, item)
+    for (const listener of this.listeners.slice()) {
+      listener.onDataAdd(target)
+    }
+  }
+
   private samePathOrder(nextItems: FileEntry[]): boolean {
     if (this.items.length !== nextItems.length) {
       return false

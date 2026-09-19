@@ -239,6 +239,16 @@ export class UgreenRemoteRepository {
     return (await this.fetchDirectory(path, rootType, key)).slice()
   }
 
+  /**
+   * 只问「这个目录里有多少项」：同一个列目录接口 + limit=1，服务端只回 1 条并带 total，
+   * 比把整个目录拉下来快一个量级（UgreenRemoteClient.listPage 的 limit 参数）。
+   * 用于「进目录前判断是不是大目录」——避免一个只有 1 个文件的目录也弹等待提示。
+   */
+  async countDirectory(path: string, rootType: number): Promise<number> {
+    const page = await this.client.listPage(path, rootType, 1, 1)
+    return page.totalCount
+  }
+
   async listPage(path: string, rootType: number, pageIndex: number,
     forceNetwork: boolean = false): Promise<UgreenDirectoryPage> {
     this.updateMetadataScope()
