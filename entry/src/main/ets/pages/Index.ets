@@ -91,6 +91,9 @@ const FLOATING_BAR_CONTENT_EXTRA_VP: number = 32
 const FLOATING_TIMELINE_WIDTH_VP: number = 68
 const FLOATING_TIMELINE_RAIL_WIDTH_VP: number = 42
 const FLOATING_TIMELINE_GAP_VP: number = 8
+// 收起态：整条向右平移，只在屏幕右缘留出一小截（日期标签的左半截，允许被裁切，
+// 正是这一小截提示用户「这里可以点」）。轴条本体因此完全移出屏外，不再挡住最右列。
+const FLOATING_TIMELINE_PEEK_VP: number = 28
 const FLOATING_TIMELINE_EFFECT_INSET_VP: number = 16
 const FLOATING_TIMELINE_UPWARD_SHIFT_VP: number = 8
 const DIRECTORY_INDEX_STALE_MS: number = 30 * 1000
@@ -738,6 +741,8 @@ struct Index {
   private timelineInteractionToken: number = 0
   private timelineFocusPinned: boolean = false
   private timelineIgnoreScrollStartUntil: number = 0
+  // 时间轴默认收起（只露一小截日期），点一下展开、再点一下收起。
+  @State timelineCollapsed: boolean = true
   private timelineVisibleFocusPendingTime: number = 0
   private timelineVisibleFocusTimer: number = 0
   private timelineLastJumpDay: number = 0
@@ -2062,7 +2067,18 @@ struct Index {
           y: this.fileContentTopInset() + FLOATING_TIMELINE_GAP_VP -
             FLOATING_TIMELINE_EFFECT_INSET_VP - FLOATING_TIMELINE_UPWARD_SHIFT_VP
         })
-        .translate({ x: 0, y: this.bottomBarOffsetY, z: 0 })
+        // 收起时整体右移，只留 FLOATING_TIMELINE_PEEK_VP 在屏内。
+        .translate({
+          x: this.timelineCollapsed
+            ? FLOATING_TIMELINE_WIDTH_VP - FLOATING_TIMELINE_PEEK_VP : 0,
+          y: this.bottomBarOffsetY, z: 0
+        })
+        .onClick(() => {
+          // 展开态下点轴条本身也能收起；拖动不会触发 onClick，不影响拖动定位。
+          this.getUIContext().animateTo({ duration: 200, curve: Curve.FastOutSlowIn }, () => {
+            this.timelineCollapsed = !this.timelineCollapsed
+          })
+        })
         .opacity(this.shouldShowTimeline() ? this.bottomBarOpacity : 0)
         // Opacity alone does not reliably suppress the native material and
         // Canvas sublayers during a directory transaction. Hidden preserves
@@ -2070,8 +2086,12 @@ struct Index {
         // so the previous directory's rail cannot survive the pop frame.
         .visibility(this.shouldShowTimeline() ? Visibility.Visible : Visibility.Hidden)
         .zIndex(21)
+        // 收起态：整层自己要点击（露出的那一小截不能被下面的图片接走）。
+        // 展开态：必须用 Default —— None 是「自身不响应」，挂在整层上的 onClick 永远收不到 ✗；
+        // Default 是「自身响应 + 子节点照常响应」，轴条的拖动定位不受影响。
         .hitTestBehavior(this.shouldShowTimeline() && !this.viewerOwnsParentInteraction()
-          ? HitTestMode.None : HitTestMode.BLOCK_DESCENDANTS)
+          ? (this.timelineCollapsed ? HitTestMode.Block : HitTestMode.Default)
+          : HitTestMode.BLOCK_DESCENDANTS)
       }
 
       if (this.screen === 'downloads' && this.transferDirection === 'download' && this.hasActiveDownload()) {
@@ -3154,7 +3174,27 @@ struct Index {
     if (!(width > 0)) {
       return 2
     }
-    return Math.max(2, Math.min(8, Math.floor(width / 94)))
+    // 目标格子宽 80–140vp（文件的网格：要放下文件名与勾选角标；图片网格同一档，
+    // 保持两者列数一致）。手机 376vp -> 4 列（与以前一致），平板竖屏 -> 上限 10 列。
+    return Math.max(2, Math.min(10, Math.floor(width / 80)))
+  }
+
+  /** 瀑布流列数：目标列宽 240vp（区间 240–360vp）。列宽直接决定图片高度，所以比网格大一档。 */
+  private waterfallColumnCount(): number {
+    const width = this.pageWidthVp - 20
+    if (!(width > 0)) {
+      return 2
+    }
+    return Math.max(2, Math.min(5, Math.floor(width / 240)))
+  }
+
+  private waterfallColumnsTemplate(): string {
+    const count = this.waterfallColumnCount()
+    let template = ''
+    for (let i = 0; i < count; i++) {
+      template += (i === 0 ? '' : ' ') + '1fr'
+    }
+    return template
   }
 
   private fileGridColumns(): string {
@@ -3399,7 +3439,7 @@ struct Index {
         // origin on this device. Put the breathing room on the first row's
         // FlowItems instead; later rows remain unchanged and can still scroll
         // naturally under the common TopFileOverlay, just like list/grid.
-        .margin({ top: index < 2 ? this.fileContentTopInset() : 0 })
+        .margin({ top: index < this.waterfallColumnCount() ? this.fileContentTopInset() : 0 })
         .onAppear(() => {
           this.resolveFileListImageRotation(entry)
           this.markWaterfallVisible(entry, true)
@@ -3415,7 +3455,7 @@ struct Index {
         })
       }, (entry: FileEntry) => entry.path)
     }
-    .columnsTemplate('1fr 1fr')
+    .columnsTemplate(this.waterfallColumnsTemplate())
     .columnsGap(8)
     .rowsGap(8)
     // Only visible FlowItems are mounted. Original-file downloads are
@@ -3432,7 +3472,10 @@ struct Index {
     .onReachEnd(() => this.loadNextDirectoryPage())
     .onAreaChange((_, area) => {
       if (typeof area.width === 'number' && area.width > 0) {
-        this.waterfallColumnWidthVp = Math.max(1, (area.width - 28) / 2)
+        const columns = this.waterfallColumnCount()
+        // 20 = 左右内边距，8 = 列间距；(columns - 1) 个间距
+        this.waterfallColumnWidthVp =
+          Math.max(1, (area.width - 20 - (columns - 1) * 8) / columns)
       }
     })
     .width('100%')
@@ -4601,6 +4644,10 @@ struct Index {
       onScrubEnd: (time: number): void => { this.finishTimelineScrub(time) },
       onSelect: (time: number, period: TimelinePeriod): void => {
         this.selectTimelinePeriod(time, period)
+        // 选完日期顺手收起：用户「点一下出来、再点一下收回」的直觉就是这个。
+        this.getUIContext().animateTo({ duration: 200, curve: Curve.FastOutSlowIn }, () => {
+          this.timelineCollapsed = true
+        })
       }
     })
   }
