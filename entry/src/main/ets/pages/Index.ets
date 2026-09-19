@@ -7690,6 +7690,9 @@ struct Index {
         }
         .width('100%')
         .aspectRatio(this.viewerImageFrameAspectRatio(entry))
+        // 兜底：高度不许超过父容器。'100%' 取的是【真实布局】，不是会过期的视口状态值
+        // —— 旋转瞬间分支可能按旧朝向选错，这一层保证盒子永远不会撑出屏幕。
+        .constraintSize({ maxHeight: '100%' })
         .scale({
           x: this.viewerPageVisualScale(entry, index),
           y: this.viewerPageVisualScale(entry, index),
@@ -7706,6 +7709,8 @@ struct Index {
         }
         .height('100%')
         .aspectRatio(this.viewerImageFrameAspectRatio(entry))
+        // 兜底：宽度不许超过父容器（同样用 '100%' 取真实布局）。
+        .constraintSize({ maxWidth: '100%' })
         .scale({
           x: this.viewerPageVisualScale(entry, index),
           y: this.viewerPageVisualScale(entry, index),
