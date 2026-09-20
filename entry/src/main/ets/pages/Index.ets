@@ -1406,6 +1406,9 @@ struct Index {
   }
 
   private shouldShowTimeline(): boolean {
+    if (this.floatingTimelineHeight() <= 0) {
+      return false
+    }
     const visibleImageCount = this.timelineVisibleImageCount()
     const currentDirectoryKey = this.currentRootType.toString() + ':' + this.currentPath
     // The index is keyed by directory. During a push/pop the live page and its
@@ -1448,13 +1451,34 @@ struct Index {
   private floatingTimelineHeight(): number {
     const fileRegionHeight = this.pageHeightVp - this.fileContentTopInset() -
       this.floatingBarBottomMargin() - FLOATING_BAR_HEIGHT_VP
-    // Equal gaps above and below keep the long vertical rail centered in the
-    // visible file region, independent of status/navigation-bar insets.
-    return Math.max(180, fileRegionHeight - FLOATING_TIMELINE_GAP_VP * 2)
+    // 预留与底栏及顶部内容的安全留白（与底栏顶部保留 FLOATING_TIMELINE_GAP_VP 间距，决不重叠）
+    const safeMaxHeight = fileRegionHeight - FLOATING_TIMELINE_GAP_VP * 2
+    if (safeMaxHeight < 120) {
+      return 0
+    }
+    return Math.min(520, safeMaxHeight)
   }
 
   private fileToolsBarHeight(): number {
     return FLOATING_BAR_HEIGHT_VP
+  }
+
+  private isUserRootPath(path: string): boolean {
+    if (path.length === 0) {
+      return false
+    }
+    const normalized = path.replace(/\/+$/, '').toLowerCase()
+    const accountName = this.username.trim().replace(/^\/+|\/+$/g, '').toLowerCase()
+    if (accountName.length > 0 && (normalized === ('/home/' + accountName) || normalized === ('/' + accountName))) {
+      return true
+    }
+    for (const root of this.personalRoots) {
+      const rootPath = (root.path.length > 0 ? root.path : '/' + root.name).replace(/\/+$/, '').toLowerCase()
+      if (rootPath === normalized) {
+        return true
+      }
+    }
+    return false
   }
 
   private shouldShowBottomBar(): boolean {
@@ -1471,15 +1495,15 @@ struct Index {
     if (this.screen !== 'files') {
       return false
     }
+    // 根目录（仅管理员可见的个人空间根、或共享空间根）
     if (this.currentPath.length === 0) {
       return true
     }
-    const accountName = this.username.trim().replace(/^\/+|\/+$/g, '')
-    if (accountName.length === 0) {
-      return false
+    // 用户个人空间主界面（用户根目录，如 /admin、/home/admin）
+    if (this.rootKind === 'personal' && this.isUserRootPath(this.currentPath)) {
+      return true
     }
-    const normalizedPath = this.currentPath.replace(/\/+$/, '').toLowerCase()
-    return normalizedPath === ('/home/' + accountName).toLowerCase()
+    return false
   }
 
   // 底栏只有三种形态，共用一个常驻外壳：
@@ -2129,6 +2153,7 @@ struct Index {
         // 收起态：整层自己要点击（露出的那一小截不能被下面的图片接走）。
         // 展开态：必须用 Default —— None 是「自身不响应」，挂在整层上的 onClick 永远收不到 ✗；
         // Default 是「自身响应 + 子节点照常响应」，轴条的拖动定位不受影响。
+        // 未显示或大图查看态：BLOCK_DESCENDANTS 屏蔽整层及所有子节点，决不阻断下方组件（如底栏切换按钮、列表项）的触控点击。
         .hitTestBehavior(this.shouldShowTimeline() && !this.viewerOwnsParentInteraction()
           ? HitTestMode.Default
           : HitTestMode.BLOCK_DESCENDANTS)
@@ -9439,9 +9464,28 @@ struct Index {
     }
   }
 
+  private directoryHasImages(entries: FileEntry[]): boolean {
+    for (const entry of entries) {
+      if (!entry.isDirectory && (this.isImage(entry) || this.isVideo(entry))) {
+        return true
+      }
+    }
+    return false
+  }
+
   /** 设置里的默认视图：有图目录用「图片默认」，否则用「文件默认」。 */
   private preferredViewMode(): FileViewMode {
-    return this.currentDirectoryIsPhotoAlbum ? this.defaultPhotoViewMode : this.defaultFileViewMode
+    const hasImages = this.directoryHasImages(this.entries)
+    if (hasImages) {
+      // 目录含图片/视频时使用「图片默认视图」
+      // 若用户设的是瀑布流，但目录中含有子文件夹或非媒体文件，瀑布流无法展示子文件夹，自动降级为网格
+      if (this.defaultPhotoViewMode === 'waterfall' && !this.isPhotoAlbumDirectory(this.entries)) {
+        return 'grid'
+      }
+      return this.defaultPhotoViewMode
+    }
+    // 无任何图片/视频的目录使用「文件夹默认视图」
+    return this.defaultFileViewMode
   }
 
   private async ensureViewState(): Promise<void> {
@@ -9485,12 +9529,26 @@ struct Index {
 
   /** 把设置里的默认落到当前视图（方案 A：手动切换只在本次停留期间有效）。 */
   /**
-   * 根级界面：用户空间主界面、共享主界面、根目录。
+   * 根级界面：根目录（仅管理员能看到）、用户空间主界面（用户根目录）、共享主界面（共享根目录）。
    * 这三个地方【强制列表模式】——不管设置里的默认视图是什么，也不允许右下角切换。
-   * 判据：路径为空（根）或导航深度 <= 1（主界面就在第一层）。
+   * 判据：
+   * 1. 根目录（仅管理员可见的个人空间根）或共享空间根目录：路径为空（currentPath.length === 0）
+   * 2. 共享空间：首屏共享根目录已被上面捕获；任何子文件夹都不属于根目录
+   * 3. 个人空间：仅当处于用户根目录（如 /admin、/home/admin）时为根目录
+   * 注意：共享空间下的任何文件夹（如 /公共照片）、用户个人空间下的任何文件夹（如 /admin/照片），
+   * 均属于第二层或更深的内容目录，不在此限（按用户偏好自动切换视图，且允许手动切换）。
    */
   private isRootListing(): boolean {
-    return this.currentPath.length === 0 || this.navigationStack.length <= 1
+    if (this.currentPath.length === 0) {
+      return true
+    }
+    if (this.rootKind === 'shared') {
+      return false
+    }
+    if (this.rootKind === 'personal') {
+      return this.isUserRootPath(this.currentPath)
+    }
+    return false
   }
 
   private applyPreferredViewMode(): void {
