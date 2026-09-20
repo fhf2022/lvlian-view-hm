@@ -1452,7 +1452,7 @@ struct Index {
     const fileRegionHeight = this.pageHeightVp - this.fileContentTopInset() -
       this.floatingBarBottomMargin() - FLOATING_BAR_HEIGHT_VP
     // 预留与底栏及顶部内容的安全留白（与底栏顶部保留 FLOATING_TIMELINE_GAP_VP 间距，决不重叠）
-    const safeMaxHeight = fileRegionHeight - FLOATING_TIMELINE_GAP_VP * 2
+    const safeMaxHeight = fileRegionHeight - FLOATING_TIMELINE_GAP_VP * 2 - FLOATING_TIMELINE_EFFECT_INSET_VP * 2
     if (safeMaxHeight < 120) {
       return 0
     }
@@ -1472,12 +1472,9 @@ struct Index {
     if (accountName.length > 0 && (normalized === ('/home/' + accountName) || normalized === ('/' + accountName))) {
       return true
     }
-    for (const root of this.personalRoots) {
-      const rootPath = (root.path.length > 0 ? root.path : '/' + root.name).replace(/\/+$/, '').toLowerCase()
-      if (rootPath === normalized) {
-        return true
-      }
-    }
+    // 注意：不要把 findDefaultPersonalDirectory()（个人空间里的第一个文件夹）当成用户根 ✗
+    // 那只是个普通文件夹；把它算作根会导致"打开它永远是列表、且切换按钮失效"。
+    // 用户根只有 /home/<登录用户名> 这一种形态，上面已经判过。
     return false
   }
 
@@ -2153,7 +2150,9 @@ struct Index {
         // 收起态：整层自己要点击（露出的那一小截不能被下面的图片接走）。
         // 展开态：必须用 Default —— None 是「自身不响应」，挂在整层上的 onClick 永远收不到 ✗；
         // Default 是「自身响应 + 子节点照常响应」，轴条的拖动定位不受影响。
-        // 未显示或大图查看态：BLOCK_DESCENDANTS 屏蔽整层及所有子节点，决不阻断下方组件（如底栏切换按钮、列表项）的触控点击。
+        // 未显示或大图查看态：必须用 BLOCK_DESCENDANTS —— 自身不响应【且阻塞所有后代】，
+        // 整棵子树退出命中测试，事件才真正落到下面的底栏/列表 ✗
+        // （None 只让「自身」不响应，子节点照常参与命中 → 隐藏态的轴条会吃掉点击。）
         .hitTestBehavior(this.shouldShowTimeline() && !this.viewerOwnsParentInteraction()
           ? HitTestMode.Default
           : HitTestMode.BLOCK_DESCENDANTS)
@@ -4758,6 +4757,9 @@ struct Index {
       .height(FLOATING_BAR_HEIGHT_VP)
       .opacity(this.bottomBarMode() === 'home' ? 1 : 0)
       .translate({ x: 0, y: this.bottomBarMode() === 'home' ? 0 : 12, z: 0 })
+      // ⚠️ 隐藏态必须用 BLOCK_DESCENDANTS ✗ 不能用 None：
+      // 三个底栏是【互相重叠的兄弟】，后画的压在上面。None 只让「自身」不响应，
+      // 子按钮照常参与命中 → 隐藏态的按钮会盖住可见底栏 → 底栏整体点不动 ✗
       .hitTestBehavior(this.bottomBarMode() === 'home'
         ? HitTestMode.Default : HitTestMode.BLOCK_DESCENDANTS)
       .animation({ duration: 200, curve: Curve.FastOutSlowIn })
@@ -4771,7 +4773,7 @@ struct Index {
       .opacity(this.bottomBarMode() === 'selection' ? 1 : 0)
       .translate({ x: 0, y: this.bottomBarMode() === 'selection' ? 0 : 12, z: 0 })
       .hitTestBehavior(this.bottomBarMode() === 'selection'
-        ? HitTestMode.Default : HitTestMode.BLOCK_DESCENDANTS)
+        ? HitTestMode.Default : HitTestMode.None)
       .animation({ duration: 200, curve: Curve.FastOutSlowIn })
 
       // 文件详情页：左圆钮 + 中间排序胶囊 + 右圆钮
@@ -9464,28 +9466,9 @@ struct Index {
     }
   }
 
-  private directoryHasImages(entries: FileEntry[]): boolean {
-    for (const entry of entries) {
-      if (!entry.isDirectory && (this.isImage(entry) || this.isVideo(entry))) {
-        return true
-      }
-    }
-    return false
-  }
-
-  /** 设置里的默认视图：有图目录用「图片默认」，否则用「文件默认」。 */
+  /** 设置里的默认视图：纯图片/视频相册目录用「图片默认」，否则用「文件默认」。 */
   private preferredViewMode(): FileViewMode {
-    const hasImages = this.directoryHasImages(this.entries)
-    if (hasImages) {
-      // 目录含图片/视频时使用「图片默认视图」
-      // 若用户设的是瀑布流，但目录中含有子文件夹或非媒体文件，瀑布流无法展示子文件夹，自动降级为网格
-      if (this.defaultPhotoViewMode === 'waterfall' && !this.isPhotoAlbumDirectory(this.entries)) {
-        return 'grid'
-      }
-      return this.defaultPhotoViewMode
-    }
-    // 无任何图片/视频的目录使用「文件夹默认视图」
-    return this.defaultFileViewMode
+    return this.currentDirectoryIsPhotoAlbum ? this.defaultPhotoViewMode : this.defaultFileViewMode
   }
 
   private async ensureViewState(): Promise<void> {
@@ -9529,14 +9512,23 @@ struct Index {
 
   /** 把设置里的默认落到当前视图（方案 A：手动切换只在本次停留期间有效）。 */
   /**
-   * 根级界面：根目录（仅管理员能看到）、用户空间主界面（用户根目录）、共享主界面（共享根目录）。
-   * 这三个地方【强制列表模式】——不管设置里的默认视图是什么，也不允许右下角切换。
-   * 判据：
-   * 1. 根目录（仅管理员可见的个人空间根）或共享空间根目录：路径为空（currentPath.length === 0）
-   * 2. 共享空间：首屏共享根目录已被上面捕获；任何子文件夹都不属于根目录
-   * 3. 个人空间：仅当处于用户根目录（如 /admin、/home/admin）时为根目录
-   * 注意：共享空间下的任何文件夹（如 /公共照片）、用户个人空间下的任何文件夹（如 /admin/照片），
-   * 均属于第二层或更深的内容目录，不在此限（按用户偏好自动切换视图，且允许手动切换）。
+   * 根级界面 = 【强制列表模式】。不看设置里的默认视图，也不允许右下角切换按钮生效。
+   *
+   * 视图规则一共就四种情况（其它一律跟设置走）：
+   * | 界面                        | 路径形态                          | 视图          |
+   * |----------------------------|----------------------------------|---------------|
+   * | 根目录（个人空间根/共享根） | 空字符串（currentPath === ''）    | 🔒 强制列表   |
+   * | 用户空间主界面（用户根）     | /home/<登录用户名> 或 /<登录用户名> | 🔒 强制列表   |
+   * | 共享主界面（共享根）         | 空字符串（同上第一条覆盖）         | 🔒 强制列表   |
+   * | 其它一切目录（含"个人空间里   | 更深                              | ⚙️ 跟设置走   |
+   * | 第一个文件夹"）              |                                  |               |
+   *
+   * ⚠️ 两个容易搞错的地方（都踩过）：
+   * 1. **不要**把 findDefaultPersonalDirectory() 的结果当"用户根"——它虽然优先返回
+   *    /home/<用户名>（那确实是用户根 ✓），但以前还有一条"personalRoots 只有一个就用它"的
+   *    兜底 ✗，会把【普通文件夹】当成根 ✗。那条已删 ✓。isUserRootPath() 现在只认路径形态 ✓。
+   * 2. **不要**把"登录落点"当成"用户根"之外的东西 ✗ —— 落点统一为 /home/<用户名> ✓
+   *    （openDefaultPersonalDirectory / loadRoot 都是 ✓），所以两端打开的层级一致 ✓。
    */
   private isRootListing(): boolean {
     if (this.currentPath.length === 0) {
@@ -11863,12 +11855,14 @@ struct Index {
     this.replaceEntries(this.personalRoots)
     this.resetPreviewState()
 
-    // 管理员/用户自己的目录作为登录后的默认落点；找不到匹配目录时保留根目录。
+    // 登录后的默认落点统一为【用户根】✓：优先用服务端给的同名目录路径；
+    // 拿不到就直接用 /home/<用户名> ✓ —— 非管理员与管理员都停在同一级 ✓
     const defaultDirectory = this.findDefaultPersonalDirectory()
-    if (defaultDirectory !== null) {
-      const personalPath = defaultDirectory.path.length > 0
-        ? defaultDirectory.path
-        : '/' + defaultDirectory.name
+    const accountName = this.username.trim()
+    const personalPath = defaultDirectory !== null
+      ? (defaultDirectory.path.length > 0 ? defaultDirectory.path : '/' + defaultDirectory.name)
+      : (accountName.length > 0 ? '/home/' + accountName : '')
+    if (personalPath.length > 0) {
       try {
         const personalPage = await this.repository.listPage(personalPath, 3, 1)
         this.navigationStack = ['']
@@ -11902,9 +11896,8 @@ struct Index {
         }
       }
     }
-    if (this.personalRoots.length === 1 && this.personalRoots[0].isDirectory) {
-      return this.personalRoots[0]
-    }
+    // 不要用"personalRoots 只有一个就用它"兜底 ✗ —— /home 下唯一的那个文件夹
+    // 仍然是【普通文件夹】不是用户根 ✓ 把它当根会导致"打开它永远列表 + 切换按钮失效"。
     return null
   }
 
@@ -11939,16 +11932,21 @@ struct Index {
 
   private async openDefaultPersonalDirectory(): Promise<void> {
     const defaultDirectory = this.findDefaultPersonalDirectory()
-    if (defaultDirectory === null) {
+    const accountName = this.username.trim()
+    // 落点统一为【用户根】✓：优先用服务端给的同名目录路径；拿不到就直接用 /home/<用户名> ✓
+    // （这样非管理员和管理员打开都停在同一级 ✓ 而且它属于根级 → 强制列表 ✓）
+    const personalPath = defaultDirectory !== null
+      ? (defaultDirectory.path.length > 0 ? defaultDirectory.path : '/' + defaultDirectory.name)
+      : (accountName.length > 0 ? '/home/' + accountName : '')
+    if (personalPath.length === 0) {
       return
     }
-    const personalPath = defaultDirectory.path.length > 0
-      ? defaultDirectory.path
-      : '/' + defaultDirectory.name
     const requestId = this.navigationRequestId
     this.isBusy = true
     this.isNavigating = true
-    this.armDirectoryOpeningHint(defaultDirectory).catch((): void => {})
+    if (defaultDirectory !== null) {
+      this.armDirectoryOpeningHint(defaultDirectory).catch((): void => {})
+    }
     try {
       const personalPage = await this.repository.listPage(personalPath, 3, 1)
       if (requestId !== this.navigationRequestId) {
