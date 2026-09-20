@@ -4,8 +4,7 @@
     "type": "entry",
     "description": "$string:module_desc",
     "mainElement": "EntryAbility",
-    // 只发手机版：平板端界面还没适配（平板常见 API 24，也和本工程 targetSdk 26 不匹配），
-    // 这里只声明 phone，平板与 2in1 就不会被分发到。
+    // 支持三端：手机、平板、2in1
     "deviceTypes": [
       "phone",
       "tablet",
