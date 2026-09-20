@@ -4772,8 +4772,11 @@ struct Index {
       .height(FLOATING_BAR_HEIGHT_VP)
       .opacity(this.bottomBarMode() === 'selection' ? 1 : 0)
       .translate({ x: 0, y: this.bottomBarMode() === 'selection' ? 0 : 12, z: 0 })
+      // ⚠️ 与另两个底栏保持一致：隐藏态必须 BLOCK_DESCENDANTS。
+      // None 只让「自身」退出命中、子节点（图标/文字）照常参与，
+      // 而 selection 层压在 home 之上 → 会挡掉落在该区域的底栏点击。
       .hitTestBehavior(this.bottomBarMode() === 'selection'
-        ? HitTestMode.Default : HitTestMode.None)
+        ? HitTestMode.Default : HitTestMode.BLOCK_DESCENDANTS)
       .animation({ duration: 200, curve: Curve.FastOutSlowIn })
 
       // 文件详情页：左圆钮 + 中间排序胶囊 + 右圆钮
