@@ -736,6 +736,15 @@ struct Index {
   private previewQueue: PreviewLoadQueue = new PreviewLoadQueue(
     ThumbnailPolicy.LIST_MAX_CONCURRENT, ThumbnailPolicy.MAX_PENDING_TASKS)
   private previewUriOrder: string[] = []
+  // previewUri() 的结果缓存：key = 条目 path，value = `<signature>\u0000<uri>`。
+  // 为什么需要：每个格子每次渲染会调 previewUri 2~3 次（fileImageSource /
+  // fileImageSourceAvailable / fileImageSourceOrientation → fileListImageBaseOrientation），
+  // 而它内部要过 NAPI fileUri.getUriFromPath。真机 Profiler 落盘数据显示
+  // getUriFromPath 的调用次数 ≈ previewUri 的调用次数，说明原有的两级缓存
+  // 在渲染路径上几乎不命中，于是每次渲染都白付一次 NAPI + 多层查表。
+  // 这里缓存"最终结果"，命中即零 NAPI、零嵌套查；signature 变化自动失效。
+  private previewUriResultCache: Map<string, string> = new Map<string, string>()
+  private previewUriResultKeys: string[] = []
   private currentPageIndex: number = 1
   private currentPageHasMore: boolean = false
   private loadingNextPage: boolean = false
@@ -18550,8 +18559,39 @@ struct Index {
   }
 
   private previewUri(entry: FileEntry): string {
-    const state = this.imageVisualState(entry.path)
     const signature = this.previewSignature(entry)
+    // 结果缓存优先：渲染路径上同一格子一帧内会问 2~3 次，命中即可省掉 NAPI。
+    const cached = this.previewUriResultCache.get(entry.path)
+    if (cached !== undefined) {
+      const sep = cached.indexOf('\u0000')
+      if (sep > 0 && cached.substring(0, sep) === signature) {
+        return cached.substring(sep + 1)
+      }
+    }
+    const resolved = this.resolvePreviewUri(entry, signature)
+    this.rememberPreviewUri(entry.path, signature, resolved)
+    return resolved
+  }
+
+  private rememberPreviewUri(path: string, signature: string, uri: string): void {
+    // 空结果不缓存：下一次可能已经有缩略图了，缓存空会把"还没好"固化下来。
+    if (path.length === 0 || uri.length === 0) {
+      return
+    }
+    if (!this.previewUriResultCache.has(path)) {
+      this.previewUriResultKeys.push(path)
+    }
+    this.previewUriResultCache.set(path, signature + '\u0000' + uri)
+    while (this.previewUriResultKeys.length > 512) {
+      const oldest = this.previewUriResultKeys.shift()
+      if (oldest !== undefined) {
+        this.previewUriResultCache.delete(oldest)
+      }
+    }
+  }
+
+  private resolvePreviewUri(entry: FileEntry, signature: string): string {
+    const state = this.imageVisualState(entry.path)
     if (state.thumbnailUri.length > 0 && state.thumbnailSignature === signature) {
       return state.thumbnailUri
     }
@@ -18595,6 +18635,9 @@ struct Index {
     if (freezesCurrentVideoPoster) {
       return
     }
+    // previewUri() 的结果缓存必须同步失效，否则会继续返回被替换掉的旧 URI
+    // （尤其是旋转修正这类 signature 不变、而 URI 变了的更新）。
+    this.previewUriResultCache.delete(path)
     const order: string[] = this.previewUriOrder.filter((key: string): boolean => key !== path)
     order.push(path)
     const evictedPaths: string[] = []
