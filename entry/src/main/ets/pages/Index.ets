@@ -792,6 +792,8 @@ struct Index {
   private waterfallAnchor: FileViewAnchor | null = null
   private waterfallAnchorRestoreToken: number = 0
   private fileVisibleStartIndex: number = 0
+  // 滚动期间被推迟的「视觉状态刷新」标记（见 scheduleImageVisualNotify）
+  private imageVisualNotifyDeferred: boolean = false
   private fileVisibleEndIndex: number = 0
   private waterfallVisibleStartIndex: number = 0
   private waterfallVisibleEndIndex: number = 0
@@ -3308,7 +3310,14 @@ struct Index {
               // 固定 1:1，和系统相册一致：不论屏幕多宽，格子永远是正方形。
               .aspectRatio(1)
               .borderRadius(0)
-              .clip(true)
+              // ⚠️ 这里绝不能加 .clip(true)：
+              // ImageFit.Cover 的官方语义是「两边都大于或等于显示边界，超出部分被截断」
+              // （FAQ faqs-tablet-13 原文即写"被截断"），裁剪是它自带的行为；
+              // 本 Stack 的其它子节点是固定 44vp 的文件夹图标和 Blank，都不会溢出。
+              // 外层再加 clip 只会给每个格子生成一个离屏图层。
+              // ⚠️ 但两版对照实测（Profiler 落盘数据、按窗口归一化）表明：这一处的有无
+              // 在 GPU 负载上**没有可观测差异**（均值 26.3% vs 24.8%，≥90% 占比 8.1% vs 7.7%）。
+              // 所以它是「逻辑上多余、收益未被证实」的清理 —— 别指望靠它能提速。
               .onAreaChange((_, area) => {
                 this.recordThumbnailArea(entry, index, 'grid', area)
                 this.recordRowHitArea(entry, index, 'grid', area)
@@ -6370,6 +6379,16 @@ struct Index {
   }
 
   private scheduleImageVisualNotify(): void {
+    // ⚠️ 滚动期间绝不 bump imageVisualEpoch：
+    // grid 里 fileImageSource() 每个条目都读这个 @State，一次 bump = 整片网格
+    // （可见约 30 条 + cachedCount(32)）全部重渲染。
+    // 而滚动中每个新进入的条目都会走 resolveFileListImageRotation → 这里，
+    // 16ms 节流后仍约每秒 60 次 × 60 条 ≈ 每秒数千次渲染（真机 renders 实测吻合）。
+    // 所以滚动中只记 dirty 标记，等 onScrollStop 统一补一次。
+    if (this.fileContentScrolling) {
+      this.imageVisualNotifyDeferred = true
+      return
+    }
     if (this.imageVisualNotifyTimer > 0) {
       return
     }
@@ -7330,17 +7349,39 @@ struct Index {
       return
     }
     const uri = this.thumbnailSurfaceUri(entry, surface)
-    this.updateImageVisualState(entry.path, (state: ImageVisualState): void => {
-      state.thumbnailIndex = index
-      state.thumbnailSurface = surface
-      state.thumbnailX = area.globalPosition.x as number
-      state.thumbnailY = area.globalPosition.y as number
-      state.thumbnailWidth = area.width as number
-      state.thumbnailHeight = area.height as number
-      if (uri.length > 0) {
-        state.transitionThumbnailUri = uri
-      }
-    }, false)
+    const x = area.globalPosition.x as number
+    const y = area.globalPosition.y as number
+    const width = area.width as number
+    const height = area.height as number
+    const existing = this.imageVisualStates[entry.path]
+    if (existing === undefined) {
+      // 首次：沿用原有创建路径（负责建立 state 记录），之后一律就地更新。
+      this.updateImageVisualState(entry.path, (state: ImageVisualState): void => {
+        state.thumbnailIndex = index
+        state.thumbnailSurface = surface
+        state.thumbnailX = x
+        state.thumbnailY = y
+        state.thumbnailWidth = width
+        state.thumbnailHeight = height
+        if (uri.length > 0) {
+          state.transitionThumbnailUri = uri
+        }
+      }, false)
+      return
+    }
+    // ⚠️ 就地更新（不拷贝、不新建对象）：本回调在滑动期可达上万次/秒（真机实测），
+    // 每次都走 copyImageVisualState 会制造同量级的堆分配 → Young GC 反复触发 → 掉帧。
+    // 这些字段的消费方（hasViewerTransitionSource 的视口校验）只要求"值是准的"，
+    // 与对象身份无关，所以就地修改即可，行为与原来完全一致。
+    existing.thumbnailIndex = index
+    existing.thumbnailSurface = surface
+    existing.thumbnailX = x
+    existing.thumbnailY = y
+    existing.thumbnailWidth = width
+    existing.thumbnailHeight = height
+    if (uri.length > 0 && existing.transitionThumbnailUri !== uri) {
+      existing.transitionThumbnailUri = uri
+    }
   }
 
   private recordThumbnailVisibility(entry: FileEntry, index: number,
@@ -7349,14 +7390,30 @@ struct Index {
       return
     }
     const uri = this.thumbnailSurfaceUri(entry, surface)
-    this.updateImageVisualState(entry.path, (state: ImageVisualState): void => {
-      state.thumbnailIndex = index
-      state.thumbnailSurface = surface
-      state.thumbnailVisibleRatio = Math.min(1, Math.max(0, ratio))
-      if (uri.length > 0) {
-        state.transitionThumbnailUri = uri
-      }
-    }, false)
+    const clamped = Math.min(1, Math.max(0, ratio))
+    const existing = this.imageVisualStates[entry.path]
+    if (existing === undefined) {
+      // 首次：沿用原有创建路径（负责建立 state 记录），之后一律就地更新。
+      this.updateImageVisualState(entry.path, (state: ImageVisualState): void => {
+        state.thumbnailIndex = index
+        state.thumbnailSurface = surface
+        state.thumbnailVisibleRatio = clamped
+        if (uri.length > 0) {
+          state.transitionThumbnailUri = uri
+        }
+      }, false)
+      return
+    }
+    // ⚠️ 就地更新（不拷贝、不新建对象）：本回调滑动期约每秒数百次，
+    // 原实现每次都走 copyImageVisualState → 多一份堆分配。
+    // 消费方（hasViewerTransitionSource 的可见比例校验）只要求"值是准的"，
+    // 与对象身份无关，所以就地修改行为完全一致。
+    existing.thumbnailIndex = index
+    existing.thumbnailSurface = surface
+    existing.thumbnailVisibleRatio = clamped
+    if (uri.length > 0 && existing.transitionThumbnailUri !== uri) {
+      existing.transitionThumbnailUri = uri
+    }
   }
 
   /**
@@ -11611,6 +11668,11 @@ struct Index {
 
   private onFileContentScrollStop(): void {
     this.fileContentScrolling = false
+    // 滚动期间被推迟的视觉状态刷新（缩略图旋转修正等）在这里统一补一次
+    if (this.imageVisualNotifyDeferred) {
+      this.imageVisualNotifyDeferred = false
+      this.scheduleImageVisualNotify()
+    }
     this.flushTimelineVisibleFocus()
     const pending = this.pendingDirectoryIndexSnapshot
     this.pendingDirectoryIndexSnapshot = null
@@ -17242,15 +17304,22 @@ struct Index {
     if (typeof position.x !== 'number' || typeof position.y !== 'number') {
       return
     }
-    const record = new RowHitArea()
-    record.entry = entry
-    record.surface = surface
+    const key = surface + ':' + entry.path
+    // ⚠️ 就地更新：本回调在滑动期频率极高（真机实测 onAreaChange 可达上万次/秒），
+    // 每次 new 一个 RowHitArea 会制造同量级的堆分配 → Young GC 反复触发 → 掉帧。
+    // 只在首次建立记录时分配，之后只改字段。
+    let record = this.rowHitAreas.get(key)
+    if (record === undefined) {
+      record = new RowHitArea()
+      record.entry = entry
+      record.surface = surface
+      this.rowHitAreas.set(key, record)
+    }
     record.index = index
     record.x = position.x as number
     record.y = position.y as number
     record.width = area.width as number
     record.height = area.height as number
-    this.rowHitAreas.set(surface + ':' + entry.path, record)
   }
 
   // 长按成功：多选态下开始拖选。起点已选中 → 这一趟是「取消」，否则是「选中」。
