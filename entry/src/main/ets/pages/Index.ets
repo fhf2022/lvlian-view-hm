@@ -803,6 +803,8 @@ struct Index {
   private fileVisibleStartIndex: number = 0
   // 滚动期间被推迟的「视觉状态刷新」标记（见 scheduleImageVisualNotify）
   private imageVisualNotifyDeferred: boolean = false
+  // 滚动期间进入可见区、但当时没能发起加载的缩略图（见 flushPendingVisibleLoads）
+  private pendingVisibleLoads: Map<string, FileEntry> = new Map<string, FileEntry>()
   private fileVisibleEndIndex: number = 0
   private waterfallVisibleStartIndex: number = 0
   private waterfallVisibleEndIndex: number = 0
@@ -3332,8 +3334,10 @@ struct Index {
                 this.recordRowHitArea(entry, index, 'grid', area)
               })
               .onVisibleAreaChange([0.0, 0.999],
-                (_isExpanding: boolean, ratio: number): void =>
-                  this.recordThumbnailVisibility(entry, index, 'grid', ratio))
+                (_isExpanding: boolean, ratio: number): void => {
+                  this.recordThumbnailVisibility(entry, index, 'grid', ratio)
+                  this.noteVisibleEntryForLoad(entry, ratio)
+                })
 
               // 图片/视频不再占文字位（紧凑方块才好看）；文件夹仍保留名字，
               // 否则网格里分不出哪个是文件夹。
@@ -4734,13 +4738,18 @@ struct Index {
       onScrubStart: (): void => { this.beginTimelineScrub() },
       onScrub: (time: number): void => { this.previewTimelineTime(time) },
       onScrubEnd: (time: number): void => { this.finishTimelineScrub(time) },
-      onTap: (): void => { this.toggleTimelineCollapsed() },
+      onTap: (): void => {
+        // ⚠️ 必须同时结束 scrub 交互：按下时 FisheyeTimeline 会调 onScrubStart →
+        // beginTimelineScrub() 会把 timelineScrubActive 置为 true，而"没有拖动的点击"
+        // 不会走 onScrubEnd / onSelect —— 那两个是唯一会复位该标志的地方。
+        // 结果就是点一次日期之后 timelineScrubActive 永久为 true，
+        // loadEntryPreview 的开头判断会跳过一切加载（连手动滑动都救不回来）。
+        this.toggleTimelineCollapsed()
+        this.releaseTimelineInteraction()
+      },
       onSelect: (time: number, period: TimelinePeriod): void => {
+        // 只定位，不收起。展开/收起的唯一入口是点「凸出来的日期」（onTap）。
         this.selectTimelinePeriod(time, period)
-        // 选完日期顺手收起：用户「点一下出来、再点一下收回」的直觉就是这个。
-        this.getUIContext().animateTo({ duration: 200, curve: Curve.FastOutSlowIn }, () => {
-          this.timelineCollapsed = true
-        })
       }
     })
   }
@@ -11704,6 +11713,8 @@ struct Index {
       this.applyDirectoryIndexSnapshot(pending, key, this.directoryIndexRequestToken)
     }
     this.warmTimelineVisibleEntries()
+    // 滚动期间只记账的可见项，在这里补加载（与 onScrollIndex 的索引无关）
+    this.flushPendingVisibleLoads()
     this.scheduleImageVisualPrune()
   }
 
@@ -11854,11 +11865,17 @@ struct Index {
     if (source.length === 0) {
       return
     }
-    start = Math.max(0, start - 2)
-    end = Math.min(source.length - 1, Math.max(start, end + 2))
+    // 上下缓冲要多留几行：onScrollIndex 上报的 last 只算「完整可见」的条目，
+    // 屏幕上只露出一部分的最后一行不在其中（首行同理）。缓冲不足时就会出现
+    // 某个固定相对位置的格子一直补不到缩略图、停在占位图 —— 往下滚动把它移到
+    // 中间才会加载。多留 2 行（8 条）足够覆盖「只露出一部分」的那一行。
+    // ⚠️ 队列上限已从 32 提到 256，所以这里扩大范围不会再被 enqueue 拒绝
+    // （之前 ±8 失败正是因为一次 warm 36~48 条 > 上限 32）。
+    start = Math.max(0, start - 8)
+    end = Math.min(source.length - 1, Math.max(start, end + 8))
     // A malformed/stale visible range must not turn a scrub release into
     // another whole-directory warmup.
-    end = Math.min(end, start + 31)
+    end = Math.min(end, start + 47)
     for (let index = start; index <= end; index++) {
       const entry = source[index]
       this.resolveFileListImageRotation(entry)
@@ -11869,6 +11886,52 @@ struct Index {
       } else {
         this.loadEntryPreview(entry, index - start)
       }
+    }
+  }
+
+  /**
+   * 记录「进入可见区的条目」以便加载缩略图，与 onScrollIndex 的索引无关。
+   *
+   * 为什么需要：GridItem.onAppear 只在挂载时触发一次；若那一刻正好在滚动，
+   * loadEntryPreview 会直接返回，而该条目此后再也不会触发 onAppear —— 表现就是
+   * 某个固定相对位置的格子一直停在占位图（尤其屏幕上只露出一部分的最后一行，
+   * onScrollIndex 上报的 last 并不包含它）。
+   *
+   * ⚠️ 这里只做记账，绝不在滚动中入队：预览队列有并发与待处理上限
+   * （LIST_MAX_CONCURRENT / MAX_PENDING_TASKS），滚动中批量入队会把队列挤满，
+   * 反而让别的条目加载不出来（这个坑已踩过两次）。
+   */
+  private noteVisibleEntryForLoad(entry: FileEntry, ratio: number): void {
+    if (ratio <= 0) {
+      this.pendingVisibleLoads.delete(entry.path)
+      return
+    }
+    if (this.previewUri(entry).length > 0) {
+      this.pendingVisibleLoads.delete(entry.path)
+      return
+    }
+    if (this.fileContentScrolling) {
+      this.pendingVisibleLoads.set(entry.path, entry)
+      return
+    }
+    // 不在滚动中，可以直接发起，无需记账。
+    this.resolveFileListImageRotation(entry)
+    this.loadEntryPreview(entry, 0)
+  }
+
+  /** 滚动停止后，把滚动期间记下的可见项补加载一次（集合很小，只有屏上那几十条）。 */
+  private flushPendingVisibleLoads(): void {
+    if (this.pendingVisibleLoads.size === 0) {
+      return
+    }
+    const pending: FileEntry[] = Array.from(this.pendingVisibleLoads.values())
+    this.pendingVisibleLoads.clear()
+    for (const entry of pending) {
+      if (this.previewUri(entry).length > 0) {
+        continue
+      }
+      this.resolveFileListImageRotation(entry)
+      this.loadEntryPreview(entry, 0)
     }
   }
 

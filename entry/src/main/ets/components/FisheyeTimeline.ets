@@ -189,6 +189,26 @@ export struct FisheyeTimeline {
     }
   }
 
+  /**
+   * 点击位置是否落在「凸出来的日期」（焦点标记）上。
+   *
+   * 交互约定：点这个放大的日期 = 展开/收起；点时间轴的其它位置 = 跳到该时间。
+   * 早先的实现把「没拖动的点击」一律当成展开/收起，定位能力就没了。
+   */
+  private hitFocusMarker(y: number): boolean {
+    const railY = y - this.verticalEffectInsetVp
+    for (const marker of this.markers()) {
+      if (!marker.isFocus) {
+        continue
+      }
+      // 阈值取焦点标记字号的一半再留些余量，保证手指点得中。
+      if (Math.abs(marker.y - railY) <= marker.length * 0.5 + 10) {
+        return true
+      }
+    }
+    return false
+  }
+
   private handleTouch(event: TouchEvent): void {
     const points = event.touches.length > 0 ? event.touches : event.changedTouches
     const point = points.length > 0 ? points[0] : null
@@ -230,9 +250,15 @@ export struct FisheyeTimeline {
         this.focusTime = this.clampFocus(snapped)
         this.onScrubEnd(this.focusTime)
       } else {
-        // 没有拖动的「点击」= 展开/收起，绝不能顺带定位（否则列表会自己滚走）。
-        // 由组件自己回调外层，避免和外层容器的 onClick 重复触发导致"看起来没反应"。
-        this.onTap()
+        // 没有拖动的「点击」分两种：
+        //   - 点在「凸出来的日期」（isFocus 焦点标记）上 → 展开/收起；
+        //   - 点在时间轴的其它位置（月/年刻度、空白处）→ 跳到该时间。
+        // 早先一律调 onTap()，定位能力因此消失了。
+        if (this.hitFocusMarker(y)) {
+          this.onTap()
+        } else {
+          this.selectNearest(y)
+        }
       }
       this.touchMoved = false
     }

@@ -35,8 +35,20 @@ export class ThumbnailPolicy {
   // edge limit for pathological panoramas.
   static readonly VIEWER_ZOOM_MAX_DIMENSION: number = 8192
   static readonly VIEWER_ZOOM_MAX_PIXELS: number = 8 * 1024 * 1024
-  static readonly LIST_MAX_CONCURRENT: number = 2
-  static readonly MAX_PENDING_TASKS: number = 32
+  // ⚠️ 并发不要压得太低也不宜过高：
+  //  - 太低（2）：一次"补加载"在网格里就近 36~48 条，要分十几批，首次加载铺满一屏很慢，
+  //    观感像"卡住/罢工"。
+  //  - 太高（6）：每个缩略图加载完成都会 bumpViewerBitmapEpoch() 触发一次重渲染，
+  //    并发越高这些"完成事件"越扎堆，主线程被反复打断 —— 表现为"加载时有点卡"。
+  // 折中取 4。若还要更快，应该去降低"同时入队的条数"（warm 缓冲），而不是继续抬并发。
+  static readonly LIST_MAX_CONCURRENT: number = 4
+  // ⚠️ 待处理上限不要压得太低：一次"补加载"（warmTimelineVisibleEntries 的
+  // start-2..end+2、再加上屏幕可见项）在网格里就近 36 条，若上限为 32，
+  // 多出来的会被 enqueue 直接拒绝，且本批内不会重试 —— 表现就是「无论怎么操作，
+  // 一次只加载 32 个缩略图，其余永远停在占位图」。
+  // 真正的并发仍由 LIST_MAX_CONCURRENT 控制，这里放宽只是让排队更长，
+  // 并不会提高同时执行的任务数。
+  static readonly MAX_PENDING_TASKS: number = 256
   static readonly BYTES_PER_RGBA_PIXEL: number = 4
 
   static maxDimension(profile: ThumbnailProfile): number {
