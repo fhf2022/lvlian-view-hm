@@ -3404,8 +3404,11 @@ struct Index {
     // 每侧缓存的条目数 = cachedCount × 列数。官方 grid.d.ts 原文：
     // "The number of the grid items to be cached before and after the currently displayed
     //  one equals the value of cachedCount multiplied by the number of columns."
-    // 注意 cachedCount 的单位是「行」而不是「条目」；官方另注最大值为 16。
-    .cachedCount(32)
+    // 注：cachedCount 的单位是「行」而不是「条目」。
+    // 取 16 是保守值 —— 双参重载 cachedCount(count, show) 的文档注明上限为 16
+    // （单参重载未注明上限）。此前为 32，即 32 × 4 列 = 上下各 128 个条目，
+    // 缓存量偏大、内存占用高。
+    .cachedCount(16)
     .onScrollIndex((first: number, last: number): void => {
       this.fileVisibleStartIndex = Math.max(0, first)
       this.fileVisibleEndIndex = Math.max(this.fileVisibleStartIndex, last)
