@@ -3401,8 +3401,10 @@ struct Index {
     .columnsTemplate(this.fileGridColumns())
     .columnsGap(1)
     .rowsGap(1)
-    // 8 只够两行缓冲，往上滑时顶部条目会被过早销毁、重新解码期间露出空白。
-    // 放大到 32（约 8 行），上下回滑时顶部图片不会提前消失。
+    // 每侧缓存的条目数 = cachedCount × 列数。官方 grid.d.ts 原文：
+    // "The number of the grid items to be cached before and after the currently displayed
+    //  one equals the value of cachedCount multiplied by the number of columns."
+    // 注意 cachedCount 的单位是「行」而不是「条目」；官方另注最大值为 16。
     .cachedCount(32)
     .onScrollIndex((first: number, last: number): void => {
       this.fileVisibleStartIndex = Math.max(0, first)
@@ -6390,9 +6392,8 @@ struct Index {
   private scheduleImageVisualNotify(): void {
     // ⚠️ 滚动期间绝不 bump imageVisualEpoch：
     // grid 里 fileImageSource() 每个条目都读这个 @State，一次 bump = 整片网格
-    // （可见约 30 条 + cachedCount(32)）全部重渲染。
-    // 而滚动中每个新进入的条目都会走 resolveFileListImageRotation → 这里，
-    // 16ms 节流后仍约每秒 60 次 × 60 条 ≈ 每秒数千次渲染（真机 renders 实测吻合）。
+    // （可见条目和仍挂载的缓存条目）都会收到更新。
+    // 滚动中每个新进入的条目都会走 resolveFileListImageRotation → 这里。
     // 所以滚动中只记 dirty 标记，等 onScrollStop 统一补一次。
     if (this.fileContentScrolling) {
       this.imageVisualNotifyDeferred = true
@@ -6403,6 +6404,11 @@ struct Index {
     }
     this.imageVisualNotifyTimer = setTimeout((): void => {
       this.imageVisualNotifyTimer = 0
+      // 定时器排队后可能已经开始下一次滚动，执行时必须重新检查。
+      if (this.fileContentScrolling) {
+        this.imageVisualNotifyDeferred = true
+        return
+      }
       this.imageVisualEpoch += 1
     }, 16)
   }
@@ -6413,6 +6419,11 @@ struct Index {
     }
     this.imageVisualPruneTimer = setTimeout((): void => {
       this.imageVisualPruneTimer = 0
+      // 裁剪包含全表遍历和全局刷新。若已恢复滚动，交给下一次
+      // onFileContentScrollStop 重新安排，避免在滚动中间清理。
+      if (this.fileContentScrolling) {
+        return
+      }
       this.pruneImageVisualStates()
     }, 450)
   }
