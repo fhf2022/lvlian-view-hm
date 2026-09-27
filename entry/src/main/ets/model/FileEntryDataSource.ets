@@ -30,6 +30,29 @@ export class FileEntryDataSource implements IDataSource {
     }
   }
 
+  /**
+   * 实验 H0：精准通知单个索引的数据变化，由 LazyForEach 局部重建对应 Item。
+   */
+  notifyItemChanged(index: number): void {
+    if (index >= 0 && index < this.items.length) {
+      for (const listener of this.listeners.slice()) {
+        listener.onDataChange(index)
+      }
+    }
+  }
+
+  /**
+   * 快速定位 path 对应的当前 index。
+   */
+  indexOfPath(path: string): number {
+    for (let index = 0; index < this.items.length; index++) {
+      if (this.items[index].path === path) {
+        return index
+      }
+    }
+    return -1
+  }
+
   replace(items: FileEntry[]): void {
     const previousItems = this.items
     const nextItems = items.slice()

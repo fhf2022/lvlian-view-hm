@@ -14,7 +14,8 @@ import { image } from '@kit.ImageKit'
 import { media } from '@kit.MediaKit'
 import { AVCastPicker, AVCastPickerState, avSession } from '@kit.AVSessionKit'
 import { visionImageAnalyzer } from '@kit.VisionKit'
-import { hilog } from '@kit.PerformanceAnalysisKit'
+import { hilog, hiTraceMeter } from '@kit.PerformanceAnalysisKit'
+import { systemDateTime } from '@kit.BasicServicesKit'
 import { DownloadTaskRecord, FileEntry } from '../model/FileEntry'
 import { CacheManager } from '../download/CacheManager'
 import { DownloadQueueManager } from '../download/DownloadQueueManager'
@@ -48,6 +49,13 @@ import {
   TimelinePeriod
 } from '../model/DirectoryTimeline'
 
+interface PendingViewerCleanupItem {
+  record: ViewerBitmapRecord
+  path: string
+  kind: 'preview' | 'original'
+  estimatedBytes: number
+}
+
 type RemoteScreen = 'login' | 'otp' | 'files' | 'downloads' | 'settings'
 type RootKind = 'personal' | 'shared'
 type BottomTab = 'home' | 'shared' | 'downloads' | 'settings'
@@ -63,13 +71,132 @@ type DeleteResolution = 'deleted' | 'failed' | 'unknown'
 // Shared-element transitions are deliberately separate from the 180 ms
 // Swiper animation.  The image should have enough time to travel from its
 // file-row frame to the viewer without delaying network/decode work.
-const IMAGE_GEOMETRY_TRANSITION_DURATION: number = 420
+// 共享元素转场时长。240ms：比 300ms 更跟手。
+// ⚠️ 这个值只影响"动画手感"，与"动画结束后丢触控"无关（那由 isBusy 的释放时机决定）。
+const IMAGE_GEOMETRY_TRANSITION_DURATION: number = 240
+// ⚠️ 是否使用"共享元素转场"（geometryTransition）做 格子→大图 的飞行。
+//
+// 【结论：不是卡顿的原因，保持开启】
+// 曾依据"官方相册 ACE_GEOMETRY_TRANSITION 为 0 次"推断它不用共享元素，并把这里置为
+// false；但实测关闭后卡顿依旧，且过场动画丢失（用户反馈"图库有完整的过场动画，
+// 现在改完我这里没了"）。说明相册是用别的机制（自定义 AnimateTo/customNavContentTransition）
+// 实现过场，不能用 ACE_GEOMETRY_TRANSITION 的次数来判断；关闭共享元素这条路无效。
+// ⚠️ 后续若要验证，改这一行即可，不要再去动两处转场分支。
+const VIEWER_USE_SHARED_ELEMENT_TRANSITION: boolean = true
+// "长按图片 = 系统识别文字"的判定时长。见 handleImageTouch / armImageLongPressWatch。
+const IMAGE_LONG_PRESS_MS: number = 400
 const IMAGE_FALLBACK_TRANSITION_DURATION: number = 160
 const VIDEO_GEOMETRY_TRANSITION_DURATION: number = 420
 const VIDEO_FALLBACK_TRANSITION_DURATION: number = 160
 const VIDEO_FRAME_CROSSFADE_DURATION: number = 120
 const IMAGE_RETURN_MOUNT_FRAME_LIMIT: number = 8
 const IMAGE_VIEWER_DIAGNOSTICS: boolean = true
+// 一次性诊断开关：记录「点击 → 画面出现/消失」各段耗时（见 tapTrace / tapTraceBegin）。
+// ⚠️ 出结论后改回 false，或整段删除。
+const TAP_TRACE: boolean = true
+// ── 实验 G：状态写入 hitrace 打点（与 ftrace 同一条时间轴）──────────────────
+//
+// 目的：把「某个根级 @State 被写入」与「随后的 CustomNodeUpdate name:Index」
+// 直接放到同一条 hitrace 时间轴上，判定昂贵的 ExecuteRerender 到底由哪一组
+// 状态写入驱动。判读不依赖 hilog 对齐，也没有 console 的额外开销。
+//
+// 打点形式：零时长区间（startTrace 后立刻 finishTrace），名字精确到状态变量，
+// 例如 `StateWrite:cbf.showPageTransition`。字符串全部是字面量，不做拼接。
+//
+// ⚠️ 出结论后把 STATE_TRACE 改回 false（或整段删除）。
+// ⚠️ G4（handleImageDismissUpdate / 下拉手势）刻意不打点：既有 trace 已证明
+//    HandleDragUpdate → CNU(Index) 相关性为 0%，无需重复验证。
+const STATE_TRACE: boolean = true
+const STATE_TRACE_TASK_ID: number = 1001
+// ── 实验 H0：条目级精准失效 vs 全局 epoch 重渲染 ────────────────────────────
+//
+// 目的：验证将"缩略图 ready → 全局 epoch++ → Index 全页重渲染"
+//      改为"缩略图 ready → datasource.notifyItemChanged(index) → 单项局部更新"，
+//      能否在保持 stable key ((entry) => entry.path) 的前提下：
+//      1) 消除缩略图完成导致的 Index.ExecuteRerender（7~11ms 长帧）；
+//      2) 保证缩略图依然正常逐张呈现；
+//      3) 不破坏 geometryTransition 共享元素动画。
+//
+//   true  = Baseline（原行为：修改根级 @State viewerBitmapEpoch，整页重跑 build）
+//   false = 实验 H0（单条目精准通知 onDataChange(index)，解耦全局 epoch）
+const USE_GLOBAL_BITMAP_EPOCH: boolean = false
+// ── 缩略图完成路径诊断（用于隔离验证 M1a / M1b）────────────────────────────
+//
+// M1 实际包含两个子问题：
+//   M1a：每张 thumbnail 完成 → installViewerBitmap → clone 整个 Map（O(n)）
+//   M1b：每张 thumbnail 完成 → bumpViewerBitmapEpoch → 全局 UI 状态传播
+//
+// 本开关只处理 M1b：
+//   false = Baseline（原行为：每张完成都立即 epoch++）
+//   true  = 实验 A（clone 次数【保持不变】，只把 epoch 提交合并为"每帧最多一次"）
+//
+// ⚠️ 本阶段刻意【不改】installViewerBitmap 的整体 Map 拷贝。
+// 这样若长帧明显下降 → M1b 贡献大；只小幅下降 → M1a 仍占相当比例；
+// 几乎不下降 → 【不能据此排除 M1】，因为 M1a 完全没动过。（下一阶段再单独取消 clone）
+const THUMB_BATCH_EPOCH: boolean = true
+// 诊断开关：汇总统计缩略图完成路径。⚠️ 只在窗口结束时输出一条 hilog，
+// 绝不逐张打印（日志本身会干扰性能测量）。
+const THUMB_DIAG: boolean = true
+// ── 实验 A：网格项把 Image 换成同尺寸 Blank（**分界实验**）────────────────
+//
+// 目的：判断"Grid measure 被拖慢"到底是【Grid 布局算法本身】还是【Image 子树/图片处理】。
+// 做法：保持 Grid / GridItem / 列数 / Cell 尺寸 / 文字 / 滚动 / FisheyeTimeline /
+//      所有布局参数【完全不变】，只把 `Image(...)` 换成同尺寸 `Blank()`。
+// 判读：若 CreateTaskMeasure[Grid] 从 ~85ms 降到几毫秒、长帧基本消失
+//      → 不是 Grid 布局算法，而是 Image 子树/图片资源处理把 measure 拖慢。
+//
+// ⚠️ 注意：本开关仍保留 fileImageSourceAvailable 判断（即仍会解析 1 次图片源），
+//   所以它去掉的是「Image 子树 + 另外 2 次源解析 + 实际解码」。
+//   若要进一步区分"解码重(M2)"还是"重复解析(R2)"，需要再做 A2（保留 Image、只换常量 source）。
+const EXPERIMENT_GRID_BLANK: boolean = false
+// ── 实验 C：关闭「从图片查看器返回后的预热」──────────────────────────────
+//
+// 剩余现象很特定：整体已可接受，但"刚返回开始滑"那一下明显卡。
+// 其时间线固定为：
+//     viewer-close-done → schedulePreviewWarmup → 约 400ms → scroll-start
+// 本开关只影响【返回】这一条路径（finishCloseImageViewer），不碰目录切换那处，
+// 也不改任何 UI 结构 —— 唯一变量就是"返回后还预热不预热"。
+//
+// true  = 关闭返回后的预热（实验组）
+// false = 保持现状（对照组）
+const DISABLE_RETURN_WARMUP: boolean = true
+// ── 实验 D：固定 source 的 Image（比 Blank 更精确的一刀）────────────────────
+//
+// Blank 实验一次去掉了太多东西（Image 节点 / ImageSource / URI / decode / PixelMap）。
+// 本实验【保持 Image 组件与节点结构完全不变】，只把 source 换成"同一个、已缓存
+// 的本地小图"，从而只消除：真实 URI / previewUri / getUriFromPath / 每文件不同
+// source / thumbnail 解码。
+//
+// 判读：
+//   · 若 CreateImageObj 的耗时从 ~41ms 掉到个位数
+//     → 贵的是「创建 Image 时处理真实 source」→ R2（source 解析/复用）是核心
+//   · 若固定资源仍要 30~40ms
+//     → 贵的是「大量 Image 节点本身创建/绑定进入 Grid 热路径」
+//       → 去优化节点复用 / prebuild / cachedCount / 减少同帧创建量
+const EXPERIMENT_GRID_FIXED_SOURCE: boolean = false
+// ── 实验 B′：网格图片的**解码尺寸**（唯一变量：source resolution）─────────────
+//
+// 目的：M2 —— 判断"图片太重"里有多少来自"源图太大"。
+// 做法：Grid Cell 320×320 / 列数 / 组件树 / fit / orientation / 排序 / 目录
+//      **全部不变**，只改 Image 的解码目标尺寸。
+//   · 0   = 不限制（= 现状基线：ArkUI 按组件尺寸自动解码）
+//   · 128 / 256 / 512 = 指定解码尺寸（SDK 注明 number 单位是 vp）
+//
+// ⚠️ 相比"生成三套 128/256/512 的缩略图文件"，用 sourceSize 更干净：
+//    source 文件完全相同 → disk cache 天然全命中、无额外 NAS 请求 →
+//    真正只有"解码目标尺寸"这一个变量在变（不必预热三套缓存）。
+//
+// 判读：
+//   · 若 GetImageData / PixelMap / Grid Measure 的 P95·P99 随分辨率明显下降 → M2 坐实
+//   · 若分辨率降了但上述指标变化不明显 → 问题偏向"重复解析/source 创建次数"(R2)
+//     下一刀就该做 resolveFileImageState，而不是继续降分辨率
+const EXPERIMENT_GRID_SOURCE_SIZE: number = 0
+// ⚠️ 实验用：取"不超过源尺寸"的解码目标。
+//   `sourceSize` 传大于源尺寸的值会导致硬件解码失败
+//   （`JPEGHWDECODER failed to do decode, err=-1` → 白屏），所以必须夹住。
+//   源尺寸优先取状态里已知的解码后尺寸（渲染路径上零 IO）；未知时退回目标值
+//   —— 实测 NAS 缩略图多为 512×384，256 在其之下，安全。
+const EXPERIMENT_GRID_SOURCE_SAFE: boolean = true
 const IMAGE_VIEWER_HILOG_DOMAIN: number = 0xD003
 const IMAGE_VIEWER_HILOG_TAG: string = 'ImageViewerDiag'
 // Pull-to-dismiss is deliberately a short, proportional gesture. The
@@ -96,7 +223,14 @@ const FLOATING_TIMELINE_GAP_VP: number = 8
 const FLOATING_TIMELINE_PEEK_VP: number = 28
 const FLOATING_TIMELINE_EFFECT_INSET_VP: number = 16
 const FLOATING_TIMELINE_UPWARD_SHIFT_VP: number = 8
-const DIRECTORY_INDEX_STALE_MS: number = 30 * 1000
+// 目录索引的新鲜度阈值。原先 30 秒 —— 进过的目录隔半分钟就会被强制全量重拉一次
+// （forceNetwork=true 会跳过内存与持久化缓存）。实测 /Photos/Camera 有 5342 项，
+// 一次重拉要 6.4 秒；这期间不仅"文件夹较大需等待"的提示一直挂着，连图片的
+// 打开/关闭都被拖慢到 2.7 秒（正常约 360ms）。放宽到 5 分钟。
+const DIRECTORY_INDEX_STALE_MS: number = 5 * 60 * 1000
+// 后台自动刷新只对中小目录做。大目录一次要拉几 MB、解析排序耗时数秒，
+// 代价远大于"新鲜度"的收益，不如等用户主动下拉刷新。
+const DIRECTORY_AUTO_REFRESH_MAX_ITEMS: number = 2000
 // 进目录的等待提示只在【预计项数 >= 这个值】时才显示（小目录不打扰）。
 const DIRECTORY_OPENING_HINT_MIN_ITEMS: number = 500
 const FILE_TOOL_HEIGHT_VP: number = 40
@@ -149,6 +283,20 @@ type ViewerImageLayer = 'thumbnail' | 'original'
 type ViewerDecodeState = 'idle' | 'loading' | 'decoded' | 'displayed' | 'failed'
 type ViewerTransitionKind = 'none' | 'entry' | 'exit'
 type ThumbnailSurfaceKind = 'none' | 'list' | 'grid' | 'waterfall' | 'search'
+
+/**
+ * R2 修复：网格项在一次 build 中需要的全部图片显示信息。
+ * 由 `resolveGridImageState()` 一次性解析，避免同一轮构建里重复求值。
+ */
+class GridImageState {
+  available: boolean = false
+  source: image.PixelMap | string = ''
+  orientation: ImageRotateOrientation = ImageRotateOrientation.UP
+  transitionId: string = ''
+  syncLoad: boolean = false
+  sourceWidth: number = 0
+  sourceHeight: number = 0
+}
 
 class ImageVisualState {
   thumbnailUri: string = ''
@@ -434,6 +582,9 @@ struct Index {
   private recycleRequestToken: number = 0
   @State @Watch('onGestureShareStateChanged') showImageViewer: boolean = false
   @State @Watch('onGestureShareStateChanged') viewerImageEntry: FileEntry | null = null
+  @State viewerInteractionUnlocked: boolean = true
+  @State viewerBlocksFileContent: boolean = false
+  @State viewerClosing: boolean = false
   @State viewerHeaderTitle: string = ''
   @State viewerImages: FileEntry[] = []
   @State viewerImageIndex: number = 0
@@ -445,10 +596,30 @@ struct Index {
   @State viewerLastNavigationDirection: number = 1
   // Pixel/geometry metadata is kept in a private identity map. The previous
   // @State record was copied in full for every visible-row callback, so the
+  // ── 返回后首个手势链路精确观测（单会话防抖打点）──────────────────
+  private closeSessionId: number = 0
+  private closeSessionActive: boolean = false
+  private closeAnimFinishMonotonic: number = 0
+  private sessionTrackedPointerId: number = -1
+  private sessionPreDispatchDownLogged: boolean = false
+  private sessionTouchTestCount: number = 0
+  private sessionRootDownLogged: boolean = false
+  private sessionChildDownLogged: boolean = false
+  private sessionPanStartLogged: boolean = false
+  private sessionFirstPanUpdateLogged: boolean = false
+  private sessionScrollStartLogged: boolean = false
+  private localInputMonitor: InputEventMonitor | null = null
+
   // cost grew with the number of images visited during a scroll session.
   @State imageVisualEpoch: number = 0
   @State imageAnalyzerTypes: ImageAnalyzerType[] = []
   @State imageAnalyzerSupported: boolean = false
+  // 用户是否正在"识别文字"（AI 按钮选中 / 识别控件可见）。见 configureImageAnalyzer。
+  // 为 true 时禁掉图片的下拉关闭手势，避免拖动文字选择光标时图片跟着移动。
+  @State imageAnalyzerActive: boolean = false
+  private imageAnalyzerListenerBound: boolean = false
+  // 长按识别文字的判定定时器（见 armImageLongPressWatch）。
+  private imageLongPressTimer: number = 0
   @State imageScale: number = 1
   @State imageSavedScale: number = 1
   @State imageOffsetX: number = 0
@@ -552,6 +723,20 @@ struct Index {
   // intentionally the only reactive value; native PixelMap objects stay in
   // the private store and are never copied through @State records.
   @State viewerBitmapEpoch: number = 0
+  // ── 缩略图完成路径诊断（THUMB_DIAG）──────────────────────────
+  // 只在窗口结束时汇总输出，避免日志干扰测量。
+  private thumbDiagFinished: number = 0
+  private thumbDiagCloneCount: number = 0
+  private thumbDiagEpochRequested: number = 0
+  private thumbDiagEpochCommitted: number = 0
+  private thumbDiagFrameCompletions: number = 0
+  private thumbDiagFrameMaxCompletions: number = 0
+  private thumbDiagCloneMsTotal: number = 0
+  private thumbDiagCloneMsMax: number = 0
+  private thumbDiagCommitMsTotal: number = 0
+  private thumbDiagCommitMsMax: number = 0
+  private thumbDiagBatchingPending: boolean = false
+  private thumbDiagWindowStartAt: number = 0
   @State waterfallAspectEpoch: number = 0
   @State waterfallColumnWidthVp: number = 0
   @State directoryCounts: Record<string, number> = {}
@@ -685,6 +870,13 @@ struct Index {
   private waterfallBitmapBytes: Record<string, number> = {}
   private waterfallBitmapLastAccessAt: Record<string, number> = {}
   private waterfallBitmapTotalBytes: number = 0
+  // Viewer 位图空闲分片释放器
+  private pendingViewerCleanupQueue: PendingViewerCleanupItem[] = []
+  private pendingViewerCleanupEstimatedBytes: number = 0
+  private viewerCleanupTimer: number = 0
+  private viewerCleanupRunning: boolean = false
+  private lastUserInteractionMonotonic: number = 0
+  private fileContentTouchActive: boolean = false
   private imageRotationStore: ImageRotationStore = new ImageRotationStore()
   private fileListPersistedDisplayState: ImageDisplayState = new ImageDisplayState()
   private fileListRotationReady: boolean = false
@@ -949,12 +1141,79 @@ struct Index {
     this.ensureImageRotationState()
     // 不再无条件注册：由 syncGestureShareRegistration 按"当前有没有可分享内容"决定。
     this.syncGestureShareRegistration()
+    this.setupLocalInputMonitor()
   }
 
   aboutToDisappear(): void {
+    this.cancelViewerCleanupTimer()
+    this.drainPendingViewerCleanupOnDisappear()
     this.closeVideoPlayer()
     this.releaseImageAnalyzer()
     this.disableGestureShare()
+    this.releaseLocalInputMonitor()
+  }
+
+  private formatGuardSnapshot(): string {
+    return 'showViewer=' + this.showImageViewer.toString() +
+      ' vet=' + this.viewerEntryTransitionActive.toString() +
+      ' fallback=' + this.viewerFallbackEntryActive.toString() +
+      ' closePending=' + this.viewerClosePending.toString() +
+      ' isBusy=' + this.isBusy.toString() +
+      ' unlocked=' + this.viewerInteractionUnlocked.toString() +
+      ' ownsParent=' + this.viewerOwnsParentInteraction().toString() +
+      ' vbfc=' + this.viewerBlocksFileContent.toString()
+  }
+
+  private getMonotonicNow(): number {
+    try {
+      return systemDateTime.getUptime(systemDateTime.TimeType.STARTUP)
+    } catch (_err) {
+      return Date.now()
+    }
+  }
+
+  private setupLocalInputMonitor(): void {
+    try {
+      const uiContext = this.getUIContext()
+      if (typeof uiContext.addLocalInputEventMonitor === 'function') {
+        this.localInputMonitor = uiContext.addLocalInputEventMonitor(
+          InputEventSubTypeMask.TOUCH_DOWN,
+          (wrapper: RawInputEventWrapper): InputEventInterceptResult => {
+            if (wrapper.isTouchEvent()) {
+              this.noteUserInteraction()
+            }
+            if (this.closeSessionActive && !this.sessionPreDispatchDownLogged && wrapper.isTouchEvent()) {
+              const touch = wrapper.asTouchEvent()
+              if (touch !== null && touch.touches.length > 0) {
+                this.sessionPreDispatchDownLogged = true
+                const first = touch.touches[0]
+                this.sessionTrackedPointerId = first.id
+                const dt = this.getMonotonicNow() - this.closeAnimFinishMonotonic
+                console.info('[TouchChain] #' + this.closeSessionId.toString() +
+                  ' PreDispatchDown +' + dt.toString() + 'ms ptr=' + first.id.toString() +
+                  ' win=(' + Math.round(first.windowX).toString() + ',' + Math.round(first.windowY).toString() + ')' +
+                  ' loc=(' + Math.round(first.x).toString() + ',' + Math.round(first.y).toString() + ')' +
+                  ' | ' + this.formatGuardSnapshot())
+              }
+            }
+            const result: InputEventInterceptResult = { action: InputEventInterceptAction.CONTINUE }
+            return result
+          }
+        )
+      }
+    } catch (_err) {
+      console.warn('[TouchChain] addLocalInputEventMonitor error')
+    }
+  }
+
+  private releaseLocalInputMonitor(): void {
+    if (this.localInputMonitor !== null) {
+      try {
+        this.getUIContext().removeLocalInputEventMonitor(this.localInputMonitor)
+      } catch (_err) {
+      }
+      this.localInputMonitor = null
+    }
   }
 
   private configureImageAnalyzer(): void {
@@ -970,6 +1229,29 @@ struct Index {
       }
       this.imageAnalyzerTypes = enabledTypes
       this.imageAnalyzerSupported = enabledTypes.length > 0
+      // ⚠️ 必须知道"用户是否正在识别文字"：此时文字选择层浮在图片上方，
+      // 拖动选择光标的手势会被图片的下拉关闭接走，导致图片跟着乱动。
+      // 官方提供两个回调正好用来判断 —— 注册后把状态记进 imageAnalyzerActive。
+      if (this.imageAnalyzerSupported && !this.imageAnalyzerListenerBound) {
+        this.imageAnalyzerListenerBound = true
+        try {
+          this.imageAnalyzerController.on('aiButtonStatusChange',
+            (status: visionImageAnalyzer.AIButtonStatus): void => {
+              this.imageAnalyzerActive =
+                status === visionImageAnalyzer.AIButtonStatus.SELECTED
+              console.info('[UgreenImageAnalyzer] aiButtonStatus=' + status.toString())
+            })
+          this.imageAnalyzerController.on('imageAnalyzerVisibilityChange',
+            (visibility: visionImageAnalyzer.ImageAnalyzerVisibility): void => {
+              if (visibility === visionImageAnalyzer.ImageAnalyzerVisibility.HIDDEN) {
+                this.imageAnalyzerActive = false
+              }
+              console.info('[UgreenImageAnalyzer] visibility=' + visibility.toString())
+            })
+        } catch (error) {
+          console.warn('[UgreenImageAnalyzer] bind listener failed: ' + JSON.stringify(error))
+        }
+      }
       console.info('[UgreenImageAnalyzer] supportTypes=' + JSON.stringify(enabledTypes))
     } catch (error) {
       this.imageAnalyzerTypes = []
@@ -980,6 +1262,16 @@ struct Index {
 
   private releaseImageAnalyzer(): void {
     try {
+      if (this.imageAnalyzerListenerBound) {
+        this.imageAnalyzerListenerBound = false
+        this.imageAnalyzerActive = false
+        try {
+          this.imageAnalyzerController.off('aiButtonStatusChange')
+          this.imageAnalyzerController.off('imageAnalyzerVisibilityChange')
+        } catch (error) {
+          console.warn('[UgreenImageAnalyzer] unbind failed: ' + JSON.stringify(error))
+        }
+      }
       this.imageAnalyzerController.setImageAnalyzerVisibility(
         visionImageAnalyzer.ImageAnalyzerVisibility.HIDDEN)
     } catch (error) {
@@ -1540,6 +1832,9 @@ struct Index {
   // reveals already rendered content. Keep that page inert until the viewer
   // has fully handed control back after its exit transition.
   private viewerOwnsParentInteraction(): boolean {
+    if (this.viewerInteractionUnlocked) {
+      return false
+    }
     return this.showImageViewer || this.viewerEntryTransitionActive ||
       this.viewerFallbackEntryActive || this.viewerClosePending
   }
@@ -1888,14 +2183,21 @@ struct Index {
   }
 
   private completeBackFileTransition(): void {
+    this.traceStateWrite('StateWrite:cbf.pageOffsetX')
     this.pageOffsetX = 0
+    this.traceStateWrite('StateWrite:cbf.outgoingPageOffsetX')
     this.outgoingPageOffsetX = 0
+    this.traceStateWrite('StateWrite:cbf.showPageTransition')
     this.showPageTransition = false
+    this.traceStateWrite('StateWrite:cbf.transitionSnapshotOnTop')
     this.transitionSnapshotOnTop = false
+    this.traceStateWrite('StateWrite:cbf.transitionSnapshotMode')
     this.transitionSnapshotMode = 'list'
+    this.traceStateWrite('StateWrite:cbf.outgoingEntries')
     this.outgoingEntries = []
     this.resetPreviewState(false)
     this.pageTransitionFinishing = false
+    this.traceStateWrite('StateWrite:cbf.isBusy')
     this.isBusy = false
   }
 
@@ -1909,16 +2211,22 @@ struct Index {
     this.cancelFileTransition()
     const token = this.pageTransitionToken
     const width = this.effectivePageWidth()
+    this.traceStateWrite('StateWrite:tbf.outgoingEntries')
     this.outgoingEntries = incomingEntries.slice()
     this.transitionFileEntryDataSource.replace(this.outgoingEntries)
+    this.traceStateWrite('StateWrite:tbf.transitionSnapshotMode')
     this.transitionSnapshotMode = incomingState === null || incomingState.mode === 'waterfall'
       ? 'list' : incomingState.mode
     // Keep the returning parent above the outgoing child for the entire pop.
     // At x = -width it is outside the viewport; at x = 0 it already forms the
     // complete final frame, so no end-of-animation z-order handoff is needed.
+    this.traceStateWrite('StateWrite:tbf.transitionSnapshotOnTop')
     this.transitionSnapshotOnTop = true
+    this.traceStateWrite('StateWrite:tbf.outgoingPageOffsetX')
     this.outgoingPageOffsetX = -width
+    this.traceStateWrite('StateWrite:tbf.pageOffsetX')
     this.pageOffsetX = 0
+    this.traceStateWrite('StateWrite:tbf.showPageTransition')
     this.showPageTransition = true
 
     await this.nextRenderFrame()
@@ -2090,12 +2398,13 @@ struct Index {
           }
         }
       }
+      .id('main-file-content')
       .width('100%')
       .height('100%')
       .backgroundColor($r('app.color.page_background'))
       .translate({ x: this.pageOffsetX, y: 0, z: 0 })
-      .hitTestBehavior(this.viewerOwnsParentInteraction()
-        ? HitTestMode.BLOCK_DESCENDANTS : HitTestMode.Default)
+      // Viewer Input Ownership: main-file-content 恒定为 Default，不再依赖动态 BLOCK_DESCENDANTS。
+      .hitTestBehavior(HitTestMode.Default)
       .onAreaChange((_, area) => {
         if (typeof area.width === 'number' && area.width > 0) {
           this.pageWidthVp = area.width
@@ -2115,6 +2424,7 @@ struct Index {
         Stack({ alignContent: Alignment.Bottom }) {
           this.BottomBar()
         }
+        .id('bottom-bar-host')
         .width('100%')
         .height('100%')
         .translate({ x: 0, y: this.bottomBarOffsetY, z: 0 })
@@ -2137,6 +2447,7 @@ struct Index {
         Stack() {
           this.DirectoryTimelineBar()
         }
+        .id('timeline-bar-host')
         .width(FLOATING_TIMELINE_WIDTH_VP)
         .height(this.floatingTimelineHeight() + FLOATING_TIMELINE_EFFECT_INSET_VP * 2)
         .position({
@@ -2223,6 +2534,7 @@ struct Index {
           // clearance instead of treating the 30vp gradient tail as a blocker.
           safeTop: this.topSafeInset() + 64, safeBottom: this.floatingBarContentInset(8),
           expanded: $importExpanded, onSelect: (source: string): void => { this.selectImportSource(source) } })
+          .id('floating-import-host')
           .position({ x: 0, y: 0 })
           // 选取页的层级是 20；悬浮球平时是 25，会一直压在选取页上面（显示逻辑不对）。
           // 选取页打开时把它降到 8，正好被盖在底下。
@@ -2244,6 +2556,7 @@ struct Index {
         Stack({ alignContent: Alignment.TopStart }) {
           this.NativeFileHeader()
         }
+        .id('native-file-header-host')
         .width('100%')
         .height('100%')
         .zIndex(10)
@@ -2272,10 +2585,11 @@ struct Index {
           }
           this.ImageViewerChrome()
         }
+        .id('viewer-overlay-root')
         .width('100%')
         .height('100%')
         .zIndex(30)
-        .hitTestBehavior(this.showImageViewer ? HitTestMode.Transparent : HitTestMode.None)
+        .hitTestBehavior(this.viewerClosing ? HitTestMode.Transparent : HitTestMode.Default)
       }
       if (this.showAudioPlayer && this.audioEntry !== null) {
         this.AudioPlayerOverlay(this.audioEntry as FileEntry)
@@ -2297,6 +2611,51 @@ struct Index {
     // dismisses the menu cannot also activate the file list underneath
     // (official bindContextMenu event-passthrough guidance).
     .hitTestBehavior(this.contextMenuEntry !== null ? HitTestMode.Block : HitTestMode.Default)
+    .onChildTouchTest((infos: Array<TouchTestInfo>): TouchResult => {
+      if (this.closeSessionActive && this.sessionTouchTestCount < 3) {
+        this.sessionTouchTestCount += 1
+        const dt = this.getMonotonicNow() - this.closeAnimFinishMonotonic
+        const candidateStrs: string[] = []
+        for (let i = 0; i < infos.length; i++) {
+          const item = infos[i]
+          const r = item.rect
+          const rStr = r ? `[${Math.round(r.x)},${Math.round(r.y)},${Math.round(r.width)},${Math.round(r.height)}]` : '[]'
+          const idStr = item.id && item.id.length > 0 ? item.id : 'unnamed'
+          candidateStrs.push(`${idStr}(rect=${rStr} local=(${Math.round(item.x)},${Math.round(item.y)}) win=(${Math.round(item.windowX)},${Math.round(item.windowY)}))`)
+        }
+        console.info('[TouchChain] #' + this.closeSessionId.toString() +
+          ' ChildTouchTest #' + this.sessionTouchTestCount.toString() +
+          ' +' + dt.toString() + 'ms candidates=[' + candidateStrs.join(', ') + ']')
+      }
+      return { strategy: TouchTestStrategy.DEFAULT, id: '' }
+    })
+    .onTouch((event: TouchEvent): void => {
+      if (event.type === TouchType.Down) {
+        this.fileContentTouchActive = true
+        this.noteUserInteraction()
+      } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
+        this.fileContentTouchActive = false
+        this.lastUserInteractionMonotonic = this.getMonotonicNow()
+        this.requestViewerCleanup()
+      }
+      if (this.closeSessionActive && event.type === TouchType.Down && !this.sessionRootDownLogged) {
+        const point = event.touches.length > 0 ? event.touches[0] : null
+        const ptrId = point !== null ? point.id : -1
+        if (this.sessionTrackedPointerId === -1 || ptrId === this.sessionTrackedPointerId) {
+          this.sessionRootDownLogged = true
+          if (this.sessionTrackedPointerId === -1) {
+            this.sessionTrackedPointerId = ptrId
+          }
+          const dt = this.getMonotonicNow() - this.closeAnimFinishMonotonic
+          const winStr = point !== null ? ' win=(' + Math.round(point.windowX).toString() + ',' + Math.round(point.windowY).toString() + ')' : ''
+          const locStr = point !== null ? ' loc=(' + Math.round(point.x).toString() + ',' + Math.round(point.y).toString() + ')' : ''
+          console.info('[TouchChain] #' + this.closeSessionId.toString() +
+            ' RootDown +' + dt.toString() + 'ms ptr=' + ptrId.toString() +
+            winStr + locStr +
+            ' | ' + this.formatGuardSnapshot())
+        }
+      }
+    })
   }
 
   @Builder
@@ -3285,6 +3644,74 @@ struct Index {
   }
 
   @Builder
+  GridItemThumbnail(entry: FileEntry, index: number, state: GridImageState): void {
+    Stack({ alignContent: Alignment.Center }) {
+      if (this.shouldReplaceViewerTransitionSource(entry)) {
+        Blank()
+          .width('100%')
+          .height('100%')
+      } else if (state.available) {
+        if (EXPERIMENT_GRID_BLANK) {
+          // 实验 A：同尺寸占位，去掉 Image 子树与图片解码。
+          // ⚠️ 必须 hitTestBehavior(None)：Blank 默认会吃掉触摸。
+          Blank()
+            .width('100%')
+            .height('100%')
+            .backgroundColor('#EFEFF3')
+            .hitTestBehavior(HitTestMode.None)
+        } else if (state.sourceWidth > 0) {
+          // 实验 B′：指定解码尺寸。宽高严格按源图比例（gridSourceSizeFor 负责），
+          // 绝不传正方形（会改比例），也绝不超过源尺寸（会解码失败）。
+          Image(state.source)
+            .width('100%')
+            .height('100%')
+            .sourceSize({ width: state.sourceWidth, height: state.sourceHeight })
+            .orientation(state.orientation)
+            .objectFit(ImageFit.Cover)
+            .geometryTransition(state.transitionId)
+            .syncLoad(state.syncLoad)
+            .onComplete((event?: ViewerImageCompleteEvent): void =>
+              this.recordThumbnailComplete(entry, this.previewUri(entry), index, 'grid', event))
+        } else {
+          Image(state.source)
+            .width('100%')
+            .height('100%')
+            .orientation(state.orientation)
+            .objectFit(ImageFit.Cover)
+            .geometryTransition(state.transitionId)
+            .syncLoad(state.syncLoad)
+            .onComplete((event?: ViewerImageCompleteEvent): void =>
+              this.recordThumbnailComplete(entry, this.previewUri(entry), index, 'grid', event))
+        }
+      } else if (entry.isDirectory) {
+        this.FolderIcon(44)
+      } else {
+        Image(this.fileIcon(entry))
+          .width(48)
+          .height(48)
+          .objectFit(ImageFit.Contain)
+      }
+    }
+    .width('100%')
+    // 固定 1:1，和系统相册一致：不论屏幕多宽，格子永远是正方形。
+    .aspectRatio(1)
+    .borderRadius(0)
+    // ⚠️ 这里绝不能加 .clip(true)：
+    // ImageFit.Cover 的官方语义是「两边都大于或等于显示边界，超出部分被截断」；
+    // 本 Stack 的其它子节点是固定 44vp 的文件夹图标和 Blank，都不会溢出。
+    // 外层再加 clip 只会给每个格子生成一个离屏图层。
+    .onAreaChange((_, area) => {
+      this.recordThumbnailArea(entry, index, 'grid', area)
+      this.recordRowHitArea(entry, index, 'grid', area)
+    })
+    .onVisibleAreaChange([0.0, 0.999],
+      (_isExpanding: boolean, ratio: number): void => {
+        this.recordThumbnailVisibility(entry, index, 'grid', ratio)
+        this.noteVisibleEntryForLoad(entry, ratio)
+      })
+  }
+
+  @Builder
   GridFileList(): void {
     Grid(this.fileListScroller) {
       LazyForEach(this.fileEntryDataSource, (entry: FileEntry, index: number) => {
@@ -3292,13 +3719,46 @@ struct Index {
           // 勾选角标放右下角（多选态）。
           Stack({ alignContent: Alignment.BottomEnd }) {
             Column({ space: 0 }) {
+              // ⚠️ 这里必须【内联】而不是提取成带参数的 @Builder：
+              // @Builder 传入新建对象会让这一层每帧重建，打断 geometryTransition
+              // 的共享元素转场（实测"过场动画消失"）。回到内联后动画恢复。
               Stack({ alignContent: Alignment.Center }) {
                 if (this.shouldReplaceViewerTransitionSource(entry)) {
                   Blank()
                     .width('100%')
                     .height('100%')
+                } else if (EXPERIMENT_GRID_FIXED_SOURCE && !entry.isDirectory) {
+                  // 实验 D：Image 组件与节点结构完全不变，只把 source 换成
+                  // 「同一个、已缓存的本地小图」。这样只消除真实 URI / previewUri /
+                  // getUriFromPath / 每文件不同 source / thumbnail 解码，
+                  // 用来区分「Image 节点本身贵」还是「处理真实 source 贵」。
+                  Image($r('app.media.startIcon'))
+                    .width('100%')
+                    .height('100%')
+                    .orientation(ImageRotateOrientation.UP)
+                    .objectFit(ImageFit.Cover)
+                    .geometryTransition(this.fileImageTransitionId(entry, 'grid'))
                 } else if (this.fileImageSourceAvailable(entry, 'grid')) {
-                  Image(this.fileImageSource(entry, 'grid'))
+                  if (this.gridSourceWidth(entry) > 0) {
+                    // 实验 B′/F：指定解码尺寸。
+                    // ⚠️ 宽高严格按源图比例（gridSourceSizeFor 负责），
+                    //    绝不传正方形（会改比例），也绝不超过源尺寸（会解码失败）。
+                    Image(this.fileImageSource(entry, 'grid'))
+                      .width('100%')
+                      .height('100%')
+                      .sourceSize({
+                        width: this.gridSourceWidth(entry),
+                        height: this.gridSourceHeight(entry)
+                      })
+                      .orientation(this.fileImageSourceOrientation(entry, 'grid'))
+                      .objectFit(ImageFit.Cover)
+                      .geometryTransition(this.fileImageTransitionId(entry, 'grid'))
+                      .syncLoad(this.fileImageShouldSyncLoad(entry))
+                      .onComplete((event?: ViewerImageCompleteEvent): void =>
+                        this.recordThumbnailComplete(entry, this.previewUri(entry), index,
+                          'grid', event))
+                  } else {
+                    Image(this.fileImageSource(entry, 'grid'))
                       .width('100%')
                       .height('100%')
                       .orientation(this.fileImageSourceOrientation(entry, 'grid'))
@@ -3308,6 +3768,7 @@ struct Index {
                       .onComplete((event?: ViewerImageCompleteEvent): void =>
                         this.recordThumbnailComplete(entry, this.previewUri(entry), index,
                           'grid', event))
+                  }
                 } else if (entry.isDirectory) {
                   this.FolderIcon(44)
                 } else {
@@ -3321,14 +3782,6 @@ struct Index {
               // 固定 1:1，和系统相册一致：不论屏幕多宽，格子永远是正方形。
               .aspectRatio(1)
               .borderRadius(0)
-              // ⚠️ 这里绝不能加 .clip(true)：
-              // ImageFit.Cover 的官方语义是「两边都大于或等于显示边界，超出部分被截断」
-              // （FAQ faqs-tablet-13 原文即写"被截断"），裁剪是它自带的行为；
-              // 本 Stack 的其它子节点是固定 44vp 的文件夹图标和 Blank，都不会溢出。
-              // 外层再加 clip 只会给每个格子生成一个离屏图层。
-              // ⚠️ 但两版对照实测（Profiler 落盘数据、按窗口归一化）表明：这一处的有无
-              // 在 GPU 负载上**没有可观测差异**（均值 26.3% vs 24.8%，≥90% 占比 8.1% vs 7.7%）。
-              // 所以它是「逻辑上多余、收益未被证实」的清理 —— 别指望靠它能提速。
               .onAreaChange((_, area) => {
                 this.recordThumbnailArea(entry, index, 'grid', area)
                 this.recordRowHitArea(entry, index, 'grid', area)
@@ -3402,6 +3855,7 @@ struct Index {
         .onDisAppear(() => this.recordThumbnailVisibility(entry, index, 'grid', 0))
       }, (entry: FileEntry) => entry.path)
     }
+    .id('main-grid')
     .columnsTemplate(this.fileGridColumns())
     .columnsGap(1)
     .rowsGap(1)
@@ -3413,6 +3867,52 @@ struct Index {
     // （单参重载未注明上限）。此前为 32，即 32 × 4 列 = 上下各 128 个条目，
     // 缓存量偏大、内存占用高。
     .cachedCount(16)
+    // 诊断：触摸是否到达列表容器。用于区分两种情况 ——
+    //   有 [TouchTrace] 但没有 [TapTrace] >>> click  → UI 收到了触摸但 click 没触发（手势/命中问题）
+    //   连 [TouchTrace] 都没有                        → 被上层覆盖层挡住了
+    .onTouch((event: TouchEvent): void => {
+      if (this.closeSessionActive && event.type === TouchType.Down && !this.sessionChildDownLogged) {
+        const point = event.touches.length > 0 ? event.touches[0] : null
+        const ptrId = point !== null ? point.id : -1
+        if (this.sessionTrackedPointerId === -1 || ptrId === this.sessionTrackedPointerId) {
+          this.sessionChildDownLogged = true
+          const dt = this.getMonotonicNow() - this.closeAnimFinishMonotonic
+          const winStr = point !== null ? ' win=(' + Math.round(point.windowX).toString() + ',' + Math.round(point.windowY).toString() + ')' : ''
+          const locStr = point !== null ? ' loc=(' + Math.round(point.x).toString() + ',' + Math.round(point.y).toString() + ')' : ''
+          console.info('[TouchChain] #' + this.closeSessionId.toString() +
+            ' ChildDown +' + dt.toString() + 'ms ptr=' + ptrId.toString() +
+            winStr + locStr)
+        }
+      }
+      if (TAP_TRACE && event.type === TouchType.Down) {
+        const point = event.touches.length > 0 ? event.touches[0] : null
+        console.info('[TouchTrace] grid-down x=' +
+          (point === null ? -1 : Math.round(point.x)).toString() + ' y=' +
+          (point === null ? -1 : Math.round(point.y)).toString())
+      }
+    })
+    .parallelGesture(
+      PanGesture({ direction: PanDirection.Vertical, distance: 4 })
+        .onActionStart((event: GestureEvent): void => {
+          if (this.closeSessionActive && !this.sessionPanStartLogged) {
+            this.sessionPanStartLogged = true
+            const ptrId = event.fingerList.length > 0 ? event.fingerList[0].id : -1
+            const dt = this.getMonotonicNow() - this.closeAnimFinishMonotonic
+            const f = event.fingerList.length > 0 ? event.fingerList[0] : null
+            const winStr = f !== null ? ' win=(' + Math.round(f.globalX).toString() + ',' + Math.round(f.globalY).toString() + ')' : ''
+            console.info('[TouchChain] #' + this.closeSessionId.toString() +
+              ' PanStart +' + dt.toString() + 'ms ptr=' + ptrId.toString() + winStr)
+          }
+        })
+        .onActionUpdate((event: GestureEvent): void => {
+          if (this.closeSessionActive && this.sessionPanStartLogged && !this.sessionFirstPanUpdateLogged) {
+            this.sessionFirstPanUpdateLogged = true
+            const dt = this.getMonotonicNow() - this.closeAnimFinishMonotonic
+            console.info('[TouchChain] #' + this.closeSessionId.toString() +
+              ' FirstPanUpdate +' + dt.toString() + 'ms dy=' + Math.round(event.offsetY).toString())
+          }
+        })
+    )
     .onScrollIndex((first: number, last: number): void => {
       this.fileVisibleStartIndex = Math.max(0, first)
       this.fileVisibleEndIndex = Math.max(this.fileVisibleStartIndex, last)
@@ -3933,7 +4433,10 @@ struct Index {
       .position({ x: this.topActionButtonX(), y: 0 })
       .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN, true))
       .overlay(this.ImportLightOverlay, { align: Alignment.Center })
-      .enabled(this.selectionMode ? this.entries.length > 0 : !this.isBusy)
+      // ⚠️ 不再绑 isBusy：转场/加载期间它会在 true/false 之间快速切换，
+      // 按钮就一闪一闪地变灰，而那段窗口用户本来就来不及点，视觉噪音没有意义。
+      // 真的忙时点击会被各自的入口守卫挡下，不会出错。空目录时禁用仍然合理。
+      .enabled(this.entries.length > 0)
       .monopolizeEvents(true)
       .onClick(() => {
         if (this.selectionMode) {
@@ -4775,7 +5278,9 @@ struct Index {
     .height(this.fileToolsBarHeight() + FLOATING_BAR_EFFECT_TOP_INSET_VP + 80)
     .margin({ bottom: this.floatingBarBottomMargin() - 40 })
     .clip(false)
-    .hitTestBehavior(HitTestMode.Default)
+    // Cut 4E-1: 将底栏全宽 Tabs 宿主的 hitTestBehavior 从 Default 改为 None。
+    // 该透明宿主自身不参与命中测试，不阻塞下层 Grid；其内部胶囊子节点继续按各自命中行为参与交互。
+    .hitTestBehavior(HitTestMode.None)
   }
 
   @Builder
@@ -4828,7 +5333,10 @@ struct Index {
     // The visible 56vp controls stay bottom-aligned at their previous screen
     // position. The extra top area only carries native shadow/deformation.
     .margin({ bottom: 40 })
-    .hitTestBehavior(HitTestMode.Default)
+    // Cut 4E-2: 将 BottomBarContent 全宽外壳从 Default 改为 None。
+    // 该容器仅用于排版与阴影承载，自身不拦截触摸，将空白区域透传给底层 Grid；
+    // 内部各胶囊子组件继续按自身的 hitTestBehavior 处理点击交互。
+    .hitTestBehavior(HitTestMode.None)
   }
 
   @Builder
@@ -6564,10 +7072,15 @@ struct Index {
     // Native bitmap maps and the private visual-state map are intentionally
     // outside @State. Reading both scalar epochs makes a targeted source or
     // orientation change re-render without copying all visited rows.
-    const epoch = this.viewerBitmapEpoch
-    const visualEpoch = this.imageVisualEpoch
-    if (epoch < 0 || visualEpoch < 0) {
-      return ''
+    if (USE_GLOBAL_BITMAP_EPOCH) {
+      const epoch = this.viewerBitmapEpoch
+      if (epoch < 0) {
+        return ''
+      }
+      const visualEpoch = this.imageVisualEpoch
+      if (visualEpoch < 0) {
+        return ''
+      }
     }
     if (this.viewerEntryTransitionActive && this.viewerEntryTransitionPath === entry.path) {
       const transitionBitmap = this.viewerTransitionKind === 'exit' &&
@@ -6759,7 +7272,85 @@ struct Index {
   }
 
   private bumpViewerBitmapEpoch(): void {
-    this.viewerBitmapEpoch += 1
+    if (THUMB_DIAG) {
+      this.thumbDiagEpochRequested += 1
+    }
+    if (!THUMB_BATCH_EPOCH) {
+      // Baseline：每张完成都立即提交。
+      this.traceStateWrite('StateWrite:epoch')
+      this.viewerBitmapEpoch += 1
+      if (THUMB_DIAG) {
+        this.thumbDiagEpochCommitted += 1
+        // 两种模式口径一致：Baseline 也要按帧产出窗口汇总。
+        this.flushThumbnailDiagWindow()
+      }
+      return
+    }
+    // ⚠️ 合并到"下一次 UI frame"，而不是固定 16ms 定时器：
+    // 16ms 只是 60Hz 的一帧近似，在 90/120Hz 上已跨帧；且定时器与真实渲染帧不同步，
+    // 还会人为增加图片出现的延迟。postRenderFrame 用的是 postFrameCallback，语义正确。
+    if (this.thumbDiagBatchingPending) {
+      return
+    }
+    this.thumbDiagBatchingPending = true
+    this.postRenderFrame((): void => {
+      this.thumbDiagBatchingPending = false
+      const startedAt = Date.now()
+      this.traceStateWrite('StateWrite:epoch')
+      this.viewerBitmapEpoch += 1
+      const cost = Date.now() - startedAt
+      if (THUMB_DIAG) {
+        this.thumbDiagEpochCommitted += 1
+        this.thumbDiagCommitMsTotal += cost
+        if (cost > this.thumbDiagCommitMsMax) {
+          this.thumbDiagCommitMsMax = cost
+        }
+      }
+      this.flushThumbnailDiagWindow()
+    })
+  }
+
+  /** 每 UI frame 结束产出一次窗口汇总（THUMB_DIAG 关闭时为空操作）。 */
+  private flushThumbnailDiagWindow(): void {
+    if (!THUMB_DIAG) {
+      return
+    }
+    if (this.thumbDiagFrameCompletions > this.thumbDiagFrameMaxCompletions) {
+      this.thumbDiagFrameMaxCompletions = this.thumbDiagFrameCompletions
+    }
+    this.thumbDiagFrameCompletions = 0
+    const now = Date.now()
+    if (this.thumbDiagWindowStartAt === 0) {
+      this.thumbDiagWindowStartAt = now
+      return
+    }
+    // 每 3 秒汇总一条；测试结束时也会由 reportThumbnailDiag 兜底输出。
+    if (now - this.thumbDiagWindowStartAt < 3000) {
+      return
+    }
+    this.reportThumbnailDiag('window')
+  }
+
+  private reportThumbnailDiag(reason: string): void {
+    if (!THUMB_DIAG) {
+      return
+    }
+    const cloneAvg = this.thumbDiagCloneCount > 0
+      ? Math.round(this.thumbDiagCloneMsTotal / this.thumbDiagCloneCount) : 0
+    const commitAvg = this.thumbDiagEpochCommitted > 0
+      ? Math.round(this.thumbDiagCommitMsTotal / this.thumbDiagEpochCommitted) : 0
+    console.info('[ThumbDiag] ' + reason +
+      ' finished=' + this.thumbDiagFinished.toString() +
+      ' clone=' + this.thumbDiagCloneCount.toString() +
+      ' epochReq=' + this.thumbDiagEpochRequested.toString() +
+      ' epochCommitted=' + this.thumbDiagEpochCommitted.toString() +
+      ' frameMaxCompletions=' + this.thumbDiagFrameMaxCompletions.toString() +
+      ' cloneMsAvg=' + cloneAvg.toString() +
+      ' cloneMsMax=' + this.thumbDiagCloneMsMax.toString() +
+      ' commitMsAvg=' + commitAvg.toString() +
+      ' commitMsMax=' + this.thumbDiagCommitMsMax.toString() +
+      ' batch=' + (THUMB_BATCH_EPOCH ? 'on' : 'off'))
+    this.thumbDiagWindowStartAt = Date.now()
   }
 
   private installViewerBitmap(target: Record<string, ViewerBitmapRecord>,
@@ -6767,11 +7358,23 @@ struct Index {
     const isWaterfallTarget = target !== this.viewerPreviewBitmaps &&
       target !== this.viewerOriginalBitmaps
     const previous = target[path]
+    // ⚠️ M1a：整体替换 Map（O(n)）。本阶段【刻意不改】，只做计数以便归因。
+    const cloneStartedAt = THUMB_DIAG ? Date.now() : 0
     const next: Record<string, ViewerBitmapRecord> = {}
     for (const key of Object.keys(target)) {
       next[key] = target[key]
     }
     next[path] = record
+    if (THUMB_DIAG) {
+      const cloneCost = Date.now() - cloneStartedAt
+      this.thumbDiagCloneCount += 1
+      this.thumbDiagCloneMsTotal += cloneCost
+      if (cloneCost > this.thumbDiagCloneMsMax) {
+        this.thumbDiagCloneMsMax = cloneCost
+      }
+      this.thumbDiagFinished += 1
+      this.thumbDiagFrameCompletions += 1
+    }
     if (target === this.viewerPreviewBitmaps) {
       this.viewerPreviewBitmaps = next
       this.viewerPreviewBitmapAliases[path] = false
@@ -6789,7 +7392,15 @@ struct Index {
       this.waterfallBitmapLastAccessAt[path] = Date.now()
       this.waterfallBitmapTotalBytes += bytes
     }
-    this.bumpViewerBitmapEpoch()
+    if (isWaterfallTarget) {
+      if (USE_GLOBAL_BITMAP_EPOCH) {
+        this.bumpViewerBitmapEpoch()
+      } else {
+        this.notifyEntryChanged(path, 'waterfall')
+      }
+    } else {
+      this.bumpViewerBitmapEpoch()
+    }
     if (isWaterfallTarget) {
       this.trimWaterfallBitmapCache()
     }
@@ -6988,26 +7599,203 @@ struct Index {
     }
   }
 
-  private async releaseViewerSessionBitmaps(entries: FileEntry[]): Promise<void> {
-    const previews = this.viewerPreviewBitmaps
-    const originals = this.viewerOriginalBitmaps
-    this.viewerPreviewBitmaps = {}
-    this.viewerOriginalBitmaps = {}
-    this.viewerOriginalLocalPaths = {}
-    const previewAliases = this.viewerPreviewBitmapAliases
-    this.viewerPreviewBitmapAliases = {}
-    this.bumpViewerBitmapEpoch()
-    for (const entry of entries) {
-      const preview = previews[entry.path]
-      if (preview !== undefined && previewAliases[entry.path] !== true) {
-        await this.viewerBitmapStore.release(preview)
+  private isPixelMapHeldByActiveStores(pixelMap: image.PixelMap): boolean {
+    for (const key of Object.keys(this.waterfallBitmaps)) {
+      const rec = this.waterfallBitmaps[key]
+      if (rec !== undefined && rec.pixelMap === pixelMap) {
+        return true
       }
-      const original = originals[entry.path]
+    }
+    for (const key of Object.keys(this.fileThumbnailBitmaps)) {
+      const rec = this.fileThumbnailBitmaps[key]
+      if (rec !== undefined && rec.pixelMap === pixelMap) {
+        return true
+      }
+    }
+    for (const key of Object.keys(this.viewerPreviewBitmaps)) {
+      const rec = this.viewerPreviewBitmaps[key]
+      if (rec !== undefined && rec.pixelMap === pixelMap) {
+        return true
+      }
+    }
+    for (const key of Object.keys(this.viewerOriginalBitmaps)) {
+      const rec = this.viewerOriginalBitmaps[key]
+      if (rec !== undefined && rec.pixelMap === pixelMap) {
+        return true
+      }
+    }
+    return false
+  }
+
+  private enqueuePendingViewerCleanup(
+    closingImages: FileEntry[],
+    closingPreviewBitmaps: Record<string, ViewerBitmapRecord>,
+    closingOriginalBitmaps: Record<string, ViewerBitmapRecord>,
+    closingPreviewAliases: Record<string, boolean>
+  ): void {
+    for (const entry of closingImages) {
+      const preview = closingPreviewBitmaps[entry.path]
+      if (preview !== undefined && closingPreviewAliases[entry.path] !== true) {
+        this.tryEnqueueViewerCleanupItem(preview, entry.path, 'preview')
+      }
+      const original = closingOriginalBitmaps[entry.path]
       if (original !== undefined) {
-        await this.viewerBitmapStore.release(original)
-              }
-            }
-          }
+        this.tryEnqueueViewerCleanupItem(original, entry.path, 'original')
+      }
+    }
+  }
+
+  private tryEnqueueViewerCleanupItem(
+    record: ViewerBitmapRecord,
+    path: string,
+    kind: 'preview' | 'original'
+  ): void {
+    if (record === null || record.pixelMap === null || record.pixelMap === undefined) {
+      return
+    }
+    // 1. 同一 PixelMap 实例防重入队（避免 preview 与 original 共享对象时双重释放）
+    for (const item of this.pendingViewerCleanupQueue) {
+      if (item.record.pixelMap === record.pixelMap) {
+        return
+      }
+    }
+    // 2. 若仍被活动 Store 持有，不入待释放队列
+    if (this.isPixelMapHeldByActiveStores(record.pixelMap)) {
+      return
+    }
+
+    let bytes = 0
+    try {
+      bytes = Math.max(1, record.pixelMap.getPixelBytesNumber())
+    } catch (_) {
+      bytes = Math.max(1, (record.physicalWidth || 1080) * (record.physicalHeight || 1920) * 4)
+    }
+
+    this.pendingViewerCleanupQueue.push({
+      record: record,
+      path: path,
+      kind: kind,
+      estimatedBytes: bytes
+    })
+    this.pendingViewerCleanupEstimatedBytes += bytes
+  }
+
+  private cancelViewerCleanupTimer(): void {
+    if (this.viewerCleanupTimer !== 0) {
+      clearTimeout(this.viewerCleanupTimer)
+      this.viewerCleanupTimer = 0
+    }
+  }
+
+  private noteUserInteraction(): void {
+    this.lastUserInteractionMonotonic = this.getMonotonicNow()
+    this.cancelViewerCleanupTimer()
+  }
+
+  private requestViewerCleanup(delayMs?: number): void {
+    if (this.pendingViewerCleanupQueue.length === 0) {
+      return
+    }
+    if (this.viewerCleanupRunning) {
+      return
+    }
+
+    const isPressure = this.pendingViewerCleanupQueue.length >= 8 ||
+      this.pendingViewerCleanupEstimatedBytes >= 120 * 1024 * 1024
+    const normalQuietWindow = 120
+    const pressureQuietWindow = 40
+    const quietWindow = isPressure ? pressureQuietWindow : normalQuietWindow
+
+    let scheduledDelay = typeof delayMs === 'number' ? delayMs : 0
+    const timeSinceInteraction = this.getMonotonicNow() - this.lastUserInteractionMonotonic
+    if (timeSinceInteraction < quietWindow) {
+      scheduledDelay = Math.max(scheduledDelay, quietWindow - timeSinceInteraction)
+    }
+
+    this.cancelViewerCleanupTimer()
+    this.viewerCleanupTimer = setTimeout((): void => {
+      this.viewerCleanupTimer = 0
+      this.cleanupOneSlice()
+    }, Math.max(16, scheduledDelay))
+  }
+
+  private cleanupOneSlice(): void {
+    if (this.viewerCleanupRunning) {
+      return
+    }
+    if (this.pendingViewerCleanupQueue.length === 0) {
+      return
+    }
+
+    // 全量交互守卫：任意交互活跃，坚决不 release
+    if (this.showImageViewer ||
+      this.viewerClosing ||
+      this.viewerClosePending ||
+      this.viewerTransitionActive ||
+      this.viewerEntryTransitionActive ||
+      this.fileContentScrolling ||
+      this.fileContentTouchActive) {
+      return
+    }
+
+    const isPressure = this.pendingViewerCleanupQueue.length >= 8 ||
+      this.pendingViewerCleanupEstimatedBytes >= 120 * 1024 * 1024
+    const quietWindow = isPressure ? 40 : 120
+    const timeSinceInteraction = this.getMonotonicNow() - this.lastUserInteractionMonotonic
+    if (timeSinceInteraction < quietWindow) {
+      this.requestViewerCleanup(quietWindow - timeSinceInteraction)
+      return
+    }
+
+    this.viewerCleanupRunning = true
+    try {
+      const item = this.pendingViewerCleanupQueue[0]
+      if (item === undefined) {
+        return
+      }
+
+      // 1. 若该 PixelMap 已被活动 Store（如瀑布流、文件列表缩略图或重新打开的 viewer）持有：
+      //    ownership 已明确转移至该活动 Store，由该 Store 负责生命周期。从队列移除，不 release
+      if (this.isPixelMapHeldByActiveStores(item.record.pixelMap)) {
+        this.pendingViewerCleanupQueue.shift()
+        this.pendingViewerCleanupEstimatedBytes = Math.max(0,
+          this.pendingViewerCleanupEstimatedBytes - item.estimatedBytes)
+        console.info('[ViewerCleanup] ownership transferred for ' + item.path + ', skipped release')
+        return
+      }
+
+      // 2. 确认无人持有：立即同步触发释放（检查与释放间无 await，杜绝事件循环插队竞态）
+      this.viewerBitmapStore.release(item.record).catch((e: Error): void => {
+        console.warn('[ViewerCleanup] release failed: ' + JSON.stringify(e))
+      })
+
+      // 3. 成功触发释放后，正式出队并扣减记账内存
+      this.pendingViewerCleanupQueue.shift()
+      this.pendingViewerCleanupEstimatedBytes = Math.max(0,
+        this.pendingViewerCleanupEstimatedBytes - item.estimatedBytes)
+      console.info('[ViewerCleanup] released slice: path=' + item.path +
+        ' kind=' + item.kind + ' remainCount=' + this.pendingViewerCleanupQueue.length.toString() +
+        ' remainBytes=' + this.pendingViewerCleanupEstimatedBytes.toString())
+    } finally {
+      this.viewerCleanupRunning = false
+      if (this.pendingViewerCleanupQueue.length > 0) {
+        const isPressureNext = this.pendingViewerCleanupQueue.length >= 8 ||
+          this.pendingViewerCleanupEstimatedBytes >= 120 * 1024 * 1024
+        this.requestViewerCleanup(isPressureNext ? 16 : 32)
+      }
+    }
+  }
+
+  private drainPendingViewerCleanupOnDisappear(): void {
+    while (this.pendingViewerCleanupQueue.length > 0) {
+      const item = this.pendingViewerCleanupQueue.shift()
+      if (item !== undefined && !this.isPixelMapHeldByActiveStores(item.record.pixelMap)) {
+        this.viewerBitmapStore.release(item.record).catch((_e: Error): void => {})
+      }
+    }
+    this.pendingViewerCleanupEstimatedBytes = 0
+    this.viewerCleanupRunning = false
+  }
 
   private viewerThumbnailUri(entry: FileEntry): string {
     const state = this.imageVisualState(entry.path)
@@ -7015,6 +7803,119 @@ struct Index {
       return state.transitionThumbnailUri
     }
     return this.previewUri(entry)
+  }
+
+  /**
+   * 一次性诊断：记录「点击 → 画面出现/消失」链路上各段的耗时。
+   *
+   * 用法：把 TAP_TRACE 打开后编译装机，复现「打开图片 / 打开文件夹 / 关闭」
+   * 各若干次，再用 `hdc shell hilog` 抓 `[TapTrace]` 行。
+   * 日志格式：
+   *   `[TapTrace] >>> open-viewer`            一轮开始
+   *   `[TapTrace] stage total=NNNms step=MMms | detail`   各打点
+   * 出结论后把 TAP_TRACE 改回 false（或整段删除）。
+   */
+  private tapTraceT0: number = 0
+  private tapTraceLast: number = 0
+
+  private tapTraceBegin(label: string): void {
+    if (!TAP_TRACE) {
+      return
+    }
+    this.tapTraceT0 = Date.now()
+    this.tapTraceLast = this.tapTraceT0
+    console.info('[TapTrace] >>> ' + label)
+  }
+
+  private tapTrace(stage: string, detail: string = ''): void {
+    if (!TAP_TRACE) {
+      return
+    }
+    const now = Date.now()
+    console.info('[TapTrace] ' + stage +
+      ' total=' + (now - this.tapTraceT0).toString() +
+      ' step=' + (now - this.tapTraceLast).toString() +
+      (detail.length > 0 ? ' | ' + detail : ''))
+    this.tapTraceLast = now
+  }
+
+  /**
+   * 实验 G：根级 @State 写入的 hitrace 打点。
+   * 产生一个零时长的 trace 区间（B/E 同刻），名字即状态变量名。
+   * 配套分析：把每个 StateWrite 与其后的第一条 `CustomNodeUpdate name:Index`
+   * 配对，统计「触发命中率 × 触发后 rerender 成本」。
+   */
+  private traceStateWrite(name: string): void {
+    if (!STATE_TRACE) {
+      return
+    }
+    hiTraceMeter.startTrace(name, STATE_TRACE_TASK_ID)
+    hiTraceMeter.finishTrace(name, STATE_TRACE_TASK_ID)
+  }
+
+  /**
+   * 实验 H0：条目级局部刷新，仅通知对应索引的 LazyForEach Item 重新求值。
+   */
+  private notifyEntryChanged(path: string, surfaceHint?: string): void {
+    if (STATE_TRACE) {
+      this.traceStateWrite('StateWrite:thumbNotify')
+    }
+    if (surfaceHint === undefined || surfaceHint === 'grid' || surfaceHint === 'list') {
+      const listIdx = this.fileEntryDataSource.indexOfPath(path)
+      if (listIdx >= 0) {
+        this.fileEntryDataSource.notifyItemChanged(listIdx)
+      }
+    }
+    if (surfaceHint === undefined || surfaceHint === 'waterfall') {
+      const wfIdx = this.waterfallDataSource.indexOfPath(path)
+      if (wfIdx >= 0) {
+        this.waterfallDataSource.notifyItemChanged(wfIdx)
+      }
+    }
+  }
+
+  // 转场/动画期间的点击会被 busy 守卫直接吞掉，用户的感觉就是"点了没反应、
+  // 像不能触控"。这里记下最后点的那一个，等这次交互收尾时补上。
+  // 只保留最后一个：连点多次时打开最后点的那个才符合直觉。
+  private pendingOpenEntry: FileEntry | null = null
+
+  private deferOpenEntry(entry: FileEntry): void {
+    this.pendingOpenEntry = entry
+    this.tapTrace('deferred-while-busy')
+  }
+
+  /** 交互收尾（释放 isBusy）时调用，补上被推迟的那一次点击。 */
+  private runPendingOpenEntry(): void {
+    const next = this.pendingOpenEntry
+    if (next === null || this.isBusy || this.isNavigating) {
+      return
+    }
+    this.pendingOpenEntry = null
+    this.openEntry(next).catch((error: Error): void => {
+      console.warn('[UgreenOpen] deferred open failed: ' + JSON.stringify(error))
+    })
+  }
+
+  /**
+   * 诊断：把可能"占着触控"的守卫标志一次性打出来。
+   * 复现"动画已结束但点不动/滑不动"时看这一行，就知道是谁没释放。
+   */
+  private traceInteractionGuards(tag: string): void {
+    if (!TAP_TRACE) {
+      return
+    }
+    console.info('[GuardTrace] ' + tag +
+      ' isBusy=' + this.isBusy.toString() +
+      ' isNavigating=' + this.isNavigating.toString() +
+      ' pageTransition=' + this.showPageTransition.toString() +
+      ' viewerClosing=' + this.viewerClosePending.toString() +
+      ' viewerTransition=' + this.viewerTransitionActive.toString() +
+      ' entryTransition=' + this.viewerEntryTransitionActive.toString() +
+      ' fallbackEntry=' + this.viewerFallbackEntryActive.toString() +
+      ' scrolling=' + this.fileContentScrolling.toString() +
+      ' scrub=' + this.timelineScrubActive.toString() +
+      ' showViewer=' + this.showImageViewer.toString() +
+      ' closeRequested=' + this.viewerCloseRequested.toString())
   }
 
   private logViewerDiagnostic(stage: string, path: string = ''): void {
@@ -7604,15 +8505,31 @@ struct Index {
 
   private clearViewerEntryTransition(): void {
     this.viewerEntryTransitionToken += 1
-    this.viewerEntryTransitionActive = false
-    this.viewerEntryTransitionPath = ''
-    this.viewerTransitionKind = 'none'
-    this.viewerTransitionLayer = 'thumbnail'
-    this.viewerGeometryBound = false
+    if (this.viewerEntryTransitionActive) {
+      this.traceStateWrite('StateWrite:vet.off')
+      this.viewerEntryTransitionActive = false
+    }
+    if (this.viewerEntryTransitionPath.length > 0) {
+      this.viewerEntryTransitionPath = ''
+    }
+    if (this.viewerTransitionKind !== 'none') {
+      this.viewerTransitionKind = 'none'
+    }
+    if (this.viewerTransitionLayer !== 'thumbnail') {
+      this.viewerTransitionLayer = 'thumbnail'
+    }
+    if (this.viewerGeometryBound) {
+      this.viewerGeometryBound = false
+    }
   }
 
   private startViewerEntryTransition(entry: FileEntry): void {
     this.clearViewerEntryTransition()
+    // 关闭共享元素转场时，这里直接返回 → viewerEntryTransitionActive 保持 false，
+    // 打开流程自然走"淡入"的 fallback 分支（见 VIEWER_USE_SHARED_ELEMENT_TRANSITION）。
+    if (!VIEWER_USE_SHARED_ELEMENT_TRANSITION) {
+      return
+    }
     if (!this.hasViewerTransitionSource(entry, false)) {
       return
     }
@@ -7620,6 +8537,7 @@ struct Index {
     this.viewerTransitionKind = 'entry'
     this.viewerTransitionLayer = 'thumbnail'
     this.viewerGeometryBound = true
+    this.traceStateWrite('StateWrite:vet.on')
     this.viewerEntryTransitionActive = true
   }
 
@@ -7658,6 +8576,7 @@ struct Index {
     this.viewerTransitionKind = 'exit'
     this.viewerTransitionLayer = layer
     this.viewerGeometryBound = false
+    this.traceStateWrite('StateWrite:vet.on')
     this.viewerEntryTransitionActive = true
     return true
   }
@@ -7780,9 +8699,10 @@ struct Index {
       .translate({ x: 0, y: this.imageBottomChromeOffsetY, z: 0 })
       .hitTestBehavior(HitTestMode.None)
     }
+    .id('viewer-chrome-host')
     .width('100%')
     .height('100%')
-    .hitTestBehavior(this.showImageViewer ? HitTestMode.Transparent : HitTestMode.None)
+    .hitTestBehavior(HitTestMode.Transparent)
   }
 
   @Builder
@@ -9998,6 +10918,84 @@ struct Index {
     return ratio > 0 ? ratio : 1
   }
 
+  /**
+   * 实验 B′ 专用：网格图片的解码目标尺寸（**严格保持源图比例**）。
+   *
+   * · 返回 null → 不设置 sourceSize（基线）
+   * · 否则返回 {width, height}，宽高严格等于源图比例，且两轴都 ≤ 源尺寸
+   *
+   * ⚠️ 两条硬约束（都踩过坑）：
+   *   1. 绝不能传正方形：源是 512×384 时按正方形缩放会【改变显示比例】。
+   *   2. 绝不能超过源尺寸：会触发 `JPEGHWDECODER failed to do decode` → 白屏。
+   * 源尺寸取状态里已知的解码尺寸（渲染路径零 IO）；两者未知时不设置，宁可走基线。
+   */
+  private gridSourceSizeFor(entry: FileEntry): ThumbnailSize | null {
+    const target = EXPERIMENT_GRID_SOURCE_SIZE
+    if (target <= 0) {
+      return null
+    }
+    const state = this.imageVisualState(entry.path)
+    let srcW = state.thumbnailDisplayWidth
+    let srcH = state.thumbnailDisplayHeight
+    if (!(srcW > 0) || !(srcH > 0)) {
+      // 退到物理尺寸；仍未知则本次不设置（不做任何猜测，避免变形或解码失败）。
+      srcW = state.physicalWidth
+      srcH = state.physicalHeight
+      if (!(srcW > 0) || !(srcH > 0)) {
+        return null
+      }
+    }
+    // 等比缩放到 target 宽，再夹到源尺寸之内 —— 比例始终不变。
+    const scale = Math.min(target / srcW, 1)
+    const width = Math.max(1, Math.round(srcW * scale))
+    const height = Math.max(1, Math.round(srcH * scale))
+    const result: ThumbnailSize = { width: width, height: height }
+    return result
+  }
+
+  /**
+   * 实验 B′/F：解码目标宽度（0 = 本次不设置 sourceSize）。 */
+  private gridSourceWidth(entry: FileEntry): number {
+    const size = this.gridSourceSizeFor(entry)
+    return size === null ? 0 : size.width
+  }
+
+  /**
+   * 实验 B′/F：解码目标高度（0 = 本次不设置 sourceSize）。 */
+  private gridSourceHeight(entry: FileEntry): number {
+    const size = this.gridSourceSizeFor(entry)
+    return size === null ? 0 : size.height
+  }
+
+  /**
+   * R2 修复：网格项"一次算完"的图片显示状态。
+   *
+   * 背景：改造前，一个 GridItem 的单次 build 会通过三个 helper 重复求值
+   *      —— `fileImageSourceAvailable()`、`Image(fileImageSource())`、
+   *      `fileImageSourceOrientation()` 各自走一遍 `fileImageSource()`，
+   *      而它内部在 grid 路径下恒为 `previewUri()`（含 NAPI `fileUri.getUriFromPath`
+   *      + 多层查表）。即"同一轮构建里把同一个事实查了 3 遍"。
+   * 现在：只解析一次，后续全部读这个对象。
+   */
+  private resolveGridImageState(entry: FileEntry): GridImageState {
+    const state = new GridImageState()
+    const source: image.PixelMap | string = this.fileImageSource(entry, 'grid')
+    state.source = source
+    const isUri = typeof source === 'string'
+    state.available = isUri ? (source as string).length > 0 : true
+    if (!state.available) {
+      return state
+    }
+    state.orientation = isUri
+      ? this.fileListImageBaseOrientation(entry) : ImageRotateOrientation.UP
+    state.transitionId = this.fileImageTransitionId(entry, 'grid')
+    state.syncLoad = this.fileImageShouldSyncLoad(entry)
+    const size = this.gridSourceSizeFor(entry)
+    state.sourceWidth = size === null ? 0 : size.width
+    state.sourceHeight = size === null ? 0 : size.height
+    return state
+  }
+
   private waterfallSourceSize(entry: FileEntry): ThumbnailSize {
     const columnVp = this.waterfallColumnWidthVp > 0 ? this.waterfallColumnWidthVp : 160
     const ratio = this.waterfallAspectRatio(entry)
@@ -11561,7 +12559,8 @@ struct Index {
       } else {
         this.timelineFocusTime = 0
       }
-      if (Date.now() - snapshot.fetchedAt > DIRECTORY_INDEX_STALE_MS) {
+      if (Date.now() - snapshot.fetchedAt > DIRECTORY_INDEX_STALE_MS &&
+        effectiveEntries.length <= DIRECTORY_AUTO_REFRESH_MAX_ITEMS) {
         setTimeout((): void => {
           if (key === this.currentRootType.toString() + ':' + this.currentPath) {
             this.scheduleCurrentDirectoryIndex(true)
@@ -11590,7 +12589,8 @@ struct Index {
     } else {
       this.timelineFocusTime = 0
     }
-    if (Date.now() - snapshot.fetchedAt > DIRECTORY_INDEX_STALE_MS) {
+    if (Date.now() - snapshot.fetchedAt > DIRECTORY_INDEX_STALE_MS &&
+      effectiveEntries.length <= DIRECTORY_AUTO_REFRESH_MAX_ITEMS) {
       setTimeout((): void => {
         if (key === this.currentRootType.toString() + ':' + this.currentPath) {
           this.scheduleCurrentDirectoryIndex(true)
@@ -11687,7 +12687,20 @@ struct Index {
   }
 
   private onFileContentScrollStart(): void {
+    if (this.closeSessionActive && !this.sessionScrollStartLogged) {
+      this.sessionScrollStartLogged = true
+      const dt = this.getMonotonicNow() - this.closeAnimFinishMonotonic
+      console.info('[TouchChain] #' + this.closeSessionId.toString() +
+        ' ScrollStart +' + dt.toString() + 'ms')
+      this.closeSessionActive = false
+    }
+    // 诊断：滑动是否被识别。若复现"丢触控"时这里没有日志，
+    // 说明滑动在 UI 层就被拦掉了。
+    if (TAP_TRACE) {
+      console.info('[TapTrace] scroll-start')
+    }
     this.fileContentScrolling = true
+    this.noteUserInteraction()
     this.cancelPendingPreviewLoads()
     this.waterfallGeometryQueue.cancelPending()
     for (const entry of this.waterfallDownloadQueue) {
@@ -11699,7 +12712,10 @@ struct Index {
   }
 
   private onFileContentScrollStop(): void {
+    this.closeSessionActive = false
     this.fileContentScrolling = false
+    this.lastUserInteractionMonotonic = this.getMonotonicNow()
+    this.requestViewerCleanup()
     // 滚动期间被推迟的视觉状态刷新（缩略图旋转修正等）在这里统一补一次
     if (this.imageVisualNotifyDeferred) {
       this.imageVisualNotifyDeferred = false
@@ -12155,7 +13171,12 @@ struct Index {
   }
 
   private async openEntry(entry: FileEntry): Promise<void> {
+    this.tapTraceBegin('openEntry ' + (entry.isDirectory ? 'dir' : 'file') + ' ' + entry.name)
     if (this.isBusy) {
+      // 不再直接丢弃：转场/动画期间的点击推迟到这次交互收尾时执行，
+      // 否则用户会以为"返回之后一段时间点不动"。
+      this.traceInteractionGuards('openEntry-blocked')
+      this.deferOpenEntry(entry)
       return
     }
     if (!entry.isDirectory) {
@@ -12196,12 +13217,14 @@ struct Index {
       // directory, so the user never sees a temporary page order followed by
       // a full-directory reorder.
       const nextSnapshot = await this.repository.ensureDirectoryIndex(nextPath, nextRootType)
+      this.tapTrace('after-ensureIndex', 'entries=' + nextSnapshot.entries.length.toString())
       const query = new DirectoryQuery()
       query.path = nextPath
       query.rootType = nextRootType
       query.sortKey = this.fileSortKey
       query.ascending = this.fileSortAscending
       const nextEntries = DirectoryTimelinePolicy.query(nextSnapshot.entries, query)
+      this.tapTrace('after-query', 'shown=' + nextEntries.length.toString())
       if (requestId !== this.navigationRequestId) {
         return
       }
@@ -12242,11 +13265,13 @@ struct Index {
         this.updateDirectoryCount(nextPath, nextSnapshot.totalCount >= 0
           ? nextSnapshot.totalCount : nextEntries.length)
       }, (): void => this.settleNewDirectoryAtTopForTransition(), true)
+      this.tapTrace('after-transition', 'transitioned=' + transitioned.toString())
       if (!transitioned) {
         return
       }
       this.statusText = nextEntries.length === 0 ? '目录读取成功（空目录）' : '目录读取成功'
-      if (Date.now() - nextSnapshot.fetchedAt > DIRECTORY_INDEX_STALE_MS) {
+      if (Date.now() - nextSnapshot.fetchedAt > DIRECTORY_INDEX_STALE_MS &&
+        nextEntries.length <= DIRECTORY_AUTO_REFRESH_MAX_ITEMS) {
         setTimeout((): void => {
           if (nextPath === this.currentPath && nextRootType === this.currentRootType) {
             this.scheduleCurrentDirectoryIndex(true)
@@ -12418,6 +13443,10 @@ struct Index {
   }
 
   private handleFileEntryClick(entry: FileEntry): void {
+    // 诊断：点击事件是否真的到达了 JS。若复现"丢触控"时这里没有日志，
+    // 说明触摸在 UI 层就被拦掉了（而不是被下面的 isBusy 等守卫丢掉）。
+    this.tapTraceBegin('click ' + entry.name)
+    this.traceInteractionGuards('click-in')
     // A long press can otherwise emit a trailing click from ListItem after
     // the gesture recognizer finishes. Keep navigation disabled while the
     // explicitly controlled context menu owns the interaction.
@@ -13287,21 +14316,30 @@ struct Index {
   }
 
   private async openImageViewer(entry: FileEntry): Promise<void> {
+    this.tapTraceBegin('openImageViewer ' + entry.name)
+    this.cancelViewerCleanupTimer()
     if (this.isBusy || this.viewerClosePending || entry.isDirectory) {
+      this.traceInteractionGuards('openImageViewer-blocked')
       return
     }
     this.closeActionMenu()
+    this.viewerBlocksFileContent = true
+    this.viewerClosing = false
+    this.viewerInteractionUnlocked = false
     this.isBusy = true
     this.errorText = ''
     this.statusText = '正在准备图片预览…'
     try {
       const imageEntries = this.imageEntriesInCurrentDirectory()
       const initialIndex = imageEntries.findIndex((item: FileEntry) => item.path === entry.path)
+      this.tapTrace('after-collect', 'imgs=' + imageEntries.length.toString() +
+        ' idx=' + initialIndex.toString())
       if (initialIndex < 0) {
         throw new Error('当前目录中未找到图片')
       }
       this.captureViewerReturnScrollPosition()
       const persistedState = await this.loadPersistedImageDisplayState(imageEntries)
+      this.tapTrace('after-persistedState')
       this.viewerGeneration += 1
       const openingGeneration = this.viewerGeneration
       this.viewerLoadQueue = []
@@ -13325,7 +14363,9 @@ struct Index {
       // Prefer cached original metadata, falling back to the thumbnail before
       // mounting, including the persisted base-orientation swap.
       await this.primeViewerFrameWindow(imageEntries, initialIndex, 2)
+      this.tapTrace('after-primeFrameWindow')
       this.ensureViewerImageFrame(entry)
+      this.tapTrace('after-ensureFrame')
       this.logViewerDiagnostic('open-frame-ready', entry.path)
       this.viewerProgressLastUpdateAt = {}
       this.viewerRevealTokens = {}
@@ -13348,10 +14388,13 @@ struct Index {
       // local thumbnail is unavailable we intentionally use the ordinary
       // no-geometry transition instead of inventing a frame.
       await this.ensureViewerPreviewBitmap(entry)
+      this.tapTrace('after-ensurePreviewBitmap')
       // Commit the source-only frame first. The following hierarchy swap is
       // the sole state change inside animateTo, so one Image leaves the file
       // surface at exactly the moment its viewer counterpart is inserted.
       this.startViewerEntryTransition(entry)
+      this.tapTrace('after-startTransition',
+        'sharedElement=' + this.viewerEntryTransitionActive.toString())
       this.logViewerDiagnostic(this.viewerEntryTransitionActive
         ? 'entry-source-bound' : 'entry-fallback', entry.path)
       if (this.viewerEntryTransitionActive) {
@@ -13360,8 +14403,17 @@ struct Index {
           this.getUIContext().animateTo({
             duration: IMAGE_GEOMETRY_TRANSITION_DURATION,
             curve: Curve.FastOutSlowIn,
-            onFinish: resolve
+            onFinish: (): void => {
+              this.tapTrace('anim-finish(shared)')
+              // ⚠️ 动画播完就是用户眼里的"已经进去了"。此刻必须放开交互锁：
+              // 否则用户"看到动画结束立刻点击/滑动"会被 isBusy 挡掉，感觉丢触控。
+              // （后面的 nextRenderFrame / clearViewerEntryTransition 只是收尾。）
+              this.isBusy = false
+              this.runPendingOpenEntry()
+              resolve()
+            }
           }, () => {
+            this.tapTrace('VISIBLE(shared) animStart')
             this.showImageViewer = true
             this.imageChromeVisible = true
             this.imageChromeOpacity = 1
@@ -13376,13 +14428,18 @@ struct Index {
         // It never guesses a square source or binds a shared-element id.
         this.viewerSurfaceOpacity = 0
         this.viewerFallbackEntryActive = true
+        this.tapTrace('VISIBLE(fallback)')
         this.showImageViewer = true
         await this.nextRenderFrame()
         await new Promise<void>((resolve: () => void): void => {
           this.getUIContext().animateTo({
             duration: IMAGE_FALLBACK_TRANSITION_DURATION,
             curve: Curve.EaseOut,
-            onFinish: resolve
+            onFinish: (): void => {
+              this.isBusy = false
+              this.runPendingOpenEntry()
+              resolve()
+            }
           }, () => {
             this.viewerSurfaceOpacity = 1
             this.imageChromeVisible = true
@@ -13416,6 +14473,7 @@ struct Index {
       this.prefetchViewerImages(initialIndex)
       this.statusText = ''
     } catch (error) {
+      this.viewerInteractionUnlocked = true
       this.clearViewerEntryTransition()
       this.showImageViewer = false
       this.viewerSurfaceOpacity = 1
@@ -13424,6 +14482,8 @@ struct Index {
       this.statusText = '图片预览失败'
     } finally {
       this.isBusy = false
+      // 打开期间被挡下的点击在这里补上
+      this.runPendingOpenEntry()
     }
   }
 
@@ -13652,7 +14712,7 @@ struct Index {
       nextStates[entry.path] = next
     }
     this.imageVisualStates = nextStates
-    this.imageVisualEpoch += 1
+    // 架构清理：Viewer session cleanup 不应该让 Grid 产生无意义响应依赖。
   }
 
   private finishCloseImageViewer(shouldRestoreSearch: boolean): void {
@@ -13662,14 +14722,24 @@ struct Index {
     const closingImages = this.viewerImages.slice()
     const returnedEntry = this.viewerImageEntry
     this.clearViewerEntryTransition()
-    this.releaseViewerVisualSession(closingImages)
-    this.releaseViewerSessionBitmaps(closingImages).catch((error: Error): void => {
-      console.warn('[UgreenBitmap] viewer release failed: ' + JSON.stringify(error))
-    })
+    const closingPreviewBitmaps = this.viewerPreviewBitmaps
+    const closingOriginalBitmaps = this.viewerOriginalBitmaps
+    const closingPreviewAliases = this.viewerPreviewBitmapAliases
+    this.viewerPreviewBitmaps = {}
+    this.viewerOriginalBitmaps = {}
+    this.viewerOriginalLocalPaths = {}
+    this.viewerPreviewBitmapAliases = {}
+
+    this.viewerBlocksFileContent = false
+    this.viewerClosing = false
+    this.viewerInteractionUnlocked = true
     this.viewerClosePending = false
     this.viewerCloseRequested = false
     this.viewerReturnReadyPath = ''
     this.isBusy = false
+    this.tapTrace('viewer-close-done')
+    // 关闭期间被挡下的点击在这里补上（用户"刚返回完点不动"的来源）
+    this.runPendingOpenEntry()
     this.viewerImageEntry = null
     this.viewerHeaderTitle = ''
     this.replaceViewerImages([])
@@ -13694,16 +14764,28 @@ struct Index {
     if (shouldRestoreSearch) {
       this.restoreSearchSession()
     }
+    // 1. 重置 viewer 会话视觉状态（立即执行，不再推迟 250ms，且不再触发全局状态标脏）
+    this.releaseViewerVisualSession(closingImages)
+    // 2. 将关闭位图移入待释放队列，在交互静默期单张分片释放
+    this.enqueuePendingViewerCleanup(closingImages, closingPreviewBitmaps, closingOriginalBitmaps, closingPreviewAliases)
+    this.requestViewerCleanup()
     this.postRenderFrame((): void => {
       if (returnedEntry !== null) {
-        this.loadEntryPreview(returnedEntry, 0)
+        setTimeout((): void => {
+          this.loadEntryPreview(returnedEntry, 0)
+        }, 200)
       }
-      this.schedulePreviewWarmup(this.previewGeneration)
+      // 实验 C：只隔离"返回后预热"这一步，UI 结构与其它逻辑完全不动。
+      if (!DISABLE_RETURN_WARMUP) {
+        this.schedulePreviewWarmup(this.previewGeneration)
+      }
     })
   }
 
   private closeImageViewer(): void {
+    this.tapTraceBegin('closeImageViewer')
     if (this.viewerClosePending) {
+      this.traceInteractionGuards('close-blocked')
       return
     }
     if (this.viewerTransitionActive ||
@@ -13723,10 +14805,15 @@ struct Index {
     const returningEntry = this.viewerImageEntry as FileEntry
     const keepFileSurfacePosition = this.screen === 'files' &&
       !this.showSearch && this.currentPath.length > 0
+    this.closeSessionId += 1
+    this.closeSessionActive = false
+    this.sessionTouchTestCount = 0
+    this.viewerInteractionUnlocked = false
     this.viewerClosePending = true
     this.isBusy = true
     this.setImageChromeVisible(false, false)
     const returnReady = await this.prepareViewerReturnSource(returningEntry)
+    this.tapTrace('after-prepareReturnSource', 'ready=' + returnReady.toString())
     if (!this.showImageViewer) {
       return
     }
@@ -13737,7 +14824,8 @@ struct Index {
       return
     }
     const lockedLayer = this.viewerActiveLayer(returningEntry)
-    const canUseGeometryTransition = returnReady &&
+    // 关闭共享元素转场时恒为 false → 退场走"淡出"的 fallback 分支
+    const canUseGeometryTransition = VIEWER_USE_SHARED_ELEMENT_TRANSITION && returnReady &&
       this.startViewerExitTransition(returningEntry, lockedLayer)
     this.logViewerDiagnostic(canUseGeometryTransition ? 'exit-source-bound' : 'exit-fallback',
       returningEntry.path)
@@ -13759,6 +14847,7 @@ struct Index {
       await this.nextRenderFrame()
       this.viewerGeometryBound = true
       await this.nextRenderFrame()
+      this.viewerClosing = true
       await new Promise<void>((resolve: () => void): void => {
         this.getUIContext().animateTo({
           duration: IMAGE_GEOMETRY_TRANSITION_DURATION,
@@ -13774,6 +14863,7 @@ struct Index {
     } else {
       // An offscreen/unmounted source gets a single-image shrink and fade;
       // it never flies to a stale rectangle from another Swiper page.
+      this.viewerClosing = true
       await new Promise<void>((resolve: () => void): void => {
         this.getUIContext().animateTo({
           duration: IMAGE_FALLBACK_TRANSITION_DURATION,
@@ -13789,13 +14879,24 @@ struct Index {
         this.restoreViewerReturnScrollPosition()
       }
     }
-    await this.nextRenderFrame()
+    this.closeAnimFinishMonotonic = this.getMonotonicNow()
+    this.closeSessionActive = true
+    this.sessionTrackedPointerId = -1
+    this.sessionPreDispatchDownLogged = false
+    this.sessionRootDownLogged = false
+    this.sessionChildDownLogged = false
+    this.sessionPanStartLogged = false
+    this.sessionFirstPanUpdateLogged = false
+    this.sessionScrollStartLogged = false
+    this.sessionTouchTestCount = 0
+    this.tapTrace('after-closeAnim')
     if (closeGeneration === this.viewerGeneration) {
       this.finishCloseImageViewer(shouldRestoreSearch)
     }
   }
 
   private setImageChromeVisible(visible: boolean, animated: boolean = true): void {
+    this.traceStateWrite('StateWrite:chrome.visible')
     this.imageChromeVisible = visible
     this.imageChromeAnimationToken += 1
     const token = this.imageChromeAnimationToken
@@ -13803,7 +14904,9 @@ struct Index {
     const targetTopOffset = visible ? 0 : -(this.topSafeInset() + 110)
     const targetBottomOffset = visible ? 0 : 130
     if (!animated) {
+      this.traceStateWrite('StateWrite:chrome.opacity')
       this.imageChromeOpacity = targetOpacity
+      this.traceStateWrite('StateWrite:chrome.offsets')
       this.imageTopChromeOffsetY = targetTopOffset
       this.imageBottomChromeOffsetY = targetBottomOffset
       return
@@ -13815,7 +14918,9 @@ struct Index {
       if (token !== this.imageChromeAnimationToken) {
         return
       }
+      this.traceStateWrite('StateWrite:chrome.opacity')
       this.imageChromeOpacity = targetOpacity
+      this.traceStateWrite('StateWrite:chrome.offsets')
       this.imageTopChromeOffsetY = targetTopOffset
       this.imageBottomChromeOffsetY = targetBottomOffset
     })
@@ -13841,6 +14946,13 @@ struct Index {
         this.imageTouchStartY = point.y
         this.imageTouchLastX = point.x
       }
+      // ⚠️ 长按图片会触发系统的"识别文字"，文字层浮在图片上方；此时拖动选择光标
+      // 会被图片的下拉关闭接走 → 图片跟着移动。
+      // 系统没有"文字层已显示"的回调（aiButtonStatusChange /
+      // imageAnalyzerVisibilityChange 只管右下角的 AI 按钮，实测长按不触发），
+      // 所以这里自己判定：按住不动超过阈值即视为"正在识别文字"。
+      this.imageAnalyzerActive = false
+      this.armImageLongPressWatch()
       return
     }
     if (event.type === TouchType.Move && this.imageTouchActive && point !== null) {
@@ -13849,19 +14961,43 @@ struct Index {
       // horizontal component still exists: the dismiss recognizer is
       // vertical-only and the Swiper has already lost this touch sequence.
       // TouchObject.x and translate() are both vp, so the delta maps 1:1.
-      if (this.imageDismissDragging) {
+      if (this.imageDismissDragging && !this.imageAnalyzerActive) {
         this.imageDismissOffsetX = point.x - this.imageDismissAnchorX
       }
       const movedX = Math.abs(point.x - this.imageTouchStartX)
       const movedY = Math.abs(point.y - this.imageTouchStartY)
       if (movedX > 8 || movedY > 8) {
         this.imageTouchMoved = true
+        // 手指动过了 → 不是长按（但若已经判定为长按，说明文字层已浮出，保持）
+        if (!this.imageAnalyzerActive) {
+          this.cancelImageLongPressWatch()
+        }
       }
       return
     }
     if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
       this.imageTouchActive = false
       this.imageTouchMoved = false
+      // 只清定时器：若已经判定为"长按识别"，保持 imageAnalyzerActive 直到下一次
+      // 在图片上按下（那时会重新判断），因为文字层此刻仍然浮着。
+      this.cancelImageLongPressWatch()
+    }
+  }
+
+  /** 长按判定的等待时长。系统长按识别约 500ms 触发，这里略早进入保护态。 */
+  private armImageLongPressWatch(): void {
+    this.cancelImageLongPressWatch()
+    this.imageLongPressTimer = setTimeout((): void => {
+      this.imageLongPressTimer = 0
+      this.imageAnalyzerActive = true
+      console.info('[UgreenImageAnalyzer] longPress -> analyzer active')
+    }, IMAGE_LONG_PRESS_MS)
+  }
+
+  private cancelImageLongPressWatch(): void {
+    if (this.imageLongPressTimer > 0) {
+      clearTimeout(this.imageLongPressTimer)
+      this.imageLongPressTimer = 0
     }
   }
 
@@ -13888,10 +15024,13 @@ struct Index {
   }
 
   private imageDismissGestureEnabled(index: number): boolean {
+    // ⚠️ imageAnalyzerActive = 用户正在识别文字，此时文字选择层浮在图片上方，
+    // 若仍允许下拉关闭，拖动选择光标就会被它接走、导致图片跟着移动。
     return this.showImageViewer && !this.viewerClosePending &&
       index === this.viewerImageIndex && this.imageScale <= 1.001 &&
       !this.viewerTransitionActive && !this.viewerEntryTransitionActive &&
-      !this.showImageMoreMenu && !this.showImageDetails && !this.showRenameDialog
+      !this.showImageMoreMenu && !this.showImageDetails && !this.showRenameDialog &&
+      !this.imageAnalyzerActive
   }
 
   private resetImageDismissTransform(): void {
@@ -14449,13 +15588,30 @@ struct Index {
 
   private async primeViewerFrameWindow(entries: FileEntry[], center: number,
     radius: number): Promise<void> {
+    // 当前这张必须准备好再返回（首帧要立刻正确）。
+    const centerEntry = entries[center]
+    if (centerEntry !== undefined) {
+      await this.primeViewerPreviewGeometry(centerEntry)
+      await this.primeViewerOriginalFrame(centerEntry)
+      this.ensureViewerImageFrame(centerEntry, false)
+    }
+    // ⚠️ 相邻图原来也是串行 await（5 张 × 2 次 I/O = 10 次串行），
+    // 实测首次打开要 228~270ms。这里改为并行，行为不变但快得多。
     const start = Math.max(0, center - radius)
     const end = Math.min(entries.length - 1, center + radius)
+    const neighbours: Promise<void>[] = []
     for (let index = start; index <= end; index += 1) {
-      await this.primeViewerPreviewGeometry(entries[index])
-      await this.primeViewerOriginalFrame(entries[index])
-      this.ensureViewerImageFrame(entries[index], false)
+      if (index === center) {
+        continue
+      }
+      const entry = entries[index]
+      neighbours.push((async (): Promise<void> => {
+        await this.primeViewerPreviewGeometry(entry)
+        await this.primeViewerOriginalFrame(entry)
+        this.ensureViewerImageFrame(entry, false)
+      })())
     }
+    await Promise.all(neighbours)
   }
 
   private async primeViewerOriginalFrame(entry: FileEntry): Promise<void> {
@@ -18774,7 +19930,11 @@ struct Index {
         }
       }, false)
     }
-    this.scheduleImageVisualNotify()
+    if (USE_GLOBAL_BITMAP_EPOCH) {
+      this.scheduleImageVisualNotify()
+    } else {
+      this.notifyEntryChanged(path, 'grid')
+    }
   }
 
   private replaceEntries(nextEntries: FileEntry[], appendWaterfall: boolean = false,

@@ -680,6 +680,7 @@ export class UgreenRemoteRepository {
     }
     this.metadataScope = nextScope
     this.cacheGeneration += 1
+    console.info('[DirTrace] CLEAR-ALL scope-changed gen=' + this.cacheGeneration.toString())
     this.directoryCache.clear()
     this.directoryPageCache.clear()
     this.directoryRequests.clear()
@@ -723,10 +724,16 @@ export class UgreenRemoteRepository {
 
   private async loadDirectoryIndex(path: string, rootType: number, key: string,
     forceNetwork: boolean): Promise<DirectoryIndexedSnapshot> {
+    const traceT0 = Date.now()
+    if (forceNetwork) {
+      console.info('[DirTrace] forceNetwork=true ' + key +
+        ' t+' + (Date.now() - traceT0).toString() + 'ms')
+    }
     if (!forceNetwork) {
       const cached = this.directoryCache.get(key)
       const cachedTimeline = this.directoryTimelines.get(key)
       if (cached !== undefined && cachedTimeline !== undefined && cachedTimeline.complete) {
+        console.info('[DirTrace] HIT-memory ' + key + ' +' + (Date.now() - traceT0).toString() + 'ms')
         const snapshot = new DirectoryIndexedSnapshot()
         snapshot.entries = cached.entries.slice()
         snapshot.fetchedAt = this.directoryTimelineFetchedAt.get(key) ?? 0
@@ -735,7 +742,14 @@ export class UgreenRemoteRepository {
         snapshot.contentSignature = cached.contentSignature
         return snapshot
       }
+      // 为什么没命中：条目在不在、timeline 在不在、timeline 是否 complete。
+      console.info('[DirTrace] MISS-memory ' + key +
+        ' hasEntries=' + (cached !== undefined).toString() +
+        ' hasTimeline=' + (cachedTimeline !== undefined).toString() +
+        ' complete=' + (cachedTimeline === undefined ? 'n/a' : cachedTimeline.complete.toString()))
       const persisted = await this.readPersistedDirectory(path, rootType)
+      console.info('[DirTrace] persisted ' + key + ' +' + (Date.now() - traceT0).toString() +
+        'ms hit=' + (persisted !== null).toString())
       if (persisted !== null) {
         this.cacheDirectoryEntries(key, persisted.entries, Date.now())
         this.directoryTimelines.set(key, persisted.timeline)
@@ -750,9 +764,13 @@ export class UgreenRemoteRepository {
       }
     }
 
+    console.info('[DirTrace] NETWORK-start ' + key +
+      ' t+' + (Date.now() - traceT0).toString() + 'ms')
     const running = this.directoryRequests.get(key)
     const entries = running !== undefined
       ? await running : await this.fetchDirectory(path, rootType, key)
+    console.info('[DirTrace] NETWORK-done ' + key + ' +' + (Date.now() - traceT0).toString() +
+      'ms entries=' + entries.length.toString())
     const timeline = this.directoryTimelines.get(key) ??
       DirectoryTimelinePolicy.build(entries, false)
     const snapshot = new DirectoryIndexedSnapshot()
