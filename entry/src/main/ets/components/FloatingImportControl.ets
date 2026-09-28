@@ -30,6 +30,7 @@ export struct FloatingImportControl {
   @Prop safeBottom: number = 100
   @Link expanded: boolean
   onSelect: (source: string) => void = () => {}
+  onControlAreaChange: (area: Area) => void = () => {}
   @State edge: string = 'right'
   @State fraction: number = 0.68
   @State dragging: boolean = false
@@ -406,6 +407,9 @@ export struct FloatingImportControl {
     .borderRadius(this.expanded ? 24 : 28)
     .hitTestBehavior(HitTestMode.Default)
     .position({ x: this.x(), y: this.y() })
+    .onAreaChange((_, area: Area) => {
+      this.onControlAreaChange(area)
+    })
   }
 
   build() {

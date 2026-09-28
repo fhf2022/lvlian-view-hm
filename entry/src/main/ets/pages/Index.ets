@@ -485,6 +485,12 @@ class SlideActionItem {
   height: number = 0
   action: (() => void) | null = null
 }
+class BottomBarTouchRect {
+  x: number = 0
+  y: number = 0
+  width: number = 0
+  height: number = 0
+}
 class RowHitArea {
   entry: FileEntry | null = null
   surface: string = ''
@@ -2533,7 +2539,8 @@ struct Index {
           // The title controls end at topSafeInset + 56vp. Keep only an 8vp
           // clearance instead of treating the 30vp gradient tail as a blocker.
           safeTop: this.topSafeInset() + 64, safeBottom: this.floatingBarContentInset(8),
-          expanded: $importExpanded, onSelect: (source: string): void => { this.selectImportSource(source) } })
+          expanded: $importExpanded, onSelect: (source: string): void => { this.selectImportSource(source) },
+          onControlAreaChange: (area: Area): void => { this.updateFloatingImportRect(area) } })
           .id('floating-import-host')
           .position({ x: 0, y: 0 })
           // 选取页的层级是 20；悬浮球平时是 25，会一直压在选取页上面（显示逻辑不对）。
@@ -2626,6 +2633,24 @@ struct Index {
         console.info('[TouchChain] #' + this.closeSessionId.toString() +
           ' ChildTouchTest #' + this.sessionTouchTestCount.toString() +
           ' +' + dt.toString() + 'ms candidates=[' + candidateStrs.join(', ') + ']')
+      }
+      if (infos.length > 0 && !this.showFileSortMenu && !this.showSelectionMoreMenu) {
+        const point = infos[0]
+        const winX = point.windowX
+        const winY = point.windowY
+        if (this.isInsideFloatingImportControl(winX, winY)) {
+          return { strategy: TouchTestStrategy.DEFAULT, id: '' }
+        }
+        if (this.isInsideRealBottomBarControl(winX, winY)) {
+          return { strategy: TouchTestStrategy.DEFAULT, id: '' }
+        }
+        if (this.isInsideBottomBarVisualHost(winX, winY)) {
+          if (TAP_TRACE) {
+            console.info('[TouchTrace] onChildTouchTest FORWARD -> main-file-content at (' +
+              Math.round(winX).toString() + ',' + Math.round(winY).toString() + ')')
+          }
+          return { strategy: TouchTestStrategy.FORWARD, id: 'main-file-content' }
+        }
       }
       return { strategy: TouchTestStrategy.DEFAULT, id: '' }
     })
@@ -5281,6 +5306,9 @@ struct Index {
     // Cut 4E-1: 将底栏全宽 Tabs 宿主的 hitTestBehavior 从 Default 改为 None。
     // 该透明宿主自身不参与命中测试，不阻塞下层 Grid；其内部胶囊子节点继续按各自命中行为参与交互。
     .hitTestBehavior(HitTestMode.None)
+    .onAreaChange((_, area: Area) => {
+      this.updateBottomBarVisualHostRect(area)
+    })
   }
 
   @Builder
@@ -5365,6 +5393,9 @@ struct Index {
     // The capsule is above the scrolling page. Keep a drag that starts here
     // inside the capsule instead of letting the underlying List receive it.
     .hitTestBehavior(this.bottomBarMode() === 'home' ? HitTestMode.Default : HitTestMode.None)
+    .onAreaChange((_, area: Area) => {
+      this.updateBottomBarInteractiveRect('home:capsule', area)
+    })
   }
 
   @Builder
@@ -5398,6 +5429,9 @@ struct Index {
         .systemMaterial(this.bottomCapsuleMaterial)
         .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
         .monopolizeEvents(this.bottomBarMode() === 'tools')
+        .onAreaChange((_, area: Area) => {
+          this.updateBottomBarInteractiveRect('tools:sort', area)
+        })
         .onClick(() => {
           HapticFeedback.confirm()
           this.toggleFileSortMenu()
@@ -5469,6 +5503,9 @@ struct Index {
     .borderRadius(FLOATING_BAR_HEIGHT_VP / 2)
     .systemMaterial(this.bottomCapsuleMaterial)
     .hitTestBehavior(this.bottomBarMode() === 'selection' ? HitTestMode.Default : HitTestMode.None)
+    .onAreaChange((_, area: Area) => {
+      this.updateBottomBarInteractiveRect('selection:capsule', area)
+    })
   }
 
   @Builder
@@ -5656,6 +5693,9 @@ struct Index {
     .systemMaterial(this.bottomCapsuleMaterial)
     .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
     .monopolizeEvents(this.bottomBarMode() === 'tools')
+    .onAreaChange((_, area: Area) => {
+      this.updateBottomBarInteractiveRect('tools:' + options.slideKey, area)
+    })
     .onClick(() => {
       HapticFeedback.confirm()
       options.action()
@@ -18649,6 +18689,92 @@ struct Index {
   }
 
 
+
+  private floatingImportRect: BottomBarTouchRect = new BottomBarTouchRect()
+
+  private updateFloatingImportRect(area: Area): void {
+    const pos = area.globalPosition
+    if (typeof pos.x === 'number' && typeof pos.y === 'number' &&
+      typeof area.width === 'number' && typeof area.height === 'number' &&
+      area.width > 0 && area.height > 0) {
+      this.floatingImportRect.x = pos.x as number
+      this.floatingImportRect.y = pos.y as number
+      this.floatingImportRect.width = area.width as number
+      this.floatingImportRect.height = area.height as number
+    }
+  }
+
+  private isInsideFloatingImportControl(windowX: number, windowY: number): boolean {
+    if (this.screen !== 'files' || this.currentPath.length === 0 || this.showSearch ||
+      this.selectionMode || this.contextMenuEntry !== null || this.showRenameDialog ||
+      this.showAudioPlayer || this.videoPlaybackUiVisible()) {
+      return false
+    }
+    const rect = this.floatingImportRect
+    if (rect.width <= 0 || rect.height <= 0) {
+      return false
+    }
+    return windowX >= rect.x && windowX <= rect.x + rect.width &&
+      windowY >= rect.y && windowY <= rect.y + rect.height
+  }
+
+  private bottomBarVisualHostRect: BottomBarTouchRect = new BottomBarTouchRect()
+  private bottomBarInteractiveRects: Map<string, BottomBarTouchRect> = new Map<string, BottomBarTouchRect>()
+
+  private updateBottomBarVisualHostRect(area: Area): void {
+    const pos = area.globalPosition
+    if (typeof pos.x === 'number' && typeof pos.y === 'number' &&
+      typeof area.width === 'number' && typeof area.height === 'number' &&
+      area.width > 0 && area.height > 0) {
+      this.bottomBarVisualHostRect.x = pos.x as number
+      this.bottomBarVisualHostRect.y = pos.y as number
+      this.bottomBarVisualHostRect.width = area.width as number
+      this.bottomBarVisualHostRect.height = area.height as number
+    }
+  }
+
+  private updateBottomBarInteractiveRect(key: string, area: Area): void {
+    const pos = area.globalPosition
+    if (typeof pos.x === 'number' && typeof pos.y === 'number' &&
+      typeof area.width === 'number' && typeof area.height === 'number' &&
+      area.width > 0 && area.height > 0) {
+      const rect = new BottomBarTouchRect()
+      rect.x = pos.x as number
+      rect.y = pos.y as number
+      rect.width = area.width as number
+      rect.height = area.height as number
+      this.bottomBarInteractiveRects.set(key, rect)
+    }
+  }
+
+  private isInsideRealBottomBarControl(windowX: number, windowY: number): boolean {
+    const mode = this.bottomBarMode()
+    const prefix = mode + ':'
+    let inside = false
+    this.bottomBarInteractiveRects.forEach((rect: BottomBarTouchRect, key: string): void => {
+      if (inside || !key.startsWith(prefix)) {
+        return
+      }
+      if (windowX >= rect.x && windowX <= rect.x + rect.width &&
+        windowY >= rect.y && windowY <= rect.y + rect.height) {
+        inside = true
+      }
+    })
+    return inside
+  }
+
+  private isInsideBottomBarVisualHost(windowX: number, windowY: number): boolean {
+    if (!this.shouldShowAnyBottomBar() || this.viewerOwnsParentInteraction() ||
+      this.bottomBarOffsetY > 20 || this.bottomBarOpacity < 0.1) {
+      return false
+    }
+    const rect = this.bottomBarVisualHostRect
+    if (rect.width <= 0 || rect.height <= 0) {
+      return false
+    }
+    return windowX >= rect.x && windowX <= rect.x + rect.width &&
+      windowY >= rect.y && windowY <= rect.y + rect.height
+  }
 
   private slideItems: Map<string, SlideActionItem> = new Map<string, SlideActionItem>()
   private slidePressKey: string = ''
