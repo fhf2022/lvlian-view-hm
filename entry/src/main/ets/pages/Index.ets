@@ -1038,9 +1038,6 @@ struct Index {
   private imageDismissAnchorX: number = 0
   private imageDismissDragging: boolean = false
   private imageDismissChromeWasVisible: boolean = true
-  // Whether the current pull has already crossed the release-to-close
-  // distance, so the threshold cue fires once per pull rather than per sample.
-  private imageDismissPastThreshold: boolean = false
   private viewerSwiperController: SwiperController = new SwiperController()
   private viewerLoadQueue: FileEntry[] = []
   private viewerLoadRequests: Record<string, boolean> = {}
@@ -15118,7 +15115,6 @@ struct Index {
     this.imageDismissAnchorX = this.imageTouchLastX
     this.imageDismissOffsetX = 0
     this.imageDismissDragging = true
-    this.imageDismissPastThreshold = false
     this.imageTouchMoved = true
   }
 
@@ -15138,19 +15134,6 @@ struct Index {
     this.imageDismissOffsetY = effectiveOffsetY
     this.imageDismissScale = 1 - progress * IMAGE_DISMISS_MAX_SCALE_REDUCTION
     this.imageDismissBackdropOpacity = Math.max(0, 1 - progress * 1.25)
-
-    // Tell the user the pull has gone far enough that releasing now closes the
-    // viewer. The rule is invisible — the backdrop just keeps fading — so
-    // without this the only way to learn it is to overshoot and hope. Fired on
-    // the crossing only, and re-armed if the finger retreats back under it.
-    const triggerDistance = Math.max(120, this.imageViewportHeightVp * IMAGE_DISMISS_TRIGGER_RATIO)
-    const pastThreshold = effectiveOffsetY >= triggerDistance
-    if (pastThreshold && !this.imageDismissPastThreshold) {
-      this.imageDismissPastThreshold = true
-      HapticFeedback.threshold()
-    } else if (!pastThreshold) {
-      this.imageDismissPastThreshold = false
-    }
   }
 
   private animateImageDismissBack(): void {
