@@ -191,6 +191,11 @@ const EXPERIMENT_GRID_FIXED_SOURCE: boolean = false
 //   · 若分辨率降了但上述指标变化不明显 → 问题偏向"重复解析/source 创建次数"(R2)
 //     下一刀就该做 resolveFileImageState，而不是继续降分辨率
 const EXPERIMENT_GRID_SOURCE_SIZE: number = 0
+// 生产方案：当前图独占高清 original。邻图仅保留/常驻轻量 preview（~786KB），
+// 禁止邻图预加载 33.5MB original，将 Viewer 峰值从 ~103MB 裁减至 ~35MB。
+const EXPERIMENT_A3_SINGLE_ORIGINAL_VIEWER: boolean = true
+// 生产基线：Grid 缓存窗口固定为 4（兼顾准入削峰与视口抗扰动）
+const EXPERIMENT_GRID_CACHED_COUNT: number = 4
 // ⚠️ 实验用：取"不超过源尺寸"的解码目标。
 //   `sourceSize` 传大于源尺寸的值会导致硬件解码失败
 //   （`JPEGHWDECODER failed to do decode, err=-1` → 白屏），所以必须夹住。
@@ -3888,7 +3893,7 @@ struct Index {
     // 取 16 是保守值 —— 双参重载 cachedCount(count, show) 的文档注明上限为 16
     // （单参重载未注明上限）。此前为 32，即 32 × 4 列 = 上下各 128 个条目，
     // 缓存量偏大、内存占用高。
-    .cachedCount(16)
+    .cachedCount(EXPERIMENT_GRID_CACHED_COUNT)
     // 诊断：触摸是否到达列表容器。用于区分两种情况 ——
     //   有 [TouchTrace] 但没有 [TapTrace] >>> click  → UI 收到了触摸但 click 没触发（手势/命中问题）
     //   连 [TouchTrace] 都没有                        → 被上层覆盖层挡住了
@@ -10982,8 +10987,11 @@ struct Index {
         return null
       }
     }
-    // 等比缩放到 target 宽，再夹到源尺寸之内 —— 比例始终不变。
-    const scale = Math.min(target / srcW, 1)
+    // 方案 A：针对 Grid 1:1 正方形单元格以 Cover 渲染的特性，
+    // 统一以短边限制在 target（320px），且绝不反向放大（限制最大 decode size）。
+    // 比例始终严格不变，Cover 裁剪保证点对点清晰，避免大缩略图（如 960x648）显存浪费。
+    const minDim = Math.min(srcW, srcH)
+    const scale = Math.min(target / minDim, 1)
     const width = Math.max(1, Math.round(srcW * scale))
     const height = Math.max(1, Math.round(srcH * scale))
     const result: ThumbnailSize = { width: width, height: height }
@@ -15406,7 +15414,9 @@ struct Index {
         await this.primeViewerOriginalFrame(adjacent)
         this.ensureViewerImageFrame(adjacent, false)
       }).catch((): void => {})
-      this.enqueueViewerOriginal(adjacent, false, false)
+      if (!EXPERIMENT_A3_SINGLE_ORIGINAL_VIEWER) {
+        this.enqueueViewerOriginal(adjacent, false, false)
+      }
     }
   }
 
@@ -15462,21 +15472,41 @@ struct Index {
     // PixelMap is a native raster, so retaining every image visited during a
     // long swipe session would defeat the viewer memory budget.
     const keepPaths: Record<string, boolean> = {}
-    const centers: number[] = [this.viewerImageIndex, this.viewerPendingIndex]
-    for (const center of centers) {
-      if (center < 0 || center >= this.viewerImages.length) {
-        continue
+    if (EXPERIMENT_A3_SINGLE_ORIGINAL_VIEWER) {
+      // A3: 仅当前项（以及正在滑动的目标 pending 项）允许保留 original
+      const centers: number[] = [this.viewerImageIndex, this.viewerPendingIndex]
+      for (const center of centers) {
+        if (center >= 0 && center < this.viewerImages.length) {
+          keepPaths[this.viewerImages[center].path] = true
+        }
       }
-      for (let index = Math.max(0, center - 2);
-        index <= Math.min(this.viewerImages.length - 1, center + 2); index += 1) {
-        keepPaths[this.viewerImages[index].path] = true
+    } else {
+      const centers: number[] = [this.viewerImageIndex, this.viewerPendingIndex]
+      for (const center of centers) {
+        if (center < 0 || center >= this.viewerImages.length) {
+          continue
+        }
+        for (let index = Math.max(0, center - 2);
+          index <= Math.min(this.viewerImages.length - 1, center + 2); index += 1) {
+          keepPaths[this.viewerImages[index].path] = true
+        }
       }
     }
     for (const key of Object.keys(this.viewerOriginalBitmaps)) {
       if (keepPaths[key] === true || this.viewerActiveLoadPaths[key] === true) {
         continue
       }
-      this.releaseViewerBitmap(this.viewerOriginalBitmaps, key).catch((): void => {})
+      if (EXPERIMENT_A3_SINGLE_ORIGINAL_VIEWER) {
+        const oldRec = this.viewerOriginalBitmaps[key]
+        if (oldRec !== undefined) {
+          this.tryEnqueueViewerCleanupItem(oldRec, key, 'original')
+          this.removeViewerBitmap(this.viewerOriginalBitmaps, key)
+          this.viewerOriginalLocalPaths[key] = ''
+          this.requestViewerCleanup()
+        }
+      } else {
+        this.releaseViewerBitmap(this.viewerOriginalBitmaps, key).catch((): void => {})
+      }
       this.updateImageVisualState(key, (state: ImageVisualState): void => {
         state.originalUri = ''
         state.originalOrientation = ImageRotateOrientation.AUTO
