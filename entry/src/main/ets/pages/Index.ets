@@ -36,9 +36,12 @@ import { BinaryDownloadProgress, BinaryProgressListener } from '../core/network/
 import { UgreenError, UgreenErrorKind, readableUgreenError } from '../ugreen/UgreenErrors'
 import { FileEntryDataSource } from '../model/FileEntryDataSource'
 import { PreviewLoadQueue } from '../media/PreviewLoadQueue'
+import { ImagePipelineTelemetry } from '../media/ImagePipelineTelemetry'
+import { ReturnPerfSession } from '../media/ReturnPerfSession'
 import { ThumbnailPolicy, ThumbnailSize } from '../media/ThumbnailPolicy'
 import { ThumbnailCacheStore } from '../media/ThumbnailCacheStore'
 import { ViewerBitmapRecord, ViewerBitmapStore } from '../media/ViewerBitmapStore'
+import { ViewerPrefetchCoordinator, ViewerEntryState } from '../media/ViewerPrefetchCoordinator'
 import { NetworkClass, NetworkPolicy } from '../core/network/NetworkPolicy'
 import { HapticFeedback } from '../core/haptic/HapticFeedback'
 import {
@@ -938,6 +941,24 @@ struct Index {
   private previewLocalSignatures: Record<string, string> = {}
   private previewQueue: PreviewLoadQueue = new PreviewLoadQueue(
     ThumbnailPolicy.LIST_MAX_CONCURRENT, ThumbnailPolicy.MAX_PENDING_TASKS)
+  private imageTelemetry: ImagePipelineTelemetry = new ImagePipelineTelemetry()
+  private returnPerfSession: ReturnPerfSession = new ReturnPerfSession()
+  private entryPathGenerations: Record<string, number> = {}
+  private viewerPrefetchCoordinator: ViewerPrefetchCoordinator | null = null
+
+  private acquirePathGeneration(path: string): number {
+    const nextGen = (this.entryPathGenerations[path] || 0) + 1
+    this.entryPathGenerations[path] = nextGen
+    return nextGen
+  }
+
+  private isPathGenerationValid(path: string, token: number): boolean {
+    return this.entryPathGenerations[path] === token
+  }
+
+  private invalidatePath(path: string): void {
+    this.entryPathGenerations[path] = (this.entryPathGenerations[path] || 0) + 1
+  }
   private previewUriOrder: string[] = []
   // previewUri() 的结果缓存：key = 条目 path，value = `<signature>\u0000<uri>`。
   // 为什么需要：每个格子每次渲染会调 previewUri 2~3 次（fileImageSource /
@@ -1150,9 +1171,26 @@ struct Index {
     // 不再无条件注册：由 syncGestureShareRegistration 按"当前有没有可分享内容"决定。
     this.syncGestureShareRegistration()
     this.setupLocalInputMonitor()
+    this.viewerPrefetchCoordinator = new ViewerPrefetchCoordinator({
+      isViewerActive: (): boolean => this.showImageViewer && !this.viewerClosePending,
+      isInteractionBusy: (): boolean => this.viewerVisualCommitBlocked('') || this.imageScale > 1.001 || this.imageTouchActive,
+      shouldAutoPrefetch: (): boolean => this.shouldAutoLoadViewerOriginal(),
+      isFileCached: (entry: FileEntry): boolean => {
+        const cacheKey = this.originalCacheKey(entry)
+        return CacheManager.findExisting(this.cacheDirectory, entry.name, cacheKey).length > 0
+      },
+      downloadOriginalFile: async (entry: FileEntry, shouldContinue: () => boolean): Promise<string> => {
+        return await this.ensureCachedFile(entry, undefined, shouldContinue)
+      },
+      onOriginalFileReady: async (entry: FileEntry, _localPath: string): Promise<void> => {
+        await this.primeViewerOriginalFrame(entry)
+        this.ensureViewerImageFrame(entry, false)
+      }
+    })
   }
 
   aboutToDisappear(): void {
+    this.viewerPrefetchCoordinator?.onViewerClosed()
     this.cancelViewerCleanupTimer()
     this.drainPendingViewerCleanupOnDisappear()
     this.closeVideoPlayer()
@@ -3781,9 +3819,14 @@ struct Index {
                       .objectFit(ImageFit.Cover)
                       .geometryTransition(this.fileImageTransitionId(entry, 'grid'))
                       .syncLoad(this.fileImageShouldSyncLoad(entry))
-                      .onComplete((event?: ViewerImageCompleteEvent): void =>
+                      .onComplete((event?: ViewerImageCompleteEvent): void => {
+                        this.imageTelemetry.recordPipelineComplete(entry.path, 'grid')
                         this.recordThumbnailComplete(entry, this.previewUri(entry), index,
-                          'grid', event))
+                          'grid', event)
+                      })
+                      .onError((): void => {
+                        this.imageTelemetry.recordPipelineError(entry.path, 'grid')
+                      })
                   } else {
                     Image(this.fileImageSource(entry, 'grid'))
                       .width('100%')
@@ -3792,9 +3835,14 @@ struct Index {
                       .objectFit(ImageFit.Cover)
                       .geometryTransition(this.fileImageTransitionId(entry, 'grid'))
                       .syncLoad(this.fileImageShouldSyncLoad(entry))
-                      .onComplete((event?: ViewerImageCompleteEvent): void =>
+                      .onComplete((event?: ViewerImageCompleteEvent): void => {
+                        this.imageTelemetry.recordPipelineComplete(entry.path, 'grid')
                         this.recordThumbnailComplete(entry, this.previewUri(entry), index,
-                          'grid', event))
+                          'grid', event)
+                      })
+                      .onError((): void => {
+                        this.imageTelemetry.recordPipelineError(entry.path, 'grid')
+                      })
                   }
                 } else if (entry.isDirectory) {
                   this.FolderIcon(44)
@@ -3817,6 +3865,10 @@ struct Index {
                 (_isExpanding: boolean, ratio: number): void => {
                   this.recordThumbnailVisibility(entry, index, 'grid', ratio)
                   this.noteVisibleEntryForLoad(entry, ratio)
+                  if (!entry.isDirectory && this.isImage(entry) && ratio > 0.05) {
+                    const isReady = this.fileImageSourceAvailable(entry, 'grid')
+                    this.imageTelemetry.recordVisibleEnter(entry.path, isReady)
+                  }
                 })
 
               // 图片/视频不再占文字位（紧凑方块才好看）；文件夹仍保留名字，
@@ -3878,6 +3930,10 @@ struct Index {
           this.loadEntryPreview(entry, this.previewPriority(index, 'grid'))
           this.recordThumbnailMountedSource(entry, this.previewUri(entry), index, 'grid')
           this.scheduleCachedDirectoryCount(entry)
+          if (!entry.isDirectory && this.isImage(entry)) {
+            this.imageTelemetry.recordPipelineStart(entry.path, 'grid')
+            this.returnPerfSession.recordItemMounted(entry.path)
+          }
         })
         .onDisAppear(() => this.recordThumbnailVisibility(entry, index, 'grid', 0))
       }, (entry: FileEntry) => entry.path)
@@ -7815,6 +7871,8 @@ struct Index {
       this.pendingViewerCleanupQueue.shift()
       this.pendingViewerCleanupEstimatedBytes = Math.max(0,
         this.pendingViewerCleanupEstimatedBytes - item.estimatedBytes)
+      this.returnPerfSession.recordViewerRelease(item.path,
+        this.pendingViewerCleanupEstimatedBytes, this.getMonotonicNow())
       console.info('[ViewerCleanup] released slice: path=' + item.path +
         ' kind=' + item.kind + ' remainCount=' + this.pendingViewerCleanupQueue.length.toString() +
         ' remainBytes=' + this.pendingViewerCleanupEstimatedBytes.toString())
@@ -8277,6 +8335,7 @@ struct Index {
     if (displayWidth <= 0 || displayHeight <= 0) {
       return
     }
+    this.returnPerfSession.recordThumbnailComplete(entry.path, this.getMonotonicNow())
     this.updateImageVisualState(entry.path, (state: ImageVisualState): void => {
       state.thumbnailIndex = index
       state.thumbnailSurface = surface
@@ -12746,6 +12805,11 @@ struct Index {
     }
     this.fileContentScrolling = true
     this.noteUserInteraction()
+    let currentOffsetY = 0
+    try {
+      currentOffsetY = this.fileListScroller.currentOffset().yOffset
+    } catch (_) {}
+    this.returnPerfSession.noteScrollStart(currentOffsetY, this.getMonotonicNow())
     this.cancelPendingPreviewLoads()
     this.waterfallGeometryQueue.cancelPending()
     for (const entry of this.waterfallDownloadQueue) {
@@ -12761,6 +12825,12 @@ struct Index {
     this.fileContentScrolling = false
     this.lastUserInteractionMonotonic = this.getMonotonicNow()
     this.requestViewerCleanup()
+    let currentOffsetY = 0
+    try {
+      currentOffsetY = this.fileListScroller.currentOffset().yOffset
+    } catch (_) {}
+    this.returnPerfSession.noteScrollStop(currentOffsetY, this.getMonotonicNow())
+    hilog.info(IMAGE_VIEWER_HILOG_DOMAIN, IMAGE_VIEWER_HILOG_TAG, this.imageTelemetry.dumpStats())
     // 滚动期间被推迟的视觉状态刷新（缩略图旋转修正等）在这里统一补一次
     if (this.imageVisualNotifyDeferred) {
       this.imageVisualNotifyDeferred = false
@@ -14203,7 +14273,11 @@ struct Index {
         next.rotationResolved = true
         next.thumbnailOrientation = orientation
       }, false)
-      this.scheduleImageVisualNotify()
+      if (USE_GLOBAL_BITMAP_EPOCH) {
+        this.scheduleImageVisualNotify()
+      } else {
+        this.notifyEntryChanged(entry.path, 'grid')
+      }
     }
     const thumbnail = this.fileThumbnailBitmaps[entry.path]
     if (thumbnail !== undefined && thumbnail.userRotation !== rotation) {
@@ -14240,7 +14314,11 @@ struct Index {
     this.updateImageVisualState(path, (state: ImageVisualState): void => {
       state.thumbnailOrientation = orientation
     }, false)
-    this.scheduleImageVisualNotify()
+    if (USE_GLOBAL_BITMAP_EPOCH) {
+      this.scheduleImageVisualNotify()
+    } else {
+      this.notifyEntryChanged(path, 'grid')
+    }
   }
 
   private persistPreviewOrientation(entry: FileEntry,
@@ -14515,6 +14593,7 @@ struct Index {
       if (!this.showImageViewer) {
         return
       }
+      this.viewerPrefetchCoordinator?.onViewerOpened(initialIndex, this.viewerImages)
       this.prefetchViewerImages(initialIndex)
       this.statusText = ''
     } catch (error) {
@@ -14814,6 +14893,23 @@ struct Index {
     // 2. 将关闭位图移入待释放队列，在交互静默期单张分片释放
     this.enqueuePendingViewerCleanup(closingImages, closingPreviewBitmaps, closingOriginalBitmaps, closingPreviewAliases)
     this.requestViewerCleanup()
+    let originalLiveBytes = 0
+    for (const key of Object.keys(closingOriginalBitmaps)) {
+      const rec = closingOriginalBitmaps[key]
+      if (rec && rec.pixelMap) {
+        try {
+          originalLiveBytes += rec.pixelMap.getPixelBytesNumber()
+        } catch (_) {
+          originalLiveBytes += (rec.physicalWidth || 1080) * (rec.physicalHeight || 1920) * 4
+        }
+      }
+    }
+    this.returnPerfSession.noteViewerClosed(
+      this.getMonotonicNow(),
+      originalLiveBytes,
+      this.pendingViewerCleanupEstimatedBytes,
+      this.pendingViewerCleanupQueue.length
+    )
     this.postRenderFrame((): void => {
       if (returnedEntry !== null) {
         setTimeout((): void => {
@@ -14846,6 +14942,7 @@ struct Index {
     if (this.viewerClosePending || !this.showImageViewer || this.viewerImageEntry === null) {
       return
     }
+    this.viewerPrefetchCoordinator?.onViewerClosed()
     const shouldRestoreSearch = this.searchSession !== null && this.searchSession.returnMode === 'image'
     const returningEntry = this.viewerImageEntry as FileEntry
     const keepFileSurfacePosition = this.screen === 'files' &&
@@ -14984,6 +15081,7 @@ struct Index {
     const points = event.touches.length > 0 ? event.touches : event.changedTouches
     const point = points.length > 0 ? points[0] : null
     if (event.type === TouchType.Down) {
+      this.viewerPrefetchCoordinator?.onUserInteraction()
       this.imageTouchActive = true
       this.imageTouchMoved = false
       if (point !== null) {
@@ -15026,6 +15124,7 @@ struct Index {
       // 只清定时器：若已经判定为"长按识别"，保持 imageAnalyzerActive 直到下一次
       // 在图片上按下（那时会重新判断），因为文字层此刻仍然浮着。
       this.cancelImageLongPressWatch()
+      this.viewerPrefetchCoordinator?.onInteractionEnded()
     }
   }
 
@@ -15152,6 +15251,7 @@ struct Index {
           this.setImageChromeVisible(true, false)
         }
         this.flushDeferredViewerVisualCommits()
+        this.viewerPrefetchCoordinator?.onInteractionEnded()
       }
     }, () => {
       // The horizontal offset MUST be cleared inside this same closure. It has
@@ -15286,6 +15386,7 @@ struct Index {
     this.imageSavedOffsetX = 0
     this.imageSavedOffsetY = 0
     this.resetImageDismissTransform()
+    this.viewerPrefetchCoordinator?.onInteractionEnded()
   }
 
   private imageEntriesInCurrentDirectory(): FileEntry[] {
@@ -15349,6 +15450,7 @@ struct Index {
     this.viewerHeaderTitle = this.viewerImages[index].name
     this.ensureViewerImageFrame(this.viewerImages[index])
     this.resetImageTransform()
+    this.viewerPrefetchCoordinator?.onViewerIndexChanged(index, this.viewerImages)
     this.prefetchViewerImages(index)
     this.primeViewerFrameWindow(this.viewerImages, index, 2).catch((error: Error): void => {
       console.warn('[UgreenViewer] prepare frame window failed: ' + JSON.stringify(error))
@@ -15385,6 +15487,7 @@ struct Index {
       this.loadViewerCachedOnly(entry, this.viewerGeneration)
     }
     if (this.viewerOriginalUri(entry).length > 0 && this.viewerImageDecoded(entry)) {
+      this.viewerPrefetchCoordinator?.onCurrentOriginalRevealed(entry.path)
       this.startAdjacentViewerPrefetch(index, this.viewerGeneration)
     }
   }
@@ -16002,6 +16105,7 @@ struct Index {
     this.viewerPendingBitmapReveals[path] = false
     this.logViewerDiagnostic('original-pixelmap-displayed', path)
     if (path === this.viewerPrimaryPath) {
+      this.viewerPrefetchCoordinator?.onCurrentOriginalRevealed(path)
       const primaryIndex = this.viewerImages.findIndex((item: FileEntry): boolean => item.path === path)
       if (primaryIndex >= 0) {
         this.startAdjacentViewerPrefetch(primaryIndex, this.viewerGeneration)
@@ -20093,6 +20197,10 @@ struct Index {
       this.fileViewMode = 'list'
       this.waterfallAnchor = null
     }
+    if (!appendWaterfall) {
+      this.imageTelemetry.reset()
+      this.returnPerfSession.resetAll()
+    }
     this.fileEntryDataSource.replace(this.entries)
     this.syncWaterfallEntries(this.entries, appendWaterfall)
     this.rebuildTimelineIndexes()
@@ -20567,22 +20675,28 @@ struct Index {
       return
     }
     const generation = this.previewGeneration
+    const pathToken = this.acquirePathGeneration(entry.path)
     this.previewRequests[entry.path] = true
     // A running task from an old directory generation must not reject a new
     // task for the same path after the user returns to that directory.
     const queueKey = entry.path + '#preview:' + generation.toString()
     const accepted = this.previewQueue.enqueue(queueKey, priority, async (): Promise<void> => {
-      await this.loadEntryPreviewNow(entry, generation)
+      await this.loadEntryPreviewNow(entry, generation, pathToken)
     })
     if (!accepted) {
       this.previewRequests[entry.path] = false
     }
   }
 
-  private async loadEntryPreviewNow(entry: FileEntry, generation: number): Promise<void> {
+  private async loadEntryPreviewNow(entry: FileEntry, generation: number, pathToken: number): Promise<void> {
     try {
       await this.ensureCacheState()
-      if (generation !== this.previewGeneration) {
+      if (generation !== this.previewGeneration || !this.isPathGenerationValid(entry.path, pathToken)) {
+        this.imageTelemetry.recordStaleCompletion(entry.path, 'generationMismatch')
+        return
+      }
+      if (this.fileEntryDataSource.indexOfPath(entry.path) < 0) {
+        this.imageTelemetry.recordStaleCompletion(entry.path, 'entryNotFound')
         return
       }
 
@@ -20593,12 +20707,20 @@ struct Index {
         const canonicalPath = this.mediaPreviewManager.cachedImagePreview(entry,
           this.thumbnailDirectory)
         if (canonicalPath.length > 0) {
+          if (!this.isPathGenerationValid(entry.path, pathToken)) {
+            this.imageTelemetry.recordStaleCompletion(entry.path, 'pathTokenSuperseded')
+            return
+          }
           await this.publishImagePreview(entry, canonicalPath, true, generation)
           return
         }
         const retainedPath = this.previewLocalPaths[entry.path]
         if (typeof retainedPath === 'string' && retainedPath.length > 0 &&
           CacheManager.exists(retainedPath)) {
+          if (!this.isPathGenerationValid(entry.path, pathToken)) {
+            this.imageTelemetry.recordStaleCompletion(entry.path, 'pathTokenSuperseded')
+            return
+          }
           await this.publishImagePreview(entry, retainedPath,
             this.previewCanonicalPaths[entry.path] === true, generation)
           return
@@ -20617,11 +20739,16 @@ struct Index {
         console.warn('[UgreenPreview] server thumbnail failed: ' + entry.path + ': ' +
           JSON.stringify(error))
       }
-      if (generation !== this.previewGeneration) {
+      if (generation !== this.previewGeneration || !this.isPathGenerationValid(entry.path, pathToken)) {
+        this.imageTelemetry.recordStaleCompletion(entry.path, 'generationMismatch')
+        return
+      }
+      if (this.fileEntryDataSource.indexOfPath(entry.path) < 0) {
+        this.imageTelemetry.recordStaleCompletion(entry.path, 'entryNotFound')
         return
       }
       if (thumbnailPath.length > 0) {
-          await this.publishThumbnailPreview(entry, thumbnailPath, false, generation)
+        await this.publishThumbnailPreview(entry, thumbnailPath, false, generation)
         return
       }
 
@@ -20631,7 +20758,7 @@ struct Index {
       // failures and for a later retry triggered by a new appearance.
       console.warn('[UgreenPreview] load failed: ' + entry.path + ': ' + JSON.stringify(error))
     } finally {
-      if (generation === this.previewGeneration) {
+      if (generation === this.previewGeneration && this.isPathGenerationValid(entry.path, pathToken)) {
         this.previewRequests[entry.path] = false
       }
     }
