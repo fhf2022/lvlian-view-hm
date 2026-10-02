@@ -1,9 +1,17 @@
+import { hilog } from '@kit.PerformanceAnalysisKit'
 import { FileEntry } from './FileEntry'
 
 /** IDataSource adapter used by List, Grid and other lazy containers. */
 export class FileEntryDataSource implements IDataSource {
   private items: FileEntry[] = []
   private listeners: DataChangeListener[] = []
+  onItemRequested: ((index: number, entry: FileEntry) => void) | null = null
+  /**
+   * R2 原型：@Observed + @ObjectLink 依赖「同一个实例被就地修改」来通知子组件。
+   * 一旦 clone 出新实例，已挂载 cell 手里的旧实例就永远收不到通知，
+   * 所以 R2 模式下必须就地自增 previewRevision，不能换实例。
+   */
+  bumpInPlace: boolean = false
 
   constructor(items: FileEntry[] = []) {
     this.items = items.slice()
@@ -14,7 +22,12 @@ export class FileEntryDataSource implements IDataSource {
   }
 
   getData(index: number): FileEntry {
-    return this.items[index]
+    const item = this.items[index]
+    if (this.onItemRequested !== null) {
+      this.onItemRequested(index, item)
+    }
+    hilog.info(0xD003, 'ThumbProbe', `[4-getData] index=${index}, path=${item ? item.path : ''}, rev=${item ? item.previewRevision : 0}`)
+    return item
   }
 
   registerDataChangeListener(listener: DataChangeListener): void {
@@ -31,11 +44,29 @@ export class FileEntryDataSource implements IDataSource {
   }
 
   /**
-   * 实验 H0：精准通知单个索引的数据变化，由 LazyForEach 局部重建对应 Item。
+   * 实验 H0 / 单 Cell 刷新：
+   * 更新指定索引的数据对象与 previewRevision，并通知 LazyForEach 局部重建/更新对应 Item。
    */
   notifyItemChanged(index: number): void {
     if (index >= 0 && index < this.items.length) {
+      if (this.bumpInPlace) {
+        // R2 原型路径：就地改同一个实例的版本号。
+        // @ObjectLink 的 cell 会因此局部重算；不产生新实例，不动任何 @State。
+        const item = this.items[index]
+        item.previewRevision = (item.previewRevision || 0) + 1
+        hilog.info(0xD003, 'ThumbProbe', `[3-notifyItemChanged-R2] index=${index}, path=${item.path}, rev=${item.previewRevision}, listeners=${this.listeners.length}`)
+        for (const listener of this.listeners.slice()) {
+          listener.onDataChange(index)
+        }
+        return
+      }
+      const oldItem = this.items[index]
+      const newItem = oldItem.clone()
+      newItem.previewRevision = (oldItem.previewRevision || 0) + 1
+      this.items[index] = newItem
+      hilog.info(0xD003, 'ThumbProbe', `[3-notifyItemChanged] index=${index}, path=${newItem.path}, rev=${newItem.previewRevision}, listeners=${this.listeners.length}`)
       for (const listener of this.listeners.slice()) {
+        hilog.info(0xD003, 'ThumbProbe', `[3b-onDataChange] notifying listener.onDataChange(${index})`)
         listener.onDataChange(index)
       }
     }

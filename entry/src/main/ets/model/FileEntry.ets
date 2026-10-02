@@ -1,3 +1,7 @@
+// R2 原型：让 FileEntry 可被 @ObjectLink 观察。
+// 网格 cell 抽成子组件后，`previewRevision` 的就地自增只通知绑定了该实例的
+// cell 重算，不再经过根组件 Index 的整树 build。
+@Observed
 export class FileEntry {
   name: string = ''
   path: string = ''
@@ -29,6 +33,31 @@ export class FileEntry {
   // Restoring needs it to strip the repository segment and rebuild the
   // original location; it is empty for entries that are not recycled.
   recycleSharePath: string = ''
+  // 缩略图/单项数据更新版本号：使 onDataChange(index) 时数据项具备可观察变化
+  previewRevision: number = 0
+
+  clone(): FileEntry {
+    const entry = new FileEntry()
+    entry.name = this.name
+    entry.path = this.path
+    entry.isDirectory = this.isDirectory
+    entry.size = this.size
+    entry.modifiedTime = this.modifiedTime
+    entry.createdTime = this.createdTime
+    entry.childCount = this.childCount
+    entry.rootType = this.rootType
+    entry.intranetShareId = this.intranetShareId
+    entry.thumbnailUrl = this.thumbnailUrl
+    entry.coverUrl = this.coverUrl
+    entry.mimeType = this.mimeType
+    entry.etag = this.etag
+    entry.checksum = this.checksum
+    entry.deletedTime = this.deletedTime
+    entry.recycleInPath = this.recycleInPath
+    entry.recycleSharePath = this.recycleSharePath
+    entry.previewRevision = this.previewRevision
+    return entry
+  }
 }
 
 export class RootDirectory {
