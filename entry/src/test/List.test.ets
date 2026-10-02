@@ -3,6 +3,7 @@ import thumbnailPolicyTest from './ThumbnailPolicy.test';
 import imageTransformPolicyTest from './ImageTransformPolicy.test';
 import fileSelectionModelTest from './FileSelectionModel.test';
 import dragSelectionScrollPolicyTest from './DragSelectionScrollPolicy.test';
+import contextMenuPreviewLayoutTest from './ContextMenuPreviewLayout.test';
 
 export default function testsuite() {
   localUnitTest();
@@ -10,4 +11,5 @@ export default function testsuite() {
   imageTransformPolicyTest();
   fileSelectionModelTest();
   dragSelectionScrollPolicyTest();
+  contextMenuPreviewLayoutTest();
 }

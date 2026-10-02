@@ -19,6 +19,7 @@ import { systemDateTime } from '@kit.BasicServicesKit'
 import { DownloadTaskRecord, FileEntry } from '../model/FileEntry'
 import { FileSelectionModel, FileSelectionState } from '../model/FileSelectionModel'
 import { DragSelectionScrollPolicy } from '../model/DragSelectionScrollPolicy'
+import { ContextMenuPreviewLayout, ContextPreviewRect } from '../model/ContextMenuPreviewLayout'
 import { CacheManager } from '../download/CacheManager'
 import { DownloadQueueManager } from '../download/DownloadQueueManager'
 import { UserFileManager } from '../download/UserFileManager'
@@ -855,7 +856,8 @@ struct Index {
   @State downloadSpeedBytesPerSecond: number = 0
   @State contextMenuVisible: boolean = false
   @State contextMenuEntry: FileEntry | null = null
-  @State contextMenuSourceY: number = 0
+  @State contextMenuLayout: ContextMenuPreviewLayout = new ContextMenuPreviewLayout()
+  @State contextMenuPreviewSurface: string = 'list'
   // Which surface supplied the entry the menu is showing. The long-press menu
   // shell (anchor, preview, lifecycle) is shared with the file manager; only
   // the row list inside it differs, so this decides which rows are rendered.
@@ -930,9 +932,10 @@ struct Index {
   @State viewerHeaderTitle: string = ''
   @State viewerImages: FileEntry[] = []
   @State viewerImageIndex: number = 0
-  // More/details keep an explicit snapshot of the committed image. The
-  // overlay must never silently switch to another file underneath the user.
+  // More/details keep their own snapshot of the committed image. Closing the
+  // popup must not clear the sheet content before its dismissal completes.
   @State viewerOverlayEntry: FileEntry | null = null
+  @State imageDetailsEntry: FileEntry | null = null
   @State showImageMoreMenu: boolean = false
   @State showImageDetails: boolean = false
   @State viewerLastNavigationDirection: number = 1
@@ -1246,6 +1249,17 @@ struct Index {
    * the surface's own edge. The anchor offset below tracks this value.
    */
   private actionMenuSafeMargin: number = 0
+  private mainContentOriginX: number = 0
+  private mainContentOriginY: number = 0
+  private contextMenuOpenToken: number = 0
+  private contextMenuOpening: boolean = false
+  private contextMenuPreviewSource: image.PixelMap | string = ''
+  private contextMenuPreviewOrientation: ImageRotateOrientation = ImageRotateOrientation.UP
+  private contextMenuPreviewBitmap: ViewerBitmapRecord | null = null
+  private contextMenuScrollMoved: boolean = false
+  private contextMenuTouchX: number = 0
+  private contextMenuTouchY: number = 0
+  private contextMenuScrollRect: BottomBarTouchRect = new BottomBarTouchRect()
   private fileEntryDataSource: FileEntryDataSource = new FileEntryDataSource()
   private waterfallDataSource: FileEntryDataSource = new FileEntryDataSource()
   private viewerImageDataSource: FileEntryDataSource = new FileEntryDataSource()
@@ -1599,6 +1613,8 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    this.closeActionMenu()
+    this.finishActionMenuDismiss()
     this.endDragSelection()
     this.viewerReturnOverlayToken += 1
     if (this.viewerReturnOverlayMountResolve !== null) {
@@ -2872,6 +2888,15 @@ struct Index {
       // Viewer Input Ownership: main-file-content 恒定为 Default，不再依赖动态 BLOCK_DESCENDANTS。
       .hitTestBehavior(HitTestMode.Default)
       .onAreaChange((_, area) => {
+        if (this.contextMenuEntry !== null &&
+          ((typeof area.width === 'number' && area.width > 0 && area.width !== this.pageWidthVp) ||
+            (typeof area.height === 'number' && area.height > 0 && area.height !== this.pageHeightVp))) {
+          this.closeActionMenu()
+        }
+        if (typeof area.globalPosition.x === 'number' && typeof area.globalPosition.y === 'number') {
+          this.mainContentOriginX = area.globalPosition.x
+          this.mainContentOriginY = area.globalPosition.y
+        }
         if (typeof area.width === 'number' && area.width > 0) {
           this.pageWidthVp = area.width
         }
@@ -4487,6 +4512,7 @@ struct Index {
     .width('100%')
     .layoutWeight(1)
     .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
+    .contentEndOffset(this.floatingBarContentInset())
     .padding({ left: 0, right: 0, top: 0, bottom: 0 })
   }
 
@@ -4725,6 +4751,7 @@ struct Index {
         .rowsGap(1)
         .width('100%')
         .layoutWeight(1)
+        .contentEndOffset(this.floatingBarContentInset())
         .padding({ left: 0, right: 0, top: 0, bottom: 0 })
       } else {
         List({ space: 0, scroller: this.transitionScroller }) {
@@ -6561,17 +6588,19 @@ struct Index {
   @Builder
   ActionContextPreview(entry: FileEntry): void {
     Navigation() {}
+      .id('context-preview-' + this.contextMenuPreviewSurface)
       .mode(NavigationMode.Stack)
       .hideBackButton(true)
       .hideToolBar(true)
-      .title({ builder: this.ActionContextPreviewCard.bind(this, entry), height: 58 }, {
+      .title({ builder: this.ActionContextPreviewCard.bind(this, entry),
+        height: this.contextMenuLayout.height }, {
         barStyle: BarStyle.STACK,
         paddingStart: LengthMetrics.vp(0),
         paddingEnd: LengthMetrics.vp(0),
         backgroundColor: Color.Transparent
       })
-      .width(Math.min(324, this.effectivePageWidth() - 52))
-      .height(58)
+      .width(this.contextMenuLayout.width)
+      .height(this.contextMenuLayout.height)
       .backgroundColor(Color.Transparent)
       .clip(false)
   }
@@ -6579,18 +6608,20 @@ struct Index {
   @Builder
   ActionMenuOverlay(): void {
     Column() {}
-      .width(Math.min(324, this.effectivePageWidth() - 52))
-      .height(58)
+      .id('context-menu-anchor')
+      .width(this.contextMenuLayout.width)
+      .height(this.contextMenuLayout.height)
       // Offset by the menu's transparent safe margin so the visible surface
       // still lands exactly where it used to.
       .position({
-        x: 26 - this.actionMenuSafeMargin,
-        y: this.contextMenuSourceY - this.actionMenuSafeMargin
+        x: this.contextMenuLayout.x - this.actionMenuSafeMargin,
+        y: this.contextMenuLayout.y - this.actionMenuSafeMargin
       })
       .hitTestBehavior(HitTestMode.None)
       .bindContextMenu(this.contextMenuVisible, this.NativeActionMenuContent, {
         preview: this.NativeActionMenuPreview,
-        previewAnimationOptions: { scale: [1, 1] },
+        previewAnimationOptions: { scale: [1, this.contextMenuLayout.scale] },
+        previewBorderRadius: this.contextMenuPreviewSurface === 'list' ? 20 : 14,
         placement: Placement.BottomLeft,
         borderRadius: 22,
         transition: this.actionMenuSurfaceTransition(),
@@ -6635,6 +6666,9 @@ struct Index {
 
   @Builder
   ActionContextPreviewCard(entry: FileEntry): void {
+    if (this.contextMenuPreviewSurface !== 'list') {
+      this.ActionContextTilePreview(entry)
+    } else {
     Row() {
       this.FileLeadingVisual(entry)
       Column({ space: 2 }) {
@@ -6663,6 +6697,53 @@ struct Index {
     // Tapping the title card must not dismiss the menu. By default the native
     // menu treats a tap anywhere inside as "close"; blocking here keeps the
     // card - and the menu - alive until a real action is actually picked.
+    .hitTestBehavior(HitTestMode.Block)
+    }
+  }
+
+  @Builder
+  ActionContextTilePreview(entry: FileEntry): void {
+    Stack({ alignContent: Alignment.Center }) {
+      if (typeof this.contextMenuPreviewSource !== 'string' || this.contextMenuPreviewSource.length > 0) {
+        Image(this.contextMenuPreviewSource)
+          .width('100%')
+          .height('100%')
+          .orientation(this.contextMenuPreviewOrientation)
+          .objectFit(this.contextMenuPreviewSurface === 'waterfall' ? ImageFit.Contain : ImageFit.Cover)
+        if (this.isVideo(entry)) {
+          SymbolGlyph($r('sys.symbol.play'))
+            .fontSize(24)
+            .fontColor([Color.White])
+        }
+      } else {
+        Column({ space: 6 }) {
+          if (entry.isDirectory) {
+            this.FolderIcon(40)
+          } else {
+            Image(this.fileIcon(entry))
+              .width(40)
+              .height(40)
+              .objectFit(ImageFit.Contain)
+          }
+          Text(entry.name)
+            .fontSize(11)
+            .fontColor($r('app.color.text_primary'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+            .textAlign(TextAlign.Center)
+        }
+        .width('100%')
+        .padding(6)
+      }
+    }
+    .width('100%')
+    .height(this.contextMenuLayout.height)
+    .borderRadius(14)
+    .clip(true)
+    .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, false))
+    // This image has no visibility/geometry callbacks or shared-element ID:
+    // it cannot overwrite the real thumbnail's telemetry or return target.
     .hitTestBehavior(HitTestMode.Block)
   }
 
@@ -6696,6 +6777,34 @@ struct Index {
     }
   }
 
+  @Builder
+  ScrollableActionMenuSurface(entry: FileEntry): void {
+    Scroll() {
+      this.ActionMenuSurfaceFor(entry)
+    }
+    .id('context-menu-actions')
+    .width('100%')
+    .height(this.actionMenuHeight(entry))
+    .enableScrollInteraction(this.actionMenuNaturalHeight(entry) > this.actionMenuHeight(entry) + 1)
+    .scrollBar(BarState.Off)
+    .edgeEffect(EdgeEffect.None)
+    .borderRadius(22)
+    .clip(true)
+    .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, false, '', false))
+    .onAreaChange((_, area) => {
+      if (typeof area.globalPosition.x === 'number' && typeof area.globalPosition.y === 'number') {
+        this.contextMenuScrollRect.x = area.globalPosition.x
+        this.contextMenuScrollRect.y = area.globalPosition.y
+        this.contextMenuScrollRect.width = area.width as number
+        this.contextMenuScrollRect.height = area.height as number
+      }
+    })
+    .onScrollStart((): void => {
+      this.contextMenuScrollMoved = true
+      this.slidePressKey = ''
+    })
+  }
+
   /**
    * The only two things you can do with something that is already deleted.
    * Restore leads and is not destructive; permanent deletion follows in the
@@ -6715,10 +6824,7 @@ struct Index {
         () => { this.runContextAction(() => { this.purgeRecycleEntry(entry) }) }, true, true)
     }
     .width('100%')
-    .height('100%')
-    .borderRadius(22)
-    .clip(true)
-    .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, false, '', false))
+    .height(this.actionMenuNaturalHeight(entry))
   }
 
   @Builder
@@ -6728,7 +6834,7 @@ struct Index {
       .hideBackButton(true)
       .hideToolBar(true)
       .title({
-        builder: this.ActionMenuSurfaceFor.bind(this, entry),
+        builder: this.ScrollableActionMenuSurface.bind(this, entry),
         height: this.actionMenuHeight(entry)
       }, {
         barStyle: BarStyle.STACK,
@@ -6753,10 +6859,10 @@ struct Index {
       // remaining edge is this surface's own material rim - which is what the
       // preview card has too, and the menu now lines up flush with that card.
       .margin({ left: -4, top: -4, right: -4, bottom: -4 })
-      // Claim drags inside the menu. The native context menu dismisses on any
-      // touch it receives that no child consumed, so sliding on the panel used to
-      // read as an outside tap and closed the menu.
-      .gesture(
+      // Consume empty-area drags without competing with the child Scroll.
+      // A normal Pan here prevents a clipped menu from scrolling and sends
+      // its Up event into the slide-to-another-action path instead.
+      .parallelGesture(
         PanGesture({ direction: PanDirection.All, distance: 4 })
           .onActionStart((event: GestureEvent) => {})
           .onActionUpdate((event: GestureEvent) => {})
@@ -6828,18 +6934,7 @@ struct Index {
           () => this.deleteEntry(entry), true, true)
     }
     .width('100%')
-    .height('100%')
-    .borderRadius(22)
-    .clip(true)
-    // Same material as the preview card above, inside a supported scope, so the
-    // material's own press point-light fires here.
-    //
-    // Shadow off, unlike every other material in the app: this surface now fills
-    // its panel exactly (see ActionContextMenu), so a shadow would spill outside
-    // the panel and be hard-cut at its edge, tracing the very outline we just
-    // removed. Measured on device, the material's own rim highlight is unaffected
-    // by this flag, so the menu keeps its glass edge.
-    .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, false, '', false))
+    .height(this.actionMenuNaturalHeight(entry))
   }
 
   @Builder
@@ -9992,17 +10087,6 @@ struct Index {
         this.ImageViewerMoreRow($r('sys.symbol.folder'), '定位到所在目录',
           () => this.triggerLocateFromViewer(), true)
       }
-      this.ImageViewerMoreRow($r('sys.symbol.list_bullet_square'), '测试定位梯度(100/1000/2500/4800)',
-        () => {
-          this.showImageMoreMenu = false
-          this.runLocateGradientExperiment([100, 1000, 2500, 4800])
-        }, true)
-      // 🔬 临时探针入口（Q3 清理时删除）
-      this.ImageViewerMoreRow($r('sys.symbol.magnifyingglass'), '测试图片 metadata Range',
-        () => {
-          this.showImageMoreMenu = false
-          this.runImageMetadataRangeProbe()
-        }, true)
       this.ImageViewerMoreRow($r('sys.symbol.rotate_left'), '旋转',
         () => this.rotateViewerOverlayImage(), true)
       this.ImageViewerMoreRow($r('sys.symbol.rectangle_and_arrowshape_turn_up_right'), '其他应用打开',
@@ -10125,13 +10209,18 @@ struct Index {
         dragBar: false,
         showClose: false,
         systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
-        onWillDismiss: () => this.closeImageDetails()
+        // Native dismissal also updates the two-way bound visibility. Keep
+        // FIT_CONTENT stable until the sheet and its modal mask have gone.
+        onDisappear: (): void => {
+          this.showImageDetails = false
+          this.imageDetailsEntry = null
+        }
       })
   }
 
   @Builder
   ImageViewerDetailsContent(): void {
-    if (this.viewerOverlayEntry !== null) {
+    if (this.imageDetailsEntry !== null) {
     Column({ space: 12 }) {
       Row() {
         Text('详情')
@@ -10140,20 +10229,21 @@ struct Index {
           .fontColor($r('app.color.text_primary'))
           .layoutWeight(1)
         Text('×')
+          .id('image-details-close')
           .fontSize(28)
           .fontColor($r('app.color.text_tertiary'))
           .onClick(() => this.closeImageDetails())
       }
       .width('100%')
 
-      this.ImageDetailsLine('文件名', (this.viewerOverlayEntry as FileEntry).name)
-      this.ImageDetailsLine('路径', this.entryDisplayPath(this.viewerOverlayEntry as FileEntry))
-      this.ImageDetailsLine('大小', this.formatSize((this.viewerOverlayEntry as FileEntry).size))
+      this.ImageDetailsLine('文件名', (this.imageDetailsEntry as FileEntry).name)
+      this.ImageDetailsLine('路径', this.entryDisplayPath(this.imageDetailsEntry as FileEntry))
+      this.ImageDetailsLine('大小', this.formatSize((this.imageDetailsEntry as FileEntry).size))
       this.ImageDetailsLine('修改时间',
-        this.formatTime((this.viewerOverlayEntry as FileEntry).modifiedTime))
+        this.formatTime((this.imageDetailsEntry as FileEntry).modifiedTime))
       this.ImageDetailsLine('文件类型',
-        this.fileType(this.viewerOverlayEntry as FileEntry).length > 0
-          ? this.fileType(this.viewerOverlayEntry as FileEntry) : '图片')
+        this.fileType(this.imageDetailsEntry as FileEntry).length > 0
+          ? this.fileType(this.imageDetailsEntry as FileEntry) : '图片')
     }
     .width('100%')
     .padding({ left: 20, right: 20, top: 18, bottom: 20 })
@@ -14977,11 +15067,11 @@ struct Index {
         this.currentPath = previousPath
         this.currentRootType = this.rootKind === 'personal' ? 4 : 3
         this.setCurrentPageState(1, false)
+        this.replaceEntries(incomingEntries)
         if (previousViewState !== null) {
           this.fileViewMode = previousViewState.mode
         }
         this.applyPreferredViewMode()
-        this.replaceEntries(incomingEntries)
         this.updateBottomBarVisibility(true)
       })
       return
@@ -15003,11 +15093,14 @@ struct Index {
         this.currentPath = previousPath
         this.currentRootType = previousRootType
         this.setCurrentPageState(previousPageIndex, previousPageHasMore)
+        // Determine the parent directory type before selecting its view mode.
+        // Using the child's album flag here can remount List/Grid during the
+        // position restore and reset the parent Scroller to the top.
+        this.replaceEntries(previousEntries)
         if (previousViewState !== null) {
           this.fileViewMode = previousViewState.mode
         }
         this.applyPreferredViewMode()
-        this.replaceEntries(previousEntries)
         this.updateBottomBarVisibility(true)
       })
       return
@@ -15027,11 +15120,11 @@ struct Index {
         this.currentPath = previousPath
         this.currentRootType = previousRootType
         this.setCurrentPageState(loadedPage.pageIndex, loadedPage.hasMore)
+        this.replaceEntries(loadedPage.entries)
         if (previousViewState !== null) {
           this.fileViewMode = previousViewState.mode
         }
         this.applyPreferredViewMode()
-        this.replaceEntries(loadedPage.entries)
         this.updateBottomBarVisibility(true)
         this.updateDirectoryCount(previousPath, loadedPage.totalCount >= 0
           ? loadedPage.totalCount : loadedPage.entries.length)
@@ -15103,13 +15196,63 @@ struct Index {
     HapticFeedback.longPress()
 
     this.pendingContextAction = null
-    this.contextMenuSourceY = Math.max(this.topSafeInset(),
-      (event.fingerList.length > 0 ? event.fingerList[0].globalY -
-        this.getUIContext().px2vp(this.statusBarHeightPx) : this.pageHeightVp / 2) - 29)
+    this.contextMenuScrollMoved = false
+    this.slidePressKey = ''
+    this.contextMenuPreviewSurface = inRecycle ? 'list' : this.activeListSurface()
+    const tile = this.contextMenuPreviewSurface !== 'list'
+    const width = this.contextMenuPreviewSurface === 'waterfall'
+      ? Math.max(1, (this.effectivePageWidth() - 20 - (this.waterfallColumnCount() - 1) * 8) /
+        this.waterfallColumnCount())
+      : Math.max(1, (this.effectivePageWidth() - this.fileGridColumnCount() + 1) /
+        this.fileGridColumnCount() - 2)
+    const height = this.contextMenuPreviewSurface === 'waterfall'
+      ? width / this.waterfallAspectRatio(entry) : width
+    const finger = event.fingerList.length > 0 ? event.fingerList[0] : null
+    const fallback: ContextPreviewRect = {
+      x: (finger === null ? this.effectivePageWidth() / 2 : finger.globalX - this.mainContentOriginX) - width / 2,
+      y: (finger === null ? this.pageHeightVp / 2 : finger.globalY - this.mainContentOriginY) -
+        (tile ? height / 2 : 29),
+      width: width,
+      height: height
+    }
+    const directoryKey = this.currentRootType.toString() + ':' + this.currentPath + ':' +
+      this.contextMenuPreviewSurface
+    const area = tile && this.rowHitDirectoryKey === directoryKey
+      ? this.rowHitAreas.get(this.contextMenuPreviewSurface + ':' + entry.path) : undefined
+    const rect: ContextPreviewRect | null = area === undefined ? null : {
+      x: area.x - this.mainContentOriginX,
+      y: area.y - this.mainContentOriginY,
+      width: area.width,
+      height: area.height
+    }
+    this.contextMenuLayout = ContextMenuPreviewLayout.fit(tile, rect, fallback,
+      this.effectivePageWidth(), this.pageHeightVp, this.topSafeInset(), this.bottomSafeInset(),
+      this.actionMenuNaturalHeight(entry))
+    // Freeze exactly one existing source, without downloads or Image Kit
+    // decoding. The lease prevents an LRU eviction/replacement from releasing
+    // a WaterFlow raster while its native preview is still animating out.
+    const bitmap = this.contextMenuPreviewSurface === 'waterfall' ? this.waterfallBitmaps[entry.path] : undefined
+    this.contextMenuPreviewBitmap = bitmap === undefined ? null : bitmap
+    if (bitmap !== undefined) {
+      this.viewerBitmapStore.retainPreview(bitmap)
+      this.contextMenuPreviewSource = bitmap.pixelMap
+      this.contextMenuPreviewOrientation = ImageRotateOrientation.UP
+    } else {
+      this.contextMenuPreviewSource = tile ? this.previewUri(entry) : ''
+      this.contextMenuPreviewOrientation = this.fileListImageBaseOrientation(entry)
+    }
     this.contextMenuEntry = entry
-    // The anchor follows the long-press position. ArkUI moves the preview only
-    // as far as necessary to fit the preview and the measured action menu.
-    this.contextMenuVisible = true
+    this.contextMenuOpening = true
+    const token = ++this.contextMenuOpenToken
+    // Submit the new anchor geometry before presenting the native subwindow.
+    // Otherwise a second long press can animate from the previous item's rect.
+    this.postRenderFrame((): void => {
+      if (token !== this.contextMenuOpenToken || this.contextMenuEntry === null) {
+        return
+      }
+      this.contextMenuOpening = false
+      this.contextMenuVisible = true
+    })
   }
 
   private actionMenuSurfaceTransition(): TransitionEffect {
@@ -15124,6 +15267,9 @@ struct Index {
   }
 
   private runContextAction(action: () => void): void {
+    if (this.contextMenuScrollMoved) {
+      return
+    }
     // Run the chosen action in the SAME tick as the dismiss request, rather
     // than waiting for onDidDisappear.
     //
@@ -15143,6 +15289,11 @@ struct Index {
   }
 
   private dismissActionMenu(): void {
+    this.contextMenuOpenToken += 1
+    if (this.contextMenuOpening) {
+      this.finishActionMenuDismiss()
+      return
+    }
     this.contextMenuVisible = false
   }
 
@@ -15156,8 +15307,22 @@ struct Index {
     // The action itself already ran in runContextAction, which is why nothing
     // is dispatched from here.
     this.contextMenuVisible = false
+    this.contextMenuOpenToken += 1
+    this.contextMenuOpening = false
+    const bitmap = this.contextMenuPreviewBitmap
+    this.contextMenuPreviewBitmap = null
+    this.contextMenuPreviewSource = ''
     this.contextMenuEntry = null
     this.pendingContextAction = null
+    this.contextMenuScrollMoved = false
+    this.slideItems.forEach((_, key: string): void => {
+      if (key.startsWith('ctxmenu:')) {
+        this.slideItems.delete(key)
+      }
+    })
+    if (bitmap !== null) {
+      this.viewerBitmapStore.releasePreview(bitmap).catch((): void => {})
+    }
   }
 
   private closeActionMenu(): void {
@@ -15166,14 +15331,17 @@ struct Index {
   }
 
   private actionMenuHeight(entry: FileEntry): number {
+    return Math.min(this.actionMenuNaturalHeight(entry), this.contextMenuLayout.menuHeight)
+  }
+
+  private actionMenuNaturalHeight(entry: FileEntry): number {
     if (this.contextMenuContext === 'recycle') {
       // Two rows, no section gap — the rows are peers, so they sit flush and
       // the panel is exactly as tall as they are. Nothing here depends on the
       // entry: restore and permanent deletion apply to folders and files
       // alike, and a recycled entry has no quick actions, no open-with and no
       // cache state.
-      return Math.min(540, 2 * 51,
-        Math.max(120, this.pageHeightVp - this.topSafeInset() - this.bottomSafeInset() - 114))
+      return 2 * 51
     }
     // Match the compact Files menu while retaining enough room for the
     // longest media menu. Scroll takes over if a future action is added.
@@ -15194,8 +15362,7 @@ struct Index {
     height += middleRows * 51
     height += 8 // details/delete section gap
     height += 101
-    return Math.min(540, height,
-      Math.max(120, this.pageHeightVp - this.topSafeInset() - this.bottomSafeInset() - 114))
+    return height
   }
 
   private actionSupportsShare(entry: FileEntry): boolean {
@@ -18188,13 +18355,13 @@ struct Index {
     if (!this.showImageViewer || this.isBusy || this.viewerOverlayEntry === null) {
       return
     }
-    this.showImageMoreMenu = false
+    this.imageDetailsEntry = this.viewerOverlayEntry
+    this.closeImageMoreMenu()
     this.showImageDetails = true
   }
 
   private closeImageDetails(): void {
     this.showImageDetails = false
-    this.viewerOverlayEntry = null
   }
 
   private async shareViewerImage(entry: FileEntry): Promise<void> {
@@ -20800,6 +20967,11 @@ struct Index {
   }
 
   private hitSlideItem(barId: string, x: number, y: number): string {
+    if (barId === 'ctxmenu' && (x < this.contextMenuScrollRect.x ||
+      x > this.contextMenuScrollRect.x + this.contextMenuScrollRect.width ||
+      y < this.contextMenuScrollRect.y || y > this.contextMenuScrollRect.y + this.contextMenuScrollRect.height)) {
+      return ''
+    }
     let found = ''
     const prefix = barId + ':'
     this.slideItems.forEach((item: SlideActionItem, key: string): void => {
@@ -20826,14 +20998,28 @@ struct Index {
     const pointY = self.y + touches[0].y
     const hit = this.hitSlideItem(barId, pointX, pointY)
     if (event.type === TouchType.Down) {
+      if (barId === 'ctxmenu') {
+        this.contextMenuScrollMoved = false
+        this.contextMenuTouchX = pointX
+        this.contextMenuTouchY = pointY
+      }
       this.slidePressKey = hit
       return
+    }
+    if (barId === 'ctxmenu' && this.contextMenuEntry !== null &&
+      this.actionMenuNaturalHeight(this.contextMenuEntry) > this.actionMenuHeight(this.contextMenuEntry) + 1 &&
+      (Math.abs(pointX - this.contextMenuTouchX) > 8 || Math.abs(pointY - this.contextMenuTouchY) > 8)) {
+      this.contextMenuScrollMoved = true
+      this.slidePressKey = ''
     }
     if (event.type !== TouchType.Up) {
       return
     }
     const pressed = this.slidePressKey
     this.slidePressKey = ''
+    if (barId === 'ctxmenu' && this.contextMenuScrollMoved) {
+      return
+    }
     if (hit.length === 0 || hit === pressed || hit === selfKey) {
       return
     }

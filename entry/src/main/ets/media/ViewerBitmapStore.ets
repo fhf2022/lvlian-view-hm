@@ -55,6 +55,33 @@ interface ExifTransform {
  * formats that do not support a DMA-backed decode.
  */
 export class ViewerBitmapStore {
+  // A native menu can outlive the WaterFlow cache entry that supplied its
+  // already-decoded preview. Lease that one raster until dismissal completes.
+  private previewLeases: Map<image.PixelMap, number> = new Map<image.PixelMap, number>()
+  private deferredPreviewReleases: Map<image.PixelMap, ViewerBitmapRecord> =
+    new Map<image.PixelMap, ViewerBitmapRecord>()
+
+  retainPreview(record: ViewerBitmapRecord): void {
+    this.previewLeases.set(record.pixelMap, (this.previewLeases.get(record.pixelMap) || 0) + 1)
+  }
+
+  async releasePreview(record: ViewerBitmapRecord): Promise<void> {
+    const count = this.previewLeases.get(record.pixelMap) || 0
+    if (count > 1) {
+      this.previewLeases.set(record.pixelMap, count - 1)
+      return
+    }
+    if (count === 0) {
+      return
+    }
+    this.previewLeases.delete(record.pixelMap)
+    const deferred = this.deferredPreviewReleases.get(record.pixelMap)
+    this.deferredPreviewReleases.delete(record.pixelMap)
+    if (deferred !== undefined) {
+      await this.release(deferred)
+    }
+  }
+
   async readMetadata(path: string, userRotation: number = 0): Promise<ViewerBitmapMetadata | null> {
     let source: image.ImageSource | null = null
     let sourceFd: number = -1
@@ -222,6 +249,10 @@ export class ViewerBitmapStore {
 
   async release(record: ViewerBitmapRecord | null): Promise<void> {
     if (record === null) {
+      return
+    }
+    if (this.previewLeases.has(record.pixelMap)) {
+      this.deferredPreviewReleases.set(record.pixelMap, record)
       return
     }
     try {
