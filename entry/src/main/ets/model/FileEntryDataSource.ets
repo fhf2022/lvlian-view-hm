@@ -1,9 +1,14 @@
 import { hilog } from '@kit.PerformanceAnalysisKit'
 import { FileEntry } from './FileEntry'
 
+// Detailed per-build probes are opt-in; string formatting and hilog otherwise
+// run for every recycled image during a fling.
+export const THUMB_PROBE: boolean = false
+
 /** IDataSource adapter used by List, Grid and other lazy containers. */
 export class FileEntryDataSource implements IDataSource {
   private items: FileEntry[] = []
+  private pathIndexes: Map<string, number> = new Map<string, number>()
   private listeners: DataChangeListener[] = []
   onItemRequested: ((index: number, entry: FileEntry) => void) | null = null
   /**
@@ -15,6 +20,7 @@ export class FileEntryDataSource implements IDataSource {
 
   constructor(items: FileEntry[] = []) {
     this.items = items.slice()
+    this.rebuildPathIndexes()
   }
 
   totalCount(): number {
@@ -26,7 +32,9 @@ export class FileEntryDataSource implements IDataSource {
     if (this.onItemRequested !== null) {
       this.onItemRequested(index, item)
     }
-    hilog.info(0xD003, 'ThumbProbe', `[4-getData] index=${index}, path=${item ? item.path : ''}, rev=${item ? item.previewRevision : 0}`)
+    if (THUMB_PROBE) {
+      hilog.info(0xD003, 'ThumbProbe', `[4-getData] index=${index}, path=${item ? item.path : ''}, rev=${item ? item.previewRevision : 0}`)
+    }
     return item
   }
 
@@ -54,7 +62,9 @@ export class FileEntryDataSource implements IDataSource {
         // @ObjectLink 的 cell 会因此局部重算；不产生新实例，不动任何 @State。
         const item = this.items[index]
         item.previewRevision = (item.previewRevision || 0) + 1
-        hilog.info(0xD003, 'ThumbProbe', `[3-notifyItemChanged-R2] index=${index}, path=${item.path}, rev=${item.previewRevision}, listeners=${this.listeners.length}`)
+        if (THUMB_PROBE) {
+          hilog.info(0xD003, 'ThumbProbe', `[3-notifyItemChanged-R2] index=${index}, path=${item.path}, rev=${item.previewRevision}, listeners=${this.listeners.length}`)
+        }
         for (const listener of this.listeners.slice()) {
           listener.onDataChange(index)
         }
@@ -64,9 +74,13 @@ export class FileEntryDataSource implements IDataSource {
       const newItem = oldItem.clone()
       newItem.previewRevision = (oldItem.previewRevision || 0) + 1
       this.items[index] = newItem
-      hilog.info(0xD003, 'ThumbProbe', `[3-notifyItemChanged] index=${index}, path=${newItem.path}, rev=${newItem.previewRevision}, listeners=${this.listeners.length}`)
+      if (THUMB_PROBE) {
+        hilog.info(0xD003, 'ThumbProbe', `[3-notifyItemChanged] index=${index}, path=${newItem.path}, rev=${newItem.previewRevision}, listeners=${this.listeners.length}`)
+      }
       for (const listener of this.listeners.slice()) {
-        hilog.info(0xD003, 'ThumbProbe', `[3b-onDataChange] notifying listener.onDataChange(${index})`)
+        if (THUMB_PROBE) {
+          hilog.info(0xD003, 'ThumbProbe', `[3b-onDataChange] notifying listener.onDataChange(${index})`)
+        }
         listener.onDataChange(index)
       }
     }
@@ -76,12 +90,17 @@ export class FileEntryDataSource implements IDataSource {
    * 快速定位 path 对应的当前 index。
    */
   indexOfPath(path: string): number {
+    const index = this.pathIndexes.get(path)
+    return index === undefined ? -1 : index
+  }
+
+  private rebuildPathIndexes(): void {
+    this.pathIndexes.clear()
     for (let index = 0; index < this.items.length; index++) {
-      if (this.items[index].path === path) {
-        return index
+      if (!this.pathIndexes.has(this.items[index].path)) {
+        this.pathIndexes.set(this.items[index].path, index)
       }
     }
-    return -1
   }
 
   replace(items: FileEntry[]): void {
@@ -93,13 +112,19 @@ export class FileEntryDataSource implements IDataSource {
     // notifying those rows would rebuild their Image nodes and briefly expose
     // the previous directory during a page transition.
     if (this.samePathOrder(nextItems)) {
-      this.items = nextItems
       const changedIndexes: number[] = []
       for (let index = 0; index < nextItems.length; index++) {
         if (!this.sameRenderedEntry(previousItems[index], nextItems[index])) {
           changedIndexes.push(index)
         }
+        if (this.bumpInPlace) {
+          // @ObjectLink still owns this exact instance. Replacing it while
+          // skipping a reload strands the mounted cell on the old object.
+          previousItems[index].updateFrom(nextItems[index])
+          nextItems[index] = previousItems[index]
+        }
       }
+      this.items = nextItems
       for (const listener of this.listeners.slice()) {
         for (const index of changedIndexes) {
           listener.onDataChange(index)
@@ -109,6 +134,7 @@ export class FileEntryDataSource implements IDataSource {
     }
 
     this.items = nextItems
+    this.rebuildPathIndexes()
     for (const listener of this.listeners.slice()) {
       listener.onDataReloaded()
     }
@@ -120,6 +146,9 @@ export class FileEntryDataSource implements IDataSource {
     }
     const startIndex = this.items.length
     for (const item of items) {
+      if (!this.pathIndexes.has(item.path)) {
+        this.pathIndexes.set(item.path, this.items.length)
+      }
       this.items.push(item)
     }
     for (let index = 0; index < items.length; index++) {
@@ -137,6 +166,7 @@ export class FileEntryDataSource implements IDataSource {
   insertAt(index: number, item: FileEntry): void {
     const target = Math.max(0, Math.min(index, this.items.length))
     this.items.splice(target, 0, item)
+    this.rebuildPathIndexes()
     for (const listener of this.listeners.slice()) {
       listener.onDataAdd(target)
     }

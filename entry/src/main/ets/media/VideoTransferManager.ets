@@ -6,6 +6,8 @@ import { fileIo } from '@kit.CoreFileKit'
 import { media } from '@kit.MediaKit'
 import { CacheManager } from '../download/CacheManager'
 import { HttpTransport } from '../core/network/HttpTransport'
+import { NasConnection } from '../core/network/NasConnection'
+import { UgreenError, UgreenErrorKind } from '../ugreen/UgreenErrors'
 import { FileEntry, DownloadDescriptor } from '../model/FileEntry'
 import { UgreenRemoteRepository } from '../repository/UgreenRemoteRepository'
 import { ByteRangeStore } from './ByteRangeStore'
@@ -59,6 +61,7 @@ class VideoTransferSession {
   ranges: ByteRangeStore = new ByteRangeStore()
   inFlight: Map<string, Promise<void>> = new Map<string, Promise<void>>()
   paused: boolean = false
+  waitingForNas: boolean = false
   removed: boolean = false
   temporaryOnly: boolean = false
   closed: boolean = false
@@ -310,6 +313,9 @@ export class VideoTransferManager {
       return handle
     }
     const session = await this.getSession(entry, signature)
+    if (session.descriptor.url.length === 0 && this.repository !== null) {
+      session.descriptor = await this.repository.mediaPlayerDescriptor(entry)
+    }
     session.closed = false
     session.downloadRequested = false
     console.info('[UgreenVideo] source ready path=' + entry.path +
@@ -415,7 +421,7 @@ export class VideoTransferManager {
       await this.promoteCachedFile(entry, signature, existing, destinationRoot, relativePath)
       return
     }
-    const session = await this.getSession(entry, signature)
+    const session = await this.getSession(entry, signature, false)
     session.destinationRoot = destinationRoot
     session.relativePath = relativePath
     session.paused = false
@@ -442,8 +448,10 @@ export class VideoTransferManager {
       const state = this.states[record.sourceKey]
       const session = this.sessions.get(record.sourceKey)
       task.status = record.durablePath.length > 0 ? 'completed' :
+        (session !== undefined && session.waitingForNas && !session.paused
+          ? (NasConnection.shared().canRequest() ? 'waiting_wifi' : 'waiting_server') :
         (state !== undefined && state.status === 'failed' ? 'failed' :
-          (session !== undefined && session.downloadPromise !== null && !session.paused ? 'downloading' : 'paused'))
+          (session !== undefined && session.downloadPromise !== null && !session.paused ? 'downloading' : 'paused')))
       task.errorMessage = state === undefined ? '' : state.errorMessage
       tasks.push(task)
     }
@@ -460,6 +468,11 @@ export class VideoTransferManager {
   async toggleTask(id: string): Promise<void> {
     const key = id.substring('video:'.length)
     const session = this.sessions.get(key)
+    if (session !== undefined && session.waitingForNas && !session.paused) {
+      if (!NasConnection.shared().canRequest()) { await NasConnection.shared().retryNow() }
+      this.resumeAwaitingNas(true)
+      return
+    }
     if (session !== undefined && session.downloadPromise !== null) { session.paused = true; this.notify(); return }
     const record = this.store.find(key)
     if (record === null || record.durablePath.length > 0) { return }
@@ -476,6 +489,7 @@ export class VideoTransferManager {
   async removeTask(id: string): Promise<void> {
     const key = id.substring('video:'.length)
     const session = this.sessions.get(key)
+    if (session !== undefined) { session.waitingForNas = false; session.removed = true; session.paused = true }
     if (session !== undefined && session.downloadPromise !== null) {
       session.removed = true
       session.paused = true
@@ -490,6 +504,36 @@ export class VideoTransferManager {
         record.userDownload = false
         this.store.put(record)
       }
+    }
+    this.notify()
+  }
+
+  handleNasUnavailable(): void {
+    for (const session of this.sessions.values()) {
+      if (!session.downloadRequested || session.temporaryOnly || session.paused || session.removed ||
+        session.durablePath.length > 0 || session.downloadPromise === null) { continue }
+      session.waitingForNas = true
+      session.errorMessage = ''
+      const state = this.ensureState(session.sourceKey)
+      state.status = 'partial'
+      state.errorMessage = ''
+      this.persistSession(session)
+    }
+    this.notify()
+  }
+
+  resumeAwaitingNas(allowed: boolean): void {
+    if (!allowed || !NasConnection.shared().canRequest()) { this.notify(); return }
+    for (const session of this.sessions.values()) {
+      if (!session.waitingForNas || session.paused || session.removed || session.temporaryOnly ||
+        session.signature.scopeKey !== this.initializedScopeKey) { continue }
+      if (session.downloadPromise !== null) {
+        const resume = (): void => { this.resumeAwaitingNas(allowed) }
+        session.downloadPromise.then(resume, resume)
+        continue
+      }
+      session.waitingForNas = false
+      this.startDownload(session).catch((): void => {})
     }
     this.notify()
   }
@@ -588,7 +632,8 @@ export class VideoTransferManager {
     await this.store.flush()
   }
 
-  private async getSession(entry: FileEntry, signature: RemoteFileSignature): Promise<VideoTransferSession> {
+  private async getSession(entry: FileEntry, signature: RemoteFileSignature,
+    preparePlayback: boolean = true): Promise<VideoTransferSession> {
     const existing = this.sessions.get(signature.key())
     if (existing !== undefined) {
       return existing
@@ -601,13 +646,15 @@ export class VideoTransferManager {
     // Some NAS versions ship without a transcode worker (9404); in that case
     // the authenticated Range-capable mediaPlayer URL still gives AVPlayer a
     // native progressive HTTP source, so degrade without surfacing an error.
-    let descriptor: DownloadDescriptor
-    try {
-      descriptor = await this.repository.streamDescriptor(entry)
-    } catch (error) {
-      console.warn('[UgreenVideo] HLS preparation unavailable, fallback to mediaPlayer: ' +
-        String(error))
-      descriptor = await this.repository.mediaPlayerDescriptor(entry)
+    let descriptor = new DownloadDescriptor()
+    if (preparePlayback) {
+      try {
+        descriptor = await this.repository.streamDescriptor(entry)
+      } catch (error) {
+        if (error instanceof UgreenError && error.kind === UgreenErrorKind.NAS_UNAVAILABLE) { throw error }
+        console.warn('[UgreenVideo] HLS preparation unavailable, fallback to mediaPlayer: ' + String(error))
+        descriptor = await this.repository.mediaPlayerDescriptor(entry)
+      }
     }
     if (descriptor.size <= 0 && entry.size > 0) {
       descriptor.size = entry.size
@@ -749,10 +796,12 @@ export class VideoTransferManager {
     try {
       await session.downloadPromise
     } catch (error) {
-      session.errorMessage = this.errorMessage(error)
+      session.waitingForNas = !session.temporaryOnly && !session.paused && !session.removed &&
+        error instanceof UgreenError && error.kind === UgreenErrorKind.NAS_UNAVAILABLE
+      session.errorMessage = session.waitingForNas ? '' : this.errorMessage(error)
       const state = this.ensureState(session.sourceKey)
-      state.status = session.paused ? 'partial' : 'failed'
-      state.errorMessage = session.paused ? '' : session.errorMessage
+      state.status = session.paused || session.waitingForNas ? 'partial' : 'failed'
+      state.errorMessage = session.paused || session.waitingForNas ? '' : session.errorMessage
       this.persistSession(session)
       this.notify()
       throw error as Error
@@ -770,6 +819,7 @@ export class VideoTransferManager {
   }
 
   private async useDownloadDescriptor(session: VideoTransferSession): Promise<void> {
+    if (session.totalBytes > 0 && session.ranges.complete(session.totalBytes)) { return }
     if (this.repository === null) {
       throw new Error('远端服务尚未初始化')
     }
@@ -868,6 +918,9 @@ export class VideoTransferManager {
         if (session.totalBytes > 0 && session.ranges.complete(session.totalBytes)) {
           break
         }
+        if (!NasConnection.shared().canRequest()) {
+          throw new UgreenError(UgreenErrorKind.NAS_UNAVAILABLE, '等待 NAS 连接')
+        }
         const targetEnd = session.totalBytes > 0
           ? session.totalBytes : cursor + VideoTransferManager.CHUNK_BYTES
         const missing = session.ranges.nextMissing(cursor, targetEnd)
@@ -904,7 +957,8 @@ export class VideoTransferManager {
     } catch (error) {
       session.errorMessage = this.errorMessage(error)
       const state = this.ensureState(session.sourceKey)
-      state.status = 'failed'
+      state.status = session.paused || (!session.temporaryOnly && error instanceof UgreenError &&
+        error.kind === UgreenErrorKind.NAS_UNAVAILABLE) ? 'partial' : 'failed'
       state.errorMessage = session.errorMessage
       state.receivedBytes = session.ranges.coveredBytes()
       state.totalBytes = session.totalBytes

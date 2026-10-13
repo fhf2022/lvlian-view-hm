@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const ts = require(process.argv[2] || 'typescript');
 const files = new Map(); const data = new Map(); let failCopy = false;
+let foreground=true;
 const put = (p, size, time=1) => files.set(p,{size,mtime:time});
 const io = {
  statSync(p) { if(files.has(p)) return {...files.get(p),isFile:()=>true,isDirectory:()=>false};
@@ -16,6 +17,7 @@ const io = {
 const prefs={async get(k,d){return data.has(k)?data.get(k):d},async put(k,v){data.set(k,v)},async delete(k){data.delete(k)},async flush(){},async getAll(){return Object.fromEntries(data)}};
 const mocks={'@kit.AbilityKit':{},'@kit.CoreFileKit':{fileIo:io,fileUri:{FileUri:class{constructor(uri){this.path=uri}}},picker:{DocumentSaveOptions:class{},DocumentPickerMode:{DOWNLOAD:1},DocumentViewPicker:class{async save(o){assert.equal(o.pickerMode,1);return ['/Download/com.example.ugreenlink']}}}},'@kit.ArkData':{preferences:{async getPreferences(){return prefs}}},'../ugreen/UgreenErrors':{UgreenError:class extends Error{constructor(k,m){super(m)}},UgreenErrorKind:{UNKNOWN:0}}};
 function load(name) {const exports={};const source=fs.readFileSync('entry/src/main/ets/download/'+name+'.ets','utf8');const js=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText;vm.runInNewContext(js,{exports,require:k=>{assert.ok(mocks[k],k);return mocks[k]},console});return exports;}
+mocks['../transfer/TransferBackgroundManager']={TransferBackgroundManager:{shared:()=>({isForeground:()=>foreground})}};
 const {StorageBudget:B}=load('StorageBudget');mocks['./StorageBudget']={StorageBudget:B};
 const context={cacheDir:'/cache',tempDir:'/temp',filesDir:'/files',databaseDir:'/db',preferencesDir:'/prefs'};
 (async()=>{
@@ -36,5 +38,11 @@ const context={cacheDir:'/cache',tempDir:'/temp',filesDir:'/files',databaseDir:'
  const recovered=await Restarted.save('/cache/interrupted.part','interrupted.jpg');
  assert.equal(files.get(recovered).size,9);assert.ok(!files.has('/Download/com.example.ugreenlink/interrupted (1).jpg'));
  assert.ok(files.has(dest));
+ foreground=false;
+ assert.equal(await D.directory(),'/Download/com.example.ugreenlink');
+ const {DownloadDestination:Ungrant}=load('DownloadDestination');Ungrant.initialize(context);
+ await assert.rejects(Ungrant.directory(),/前台授权/);foreground=true;
+ assert.equal(await Ungrant.directory(),'/Download/com.example.ugreenlink');
+ console.log('PASS: cached public directory grant works in background; a fresh process cannot invoke background picker');
  console.log('PASS: restart recovers interrupted public copy');console.log('PASS: shared quota, LRU, partial eviction, pins, limit rollback, public isolation, copy rollback/retry, deferred cleanup, collision and traversal');
 })().catch(e=>{console.error(e);process.exitCode=1});

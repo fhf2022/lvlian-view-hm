@@ -1,6 +1,6 @@
 import { Context } from '@kit.AbilityKit'
 import { fileIo } from '@kit.CoreFileKit'
-import { CacheManager } from '../download/CacheManager'
+import { CacheManager, CachedFile } from '../download/CacheManager'
 import { JsonObject } from '../core/network/HttpTypes'
 
 interface ThumbnailCacheItem {
@@ -184,12 +184,15 @@ export class ThumbnailCacheStore {
     files.sort((left: ThumbnailPhysicalFile, right: ThumbnailPhysicalFile): number => {
       return left.lastAccessAt - right.lastAccessAt
     })
+    const removedPaths = new Set<string>()
     for (const file of files) {
       if (total <= maxBytes) {
         break
       }
       try {
         fileIo.unlinkSync(file.path)
+        CacheManager.invalidateThumbnailInventory()
+        removedPaths.add(file.path)
         total = Math.max(0, total - file.size)
         this.removeKeysForPath(file.path)
       } catch (_) {
@@ -197,6 +200,11 @@ export class ThumbnailCacheStore {
         // the remaining LRU candidates from being considered.
       }
     }
+    CacheManager.primeThumbnailInventory(this.directory,
+      files.filter((file: ThumbnailPhysicalFile): boolean => !removedPaths.has(file.path))
+        .map((file: ThumbnailPhysicalFile): CachedFile => {
+          return { path: file.path, size: file.size, modifiedTime: file.modifiedTime / 1000 }
+        }))
   }
 
   private listPhysicalFiles(): ThumbnailPhysicalFile[] {
@@ -315,7 +323,10 @@ export class ThumbnailCacheStore {
     }
     for (const path of Object.keys(removedPaths)) {
       if (retainedPaths[path] !== true) {
-        try { fileIo.unlinkSync(path) } catch (_) {}
+        try {
+          fileIo.unlinkSync(path)
+          CacheManager.invalidateThumbnailInventory()
+        } catch (_) {}
       }
     }
   }

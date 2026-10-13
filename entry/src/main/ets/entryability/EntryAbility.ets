@@ -1,6 +1,7 @@
 import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
+import { TransferBackgroundManager } from '../transfer/TransferBackgroundManager';
 
 const DOMAIN = 0x0000;
 
@@ -34,6 +35,7 @@ export default class EntryAbility extends UIAbility {
   private applySystemBars(win: window.Window, colorMode: ConfigurationConstant.ColorMode): void {
     const isDark = colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
     AppStorage.setOrCreate('isDarkTheme', isDark);
+    TransferBackgroundManager.shared().setDarkTheme(isDark);
     win.setWindowSystemBarProperties({
       // 透明系统栏必须和应用背景统一，否则上下会出现明显色带。
       statusBarColor: '#00FFFFFF',
@@ -46,6 +48,8 @@ export default class EntryAbility extends UIAbility {
   }
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    TransferBackgroundManager.shared().initialize(this.context);
+    AppStorage.setOrCreate('transferNavigationRequest', want.parameters?.transferEntry === true ? 1 : 0);
     AppStorage.setOrCreate('abilityInBackground', false);
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
@@ -56,6 +60,7 @@ export default class EntryAbility extends UIAbility {
   }
 
   onDestroy(): void {
+    TransferBackgroundManager.shared().destroy().catch(() => {});
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onDestroy');
   }
 
@@ -83,6 +88,7 @@ export default class EntryAbility extends UIAbility {
         return;
       }
       hilog.info(DOMAIN, 'testTag', 'Succeeded in loading the content.');
+      TransferBackgroundManager.shared().requestNotificationPermission().catch(() => {});
     });
   }
 
@@ -99,14 +105,23 @@ export default class EntryAbility extends UIAbility {
   }
 
   onForeground(): void {
+    TransferBackgroundManager.shared().setForeground(true);
     // Ability has brought to foreground
     AppStorage.setOrCreate('abilityInBackground', false);
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onForeground');
   }
 
   onBackground(): void {
+    TransferBackgroundManager.shared().setForeground(false);
     // Ability has back to background
     AppStorage.setOrCreate('abilityInBackground', true);
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onBackground');
+  }
+
+  onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    if (want.parameters?.transferEntry === true) {
+      const previous = AppStorage.get<number>('transferNavigationRequest') ?? 0;
+      AppStorage.setOrCreate('transferNavigationRequest', previous + 1);
+    }
   }
 }

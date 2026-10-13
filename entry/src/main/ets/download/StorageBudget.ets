@@ -36,7 +36,7 @@ export class StorageBudget {
   static initialize(context: Context, limit: number): void {
     StorageBudget.roots = [context.cacheDir, context.tempDir,
       context.filesDir + '/ugreen-download-tasks', context.filesDir + '/ugreen-video-transfers',
-      context.filesDir + '/ugreen-upload-tasks']
+      context.filesDir + '/ugreen-upload-tasks', context.filesDir + '/ugreen-album-uploads']
     StorageBudget.thumbnailRoot = context.filesDir + '/ugreen-thumbnail-cache'
     StorageBudget.metadataRoots = [context.databaseDir, context.preferencesDir,
       context.filesDir + '/ugreen-thumbnail-index.json']
@@ -151,6 +151,27 @@ export class StorageBudget {
   }
   static thumbnailAllowance(): number {
     return Math.max(1, StorageBudget.PERSISTENT_LIMIT - StorageBudget.metadataUsage())
+  }
+  /** Admission still accounts for current metadata, without blocking ArkUI on stat/list. */
+  static async thumbnailAllowanceAsync(): Promise<number> {
+    let bytes = 0
+    for (const root of StorageBudget.metadataRoots) {
+      bytes += await StorageBudget.walkSizeAsync(root)
+    }
+    return Math.max(1, StorageBudget.PERSISTENT_LIMIT - bytes)
+  }
+  private static async walkSizeAsync(path: string): Promise<number> {
+    if (path.length === 0) { return 0 }
+    try {
+      const stat = await fileIo.stat(path)
+      if (stat.isFile()) { return stat.size }
+      if (!stat.isDirectory()) { return 0 }
+      let bytes = 0
+      for (const name of await fileIo.listFile(path)) {
+        bytes += await StorageBudget.walkSizeAsync(path + '/' + name)
+      }
+      return bytes
+    } catch (_) { return 0 }
   }
   private static walk(path: string): StorageFile[] {
     if (path.length === 0) { return [] }

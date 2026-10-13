@@ -125,7 +125,7 @@ C:\Users\admin\.ohos\signing\lianwenjian\
 2. **APP ID**：`APP ID → 新建` → 应用名称「联文件」，包名 `cn.fhf.linkfiles`
    → 开放能力**一个都不勾**
 3. **Profile**：`Profile → 添加` → 类型「**发布**」、绑包名 `cn.fhf.linkfiles`、选该证书
-   → **「受限ACL权限」不勾** → 得到 `.p7b`
+   → 图片文件夹上传功能需申请并加入 **`ohos.permission.READ_IMAGEVIDEO`** → 得到 `.p7b`。2026-10-09 已取得该权限的正式发布 Profile；旧版不含该权限的 Profile 不再用于当前版本发布。
 
 ### 4.3 两套签名并存（工程已配好）
 
@@ -177,6 +177,24 @@ H="C:/Program Files/Huawei/DevEco Studio/tools/hvigor/bin/hvigorw.js"
 ---
 
 ## 五、上传与测试
+
+### 2026-10-09：图片文件夹上传的正式权限
+
+`上传图片Release.p7b` 已接入现有 release 签名的 `C:/Users/admin/.ohos/signing/lianwenjian/lianwenjian-release.p7b`；原文件备份在同目录 `backups/release-profile-20261009-164105/`。新 Profile 含 `ohos.permission.READ_IMAGEVIDEO`，有效期至 2029-09-17，与原发布证书和应用标识一致。调试签名及发布私钥、证书均保留，签名配置无需重新输入密码。
+
+本次用 DevEco 内置 Hvigor 完成 1.0.6 的 Release 构建与正式签名。CLI 构建若停在 daemon 启动后，可结束当前构建，并在工程目录执行以下命令；不要同时运行两个构建，也不需要因此删除工程或签名材料：
+
+```powershell
+$env:DEVECO_SDK_HOME = 'C:/Program Files/Huawei/DevEco Studio/sdk'
+$releaseNode = 'C:/Program Files/Huawei/DevEco Studio/tools/node/node.exe'
+$releaseHvigor = 'C:/Program Files/Huawei/DevEco Studio/tools/hvigor/bin/hvigorw.js'
+& $releaseNode $releaseHvigor --mode module -p product=release -p buildMode=release --no-daemon --no-incremental assembleHap
+& $releaseNode $releaseHvigor --mode project -p product=release -p buildMode=release --no-daemon --no-incremental assembleApp
+```
+
+最终 Profile、独立 HAP 的签名及权限签名、APP 的整体签名均通过官方工具校验；包内 READ_IMAGEVIDEO、版本 1.0.6、`debug:false` 与 Release SDK 校验通过。上架产物仍为 `build/outputs/release/ugreenlink-remote-release-signed.app`。默认 APP 内的模块未单独签名，AGC 发布流程会再签名；检查 APP 本身及包内代码、资源、清单，不能要求其内部 HAP 与独立签名 HAP 字节相同。
+
+本次未上传 AGC。API 26 的 Upload Product 流程支持再次签名；若使用手动签名，选择本次含图库权限的 Profile，并沿用原发布证书。若改用云管理签名，应确认最终 Profile 同样含该权限。不要误选旧版不含图库 ACL 的 Profile。
 
 - **发布包只能用发布证书签、且 hdc 装不了**（报 `INSTALL_FAILED_APP_SOURCE_NOT_TRUSTED`）。
   发布证书的包**只能走 AGC 的邀请测试或正式上架**。

@@ -110,9 +110,9 @@ export struct FloatingImportControl {
     if (this.dragging) { return this.dragY }
     return this.safeTop + this.fraction * (this.maxY() - this.safeTop)
   }
-  private expandedSurfaceWidth(): number { return Math.min(216, this.viewportWidth - 16) }
+  private expandedSurfaceWidth(): number { return Math.min(236, this.viewportWidth - 16) }
   private surfaceWidth(): number { return this.expanded ? this.expandedSurfaceWidth() : 56 }
-  private surfaceHeight(): number { return this.expanded ? 160 : 56 }
+  private surfaceHeight(): number { return this.expanded ? 208 : 56 }
   private x(): number { return Math.max(8, Math.min(this.circleX(), this.viewportWidth - this.surfaceWidth() - 8)) }
   private y(): number {
     return Math.max(this.safeTop, Math.min(this.circleY(), this.viewportHeight - this.safeBottom - this.surfaceHeight()))
@@ -145,13 +145,13 @@ export struct FloatingImportControl {
     this.onSelect(source)
   }
 
-  /** 展开菜单里 y 落在第几项（三项等高 48vp，容器上下各 8vp 内边距）。 */
+  /** 展开菜单里 y 落在第几项（四项等高 48vp，容器上下各 8vp 内边距）。 */
   private sourceAt(y: number): string {
     const index = Math.floor((y - 8) / 48)
-    if (index < 0 || index > 2) {
+    if (index < 0 || index > 3) {
       return ''
     }
-    const sources: string[] = ['files', 'gallery', 'folder']
+    const sources: string[] = ['files', 'gallery', 'album', 'folder']
     return sources[index]
   }
   private async dock(): Promise<void> {
@@ -201,10 +201,11 @@ export struct FloatingImportControl {
       Column() {
         this.ChoiceVisual($r('sys.symbol.folder'), '文件')
         this.ChoiceVisual($r('sys.symbol.picture_on_square'), '图库')
+        this.ChoiceVisual($r('sys.symbol.picture_on_square'), '图片文件夹内图片上传')
         this.ChoiceVisual($r('sys.symbol.folder_badge_plus'), '新建文件夹')
       }
       .width(this.expandedSurfaceWidth())
-      .height(160)
+      .height(208)
       .padding({ top: 8, bottom: 8 })
       .position({ x: 0, y: 0 })
       .opacity(this.expanded ? 1 : 0)
@@ -220,24 +221,26 @@ export struct FloatingImportControl {
 
   @Builder
   ChoiceVisual(symbol: Resource, label: string) {
-    Row({ space: 14 }) {
+    Row({ space: 12 }) {
       SymbolGlyph(symbol)
         .fontSize(24)
         .fontColor([$r('sys.color.icon_primary')])
       Text(label)
         .fontSize(16)
         .fontColor($r('sys.color.font_primary'))
+        .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
     }
-    .width('100%').height(48).padding({ left: 20, right: 16 })
+    .width('100%').height(48).padding({ left: 16, right: 12 })
     .hitTestBehavior(HitTestMode.None)
   }
 
   @Builder
   ChoiceHitTarget(label: string, source: string) {
     Row()
-    .width('100%').height(48).padding({ left: 20, right: 16 })
+    .width('100%').height(48).padding({ left: 16, right: 12 })
     .onClick(() => this.choose(source))
     .accessibilityText(label)
+    .id('import-choice:' + source)
   }
 
   /**
@@ -317,6 +320,7 @@ export struct FloatingImportControl {
     })
     .onClick(() => { if (!this.expanded && !this.dragging) { this.changeExpanded(true) } })
     .accessibilityText(this.expanded ? '导入选项' : '导入文件或图片')
+    .id('import-open-button')
     .gesture(PanGesture({ direction: PanDirection.All, distance: DRAG_SLOP })
       .onActionStart((event: GestureEvent) => {
         if (this.expanded || event.fingerList.length === 0) { return }
@@ -356,16 +360,17 @@ export struct FloatingImportControl {
       Column() {
         this.ChoiceHitTarget('文件', 'files')
         this.ChoiceHitTarget('图库', 'gallery')
+        this.ChoiceHitTarget('图片文件夹内图片上传', 'album')
         this.ChoiceHitTarget('新建文件夹', 'folder')
       }
       .width(this.expandedSurfaceWidth())
-      .height(160)
+      .height(208)
       .padding({ top: 8, bottom: 8 })
       .position({ x: 0, y: 0 })
       .opacity(this.expanded ? 1 : 0)
       .animation({ duration: this.expanded ? 120 : 70, curve: Curve.EaseOut })
       .hitTestBehavior(this.expanded ? HitTestMode.Default : HitTestMode.BLOCK_DESCENDANTS)
-      // 「按下 A、滑到 B 松手 → 执行 B」。三项等高 48vp、容器上下各 8vp 内边距，
+      // 「按下 A、滑到 B 松手 → 执行 B」。四项等高 48vp、容器上下各 8vp 内边距，
       // 所以按 y 直接算索引即可。松手仍落在按下的那一项上时不处理——交给 onClick，
       // 两者互补，不会重复执行。
       .onTouch((event: TouchEvent) => {

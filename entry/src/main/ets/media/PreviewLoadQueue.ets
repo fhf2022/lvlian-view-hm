@@ -13,7 +13,7 @@ interface PreviewTask {
  */
 export class PreviewLoadQueue {
   private pending: PreviewTask[] = []
-  private activeKeys: Record<string, boolean> = {}
+  private activeKeys: Set<string> = new Set<string>()
   private activeCount: number = 0
   private sequence: number = 0
   private maxConcurrent: number
@@ -25,8 +25,10 @@ export class PreviewLoadQueue {
   }
 
   enqueue(key: string, priority: number, runner: PreviewTaskRunner): boolean {
-    if (key.length === 0 || this.activeKeys[key] === true ||
-      this.pending.some((task: PreviewTask): boolean => task.key === key)) {
+    if (key.length === 0 || this.activeKeys.has(key)) {
+      return false
+    }
+    if (this.promote(key, priority)) {
       return false
     }
     if (this.pending.length >= this.maxPending) {
@@ -42,6 +44,16 @@ export class PreviewLoadQueue {
       runner: runner
     })
     this.pump()
+    return true
+  }
+
+  /** Promote a queued preload without replacing its runner or owner token. */
+  promote(key: string, priority: number): boolean {
+    const task = this.pending.find((item: PreviewTask): boolean => item.key === key)
+    if (task === undefined) {
+      return false
+    }
+    task.priority = Math.min(task.priority, priority)
     return true
   }
 
@@ -76,13 +88,13 @@ export class PreviewLoadQueue {
         return
       }
       this.activeCount += 1
-      this.activeKeys[task.key] = true
+      this.activeKeys.add(task.key)
       task.runner().catch((): void => {
         // The caller owns error reporting. Queue failures must not stop the
         // remaining visible thumbnails from being processed.
       }).finally((): void => {
         this.activeCount = Math.max(0, this.activeCount - 1)
-        this.activeKeys[task.key] = false
+        this.activeKeys.delete(task.key)
         this.pump()
       })
     }

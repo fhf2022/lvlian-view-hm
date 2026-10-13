@@ -12,9 +12,14 @@ import { backgroundTaskManager } from '@kit.BackgroundTasksKit'
  */
 export class VideoBackgroundTaskManager {
   private running: boolean = false
+  private taskId: number = -1
   private desired: boolean = false
   private operation: number = 0
   private queue: Promise<void> = Promise.resolve()
+  private subscribed: boolean = false
+  private cancelled = (info: backgroundTaskManager.ContinuousTaskCancelInfo): void => {
+    if (info.id === this.taskId) { this.running = false; this.taskId = -1 }
+  }
 
   setPlaying(context: Context, playing: boolean): void {
     this.desired = playing
@@ -44,6 +49,10 @@ export class VideoBackgroundTaskManager {
     this.desired = false
     this.operation += 1
     await this.queue.catch((): void => {})
+    if (this.subscribed) {
+      try { backgroundTaskManager.off('continuousTaskCancel', this.cancelled) } catch (_) {}
+      this.subscribed = false
+    }
     if (!this.running) {
       return
     }
@@ -55,6 +64,10 @@ export class VideoBackgroundTaskManager {
       return
     }
     const abilityContext = context as common.UIAbilityContext
+    if (!this.subscribed) {
+      backgroundTaskManager.on('continuousTaskCancel', this.cancelled)
+      this.subscribed = true
+    }
     const info: wantAgent.WantAgentInfo = {
       wants: [
         {
@@ -67,9 +80,14 @@ export class VideoBackgroundTaskManager {
       actionFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
     }
     const agent = await wantAgent.getWantAgent(info)
-    // The list overload is the current UIAbility API and is also the form
-    // used by the official long-video sample.
-    await backgroundTaskManager.startBackgroundRunning(context, ['audioPlayback'], agent)
+    const request = new backgroundTaskManager.ContinuousTaskRequest()
+    request.backgroundTaskModes = [backgroundTaskManager.BackgroundTaskMode.MODE_AUDIO_PLAYBACK]
+    request.backgroundTaskSubmodes = [backgroundTaskManager.BackgroundTaskSubmode.SUBMODE_AVSESSION_AUDIO_PLAYBACK]
+    request.wantAgent = agent
+    request.combinedTaskNotification = false
+    const result = await backgroundTaskManager.startBackgroundRunning(context, request)
+    this.taskId = result.continuousTaskId ?? -1
+    if (this.taskId < 0) { throw new Error('系统未返回播放任务标识') }
     this.running = true
     console.info('[UgreenVideo] background audioPlayback task started')
   }
@@ -79,9 +97,10 @@ export class VideoBackgroundTaskManager {
       return
     }
     try {
-      await backgroundTaskManager.stopBackgroundRunning(context)
+      if (this.taskId >= 0) { await backgroundTaskManager.stopBackgroundRunning(context, this.taskId) }
     } finally {
       this.running = false
+      this.taskId = -1
       console.info('[UgreenVideo] background audioPlayback task stopped')
     }
   }

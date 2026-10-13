@@ -6,11 +6,14 @@ import { StorageBudget } from './StorageBudget'
 import { DownloadDescriptor, DownloadTaskRecord, DownloadTaskStatus, FileEntry } from '../model/FileEntry'
 import { BinaryDownloadProgress, HttpTransport, StreamDownloadResult } from '../core/network/HttpTransport'
 import { NetworkClass, NetworkPolicy } from '../core/network/NetworkPolicy'
-import { UgreenError } from '../ugreen/UgreenErrors'
+import { NasConnection, NasConnectionState } from '../core/network/NasConnection'
+import { UgreenError, UgreenErrorKind } from '../ugreen/UgreenErrors'
 import { UgreenRemoteRepository } from '../repository/UgreenRemoteRepository'
+import { TransferBackgroundManager } from '../transfer/TransferBackgroundManager'
+import { TransferProgress } from '../transfer/TransferProgress'
 
 export type DownloadQueueListener = (tasks: DownloadTaskRecord[], speedBytesPerSecond: number) => void
-type PauseReason = 'none' | 'user' | 'network' | 'logout'
+type PauseReason = 'none' | 'user' | 'network' | 'server' | 'logout' | 'background'
 
 /**
  * Persistent, serial user-download queue.
@@ -97,6 +100,15 @@ export class DownloadQueueManager {
     this.reconcileStaging()
     this.initialized = true
     networkPolicy.onChange(this.networkListener)
+    NasConnection.shared().onChange((state: NasConnectionState): void => this.handleNasState(state))
+    TransferBackgroundManager.shared().onChange(() => { this.schedule() })
+    TransferBackgroundManager.shared().onCancel(() => {
+      this.activePauseReason = 'user'
+      for (const task of this.tasks) {
+        if (task.status === 'queued' || task.status === 'downloading') { task.status = 'paused' }
+      }
+      this.requestPersist(); this.notify()
+    })
     this.notify()
   }
 
@@ -171,6 +183,12 @@ export class DownloadQueueManager {
       }
     }
     const now = Date.now()
+    const scope = this.repository?.cacheScopeHash() ?? ''
+    await DownloadDestination.directory()
+    await TransferBackgroundManager.shared().requestResume()
+    if (!this.ready || scope !== (this.repository?.cacheScopeHash() ?? '')) {
+      throw new Error('账号已变化，请重新发起下载')
+    }
     const task = new DownloadTaskRecord()
     task.id = now.toString() + '-' + Math.floor(Math.random() * 1000000).toString()
     task.remotePath = entry.path
@@ -213,6 +231,17 @@ export class DownloadQueueManager {
     }
     if (!this.isQueueHead(task)) {
       return false
+    }
+    const scope = this.repository?.cacheScopeHash() ?? ''
+    await DownloadDestination.directory()
+    await TransferBackgroundManager.shared().requestResume()
+    if (!this.ready || this.findTask(id) !== task || scope !== (this.repository?.cacheScopeHash() ?? '')) {
+      return false
+    }
+    if (task.status === 'waiting_server') {
+      await NasConnection.shared().retryNow()
+      this.schedule()
+      return true
     }
     if (task.status === 'failed') {
       task.errorMessage = ''
@@ -315,7 +344,9 @@ export class DownloadQueueManager {
       .map((task: DownloadTaskRecord): string => task.stagingPath)
     for (const name of fileIo.listFileSync(this.stagingDirectory)) {
       const path = this.stagingDirectory + '/' + name
-      if (owned.indexOf(path) < 0 && name.endsWith('.part')) { this.removeFile(path) }
+      if (name.endsWith('.part.incoming') || (owned.indexOf(path) < 0 && name.endsWith('.part'))) {
+        this.removeFile(path)
+      }
     }
     for (const task of this.tasks) {
       if (task.status !== 'completed') { task.receivedBytes = this.fileSize(task.stagingPath) }
@@ -324,7 +355,7 @@ export class DownloadQueueManager {
 
   private normalizeStatus(status: DownloadTaskStatus): DownloadTaskStatus {
     if (status === 'queued' || status === 'downloading' || status === 'paused' ||
-      status === 'waiting_wifi' || status === 'completed' || status === 'failed') {
+      status === 'waiting_wifi' || status === 'waiting_server' || status === 'completed' || status === 'failed') {
       return status
     }
     return 'queued'
@@ -343,7 +374,7 @@ export class DownloadQueueManager {
         active.errorMessage = ''
         active.updatedAt = Date.now()
       }
-      this.activePauseReason = 'none'
+      if (this.activePauseReason === 'network') { this.activePauseReason = 'none' }
       this.requestPersist()
       this.notify()
       this.schedule()
@@ -371,6 +402,27 @@ export class DownloadQueueManager {
     active.updatedAt = Date.now()
     active.errorMessage = ''
     this.speedBytesPerSecond = 0
+    this.requestPersist()
+    this.notify()
+  }
+
+  private handleNasState(state: NasConnectionState): void {
+    if (state === 'online') {
+      for (const task of this.tasks) {
+        if (task.status === 'waiting_server') { task.status = 'queued'; task.errorMessage = '' }
+      }
+      this.schedule()
+    } else if (state === 'unavailable' || state === 'connecting') {
+      for (const task of this.tasks) {
+        if (task.status === 'queued' || task.status === 'downloading') {
+          if (task.id === this.activeRecordId) { this.activePauseReason = 'server' }
+          task.status = 'waiting_server'
+          task.errorMessage = ''
+          task.updatedAt = Date.now()
+        }
+      }
+      this.speedBytesPerSecond = 0
+    }
     this.requestPersist()
     this.notify()
   }
@@ -414,13 +466,14 @@ export class DownloadQueueManager {
     if (this.activeRecordId.length > 0) {
       return
     }
+    if (!TransferBackgroundManager.shared().canRun()) { this.notify(); return }
     const head = this.queueHead()
     if (head === null || head.status === 'paused' || head.status === 'failed') {
       return
     }
     if (!this.canStart(head)) {
       if (head.status === 'queued') {
-        head.status = 'waiting_wifi'
+        head.status = NasConnection.shared().canRequest() ? 'waiting_wifi' : 'waiting_server'
         head.updatedAt = Date.now()
         this.requestPersist()
         this.notify()
@@ -431,6 +484,7 @@ export class DownloadQueueManager {
   }
 
   private canStart(task: DownloadTaskRecord): boolean {
+    if (!NasConnection.shared().canRequest()) { return false }
     const state = this.networkPolicy === null ? 'unknown' : this.networkPolicy.current()
     if (state === 'offline') {
       return false
@@ -498,8 +552,14 @@ export class DownloadQueueManager {
         record.updatedAt = Date.now()
         return
       }
+      if (!TransferBackgroundManager.shared().canRun()) {
+        record.status = 'queued'
+        record.updatedAt = Date.now()
+        this.requestPersist(); this.notify()
+        return
+      }
       if (!this.canStart(record)) {
-        record.status = 'waiting_wifi'
+        record.status = NasConnection.shared().canRequest() ? 'waiting_wifi' : 'waiting_server'
         record.updatedAt = Date.now()
         this.requestPersist()
         this.notify()
@@ -531,7 +591,12 @@ export class DownloadQueueManager {
       }
       await this.finalizeRecord(record)
     } catch (error) {
-      if (record.status === 'paused' || record.status === 'waiting_wifi' ||
+      if (error instanceof UgreenError && error.kind === UgreenErrorKind.NAS_UNAVAILABLE &&
+        record.status !== 'paused' && this.activePauseReason !== 'user') {
+        record.status = 'waiting_server'
+        record.receivedBytes = this.fileSize(record.stagingPath)
+      }
+      if (record.status === 'paused' || record.status === 'waiting_wifi' || record.status === 'waiting_server' ||
         this.activePauseReason !== 'none') {
         record.errorMessage = ''
         this.requestPersist()
@@ -585,6 +650,10 @@ export class DownloadQueueManager {
   }
 
   private shouldContinueActive(record: DownloadTaskRecord): boolean {
+    if (!TransferBackgroundManager.shared().canRun()) {
+      this.activePauseReason = 'background'; record.status = 'queued'
+      this.requestPersist(); this.notify(); return false
+    }
     if (!this.ready) {
       this.activePauseReason = 'logout'
       record.status = 'paused'
@@ -595,6 +664,10 @@ export class DownloadQueueManager {
       return false
     }
     if (this.activePauseReason !== 'none') {
+      return false
+    }
+    if (!NasConnection.shared().canRequest()) {
+      this.handleNasState('unavailable')
       return false
     }
     if (this.networkPolicy === null) {
@@ -726,6 +799,18 @@ export class DownloadQueueManager {
   }
 
   private notify(): void {
+    const head = this.queueHead()
+    TransferBackgroundManager.shared().update('download', this.tasks.map((task: DownloadTaskRecord): TransferProgress => {
+      const value = new TransferProgress()
+      value.id = task.id; value.direction = 'download'; value.bytes = task.size
+      value.doneBytes = task.status === 'completed' ? task.size : task.receivedBytes
+      value.done = task.status === 'completed' ? 1 : 0
+      value.failed = task.status === 'failed' ? 1 : 0
+      value.state = this.ready ? task.status : 'cancelled'
+      value.pending = task.status === 'queued' || task.status === 'downloading'
+      value.active = this.ready && value.pending && head !== null && head.id === task.id && this.canStart(task)
+      return value
+    }))
     const snapshot = this.snapshot()
     for (const listener of this.listeners.slice()) {
       try {

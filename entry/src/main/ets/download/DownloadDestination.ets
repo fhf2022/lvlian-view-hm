@@ -2,6 +2,7 @@ import { Context } from '@kit.AbilityKit'
 import { fileIo, fileUri, picker } from '@kit.CoreFileKit'
 import { preferences } from '@kit.ArkData'
 import { StorageBudget } from './StorageBudget'
+import { TransferBackgroundManager } from '../transfer/TransferBackgroundManager'
 
 interface SaveIntent {
   source: string
@@ -15,6 +16,8 @@ interface SaveIntent {
 export class DownloadDestination {
   private static context: Context | null = null
   private static queue: Promise<void> = Promise.resolve()
+  private static grantedRoot: string = ''
+  private static granting: Promise<string> | null = null
 
   private static recoveryStarted: boolean = false
   static initialize(context: Context): void {
@@ -54,6 +57,17 @@ export class DownloadDestination {
   }
 
   static async directory(): Promise<string> {
+    if (DownloadDestination.grantedRoot) { return DownloadDestination.grantedRoot }
+    if (DownloadDestination.granting) { return await DownloadDestination.granting }
+    if (!TransferBackgroundManager.shared().isForeground()) { throw new Error('请回到前台授权下载保存目录') }
+    DownloadDestination.granting = DownloadDestination.obtainDirectory()
+    try {
+      DownloadDestination.grantedRoot = await DownloadDestination.granting
+      return DownloadDestination.grantedRoot
+    } finally { DownloadDestination.granting = null }
+  }
+
+  private static async obtainDirectory(): Promise<string> {
     if (DownloadDestination.context === null) { throw new Error('下载目录尚未初始化') }
     const options = new picker.DocumentSaveOptions()
     options.pickerMode = picker.DocumentPickerMode.DOWNLOAD

@@ -5,6 +5,7 @@ import { UgreenSession } from '../model/Session'
 import { SessionStore } from '../core/session/SessionStore'
 import { UgreenCrypto } from '../core/crypto/UgreenCrypto'
 import { HttpTransport } from '../core/network/HttpTransport'
+import { NasConnection } from '../core/network/NasConnection'
 import { HttpResult, JsonObject } from '../core/network/HttpTypes'
 import { UGREENLINK_RESOLVE_URL, UgreenEndpoints } from './UgreenEndpoints'
 import { UgreenError, UgreenErrorKind } from './UgreenErrors'
@@ -32,6 +33,8 @@ export class UgreenRemoteClient {
   private pendingLogin: PendingLogin | null = null
   private reconnectCredentials: PendingLogin | null = null
   private reconnectPromise: Promise<boolean> | null = null
+  private offlineScope: string = ''
+  private sessionGeneration: number = 0
 
   constructor(transport: HttpTransport = new HttpTransport(), sessionStore: SessionStore = new SessionStore()) {
     this.transport = transport
@@ -52,13 +55,16 @@ export class UgreenRemoteClient {
   }
 
   clearSession(): void {
+    this.sessionGeneration += 1
     this.sessionStore.clear()
     this.pendingLogin = null
     this.reconnectCredentials = null
     this.reconnectPromise = null
+    this.offlineScope = ''
+    NasConnection.shared().clear()
   }
 
-  /** Reconnect once for transient network/auth failures. */
+  /** Only explicit authentication rejection can safely replay an operation. */
   async withReconnect<T>(operation: () => Promise<T>): Promise<T> {
     try {
       return await operation()
@@ -76,7 +82,7 @@ export class UgreenRemoteClient {
   cacheScope(): string {
     const session = this.sessionStore.get()
     if (session === null) {
-      return ''
+      return this.offlineScope
     }
     const identity = session.uid.length > 0 ? session.uid : session.tokenId
     return session.baseUrl + '|' + identity
@@ -97,10 +103,42 @@ export class UgreenRemoteClient {
     }
     const baseUrl = relayDomain.includes('://') ? relayDomain : 'https://' + alias + '.' + relayDomain
     this.endpoints = new UgreenEndpoints(baseUrl)
+    this.configureConnection()
     return this.endpoints.baseUrl
   }
 
+  sessionIdentity(): string {
+    const session = this.sessionStore.get()
+    return session === null || session.uid.length === 0 ? '' : session.baseUrl + '|' + session.uid
+  }
+
+  restoreOfflineIdentity(baseUrl: string, uid: string): void {
+    this.endpoints = new UgreenEndpoints(baseUrl)
+    this.offlineScope = this.endpoints.baseUrl + '|' + uid
+    this.configureConnection()
+    NasConnection.shared().markUnavailable()
+  }
+
+  async restoreSession(): Promise<boolean> {
+    return this.sessionStore.get() !== null || await this.reconnect()
+  }
+
+  private configureConnection(): void {
+    const urls = this.endpoints
+    if (urls === null) { return }
+    NasConnection.shared().configure(urls.baseUrl, async (): Promise<boolean> => {
+      const credentials = this.reconnectCredentials
+      if (credentials === null) { return false }
+      const body: JsonObject = { 'username': credentials.username }
+      const result = await this.transport.requestJson(urls.rsaCheck(), http.RequestMethod.POST, body, {}, true)
+      // A relay's generic HTTP 200 page is not proof that UGOS is available.
+      return this.numberValue(result.body['code']) === 200 &&
+        this.headerValue(result.headers, 'x-rsa-token').length > 0
+    })
+  }
+
   async login(username: string, password: string): Promise<LoginResult> {
+    const generation = this.sessionGeneration
     const cleanUsername = username.trim()
     if (cleanUsername.length === 0 || password.length === 0) {
       throw new UgreenError(UgreenErrorKind.LOGIN_FAILED, '请输入 NAS 用户名和密码')
@@ -108,8 +146,9 @@ export class UgreenRemoteClient {
     const urls = this.requireEndpoints()
     const rsaBody: JsonObject = {}
     rsaBody['username'] = cleanUsername
-    const rsaResponse = await this.transport.requestJson(urls.rsaCheck(), http.RequestMethod.POST, rsaBody)
+    const rsaResponse = await this.transport.requestJson(urls.rsaCheck(), http.RequestMethod.POST, rsaBody, {}, true)
     this.successData(rsaResponse.body, '获取 RSA 公钥失败')
+    this.checkSessionGeneration(generation)
     const rsaToken = this.headerValue(rsaResponse.headers, 'x-rsa-token')
     if (rsaToken.length === 0) {
       throw new UgreenError(UgreenErrorKind.API_CHANGED, '登录接口没有返回 RSA 公钥')
@@ -122,7 +161,8 @@ export class UgreenRemoteClient {
     loginRequestBody['password'] = encryptedPassword
     loginRequestBody['otp'] = true
     loginRequestBody['is_simple'] = true
-    const loginResponse = await this.transport.requestJson(urls.login(), http.RequestMethod.POST, loginRequestBody)
+    const loginResponse = await this.transport.requestJson(urls.login(), http.RequestMethod.POST, loginRequestBody, {}, true)
+    this.checkSessionGeneration(generation)
     const loginResponseBody = loginResponse.body
     const loginCode = this.numberValue(loginResponseBody['code'])
     const loginData = this.asRecord(loginResponseBody['data'])
@@ -150,10 +190,13 @@ export class UgreenRemoteClient {
     ))
     this.reconnectCredentials = pending
     this.pendingLogin = null
+    this.offlineScope = ''
+    NasConnection.shared().response(urls.baseUrl, NasConnection.shared().begin(urls.baseUrl, true), 200)
     return new LoginResult(false, '登录成功')
   }
 
   async verifyOtp(code: string, trustDevice: boolean = false): Promise<LoginResult> {
+    const generation = this.sessionGeneration
     const urls = this.requireEndpoints()
     const cleanCode = code.trim()
     if (cleanCode.length !== 6) {
@@ -167,6 +210,7 @@ export class UgreenRemoteClient {
       body['username'] = pending.username
     }
     const response = await this.transport.requestJson(urls.otpLogin(), http.RequestMethod.POST, body)
+    this.checkSessionGeneration(generation)
     const data = this.successData(response.body, '验证码登录失败')
     const tokenId = this.stringValue(data['token_id'])
     const token = this.stringValue(data['token'])
@@ -185,6 +229,8 @@ export class UgreenRemoteClient {
       this.reconnectCredentials = pending
     }
     this.pendingLogin = null
+    this.offlineScope = ''
+    NasConnection.shared().response(urls.baseUrl, NasConnection.shared().begin(urls.baseUrl, true), 200)
     return new LoginResult(false, '登录成功')
   }
 
@@ -566,7 +612,7 @@ export class UgreenRemoteClient {
       const body: JsonObject = {}
       body['path'] = path
       body['new_name'] = newName
-      const response = await this.transport.requestJson(urls.rename(), http.RequestMethod.POST, body, headers)
+      const response = await this.transport.requestJson(urls.rename(), http.RequestMethod.POST, body, headers, false, 60000)
       this.successData(response.body, '文件重命名失败')
     })
   }
@@ -578,7 +624,7 @@ export class UgreenRemoteClient {
       const body: JsonObject = {}
       body['paths'] = paths
       body['target_path'] = targetPath
-      const response = await this.transport.requestJson(urls.copyPaths(), http.RequestMethod.POST, body, headers)
+      const response = await this.transport.requestJson(urls.copyPaths(), http.RequestMethod.POST, body, headers, false, 60000)
       this.successData(response.body, '文件复制失败')
     })
   }
@@ -590,7 +636,7 @@ export class UgreenRemoteClient {
       const body: JsonObject = {}
       body['paths'] = paths
       body['target_path'] = targetPath
-      const response = await this.transport.requestJson(urls.movePaths(), http.RequestMethod.POST, body, headers)
+      const response = await this.transport.requestJson(urls.movePaths(), http.RequestMethod.POST, body, headers, false, 60000)
       this.successData(response.body, '文件移动失败')
     })
   }
@@ -603,7 +649,7 @@ export class UgreenRemoteClient {
       body['path'] = path
       body['no_recursive_creation'] = true
       const response = await this.transport.requestJson(urls.createFolder(),
-        http.RequestMethod.POST, body, headers)
+        http.RequestMethod.POST, body, headers, false, 60000)
       this.successData(response.body, '文件夹创建失败')
     })
   }
@@ -615,7 +661,7 @@ export class UgreenRemoteClient {
       const body: JsonObject = {}
       body['paths'] = [path]
       body['forever'] = false
-      const response = await this.transport.requestJson(urls.deletePaths(), http.RequestMethod.POST, body, headers)
+      const response = await this.transport.requestJson(urls.deletePaths(), http.RequestMethod.POST, body, headers, false, 60000)
       this.successData(response.body, '文件删除失败')
     })
   }
@@ -638,7 +684,7 @@ export class UgreenRemoteClient {
       const body: JsonObject = {}
       body['paths'] = paths
       body['forever'] = true
-      const response = await this.transport.requestJson(urls.deletePaths(), http.RequestMethod.POST, body, headers)
+      const response = await this.transport.requestJson(urls.deletePaths(), http.RequestMethod.POST, body, headers, false, 60000)
       this.successData(response.body, '文件删除失败')
     })
   }
@@ -663,20 +709,12 @@ export class UgreenRemoteClient {
   }
 
   private async performReconnect(credentials: PendingLogin): Promise<boolean> {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      if (attempt > 0) {
-        await new Promise<void>((resolve: () => void) => {
-          setTimeout(resolve, 600)
-        })
-      }
-      try {
-        const result = await this.login(credentials.username, credentials.password)
-        if (!result.requiresOtp) {
-          return true
-        }
-        return false
-      } catch (_) {
-        // A second attempt covers a short Wi-Fi/mobile-network handoff.
+    try {
+      const result = await this.login(credentials.username, credentials.password)
+      return !result.requiresOtp
+    } catch (error) {
+      if (error instanceof UgreenError && error.kind === UgreenErrorKind.NAS_UNAVAILABLE) {
+        throw error
       }
     }
     return false
@@ -689,17 +727,15 @@ export class UgreenRemoteClient {
     if (error.kind === UgreenErrorKind.AUTH_EXPIRED) {
       return true
     }
-    if (error.status === 401 || error.status === 403 || error.status === 408 || error.status === 429 ||
-      error.apiCode === 401 || error.apiCode === 403 || error.apiCode === 419) {
-      return true
-    }
-    return error.kind === UgreenErrorKind.NETWORK &&
-      (error.status === 0 || error.status >= 500)
+    return error.status === 401 || error.apiCode === 401 || error.apiCode === 419
   }
 
   private async authHeaders(): Promise<Record<string, string>> {
     const session = this.sessionStore.get()
     if (session === null) {
+      if (this.offlineScope.length > 0) {
+        throw new UgreenError(UgreenErrorKind.NAS_UNAVAILABLE, 'NAS 连接恢复后将自动登录，已缓存内容仍可浏览')
+      }
       throw new UgreenError(UgreenErrorKind.AUTH_EXPIRED, '登录状态已失效，请重新登录')
     }
     return {
@@ -738,8 +774,9 @@ export class UgreenRemoteClient {
       undefined, await this.authHeaders())
     const count = Number(this.successData(response.body, '查询上传断点失败')['result'] || 0)
     if (!Number.isFinite(count) || count < 0 || count > size) { throw new Error('上传断点无效') }
-    // UGOS's browser uploader replays the last acknowledged byte on resume.
-    return Math.max(0, count - 1)
+    // The endpoint reports a byte count, which is the next offset. Replaying
+    // count - 1 fails UGOS data verification after a paused upload.
+    return count
   }
 
   async uploadChunk(dir: string, name: string, uuid: string, size: number,
@@ -771,6 +808,12 @@ export class UgreenRemoteClient {
       throw new UgreenError(UgreenErrorKind.API_CHANGED, '请先解析云盘 ID')
     }
     return value
+  }
+
+  private checkSessionGeneration(generation: number): void {
+    if (generation !== this.sessionGeneration) {
+      throw new UgreenError(UgreenErrorKind.AUTH_EXPIRED, '登录操作已取消')
+    }
   }
 
   private successData(body: JsonObject, context: string): JsonObject {
@@ -805,7 +848,7 @@ export class UgreenRemoteClient {
    * narrow enough that ordinary API errors still reach the UI unchanged.
    */
   private isAuthenticationFailure(code: number, message: string): boolean {
-    if (code === 401 || code === 403 || code === 419) {
+    if (code === 401 || code === 419) {
       return true
     }
     const normalized = message.toLowerCase()

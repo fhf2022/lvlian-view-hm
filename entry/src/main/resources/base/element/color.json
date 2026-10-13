@@ -1,6 +1,26 @@
 {
   "color": [
     {
+      "name": "album_picker_panel",
+      "value": "#F1F3F5"
+    },
+    {
+      "name": "album_picker_header",
+      "value": "#E6E8EB"
+    },
+    {
+      "name": "album_picker_fade_start",
+      "value": "#00FFFFFF"
+    },
+    {
+      "name": "album_picker_background",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "album_upload_error",
+      "value": "#B3261E"
+    },
+    {
       "name": "start_window_background",
       "value": "#F6F8FC"
     },

@@ -10,6 +10,8 @@ import { ThumbnailProfile } from '../media/ThumbnailPolicy'
 import { ThumbnailCacheStore } from '../media/ThumbnailCacheStore'
 import { DirectoryMetadataPage, DirectoryMetadataSnapshot, DirectoryMetadataStore } from './DirectoryMetadataStore'
 import { NetworkPolicy } from '../core/network/NetworkPolicy'
+import { NasConnection } from '../core/network/NasConnection'
+import { UgreenError, UgreenErrorKind } from '../ugreen/UgreenErrors'
 import {
   DirectoryIndexedSnapshot,
   DirectoryQuery,
@@ -131,6 +133,13 @@ export class UgreenRemoteRepository {
     this.client.setReconnectCredentials(username, password)
   }
 
+  sessionIdentity(): string { return this.client.sessionIdentity() }
+  restoreOfflineIdentity(baseUrl: string, uid: string): void {
+    this.client.restoreOfflineIdentity(baseUrl, uid)
+    this.updateMetadataScope()
+  }
+  async restoreSession(): Promise<boolean> { return await this.client.restoreSession() }
+
   cacheScopeHash(): string {
     const scope = this.client.cacheScope()
     return scope.length > 0 ? CacheManager.hash('cache-scope-v2:' + scope) : ''
@@ -196,14 +205,24 @@ export class UgreenRemoteRepository {
   // 并保留首选值——后续在根这一层列目录会用到。
   private async listFirstAvailableRoot(rootTypes: number[],
     forceNetwork: boolean): Promise<RootListing> {
+    let unavailable: UgreenError | null = null
     for (const rootType of rootTypes) {
       try {
         const entries = await this.list('', rootType, forceNetwork)
         return new RootListing(entries.filter((item: FileEntry) => item.isDirectory), rootType)
-      } catch (_) {
-        // 该 root_type 对当前账号不可用（普通账号没有 root_type=4），试下一个。
+      } catch (error) {
+        if (error instanceof UgreenError && error.kind === UgreenErrorKind.NAS_UNAVAILABLE) {
+          unavailable = error
+          // Another root type may have an existing offline snapshot.
+          if (!forceNetwork) { continue }
+        }
+        if (!(error instanceof UgreenError) ||
+          (error.kind !== UgreenErrorKind.PERMISSION_DENIED && error.apiCode !== 1301)) {
+          throw error as Error
+        }
       }
     }
+    if (unavailable !== null) { throw unavailable }
     return new RootListing([], rootTypes[0])
   }
 
@@ -212,7 +231,8 @@ export class UgreenRemoteRepository {
     const key = this.directoryCacheKey(path, rootType)
     const now = Date.now()
     const cached = this.directoryCache.get(key)
-    if (!forceNetwork && cached !== undefined && cached.expiresAt > now) {
+    if (!forceNetwork && cached !== undefined &&
+      (cached.expiresAt > now || !NasConnection.shared().canRequest())) {
       cached.lastAccessAt = now
       return cached.entries.slice()
     }
@@ -344,7 +364,7 @@ export class UgreenRemoteRepository {
   }
 
   async preindexPhotosDirectories(homePath: string): Promise<void> {
-    if (homePath.length === 0 || this.networkPolicy.isMetered() ||
+    if (!NasConnection.shared().canRequest() || homePath.length === 0 || this.networkPolicy.isMetered() ||
       this.networkPolicy.current() === 'offline') {
       return
     }
@@ -361,7 +381,7 @@ export class UgreenRemoteRepository {
       candidates.sort((left: FileEntry, right: FileEntry): number =>
         right.childCount - left.childCount)
       for (const entry of candidates) {
-        if (this.networkPolicy.isMetered() || this.networkPolicy.current() === 'offline') {
+        if (!NasConnection.shared().canRequest() || this.networkPolicy.isMetered() || this.networkPolicy.current() === 'offline') {
           return
         }
         const candidatePath = entry.path.length > 0
@@ -654,7 +674,8 @@ export class UgreenRemoteRepository {
   }
 
   private scheduleBackgroundRefresh(path: string, rootType: number, key: string): void {
-    if (this.backgroundRefreshTimers[key] > 0 || this.directoryRequests.has(key)) {
+    if (!NasConnection.shared().canRequest() ||
+      this.backgroundRefreshTimers[key] > 0 || this.directoryRequests.has(key)) {
       return
     }
     const scope = this.metadataScope
@@ -664,7 +685,8 @@ export class UgreenRemoteRepository {
       if (generation !== this.cacheGeneration || scope !== this.metadataScope || this.directoryRequests.has(key)) {
         return
       }
-      if (this.networkPolicy.isMetered() && !this.meteredBackgroundRefreshAllowed) {
+      if (!NasConnection.shared().canRequest() || this.networkPolicy.current() === 'offline' ||
+        (this.networkPolicy.isMetered() && !this.meteredBackgroundRefreshAllowed)) {
         return
       }
       this.fetchDirectory(path, rootType, key).catch((): FileEntry[] => [])
@@ -846,6 +868,8 @@ export class UgreenRemoteRepository {
       return directPath
     }
 
+    if (!NasConnection.shared().canRequest()) { return '' }
+
     const descriptors = await this.client.thumbnailCandidates(entry)
 
     // Resolve every persistent candidate before starting any network request.
@@ -900,7 +924,9 @@ export class UgreenRemoteRepository {
           return preparedPath
         }
       } catch (error) {
-        console.warn('[UgreenThumbnail] route failed: ' + descriptor.url + ': ' + JSON.stringify(error))
+        if (error instanceof UgreenError && error.kind === UgreenErrorKind.NAS_UNAVAILABLE) { return '' }
+        console.warn('[UgreenThumbnail] route failed kind=' +
+          (error instanceof UgreenError ? error.kind : 'UNKNOWN'))
       } finally {
         if (this.thumbnailRequests.get(cacheKey) === request) {
           this.thumbnailRequests.delete(cacheKey)
@@ -954,18 +980,22 @@ export class UgreenRemoteRepository {
 
   async prepareUpload(dir: string, name: string, uuid: string, size: number,
     changed: number): Promise<boolean> {
-    return this.client.prepareUpload(dir, name, uuid, size, changed)
+    return await this.client.withReconnect(() => this.client.prepareUpload(dir, name, uuid, size, changed))
+  }
+
+  async listUploadDestinationPage(path: string, rootType: number, pageIndex: number): Promise<UgreenDirectoryPage> {
+    return await this.client.withReconnect(() => this.client.listPage(path, rootType, pageIndex, 200))
   }
   async uploadOffset(dir: string, uuid: string, size: number): Promise<number> {
-    return this.client.uploadOffset(dir, uuid, size)
+    return await this.client.withReconnect(() => this.client.uploadOffset(dir, uuid, size))
   }
   async uploadChunk(dir: string, name: string, uuid: string, size: number,
     changed: number, offset: number, bytes: ArrayBuffer): Promise<void> {
-    await this.client.uploadChunk(dir, name, uuid, size, changed, offset, bytes)
+    await this.client.withReconnect(() => this.client.uploadChunk(dir, name, uuid, size, changed, offset, bytes))
     if (offset + bytes.byteLength >= size) { await this.clearDirectoryMetadataAfterMutation() }
   }
   async removeUploadTemporary(dir: string, uuid: string): Promise<void> {
-    await this.client.removeUploadTemporary(dir, uuid)
+    await this.client.withReconnect(() => this.client.removeUploadTemporary(dir, uuid))
   }
 
   async trash(entry: FileEntry, parentPath: string = '', rootType: number = 3): Promise<void> {

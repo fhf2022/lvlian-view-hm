@@ -1,11 +1,18 @@
 import { StorageBudget } from '../download/StorageBudget'
 import { DownloadDestination } from '../download/DownloadDestination'
+import { TransferBackgroundManager } from '../transfer/TransferBackgroundManager'
 import { promptAction, uiMaterial, curves, window, LengthMetrics, FrameCallback, PiPWindow } from '@kit.ArkUI'
 import { systemShare, harmonyShare } from '@kit.ShareKit'
 import { Context, Want, common, wantConstant, autoFillManager } from '@kit.AbilityKit'
 import { fileIo, fileUri, picker } from '@kit.CoreFileKit'
 import { photoAccessHelper } from '@kit.MediaLibraryKit'
 import { FloatingImportControl } from '../components/FloatingImportControl'
+import { AlbumUploadPicker } from '../components/AlbumUploadPicker'
+import { AlbumUploadSheet } from '../components/AlbumUploadSheet'
+import { AlbumUploadDetails } from '../components/AlbumUploadDetails'
+import { AlbumUploadManager } from '../upload/AlbumUploadManager'
+import { AlbumUploadJob, LocalImageAlbum } from '../upload/AlbumUploadModel'
+import { LocalAlbumSource } from '../upload/LocalAlbumSource'
 import { FisheyeTimeline } from '../components/FisheyeTimeline'
 import { ProximityLightReceiver } from '../components/ProximityLightReceiver'
 import { UploadQueueManager, UploadTaskRecord } from '../upload/UploadQueueManager'
@@ -37,7 +44,7 @@ import { ImageRotationRecord, ImageRotationStore } from '../media/ImageRotationS
 import { RemoteSearchScope, UgreenRemoteRepository } from '../repository/UgreenRemoteRepository'
 import { BinaryDownloadProgress, BinaryProgressListener, HttpTransport } from '../core/network/HttpTransport'
 import { UgreenError, UgreenErrorKind, readableUgreenError } from '../ugreen/UgreenErrors'
-import { FileEntryDataSource } from '../model/FileEntryDataSource'
+import { FileEntryDataSource, THUMB_PROBE } from '../model/FileEntryDataSource'
 import { PreviewLoadQueue } from '../media/PreviewLoadQueue'
 import { ImagePipelineTelemetry } from '../media/ImagePipelineTelemetry'
 import { ReturnPerfSession } from '../media/ReturnPerfSession'
@@ -46,6 +53,8 @@ import { ThumbnailCacheStore } from '../media/ThumbnailCacheStore'
 import { ViewerBitmapRecord, ViewerBitmapStore } from '../media/ViewerBitmapStore'
 import { ViewerPrefetchCoordinator, ViewerEntryState } from '../media/ViewerPrefetchCoordinator'
 import { NetworkClass, NetworkPolicy } from '../core/network/NetworkPolicy'
+import { NasConnection, NasConnectionState } from '../core/network/NasConnection'
+import { OfflineAccountProfile } from '../core/session/OfflineAccountProfile'
 import { HapticFeedback } from '../core/haptic/HapticFeedback'
 import {
   DirectoryIndexedSnapshot,
@@ -91,6 +100,10 @@ const IMAGE_GEOMETRY_TRANSITION_DURATION: number = 240
 const VIEWER_USE_SHARED_ELEMENT_TRANSITION: boolean = true
 // "长按图片 = 系统识别文字"的判定时长。见 handleImageTouch / armImageLongPressWatch。
 const IMAGE_LONG_PRESS_MS: number = 400
+// Allow a short NAS download to finish on this grab rather than proactively
+// rejecting at 2.5 seconds. Share Kit recommends submission within 3 seconds
+// but exposes no API to extend its own timeout; this only bounds our wait.
+const GESTURE_SHARE_PREPARATION_MS: number = 5000
 const IMAGE_FALLBACK_TRANSITION_DURATION: number = 160
 const VIDEO_GEOMETRY_TRANSITION_DURATION: number = 420
 const VIDEO_FALLBACK_TRANSITION_DURATION: number = 160
@@ -782,6 +795,10 @@ interface GestureTransferCacheResult {
   failedCount: number
 }
 
+interface GestureTransferPreparedData extends GestureTransferCacheResult {
+  skippedCount: number
+}
+
 class ImageDisplayState {
   rotations: Record<string, number> = {}
   previewOrientations: Record<string, ImageRotateOrientation> = {}
@@ -1096,6 +1113,19 @@ struct Index {
   @State pageHeightVp: number = 800
   @State transferDirection: string = 'download'
   @State uploadTasks: UploadTaskRecord[] = []
+  @State albumUploadJobs: AlbumUploadJob[] = []
+  @State showAlbumPicker: boolean = false
+  @State showAlbumUpload: boolean = false
+  @State albumUploadSelection: LocalImageAlbum = new LocalImageAlbum()
+  private albumConfirmationPending: boolean = false
+  private albumReselectPending: boolean = false
+  @State showAlbumDetails: boolean = false
+  @State albumDetailsId: string = ''
+  @State albumDetailsName: string = ''
+  @State albumUploadDestination: string = ''
+  private albumUploadRootType: number = 0
+  private albumUploadScope: string = ''
+  private albumUpload: AlbumUploadManager = new AlbumUploadManager()
   @State importExpanded: boolean = false
   @State importSelecting: boolean = false
   private uploadQueue: UploadQueueManager = new UploadQueueManager()
@@ -1137,6 +1167,13 @@ struct Index {
   @StorageProp('isDarkTheme') isDarkTheme: boolean = false
   @StorageProp('abilityInBackground') @Watch('onAbilityBackgroundChanged')
   abilityInBackground: boolean = false
+  @StorageProp('transferNavigationRequest') @Watch('onTransferNavigationRequested')
+  transferNavigationRequest: number = 0
+  @StorageProp('transferProtectionActive') transferProtectionActive: boolean = false
+  @StorageProp('transferProtectionError') transferProtectionError: string = ''
+  @StorageProp('transferNotificationBlocked') transferNotificationBlocked: boolean = false
+  @StorageProp('transferProgressText') transferProgressText: string = ''
+  private transferNavigationHandled: number = 0
   private repository: UgreenRemoteRepository = new UgreenRemoteRepository()
   private networkPolicy: NetworkPolicy = NetworkPolicy.shared()
   private downloadQueue: DownloadQueueManager = new DownloadQueueManager()
@@ -1496,6 +1533,10 @@ struct Index {
   private errorDialogShowing: boolean = false
   private networkStateListener = (state: NetworkClass): void => {
     this.networkClass = state
+    NasConnection.shared().setPhoneOffline(state === 'offline')
+    if (state === 'unmetered' && !this.offlineCacheMode && NasConnection.shared().canRequest()) {
+      this.videoTransferManager.resumeAwaitingNas(true)
+    }
     if ((state === 'metered' || state === 'unknown') && !this.meteredAutoOriginal) {
       this.stopQueuedViewerAutoLoads()
     }
@@ -1507,6 +1548,26 @@ struct Index {
     this.downloadTasks = tasks.concat(this.videoTransferManager.snapshotTasks())
     this.downloadSpeedBytesPerSecond = speed
   }
+  @State private nasState: NasConnectionState = 'unknown'
+  @State private offlineCacheMode: boolean = false
+  private offlineProfile: OfflineAccountProfile | null = null
+  private personalRootEntriesType: number = 4
+  private offlineProfileTimer: number = 0
+  private nasRecoveryTimer: number = 0
+  private nasRecoveryPending: boolean = false
+  private nasSessionRecovery: Promise<void> | null = null
+  private nasStateListener = (state: NasConnectionState): void => {
+    const previous = this.nasState
+    this.nasState = state
+    if (state === 'unavailable' || state === 'connecting') {
+      this.stopQueuedViewerAutoLoads()
+      this.videoTransferManager.handleNasUnavailable()
+    }
+    if (state === 'online' && (previous === 'unavailable' || previous === 'connecting')) {
+      this.nasRecoveryPending = true
+      this.scheduleNasRecovery()
+    }
+  }
   private videoTransferStateListener = (states: VideoTransferState[]): void => {
     const next: Record<string, VideoTransferState> = {}
     for (const state of states) {
@@ -1516,9 +1577,8 @@ struct Index {
     this.downloadTasks = this.downloadQueue.snapshot().concat(this.videoTransferManager.snapshotTasks())
   }
   private gestureShareRegistered: boolean = false
-  private gestureShareRegistering: boolean = false
-  private gestureShareLifecycleToken: number = 0
-  private gestureShareCapability: harmonyShare.SendCapabilityRegistry | null = null
+  private gestureSharePageVisible: boolean = true
+  private gestureSharePreparing: boolean = false
   private gestureShareCallback = (target: harmonyShare.SharableTarget): void => {
     this.handleGestureShare(target)
   }
@@ -1542,6 +1602,9 @@ struct Index {
     HapticFeedback.prepare()
     this.statusText = ''
     this.configureImageAnalyzer()
+    this.nasState = NasConnection.shared().current()
+    NasConnection.shared().onChange(this.nasStateListener)
+    NasConnection.shared().setForeground(!this.abilityInBackground)
     this.ensureCacheState()
     this.ensureNetworkState()
     this.ensureDownloadState()
@@ -1613,6 +1676,11 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    this.albumUpload.setForeground(false)
+    this.gestureSharePageVisible = false
+    NasConnection.shared().setForeground(false)
+    NasConnection.shared().offChange(this.nasStateListener)
+    if (this.nasRecoveryTimer !== 0) { clearTimeout(this.nasRecoveryTimer); this.nasRecoveryTimer = 0 }
     this.closeActionMenu()
     this.finishActionMenuDismiss()
     this.endDragSelection()
@@ -1760,12 +1828,21 @@ struct Index {
   }
 
   onPageHide(): void {
+    this.albumUpload.setForeground(false)
+    this.gestureSharePageVisible = false
+    NasConnection.shared().setForeground(false)
+    this.disableGestureShare()
     this.endDragSelection()
     this.handlePlaybackBackgroundState(true)
     this.updateVideoMediaSession(true)
   }
 
   onPageShow(): void {
+    this.albumUpload.setForeground(!this.abilityInBackground)
+    this.gestureSharePageVisible = true
+    NasConnection.shared().setForeground(!this.abilityInBackground)
+    this.scheduleNasRecovery()
+    this.syncGestureShareRegistration()
     this.handlePlaybackBackgroundState(false)
     this.scheduleVideoPipRestore()
     if (this.showVideoPlayer) {
@@ -1776,10 +1853,24 @@ struct Index {
   }
 
   onAbilityBackgroundChanged(): void {
+    this.albumUpload.setForeground(this.gestureSharePageVisible && !this.abilityInBackground)
+    NasConnection.shared().setForeground(this.gestureSharePageVisible && !this.abilityInBackground)
+    if (!this.abilityInBackground) { this.scheduleNasRecovery() }
+    this.syncGestureShareRegistration()
     this.handlePlaybackBackgroundState(this.abilityInBackground)
     if (!this.abilityInBackground) {
       this.scheduleVideoPipRestore()
     }
+  }
+
+  onTransferNavigationRequested(): void {
+    if (this.transferNavigationRequest <= this.transferNavigationHandled ||
+      this.screen === 'login' || this.screen === 'otp') { return }
+    if (this.isBusy && !this.isNavigating && !this.showPageTransition) { return }
+    this.transferNavigationHandled = this.transferNavigationRequest
+    if (this.showVideoPlayer) { this.closeVideoPlayer() }
+    if (this.showImageViewer) { this.closeImageViewer() }
+    this.openDownloads()
   }
 
   private scheduleVideoPipRestore(): void {
@@ -1843,59 +1934,38 @@ struct Index {
 
   /**
    * Register the official HarmonyOS one-grab-one-release sender callback.
-   * The callback is kept for the lifetime of this page, but it only accepts
-   * content while an image viewer or a file multi-selection is active.
+   * Only the visible foreground page with shareable content owns a listener.
    * HarmonyOS owns the gesture affordance and transfer animation; the app
    * supplies only a local SharedData payload.
    */
   private enableGestureShare(): void {
-    if (this.gestureShareRegistered || this.gestureShareRegistering ||
+    if (this.gestureShareRegistered ||
       !canIUse('SystemCapability.Collaboration.HarmonyShare')) {
       return
     }
-    this.gestureShareRegistering = true
-    const token = this.gestureShareLifecycleToken + 1
-    this.gestureShareLifecycleToken = token
-    const context = getContext(this) as common.UIAbilityContext
-    window.getLastWindow(context).then((win: window.Window): void => {
-      if (token !== this.gestureShareLifecycleToken) {
-        this.gestureShareRegistering = false
-        return
-      }
-      try {
-        const capability: harmonyShare.SendCapabilityRegistry = {
-          windowId: win.getWindowProperties().id,
-          sendOnly: true
-        }
-        harmonyShare.on('gesturesShare', capability, this.gestureShareCallback)
-        this.gestureShareCapability = capability
-        this.gestureShareRegistered = true
-      } catch (error) {
-        console.warn('[UgreenShare] register gesturesShare failed: ' + JSON.stringify(error))
-      }
-      this.gestureShareRegistering = false
-    }).catch((error: Error): void => {
-      this.gestureShareRegistering = false
-      console.warn('[UgreenShare] get share window failed: ' + JSON.stringify(error))
-    })
+    try {
+      // Use the documented page listener. getLastWindow() can return a native
+      // context-menu child window that is already dismissing, leaving the
+      // listener attached to a window that immediately disappears.
+      harmonyShare.on('gesturesShare', this.gestureShareCallback)
+      this.gestureShareRegistered = true
+      console.info('[UgreenShare] gestures-listener registered scene=' +
+        (this.showImageViewer ? 'viewer' : 'selection'))
+    } catch (error) {
+      console.warn('[UgreenShare] register gesturesShare failed: ' + JSON.stringify(error))
+    }
   }
 
   private disableGestureShare(): void {
-    this.gestureShareLifecycleToken += 1
-    this.gestureShareRegistering = false
     if (!this.gestureShareRegistered) {
       return
     }
     try {
-      if (this.gestureShareCapability !== null) {
-        harmonyShare.off('gesturesShare', this.gestureShareCapability, this.gestureShareCallback)
-      } else {
-        harmonyShare.off('gesturesShare', this.gestureShareCallback)
-      }
+      harmonyShare.off('gesturesShare', this.gestureShareCallback)
+      console.info('[UgreenShare] gestures-listener unregistered')
     } catch (error) {
       console.warn('[UgreenShare] unregister gesturesShare failed: ' + JSON.stringify(error))
     }
-    this.gestureShareCapability = null
     this.gestureShareRegistered = false
   }
 
@@ -1915,7 +1985,7 @@ struct Index {
    * 于是"没有内容的界面"上截屏手势也被吃掉、还会弹"无可分享内容"。
    */
   private hasGestureShareContent(): boolean {
-    return this.gestureShareCandidates().length > 0
+    return this.gestureShareCandidates().some((entry: FileEntry): boolean => !entry.isDirectory)
   }
 
   private onGestureShareStateChanged(): void {
@@ -1931,7 +2001,7 @@ struct Index {
   }
 
   private syncGestureShareRegistration(): void {
-    if (this.hasGestureShareContent()) {
+    if (this.gestureSharePageVisible && !this.abilityInBackground && this.hasGestureShareContent()) {
       this.enableGestureShare()
     } else {
       this.disableGestureShare()
@@ -1968,14 +2038,15 @@ struct Index {
           cachedPath = ''
         }
       }
-      if (cachedPath.length > 0 || this.networkClass === 'unmetered') {
+      if (cachedPath.length > 0) {
         allowed.push(entry)
         continue
       }
-      if (this.networkClass === 'offline') {
+      if (this.networkClass === 'offline' || this.offlineCacheMode || !NasConnection.shared().canRequest()) {
         skippedCount += 1
         continue
       }
+      if (this.networkClass === 'unmetered') { allowed.push(entry); continue }
       // Unknown and cellular networks are controlled by the existing settings:
       // original images use the image switch, all other files use the download
       // continuation switch. Cached files above remain available offline.
@@ -1990,7 +2061,8 @@ struct Index {
     return { entries: allowed, skippedCount: skippedCount }
   }
 
-  private async cacheGestureEntries(entries: FileEntry[]): Promise<GestureTransferCacheResult> {
+  private async cacheGestureEntries(entries: FileEntry[],
+    pinnedPaths: string[]): Promise<GestureTransferCacheResult> {
     const localPaths: Record<string, string> = {}
     let failedCount = 0
     let nextIndex = 0
@@ -2005,6 +2077,12 @@ struct Index {
         try {
           const localPath = await this.ensureCachedFile(entry)
           if (CacheManager.exists(localPath)) {
+            // A later download in the same selection must not evict an
+            // earlier record before HarmonyShare has consumed its URI.
+            if (pinnedPaths.indexOf(localPath) < 0) {
+              StorageBudget.pin(localPath)
+              pinnedPaths.push(localPath)
+            }
             localPaths[entry.path] = localPath
           } else {
             failedCount += 1
@@ -2022,9 +2100,41 @@ struct Index {
     }
     await Promise.all(workers)
     const cachedEntries = entries.filter((entry: FileEntry): boolean => {
-      return typeof localPaths[entry.path] === 'string' && localPaths[entry.path].length > 0
+      return typeof localPaths[entry.path] === 'string' && CacheManager.exists(localPaths[entry.path])
     })
     return { entries: cachedEntries, localPaths: localPaths, failedCount: failedCount }
+  }
+
+  private async prepareGestureShare(candidates: FileEntry[],
+    pinnedPaths: string[]): Promise<GestureTransferPreparedData> {
+    const selection = await this.filterGestureTransferEntries(candidates)
+    // SharedData supports at most 500 records.
+    const transferEntries = selection.entries.slice(0, 500)
+    for (const entry of transferEntries) {
+      if (!this.isVideo(entry)) {
+        // Pin even an as-yet missing destination before awaiting downloads:
+        // DownloadManager releases its own pin as it returns, and another
+        // worker may otherwise evict the file before this caller resumes.
+        const path = CacheManager.cachePath(this.cacheDirectory, entry.name, this.originalCacheKey(entry))
+        if (pinnedPaths.indexOf(path) < 0) {
+          StorageBudget.pin(path)
+          pinnedPaths.push(path)
+        }
+      }
+    }
+    const cached = await this.cacheGestureEntries(transferEntries, pinnedPaths)
+    return { entries: cached.entries, localPaths: cached.localPaths,
+      failedCount: cached.failedCount,
+      skippedCount: selection.skippedCount + Math.max(0, selection.entries.length - 500) }
+  }
+
+  private canShowGestureShareFeedback(candidates: FileEntry[]): boolean {
+    if (!this.gestureSharePageVisible || this.abilityInBackground || this.isBusy) {
+      return false
+    }
+    const current = this.gestureShareCandidates()
+    return current.length === candidates.length && current.every(
+      (entry: FileEntry, index: number): boolean => entry.path === candidates[index].path)
   }
 
   private gestureShareThumbnailUri(entry: FileEntry): string {
@@ -2037,71 +2147,110 @@ struct Index {
   }
 
   private async handleGestureShare(target: harmonyShare.SharableTarget): Promise<void> {
+    const startedAt = this.getMonotonicNow()
+    const candidates = this.gestureShareCandidates()
+    console.info('[UgreenShare] gesture received scene=' +
+      (this.showImageViewer ? 'viewer' : 'selection') + ' count=' + candidates.length.toString())
+    if (this.gestureSharePreparing || this.isBusy) {
+      this.showImmersiveToast(this.gestureSharePreparing
+        ? '原文件正在准备，请完成后再次抓取' : '正在处理中，请稍后重试')
+      await this.rejectGestureShare(target, harmonyShare.SharableErrorCode.DOWNLOAD_ERROR)
+      return
+    }
+    if (!this.gestureSharePageVisible || this.abilityInBackground ||
+      !candidates.some((entry: FileEntry): boolean => !entry.isDirectory)) {
+      await this.rejectGestureShare(target, harmonyShare.SharableErrorCode.NO_CONTENT_ERROR)
+      return
+    }
+    // Claim before the first await. This operation owns its own flag, never
+    // isBusy: viewer transitions and unrelated file actions own that flag.
+    this.gestureSharePreparing = true
+    const pinnedPaths: string[] = []
+    let preparationTimer = -1
     let shareRequested = false
+    let targetRejected = false
+    let stage = 'prepare'
     try {
-      const candidates = this.gestureShareCandidates()
-      if (this.isBusy) {
-        // 忙和"没有内容"是两回事：一律报"无可分享内容"会让人以为功能坏了。
-        this.showImmersiveToast('正在处理中，请稍后重试')
-        await this.rejectGestureShare(target, harmonyShare.SharableErrorCode.DOWNLOAD_ERROR)
-        return
-      }
-      if (candidates.length === 0) {
-        await this.rejectGestureShare(target, harmonyShare.SharableErrorCode.NO_CONTENT_ERROR)
-        return
-      }
-      const selection = await this.filterGestureTransferEntries(candidates)
-      if (selection.entries.length === 0) {
-        await this.rejectGestureShare(target, harmonyShare.SharableErrorCode.NO_CONTENT_ERROR)
-        return
-      }
-
-      // SharedData supports at most 500 records. This is the platform limit,
-      // not an app-defined size/count threshold.
-      const transferEntries = selection.entries.length > 500
-        ? selection.entries.slice(0, 500) : selection.entries
-      const thumbnailUri = this.gestureShareThumbnailUri(transferEntries[0])
-      if (thumbnailUri.length > 0) {
-        try {
-          await target.updateShareData({ thumbnailUri: thumbnailUri })
-        } catch (error) {
-          console.warn('[UgreenShare] update preview failed: ' + JSON.stringify(error))
-        }
-      }
-
-      this.isBusy = true
       this.errorText = ''
       this.statusText = '正在准备隔空传送…'
-      const cached = await this.cacheGestureEntries(transferEntries)
-      if (cached.entries.length === 0) {
+      const preparation = this.prepareGestureShare(candidates.map(
+        (entry: FileEntry): FileEntry => entry.clone()), pinnedPaths)
+      const deadline = new Promise<GestureTransferPreparedData | null>((resolve): void => {
+        preparationTimer = setTimeout((): void => resolve(null), GESTURE_SHARE_PREPARATION_MS)
+      })
+      const cached = await Promise.race([preparation, deadline])
+      clearTimeout(preparationTimer)
+      preparationTimer = -1
+      if (cached === null || this.getMonotonicNow() - startedAt >= GESTURE_SHARE_PREPARATION_MS) {
+        targetRejected = true
         await this.rejectGestureShare(target, harmonyShare.SharableErrorCode.DOWNLOAD_ERROR)
-        this.reportError(new Error('没有可传输的本地文件'), '隔空传送失败')
+        console.info('[UgreenShare] preparation exceeded app wait elapsedMs=' +
+          (this.getMonotonicNow() - startedAt).toString())
+        if (this.canShowGestureShareFeedback(candidates)) {
+          this.showImmersiveToast('原文件正在准备，完成后请再次抓取')
+        }
+        // Continue only the user's explicit preparation. Never send using the
+        // expired target and never prefetch originals on selection changes.
+        const completed = cached === null ? await preparation : cached
+        console.info('[UgreenShare] retry-ready count=' + completed.entries.length.toString() +
+          ' failed=' + completed.failedCount.toString() + ' elapsedMs=' +
+          (this.getMonotonicNow() - startedAt).toString())
+        if (this.canShowGestureShareFeedback(candidates)) {
+          this.showImmersiveToast(completed.entries.length > 0
+            ? '已准备 ' + completed.entries.length.toString() + ' 个原文件，请再次抓取'
+            : '原文件准备失败，请检查网络或缓存空间')
+        }
+        return
+      }
+      if (cached.entries.length === 0) {
+        targetRejected = true
+        await this.rejectGestureShare(target, cached.failedCount > 0
+          ? harmonyShare.SharableErrorCode.DOWNLOAD_ERROR : harmonyShare.SharableErrorCode.NO_CONTENT_ERROR)
+        if (this.canShowGestureShareFeedback(candidates)) {
+          this.showImmersiveToast(this.offlineCacheMode || !NasConnection.shared().canRequest()
+            ? 'NAS 暂时无法连接，此文件尚未缓存，请恢复连接后传送'
+            : (cached.failedCount > 0 ? '原文件准备失败，请检查网络或缓存空间' : '当前没有可传送的文件，请检查网络设置'))
+        }
         return
       }
 
+      stage = 'submit'
       const sharedData = new systemShare.SharedData(this.shareRecord(
         cached.entries[0], cached.localPaths[cached.entries[0].path]))
       for (let index = 1; index < cached.entries.length; index += 1) {
         const entry = cached.entries[index]
         sharedData.addRecord(this.shareRecord(entry, cached.localPaths[entry.path]))
       }
+      console.info('[UgreenShare] submit count=' + cached.entries.length.toString() +
+        ' elapsedMs=' + (this.getMonotonicNow() - startedAt).toString())
       shareRequested = true
       await target.share(sharedData)
-      this.statusText = ''
-      if (selection.skippedCount > 0 || cached.failedCount > 0 ||
-        cached.entries.length < transferEntries.length) {
-        console.info('[UgreenShare] skipped files: ' +
-          (selection.skippedCount + cached.failedCount).toString())
+      console.info('[UgreenShare] share completed elapsedMs=' +
+        (this.getMonotonicNow() - startedAt).toString())
+      if ((cached.skippedCount > 0 || cached.failedCount > 0) && this.canShowGestureShareFeedback(candidates)) {
+        this.showImmersiveToast('已提交 ' + cached.entries.length.toString() + ' 个文件，' +
+          (cached.skippedCount + cached.failedCount).toString() + ' 个文件未能传送')
       }
     } catch (error) {
-      console.warn('[UgreenShare] gesturesShare failed: ' + JSON.stringify(error))
-      if (!shareRequested) {
+      console.warn('[UgreenShare] gesturesShare failed stage=' + stage + ' elapsedMs=' +
+        (this.getMonotonicNow() - startedAt).toString() + ' error=' + JSON.stringify(error))
+      if (!shareRequested && !targetRejected) {
         await this.rejectGestureShare(target, harmonyShare.SharableErrorCode.DOWNLOAD_ERROR)
       }
-      this.reportError(error as Object, '隔空传送失败')
-      this.statusText = '隔空传送失败'
+      if (this.canShowGestureShareFeedback(candidates)) {
+        this.reportError(error as Object, '隔空传送失败')
+      }
     } finally {
-      this.isBusy = false
+      if (preparationTimer >= 0) {
+        clearTimeout(preparationTimer)
+      }
+      for (const path of pinnedPaths) {
+        StorageBudget.unpin(path)
+      }
+      if (this.statusText === '正在准备隔空传送…') {
+        this.statusText = ''
+      }
+      this.gestureSharePreparing = false
     }
   }
 
@@ -2201,7 +2350,6 @@ struct Index {
     // metadata can be one step apart; never paint the previous directory's
     // rail over the incoming page.
     return this.fileSortKey === 'time' && !this.showPageTransition &&
-      !this.showDestinationPicker && !this.showCreateFolderDialog &&
       this.indexedDirectoryKey === currentDirectoryKey && this.directoryTimeline.eligible(
       DirectoryTimelinePolicy.minimumImageCount(visibleImageCount)) &&
       this.shouldShowFileToolsBar()
@@ -2320,6 +2468,21 @@ struct Index {
       this.viewerFallbackEntryActive || this.viewerClosePending
   }
 
+  // Parent chrome is retained beneath overlays. Only input ownership changes;
+  // do not use these flags to unmount material hosts or change the bar's mode.
+  private parentOverlayOwnsInteraction(): boolean {
+    return this.viewerOwnsParentInteraction() || this.showAudioPlayer ||
+      this.videoPlaybackUiVisible() || this.videoEntryTransitionActive ||
+      this.contextMenuEntry !== null || this.showRenameDialog ||
+      this.showDestinationPicker || this.showCreateFolderDialog ||
+      this.showAlbumPicker || this.showAlbumUpload || this.showAlbumDetails
+  }
+
+  private shouldShowFloatingImportControl(): boolean {
+    return this.screen === 'files' && this.currentPath.length > 0 &&
+      !this.showSearch && !this.selectionMode
+  }
+
   // 胶囊宽度按按钮数量算：4 项 = 328vp；详情页的排序胶囊固定 140vp。
   private wideBottomBarCapsuleWidth(): number {
     return Math.min(BOTTOM_BAR_ITEM_WIDTH_VP * BOTTOM_BAR_MAX_ITEMS,
@@ -2336,9 +2499,7 @@ struct Index {
 
   private shouldShowFileToolsBar(): boolean {
     return this.screen === 'files' && !this.showSearch &&
-      !this.shouldShowBottomBar() && this.contextMenuEntry === null &&
-      !this.showRenameDialog &&
-      !this.showAudioPlayer && !this.videoPlaybackUiVisible() && !this.selectionMode
+      !this.shouldShowBottomBar() && !this.selectionMode
   }
 
   private videoPlaybackUiVisible(): boolean {
@@ -2737,6 +2898,9 @@ struct Index {
   }
 
   onBackPress(): boolean {
+    if (this.showAlbumPicker) { this.albumConfirmationPending = false; this.showAlbumPicker = false; return true }
+    if (this.showAlbumUpload) { this.showAlbumUpload = false; return true }
+    if (this.showAlbumDetails) { this.showAlbumDetails = false; return true }
     if (this.importExpanded) {
       this.getUIContext().animateTo({ duration: 220, curve: Curve.EaseOut }, () => { this.importExpanded = false })
       return true
@@ -2905,11 +3069,9 @@ struct Index {
         }
       })
 
-      // 同样不排除 showDestinationPicker：底栏若被卸载，从选取页返回时要重建，
-      // 观感上就是闪一下/白一下。
-      if ((this.screen === 'files' || this.screen === 'downloads' || this.screen === 'settings') &&
-        this.contextMenuEntry === null && !this.showRenameDialog &&
-        !this.showAudioPlayer && !this.videoPlaybackUiVisible()) {
+      // Keep material hosts and the current bar mode across every overlay,
+      // matching the image viewer's return path.
+      if (this.screen === 'files' || this.screen === 'downloads' || this.screen === 'settings') {
         // 三种底栏形态共用这一个常驻外壳，内部按 bottomBarMode() 交叉淡化；
         // 显隐仍由 bottomBarOffsetY/bottomBarOpacity 控制。
         Stack({ alignContent: Alignment.Bottom }) {
@@ -2923,7 +3085,7 @@ struct Index {
         .zIndex(20)
         // The host is transparent and contains only the capsule. Its empty
         // area must pass through to the file surface below.
-        .hitTestBehavior(this.viewerOwnsParentInteraction()
+        .hitTestBehavior(this.parentOverlayOwnsInteraction()
           ? HitTestMode.BLOCK_DESCENDANTS : HitTestMode.None)
       }
 
@@ -2961,14 +3123,14 @@ struct Index {
         // the renderer node and its layout while removing it from painting,
         // so the previous directory's rail cannot survive the pop frame.
         .visibility(this.shouldShowTimeline() ? Visibility.Visible : Visibility.Hidden)
-        .zIndex(21)
+        .zIndex(this.showDestinationPicker ? 8 : 21)
         // 收起态：整层自己要点击（露出的那一小截不能被下面的图片接走）。
         // 展开态：必须用 Default —— None 是「自身不响应」，挂在整层上的 onClick 永远收不到 ✗；
         // Default 是「自身响应 + 子节点照常响应」，轴条的拖动定位不受影响。
         // 未显示或大图查看态：必须用 BLOCK_DESCENDANTS —— 自身不响应【且阻塞所有后代】，
         // 整棵子树退出命中测试，事件才真正落到下面的底栏/列表 ✗
         // （None 只让「自身」不响应，子节点照常参与命中 → 隐藏态的轴条会吃掉点击。）
-        .hitTestBehavior(this.shouldShowTimeline() && !this.viewerOwnsParentInteraction()
+        .hitTestBehavior(this.shouldShowTimeline() && !this.parentOverlayOwnsInteraction()
           ? HitTestMode.Default
           : HitTestMode.BLOCK_DESCENDANTS)
       }
@@ -2981,12 +3143,11 @@ struct Index {
         this.TransferDirectionControl()
       }
 
-      // 同上：选取页打开时这一层也保持挂载，返回时不必重建。
-      if (this.screen === 'files' && this.currentPath.length > 0 && !this.showSearch &&
-        !this.selectionMode && this.contextMenuEntry === null &&
-        !this.showRenameDialog &&
-        !this.showAudioPlayer && !this.videoPlaybackUiVisible()) {
-        if (this.importExpanded) {
+      // Retain the control's docking state and native material while an overlay
+      // covers it. Search/selection only hide it; they do not create a new ball.
+      if (this.screen === 'files' && this.currentPath.length > 0) {
+        if (this.importExpanded && this.shouldShowFloatingImportControl() &&
+          !this.parentOverlayOwnsInteraction()) {
           Row().width('100%').height('100%').backgroundColor(Color.Transparent).zIndex(24)
             .onClick(() => {
               this.getUIContext().animateTo({ duration: 220, curve: Curve.EaseOut }, () => {
@@ -3028,23 +3189,21 @@ struct Index {
           onControlAreaChange: (area: Area): void => { this.updateFloatingImportRect(area) } })
           .id('floating-import-host')
           .position({ x: 0, y: 0 })
+          .visibility(this.shouldShowFloatingImportControl() ? Visibility.Visible : Visibility.Hidden)
           // 选取页的层级是 20；悬浮球平时是 25，会一直压在选取页上面（显示逻辑不对）。
           // 选取页打开时把它降到 8，正好被盖在底下。
           .zIndex(this.showDestinationPicker || this.viewerClosePending ? 8 : 25)
           // The overlay is a full page sized host whose only interactive part is
           // the ball itself. Keeping the host out of the touch test lets taps
           // reach the file list under it.
-          .hitTestBehavior(this.viewerOwnsParentInteraction()
+          .hitTestBehavior(!this.shouldShowFloatingImportControl() || this.parentOverlayOwnsInteraction()
             ? HitTestMode.BLOCK_DESCENDANTS
             : (this.importSelecting || this.showCreateFolderDialog
               ? HitTestMode.BLOCK_DESCENDANTS : HitTestMode.None))
       }
 
-      // 这里刻意不排除 showDestinationPicker：标题栏一旦被卸载，从选取页返回时
-      // 会重新挂载，看起来就是"要等页面重新加载"。让它一直留在树上，选取页用更高
-      // 的 zIndex 压在它上面（见下方 DestinationPickerOverlay 的包裹 Stack）。
-      if ((this.screen === 'files' || this.screen === 'downloads' || this.screen === 'settings') &&
-        !this.showAudioPlayer && !this.videoPlaybackUiVisible()) {
+      // Native title materials stay mounted beneath media and picker overlays.
+      if (this.screen === 'files' || this.screen === 'downloads' || this.screen === 'settings') {
         Stack({ alignContent: Alignment.TopStart }) {
           this.NativeFileHeader()
         }
@@ -3052,7 +3211,7 @@ struct Index {
         .width('100%')
         .height('100%')
         .zIndex(10)
-        .hitTestBehavior(this.viewerOwnsParentInteraction()
+        .hitTestBehavior(this.parentOverlayOwnsInteraction()
           ? HitTestMode.BLOCK_DESCENDANTS : HitTestMode.None)
       }
 
@@ -3106,6 +3265,7 @@ struct Index {
       this.CreateFolderOverlay()
       this.DestinationFolderOverlay()
       this.ImageViewerDetailsOverlay()
+      this.AlbumUploadOverlay()
     }
     .width('100%')
     .height('100%')
@@ -3131,7 +3291,8 @@ struct Index {
           ' ChildTouchTest #' + this.sessionTouchTestCount.toString() +
           ' +' + dt.toString() + 'ms candidates=[' + candidateStrs.join(', ') + ']')
       }
-      if (infos.length > 0 && !this.showFileSortMenu && !this.showSelectionMoreMenu) {
+      if (infos.length > 0 && !this.parentOverlayOwnsInteraction() &&
+        !this.showFileSortMenu && !this.showSelectionMoreMenu) {
         const point = infos[0]
         const winX = point.windowX
         const winY = point.windowY
@@ -3917,8 +4078,11 @@ struct Index {
       if (!this.isBusy && ((this.fileViewMode === 'waterfall'
         && this.waterfallEntries.length === 0) || (this.fileViewMode !== 'waterfall'
         && this.entries.length === 0))) {
-        Text(this.fileViewMode === 'waterfall'
+        Text(this.nasState === 'unavailable' || this.nasState === 'connecting' || this.offlineCacheMode
+          ? '此目录暂无可用缓存，连接恢复后可重试'
+          : (this.fileViewMode === 'waterfall'
           ? '当前目录没有图片' : '当前目录为空或没有可显示的文件')
+          )
           .fontSize(13)
           .fontColor($r('app.color.text_muted'))
           .margin({ top: 10 })
@@ -3940,7 +4104,33 @@ struct Index {
         }
         .width('100%')
 
-        if (this.visibleTransferTasks().length === 0) {
+        if (this.transferProgressText.length > 0 || this.transferProtectionError.length > 0 || this.transferNotificationBlocked) {
+          ListItem() {
+            Column({ space: 6 }) {
+              if (this.transferProgressText.length > 0) {
+                Text(this.transferProgressText).fontSize(14).fontColor($r('sys.color.font_primary'))
+                  .width('100%').id('transfer-total-progress')
+              }
+              Text(this.transferNotificationBlocked ? '通知未开启，当前仅前台传输' : (this.transferProtectionError.length > 0 ? this.transferProtectionError :
+                (this.transferProtectionActive ? '后台传输保护已开启，锁屏后可继续' : '正在申请后台传输保护'))
+              )
+                .fontSize(12).fontColor($r('app.color.text_muted')).width('100%')
+                .id('transfer-background-status')
+              if (this.transferNotificationBlocked) {
+                Button('开启通知').fontSize(13).height(36)
+                  .onClick(() => { TransferBackgroundManager.shared().openNotificationSettings().catch(() => {}) })
+                  .id('transfer-notifications-enable')
+              }
+            }.padding({ left: 20, right: 20, top: 8, bottom: 16 }).width('100%')
+          }.width('100%')
+        }
+        if (this.transferDirection === 'upload') {
+          ForEach(this.albumUploadJobs, (job: AlbumUploadJob) => {
+            ListItem() { this.AlbumUploadTaskRow(job) }.width('100%')
+          }, (job: AlbumUploadJob): string => job.id)
+        }
+        if (this.visibleTransferTasks().length === 0 &&
+          (this.transferDirection !== 'upload' || this.albumUploadJobs.length === 0)) {
           ListItem() {
             Text(this.transferDirection === 'upload' ? '暂无上传任务' : '暂无下载任务')
               .fontSize(14)
@@ -3993,6 +4183,133 @@ struct Index {
     return this.transferDirection === 'upload' ? this.uploadTasks : this.downloadTasks
   }
 
+  private albumUploadStatus(job: AlbumUploadJob): string {
+    if (job.state === 'building') { return '正在固定图片清单' }
+    if (job.state === 'checking') { return '正在检查 NAS 已有图片' }
+    if (job.state === 'paused') { return '已暂停' }
+    if (job.state === 'waiting_wifi') { return '等待 WiFi' }
+    if (job.state === 'waiting_server') { return '等待 NAS 恢复连接' }
+    if (job.state === 'waiting_foreground') { return '回到应用前台后继续' }
+    if (job.state === 'completed') { return '已完成' }
+    if (job.state === 'failed') { return job.error || '部分图片失败，可重试' }
+    return job.state === 'running' ? '正在上传' : '等待上传'
+  }
+
+  @Builder
+  AlbumUploadTaskRow(job: AlbumUploadJob): void {
+    Column({ space: 8 }) {
+      Text(job.albumName + ' · 图片文件夹上传').fontSize(16).fontWeight(FontWeight.Medium).width('100%').maxLines(2)
+      Text(this.albumUploadStatus(job)).fontSize(13).fontColor($r('app.color.text_secondary')).width('100%').maxLines(2)
+      Progress({ value: job.uploaded + job.skipped + job.failed, total: Math.max(1, job.total), type: ProgressType.Linear }).width('100%')
+      Text('共 ' + job.total.toString() + ' 张 · 已上传 ' + job.uploaded.toString() + ' · 跳过 ' + job.skipped.toString() + ' · 失败 ' + job.failed.toString())
+        .fontSize(12).fontColor($r('app.color.text_muted')).width('100%')
+      if (job.currentName) {
+        Text(job.currentName + ' · ' + Math.floor(job.currentSize > 0 ? job.currentBytes / job.currentSize * 100 : 0).toString() + '%')
+          .fontSize(12).fontColor($r('app.color.text_muted')).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
+      }
+      Text('目标：' + job.destination).fontSize(12).fontColor($r('app.color.text_muted')).width('100%').maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+      Row({ space: 12 }) {
+        if (job.state !== 'completed' && job.state !== 'building') {
+          Button(job.state === 'running' || job.state === 'checking' || job.state === 'queued' ? '暂停' : (job.state === 'failed' ? '重试失败项' : '继续'))
+            .fontSize(13).height(32).onClick(() => {
+              this.toggleAlbumUpload(job)
+            })
+        }
+        Button('明细').fontSize(13).height(32).onClick(() => {
+          this.albumDetailsId = job.id; this.albumDetailsName = job.albumName; this.showAlbumDetails = true
+        })
+        Button('移除').fontSize(13).height(32).enabled(job.state !== 'building').onClick(() => {
+          this.confirmRemoveAlbumUpload(job)
+        })
+      }
+    }.width('100%').alignItems(HorizontalAlign.Start).padding(16).backgroundColor($r('app.color.surface_card'))
+      .borderRadius(16).margin({ top: 8, bottom: 8 })
+  }
+
+  private async confirmRemoveAlbumUpload(job: AlbumUploadJob): Promise<void> {
+    const result = await promptAction.showDialog({ title: '移除图片文件夹上传任务',
+      message: '停止本批上传并移除任务记录，已上传到 NAS 的图片会保留。',
+      buttons: [{ text: '取消', color: '#536174' }, { text: '移除', color: '#B94739' }] })
+    if (result.index !== 1) { return }
+    try { await this.albumUpload.remove(job.id) }
+    catch (error) { this.showImmersiveToast((error as Error).message || '移除失败，请恢复 NAS 连接后重试') }
+  }
+
+  private async toggleAlbumUpload(job: AlbumUploadJob): Promise<void> {
+    try {
+      if (job.state !== 'running' && job.state !== 'checking' && job.state !== 'queued') {
+        await new LocalAlbumSource(getContext(this) as common.UIAbilityContext).requestPermission()
+      }
+      await this.albumUpload.toggle(job.id)
+    } catch (error) { this.showImmersiveToast((error as Error).message || '继续上传失败') }
+  }
+
+  @Builder
+  AlbumUploadOverlay(): void {
+    Column() {}.width(0).height(0)
+      .bindContentCover($$this.showAlbumPicker, this.AlbumUploadPickerContent, {
+        modalTransition: ModalTransition.DEFAULT, enableSafeArea: false,
+        backgroundColor: Color.Transparent,
+        onDisappear: () => {
+          // Open the next modal only after the native picker has released its input layer.
+          if (!this.albumConfirmationPending) { return }
+          this.albumConfirmationPending = false
+          if (this.albumUploadContextValid()) { this.showAlbumUpload = true }
+        }
+      })
+    Column() {}.width(0).height(0)
+      .bindSheet($$this.showAlbumUpload, this.AlbumUploadOverlayContent, {
+        height: SheetSize.FIT_CONTENT, dragBar: true, showClose: false,
+        backgroundColor: $r('app.color.page_background'),
+        onDisappear: () => {
+          if (!this.albumReselectPending) { return }
+          this.albumReselectPending = false
+          if (this.albumUploadContextValid()) { this.showAlbumPicker = true }
+        }
+      })
+    Column() {}.width(0).height(0)
+      .bindSheet($$this.showAlbumDetails, this.AlbumUploadDetailsContent, {
+        height: '85%', dragBar: true, showClose: true,
+        systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false)
+      })
+  }
+
+  @Builder
+  AlbumUploadPickerContent(): void {
+    AlbumUploadPicker({ visible: $showAlbumPicker, safeTop: this.topSafeInset(), safeBottom: this.bottomSafeInset(),
+      viewportWidth: this.pageWidthVp,
+      onSelected: (album: LocalImageAlbum): void => {
+        this.albumUploadSelection = album
+        this.albumConfirmationPending = this.albumUploadContextValid()
+        this.showAlbumPicker = false
+      } })
+  }
+
+  private albumUploadContextValid(): boolean {
+    return this.screen === 'files' && this.currentPath === this.albumUploadDestination &&
+      this.currentRootType === this.albumUploadRootType && this.repository.cacheScopeHash() === this.albumUploadScope
+  }
+
+  @Builder
+  AlbumUploadOverlayContent(): void {
+    AlbumUploadSheet({ visible: $showAlbumUpload, album: this.albumUploadSelection, destination: this.albumUploadDestination,
+      contentMaxHeight: Math.max(80, this.pageHeightVp * 0.85 - this.topSafeInset() - this.bottomSafeInset() - 140),
+      onReselect: (): void => { this.albumReselectPending = true; this.showAlbumUpload = false },
+      onStart: async (album: LocalImageAlbum): Promise<void> => {
+        await this.albumUpload.create(album, this.albumUploadDestination, this.albumUploadRootType,
+          this.albumUploadScope, false)
+        this.showAlbumUpload = false
+        this.transferDirection = 'upload'
+        this.openDownloads()
+        this.showImmersiveToast('已创建图片文件夹上传任务')
+      } })
+  }
+
+  @Builder
+  AlbumUploadDetailsContent(): void {
+    AlbumUploadDetails({ manager: this.albumUpload, batchId: this.albumDetailsId, albumName: this.albumDetailsName })
+  }
+
   @Builder
   TransferDirectionSurface(): void {
     Row({ space: 8 }) {
@@ -4038,7 +4355,21 @@ struct Index {
 
   private async selectImportSource(source: string): Promise<void> {
     if (source === 'folder') { this.openCreateFolder(); return }
-    if (this.currentPath.length === 0 || this.importSelecting || this.isBusy) { return }
+    if (this.currentPath.length === 0 || this.importSelecting || this.isBusy || this.showAlbumPicker || this.showAlbumUpload) { return }
+    if (source === 'album') {
+      const destination = this.currentPath
+      const rootType = this.currentRootType
+      const scope = this.repository.cacheScopeHash()
+      await this.ensureDownloadState()
+      if (this.currentPath !== destination || this.repository.cacheScopeHash() !== scope || this.screen !== 'files') { return }
+      this.albumUploadDestination = destination
+      this.albumUploadRootType = rootType
+      this.albumUploadScope = scope
+      this.albumConfirmationPending = false
+      this.albumReselectPending = false
+      this.showAlbumPicker = true
+      return
+    }
     const target = this.currentPath
     const scope = this.repository.cacheScopeHash()
     this.importSelecting = true
@@ -5009,6 +5340,13 @@ struct Index {
         .hitTestBehavior(HitTestMode.Default)
       }
 
+      if (this.nasState === 'unavailable' || this.nasState === 'connecting' || this.offlineCacheMode) {
+        Row() { this.NasConnectionNotice() }
+          .width('100%')
+          .margin({ top: this.topSafeInset() + (this.showSearch ? 108 : 56) })
+          .hitTestBehavior(HitTestMode.None)
+          .zIndex(4)
+      }
       if (this.showSearch) {
         Row({ space: 8 }) {
           this.SearchScopeButton('本级', 'current')
@@ -5047,6 +5385,33 @@ struct Index {
     // The gradient is visual only. The root must not pass a touch started on
     // a floating control into the List below; its child controls remain in
     // the hit-test chain.
+    .hitTestBehavior(HitTestMode.None)
+  }
+
+  @Builder
+  NasConnectionNotice(): void {
+    Row({ space: 6 }) {
+      Text(this.nasState === 'connecting' ? '正在连接 NAS…' :
+        (this.offlineCacheMode && this.nasState === 'online' ? '正在恢复登录…' :
+        (this.networkClass === 'offline' ? '手机暂无网络 · 缓存可浏览' : 'NAS 暂时无法连接 · 缓存可浏览')))
+        .fontSize(11)
+        .fontColor($r('sys.color.font_secondary'))
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .layoutWeight(1)
+        .hitTestBehavior(HitTestMode.None)
+      Button('重试')
+        .fontSize(12)
+        .height(24)
+        .padding({ left: 10, right: 10 })
+        .backgroundColor(Color.Transparent)
+        .fontColor($r('sys.color.font_primary'))
+        .enabled(this.nasState !== 'connecting')
+        .onClick((): void => { this.retryNasConnection() })
+    }
+    .height(24)
+    .width('100%')
+    .padding({ left: 24, right: 16 })
     .hitTestBehavior(HitTestMode.None)
   }
 
@@ -7823,7 +8188,9 @@ struct Index {
         return ''
       }
     }
-    hilog.info(IMAGE_VIEWER_HILOG_DOMAIN, 'ThumbProbe', `[6-fileImageSource] path=${entry.path}, surface=${surface}, rev=${_rev}`)
+    if (THUMB_PROBE) {
+      hilog.info(IMAGE_VIEWER_HILOG_DOMAIN, 'ThumbProbe', `[6-fileImageSource] path=${entry.path}, surface=${surface}, rev=${_rev}`)
+    }
     if (this.viewerEntryTransitionActive && this.viewerEntryTransitionPath === entry.path) {
       const transitionBitmap = this.viewerTransitionKind === 'exit' &&
         this.viewerTransitionLayer === 'original'
@@ -7857,7 +8224,9 @@ struct Index {
     const _rev = entry.previewRevision
     const source = this.fileImageSource(entry, surface)
     const avail = typeof source === 'string' ? source.length > 0 : true
-    hilog.info(IMAGE_VIEWER_HILOG_DOMAIN, 'ThumbProbe', `[5-fileImageSourceAvailable] path=${entry.path}, surface=${surface}, rev=${_rev}, avail=${avail}`)
+    if (THUMB_PROBE) {
+      hilog.info(IMAGE_VIEWER_HILOG_DOMAIN, 'ThumbProbe', `[5-fileImageSourceAvailable] path=${entry.path}, surface=${surface}, rev=${_rev}, avail=${avail}`)
+    }
     return avail
   }
 
@@ -8612,7 +8981,9 @@ struct Index {
     }
     if (surfaceHint === undefined || surfaceHint === 'grid' || surfaceHint === 'list') {
       const listIdx = this.fileEntryDataSource.indexOfPath(path)
-      hilog.info(IMAGE_VIEWER_HILOG_DOMAIN, 'ThumbProbe', `[2-notifyEntry] surface=grid/list, path=${path}, listIdx=${listIdx}`)
+      if (THUMB_PROBE) {
+        hilog.info(IMAGE_VIEWER_HILOG_DOMAIN, 'ThumbProbe', `[2-notifyEntry] surface=grid/list, path=${path}, listIdx=${listIdx}`)
+      }
       if (listIdx >= 0) {
         this.fileEntryDataSource.notifyItemChanged(listIdx)
         // R2：子组件已由 @ObjectLink 局部刷新，这里不能再写 @State 数组
@@ -8625,7 +8996,9 @@ struct Index {
     }
     if (surfaceHint === undefined || surfaceHint === 'waterfall') {
       const wfIdx = this.waterfallDataSource.indexOfPath(path)
-      hilog.info(IMAGE_VIEWER_HILOG_DOMAIN, 'ThumbProbe', `[2-notifyEntry] surface=waterfall, path=${path}, wfIdx=${wfIdx}`)
+      if (THUMB_PROBE) {
+        hilog.info(IMAGE_VIEWER_HILOG_DOMAIN, 'ThumbProbe', `[2-notifyEntry] surface=waterfall, path=${path}, wfIdx=${wfIdx}`)
+      }
       if (wfIdx >= 0) {
         this.waterfallDataSource.notifyItemChanged(wfIdx)
         // R2W：瀑布流子组件已由 @ObjectLink 局部刷新，这里不能再写 @State 数组。
@@ -9602,6 +9975,9 @@ struct Index {
     Stack() {
       Column() {
         this.ImageViewerNativeHeader()
+        if (this.nasState === 'unavailable' || this.nasState === 'connecting' || this.offlineCacheMode) {
+          this.NasConnectionNotice()
+        }
         Blank()
           .layoutWeight(1)
           .hitTestBehavior(HitTestMode.None)
@@ -10378,6 +10754,8 @@ struct Index {
     .width('100%')
     .height('100%')
     .backgroundColor('#101828')
+    .id('audio-overlay-root')
+    .zIndex(30)
   }
 
   @Builder
@@ -10491,6 +10869,8 @@ struct Index {
     // page underneath without creating a second video node or stopping AVPlayer.
     .width(this.videoPipBackgrounded ? 1 : '100%')
     .height(this.videoPipBackgrounded ? 1 : '100%')
+    .id('video-overlay-root')
+    .zIndex(30)
     .backgroundColor(this.videoPipBackgrounded ? Color.Transparent : Color.Black)
     .opacity(this.videoPipBackgrounded ? 1 : this.videoOverlayOpacity)
     .hitTestBehavior(this.videoPipBackgrounded ? HitTestMode.None :
@@ -10793,6 +11173,13 @@ struct Index {
   }
 
   private reportError(error: Object, title: string = '操作失败'): void {
+    if (error instanceof UgreenError && error.kind === UgreenErrorKind.NAS_UNAVAILABLE && this.screen !== 'login') {
+      const mutation = title.includes('复制') || title.includes('移动') || title.includes('删除') ||
+        title.includes('重命名') || title.includes('创建') || title.includes('还原')
+      this.showImmersiveToast(mutation ? title + '，结果尚未确认，请恢复连接后检查' :
+        'NAS 暂时无法连接，已缓存内容仍可浏览')
+      return
+    }
     this.presentErrorMessage(readableUgreenError(error), title)
   }
 
@@ -10849,6 +11236,7 @@ struct Index {
     StorageBudget.initialize(context, this.cacheLimitBytes)
     StorageBudget.protect((): string[] => {
       const paths: string[] = [this.audioLocalPath, this.videoLocalPath]
+      paths.push(...this.albumUpload.protectedPaths())
       if (this.showImageViewer) {
         for (const key of Object.keys(this.viewerOriginalLocalPaths)) { paths.push(this.viewerOriginalLocalPaths[key]) }
       }
@@ -10927,6 +11315,10 @@ struct Index {
           this.uploadTasks = tasks.slice()
           this.syncImportedUploads(tasks)
         })
+      await this.albumUpload.initialize(context as common.UIAbilityContext, this.repository, this.networkPolicy,
+        (jobs: AlbumUploadJob[]): void => { this.albumUploadJobs = jobs },
+        (): void => {})
+      this.albumUpload.setForeground(this.gestureSharePageVisible && !this.abilityInBackground)
       this.downloadQueue.onChange(this.downloadStateListener)
       this.downloadTasks = this.downloadQueue.snapshot().concat(this.videoTransferManager.snapshotTasks())
       this.downloadSpeedBytesPerSecond = this.downloadQueue.speed()
@@ -10959,6 +11351,7 @@ struct Index {
     }
     await this.networkPolicy.initialize()
     this.networkClass = this.networkPolicy.current()
+    NasConnection.shared().setPhoneOffline(this.networkClass === 'offline')
     this.repository.setMeteredBackgroundRefreshAllowed(this.meteredBackgroundRefresh)
   }
 
@@ -11032,6 +11425,7 @@ struct Index {
     await this.persistNetworkPreferences()
     await this.ensureDownloadState()
     await this.downloadQueue.setMeteredDownloadContinue(value)
+    if (value && !this.offlineCacheMode) { this.videoTransferManager.resumeAwaitingNas(true) }
   }
 
   private networkDisplayName(): string {
@@ -11087,6 +11481,8 @@ struct Index {
         // has expired after a long idle period or the UI object was rebuilt.
         this.repository.setReconnectCredentials(this.username, this.password)
       }
+      this.offlineProfile = OfflineAccountProfile.read(
+        String(await this.loginPreferences.get('offline_account_v1', '')), this.linkId, this.username)
       if (this.autoLogin && this.rememberPassword && this.linkId.length > 0 &&
         this.username.length > 0 && this.password.length > 0) {
         this.silentAutoLogin = true
@@ -11126,9 +11522,186 @@ struct Index {
       await this.loginPreferences.put('remember_password', this.rememberPassword)
       await this.loginPreferences.put('remember_address', this.rememberAddress)
       await this.loginPreferences.put('auto_login', this.autoLogin)
+      if (!this.rememberPassword || !this.autoLogin) {
+        this.offlineProfile = null
+        await this.loginPreferences.put('offline_account_v1', '')
+      }
       await this.loginPreferences.flush()
     } catch (_) {
       // The login flow must not fail only because preferences cannot be written.
+    }
+  }
+
+  private scheduleOfflineProfileSave(): void {
+    if (this.offlineProfileTimer !== 0) { clearTimeout(this.offlineProfileTimer) }
+    if (!this.rememberPassword || !this.autoLogin || this.offlineCacheMode ||
+      this.repository.sessionIdentity().length === 0) { this.offlineProfileTimer = 0; return }
+    this.offlineProfileTimer = setTimeout((): void => {
+      this.offlineProfileTimer = 0
+      this.saveOfflineProfile().catch(() => {})
+    }, 1000)
+  }
+
+  private async saveOfflineProfile(): Promise<void> {
+    if (!this.rememberPassword || !this.autoLogin || this.offlineCacheMode || this.loginPreferences === null) { return }
+    const identity = this.repository.sessionIdentity()
+    const separator = identity.lastIndexOf('|')
+    if (separator <= 0) { return }
+    const profile = new OfflineAccountProfile()
+    profile.linkId = this.linkId
+    profile.username = this.username
+    profile.baseUrl = identity.substring(0, separator)
+    profile.uid = identity.substring(separator + 1)
+    profile.path = this.currentPath
+    profile.rootType = this.currentRootType
+    profile.personalRootType = this.personalRootEntriesType
+    profile.rootKind = this.rootKind
+    this.offlineProfile = profile
+    try {
+      await this.loginPreferences.put('offline_account_v1', JSON.stringify(profile))
+      await this.loginPreferences.flush()
+    } catch (_) {}
+  }
+
+  private async openOfflineCache(): Promise<boolean> {
+    const profile = this.offlineProfile
+    if (profile === null || profile.linkId !== this.linkId || profile.username !== this.username ||
+      !this.autoLogin || !this.rememberPassword) { return false }
+    this.baseUrl = profile.baseUrl
+    this.repository.restoreOfflineIdentity(profile.baseUrl, profile.uid)
+    this.offlineCacheMode = true
+    await this.ensureCacheState()
+    this.rootKind = profile.rootKind
+    this.selectedBottomTab = profile.rootKind === 'personal' ? 'home' : 'shared'
+    this.personalRootEntriesType = profile.personalRootType
+    try { this.personalRoots = await this.repository.list('', profile.personalRootType) } catch (_) {}
+    try { this.sharedRoots = await this.repository.list('', 3) } catch (_) {}
+    this.currentPath = profile.path
+    this.currentRootType = profile.rootType
+    let cached: FileEntry[] = []
+    if (profile.path.length === 0) { cached = this.rootKind === 'personal' ? this.personalRoots : this.sharedRoots }
+    else {
+      try {
+        const snapshot = await this.repository.ensureDirectoryIndex(profile.path, profile.rootType)
+        cached = snapshot.entries
+        this.setCurrentPageState(Math.max(1, Math.ceil(cached.length / 200)), false)
+      } catch (_) {
+        try {
+          const page = await this.repository.listPage(profile.path, profile.rootType, 1)
+          cached = page.entries
+          this.setCurrentPageState(page.pageIndex, page.hasMore)
+        } catch (_) {
+          this.currentPath = ''
+          this.currentRootType = this.rootKind === 'personal' ? profile.personalRootType : 3
+          cached = this.rootKind === 'personal' ? this.personalRoots : this.sharedRoots
+          this.setCurrentPageState(1, false)
+        }
+      }
+    }
+    this.navigationStack = this.currentPath.length > 0 ? [''] : []
+    this.navigationEntryStack = []
+    this.navigationRootTypeStack = []
+    this.navigationViewStateStack = []
+    this.navigationPageIndexStack = []
+    this.navigationPageHasMoreStack = []
+    this.replaceEntries(cached)
+    this.applyPreferredViewMode()
+    this.updateTopTitle(this.fileTitle(this.currentPath), false)
+    this.screen = 'files'
+    this.updateBottomBarVisibility(false)
+    return true
+  }
+
+  private async retryNasConnection(): Promise<void> {
+    await this.networkPolicy.refresh()
+    if (this.networkPolicy.current() === 'offline') {
+      this.showImmersiveToast('手机暂无网络，请先连接网络')
+      return
+    }
+    if (NasConnection.shared().current() !== 'online') { await NasConnection.shared().retryNow() }
+    if (NasConnection.shared().current() === 'online') {
+      this.nasRecoveryPending = true
+      this.scheduleNasRecovery()
+    }
+  }
+
+  private scheduleNasRecovery(): void {
+    if (!this.nasRecoveryPending || this.nasRecoveryTimer !== 0 ||
+      !this.gestureSharePageVisible || this.abilityInBackground) { return }
+    this.nasRecoveryTimer = setTimeout((): void => {
+      this.nasRecoveryTimer = 0
+      if (!this.nasRecoveryPending || !NasConnection.shared().canRequest() ||
+        !this.gestureSharePageVisible || this.abilityInBackground) { return }
+      if (this.isBusy || this.isNavigating || this.fileContentScrolling || this.imageTouchActive ||
+        this.viewerClosePending || this.viewerReturnOverlayVisible || this.showPageTransition || this.dragSelectionPanActive) {
+        this.scheduleNasRecovery()
+        return
+      }
+      if (this.offlineCacheMode) {
+        if (this.nasSessionRecovery === null) {
+          this.nasSessionRecovery = this.recoverOfflineSession().finally((): void => {
+            this.nasSessionRecovery = null
+          })
+        }
+        return
+      }
+      this.nasRecoveryPending = false
+      this.videoTransferManager.resumeAwaitingNas(this.networkClass === 'unmetered' || this.meteredDownloadContinue)
+      if (this.showImageViewer) {
+        this.prefetchViewerImages(this.viewerImageIndex)
+        const entry = this.committedViewerEntry()
+        if (entry !== null) { this.ensureViewerImageFrame(entry, false) }
+      } else if (this.screen === 'files') {
+        this.flushPendingVisibleLoads()
+        this.warmTimelineVisibleEntries()
+      }
+    }, 300)
+  }
+
+  private async recoverOfflineSession(): Promise<void> {
+    const profile = this.offlineProfile
+    if (profile === null || this.screen === 'login') { return }
+    try {
+      const restored = await this.repository.restoreSession()
+      if (profile !== this.offlineProfile || String(this.screen) === 'login') { return }
+      if (!restored) {
+        this.nasRecoveryPending = false
+        this.offlineCacheMode = false
+        this.screen = 'login'
+        this.presentErrorMessage('登录状态已失效，请重新登录', '需要登录')
+        return
+      }
+      if (this.repository.sessionIdentity() !== profile.baseUrl + '|' + profile.uid) {
+        this.nasRecoveryPending = false
+        this.offlineCacheMode = false
+        this.offlineProfile = null
+        this.repository.logout()
+        this.replaceEntries([])
+        this.resetPreviewState()
+        this.screen = 'login'
+        if (this.loginPreferences !== null) {
+          await this.loginPreferences.put('offline_account_v1', '')
+          await this.loginPreferences.flush()
+        }
+        this.presentErrorMessage('账号信息已变化，请重新登录', '需要登录')
+        return
+      }
+      if (this.entries.length === 0 && !this.showImageViewer) { await this.loadRoot() }
+      this.offlineCacheMode = false
+      await this.refreshVideoManager()
+      await this.ensureDownloadState()
+      if (profile !== this.offlineProfile || String(this.screen) === 'login') { return }
+      await this.downloadQueue.setReady(true)
+      if (profile !== this.offlineProfile || String(this.screen) === 'login') { return }
+      await this.uploadQueue.setReady(true)
+      await this.albumUpload.setReady(true)
+      await this.saveOfflineProfile()
+      this.scheduleNasRecovery()
+    } catch (error) {
+      if (!(error instanceof UgreenError) || error.kind !== UgreenErrorKind.NAS_UNAVAILABLE) {
+        this.nasRecoveryPending = false
+        this.reportError(error as Object, '连接恢复失败')
+      }
     }
   }
 
@@ -12057,7 +12630,8 @@ struct Index {
    */
   private resolveWaterfallImageStateInto(entry: FileEntry,
     state: WaterfallImageState): WaterfallImageState {
-    const available = this.fileImageSourceAvailable(entry, 'waterfall')
+    const source = this.fileImageSource(entry, 'waterfall')
+    const available = typeof source === 'string' ? source.length > 0 : true
     const aspectReady = this.waterfallAspectRatioReady(entry)
     state.available = available
     state.aspectReady = aspectReady
@@ -12071,8 +12645,9 @@ struct Index {
       this.waterfallRenderedPreviewKey[entry.path] = ''
       return state
     }
-    state.source = this.fileImageSource(entry, 'waterfall')
-    state.orientation = this.fileImageSourceOrientation(entry, 'waterfall')
+    state.source = source
+    state.orientation = typeof source === 'string'
+      ? this.fileListImageBaseOrientation(entry) : ImageRotateOrientation.UP
     state.transitionId = this.fileImageTransitionId(entry, 'waterfall')
     state.syncLoad = this.fileImageShouldSyncLoad(entry)
     if (aspectReady) {
@@ -13943,10 +14518,13 @@ struct Index {
         return
       }
       await this.loadRoot()
+      this.offlineCacheMode = false
+      await this.saveOfflineProfile()
       await this.refreshVideoManager()
       await this.ensureDownloadState()
       await this.downloadQueue.setReady(true)
       await this.uploadQueue.setReady(true)
+      await this.albumUpload.setReady(true)
       if (!silent) {
         // 只有用户亲手登录才请求保存（自动登录每次进来都弹保存提示会很烦），
         // 且必须赶在切换页面之前，系统要读登录字段。
@@ -13956,6 +14534,13 @@ struct Index {
       this.updateBottomBarVisibility(false)
       this.statusText = silent ? '' : '登录成功'
     } catch (error) {
+      const connectionFailure = error instanceof UgreenError &&
+        (error.kind === UgreenErrorKind.NAS_UNAVAILABLE ||
+        (error.kind === UgreenErrorKind.NETWORK && (error.status === 0 || error.status >= 500)))
+      if (silent && connectionFailure && await this.openOfflineCache()) {
+        this.statusText = ''
+        return
+      }
       if (silent) {
         this.screen = 'login'
       }
@@ -13963,6 +14548,8 @@ struct Index {
       this.statusText = ''
     } finally {
       this.isBusy = false
+      if (this.offlineCacheMode) { this.retryNasConnection().catch(() => {}) }
+      this.onTransferNavigationRequested()
     }
   }
 
@@ -13976,10 +14563,13 @@ struct Index {
     try {
       const result = await this.repository.verifyOtp(this.otpCode, this.trustDevice)
       await this.loadRoot()
+      this.offlineCacheMode = false
+      await this.saveOfflineProfile()
       await this.refreshVideoManager()
       await this.ensureDownloadState()
       await this.downloadQueue.setReady(true)
       await this.uploadQueue.setReady(true)
+      await this.albumUpload.setReady(true)
       this.requestVaultSave()
       this.screen = 'files'
       this.updateBottomBarVisibility(false)
@@ -13989,6 +14579,7 @@ struct Index {
       this.statusText = '验证码验证失败'
     } finally {
       this.isBusy = false
+      this.onTransferNavigationRequested()
     }
   }
 
@@ -13996,6 +14587,7 @@ struct Index {
     this.currentPageIndex = Math.max(1, pageIndex)
     this.currentPageHasMore = hasMore
     this.loadingNextPage = false
+    this.scheduleOfflineProfileSave()
   }
 
   private async loadNextDirectoryPage(): Promise<void> {
@@ -14035,6 +14627,7 @@ struct Index {
   }
 
   private scheduleCurrentDirectoryIndex(forceNetwork: boolean = false): void {
+    if (forceNetwork && (this.offlineCacheMode || !NasConnection.shared().canRequest())) { return }
     if (this.screen !== 'files' || this.showSearch || this.currentPath.length === 0) {
       this.directoryIndexRequestToken += 1
       this.indexedDirectoryKey = ''
@@ -14336,9 +14929,9 @@ struct Index {
       const key = this.currentRootType.toString() + ':' + this.currentPath
       this.applyDirectoryIndexSnapshot(pending, key, this.directoryIndexRequestToken)
     }
-    this.warmTimelineVisibleEntries()
     // 滚动期间只记账的可见项，在这里补加载（与 onScrollIndex 的索引无关）
     this.flushPendingVisibleLoads()
+    this.warmTimelineVisibleEntries()
     this.scheduleImageVisualPrune()
   }
 
@@ -14502,20 +15095,28 @@ struct Index {
     // 中间才会加载。多留 2 行（8 条）足够覆盖「只露出一部分」的那一行。
     // ⚠️ 队列上限已从 32 提到 256，所以这里扩大范围不会再被 enqueue 拒绝
     // （之前 ±8 失败正是因为一次 warm 36~48 条 > 上限 32）。
-    start = Math.max(0, start - 8)
-    end = Math.min(source.length - 1, Math.max(start, end + 8))
+    const visibleStart = Math.max(0, start)
+    const visibleEnd = Math.min(source.length - 1, Math.max(visibleStart, end))
+    start = Math.max(0, visibleStart - 8)
+    end = Math.min(source.length - 1, Math.max(start, visibleEnd + 8))
     // A malformed/stale visible range must not turn a scrub release into
     // another whole-directory warmup.
     end = Math.min(end, start + 47)
-    for (let index = start; index <= end; index++) {
+    const indexes: number[] = []
+    // Real visible requests start before adjacent preloads can occupy all four
+    // slots. Preserve the same warm window, concurrency and amount of work.
+    for (let index = visibleStart; index <= Math.min(visibleEnd, end); index++) { indexes.push(index) }
+    for (let index = start; index < visibleStart && index <= end; index++) { indexes.push(index) }
+    for (let index = visibleEnd + 1; index <= end; index++) { indexes.push(index) }
+    for (const index of indexes) {
       const entry = source[index]
       this.resolveFileListImageRotation(entry)
       if (this.fileViewMode === 'waterfall') {
-        this.loadEntryPreview(entry, index - start)
+        this.loadEntryPreview(entry, this.previewPriority(index, 'waterfall'))
         this.enqueueWaterfallPreviewGeometry(entry, index)
         this.enqueueWaterfallOriginal(entry, index, true)
       } else {
-        this.loadEntryPreview(entry, index - start)
+        this.loadEntryPreview(entry, this.previewPriority(index, this.fileViewMode))
       }
     }
   }
@@ -14537,8 +15138,13 @@ struct Index {
       this.pendingVisibleLoads.delete(entry.path)
       return
     }
+    // Keep the actual visible set, including partial edge rows and entries
+    // that became ready silently while the viewer temporarily froze commits.
+    this.pendingVisibleLoads.set(entry.path, entry)
     if (this.previewUri(entry).length > 0) {
-      this.pendingVisibleLoads.delete(entry.path)
+      if (!this.fileContentScrolling && !this.locateProgrammaticScrolling) {
+        this.refreshVisiblePreviewIfNeeded(entry)
+      }
       return
     }
     if (this.fileContentScrolling || this.locateProgrammaticScrolling) {
@@ -14550,14 +15156,28 @@ struct Index {
     this.loadEntryPreview(entry, 0)
   }
 
+  private refreshVisiblePreviewIfNeeded(entry: FileEntry): boolean {
+    if (this.fileViewMode === 'list' || this.showImageViewer || this.viewerEntryTransitionActive ||
+      this.viewerClosePending || this.showPageTransition) { return false }
+    const uri = this.previewUri(entry)
+    const rendered = this.fileViewMode === 'waterfall'
+      ? this.waterfallRenderedPreviewKey[entry.path] : this.gridRenderedPreviewKey[entry.path]
+    if (uri.length === 0 || rendered === uri) { return false }
+    this.notifyEntryChanged(entry.path, this.fileViewMode)
+    return true
+  }
+
   /** 滚动停止后，把滚动期间记下的可见项补加载一次（集合很小，只有屏上那几十条）。 */
   private flushPendingVisibleLoads(): number {
     const pending: FileEntry[] = Array.from(this.pendingVisibleLoads.values())
-    this.pendingVisibleLoads.clear()
 
     const isWaterfall = this.fileViewMode === 'waterfall'
     let visibleStart = isWaterfall ? this.waterfallVisibleStartIndex : this.fileVisibleStartIndex
     let visibleEnd = isWaterfall ? this.waterfallVisibleEndIndex : this.fileVisibleEndIndex
+    if (this.fileViewMode === 'list') {
+      visibleStart = Math.max(0, visibleStart - 1)
+      visibleEnd = Math.max(visibleStart, visibleEnd - 1)
+    }
     const items = isWaterfall ? this.waterfallEntries : this.entries
 
     if (this.locateTargetIndex >= 0 && (visibleEnd <= 0 || visibleEnd < this.locateTargetIndex - 20)) {
@@ -14567,19 +15187,19 @@ struct Index {
 
     const minIdx = Math.max(0, visibleStart - 8)
     const maxIdx = Math.min(items.length - 1, visibleEnd + 8)
-    const visiblePathSet = new Set<string>()
-    for (let i = minIdx; i <= maxIdx; i++) {
-      if (items[i]) {
-        visiblePathSet.add(items[i].path)
-      }
-    }
-
     let flushedCount = 0
+    let scanNotifiedCount = 0
+    const processedPaths = new Set<string>()
     for (const entry of pending) {
-      if (!visiblePathSet.has(entry.path)) {
+      // onVisibleAreaChange is more accurate than onScrollIndex for clipped
+      // edge rows. Reject old-directory descriptors, not valid visible edges.
+      if (this.fileEntryDataSource.indexOfPath(entry.path) < 0) {
+        this.pendingVisibleLoads.delete(entry.path)
         continue
       }
+      processedPaths.add(entry.path)
       if (this.previewUri(entry).length > 0) {
+        if (this.refreshVisiblePreviewIfNeeded(entry)) { scanNotifiedCount++ }
         continue
       }
       flushedCount++
@@ -14602,11 +15222,10 @@ struct Index {
     //     rendered = gridRenderedPreviewKey[path]（这一格上次 build 实际画了什么）
     //   只有两者不一致才补一次 notify；一致就是 0 操作。
     let scanLoadedCount = 0
-    let scanNotifiedCount = 0
     const endScan = visibleEnd > 0 ? visibleEnd : Math.min(items.length - 1, 24)
     for (let i = visibleStart; i <= endScan; i++) {
       const entry = items[i]
-      if (!entry || entry.isDirectory || !this.isImage(entry)) {
+      if (!entry || processedPaths.has(entry.path) || entry.isDirectory || !this.isImage(entry)) {
         continue
       }
       const uri = this.previewUri(entry)
@@ -14619,7 +15238,7 @@ struct Index {
           scanNotifiedCount++
           this.notifyEntryChanged(entry.path, isWaterfall ? 'waterfall' : 'grid')
         }
-      } else if (!this.isPreviewRequestActive(entry.path)) {
+      } else {
         scanLoadedCount++
         this.resolveFileListImageRotation(entry)
         this.loadEntryPreview(entry, 0)
@@ -14711,6 +15330,7 @@ struct Index {
     // 个人空间的 root_type 随账号角色不同（管理员 4、普通账号 2），
     // 用根列表实际取到的那个值，别写死 4——否则普通账号在根这一层列目录会 1301。
     this.currentRootType = root.personalRootType
+    this.personalRootEntriesType = root.personalRootType
     this.currentPath = ''
     this.updateTopTitle('个人空间', false)
     this.navigationStack = []
@@ -14853,7 +15473,7 @@ struct Index {
     this.clearSearchIfPresent()
     this.rootKind = kind
     this.selectedBottomTab = kind === 'personal' ? 'home' : 'shared'
-    this.currentRootType = kind === 'personal' ? 4 : 3
+    this.currentRootType = kind === 'personal' ? this.personalRootEntriesType : 3
     this.currentPath = ''
     this.navigationStack = []
     this.navigationEntryStack = []
@@ -14991,6 +15611,8 @@ struct Index {
               '（路径：' + nextPath + '）', '目录读取失败')
             this.statusText = '目录读取失败'
           }
+        } else if (error instanceof UgreenError && error.kind === UgreenErrorKind.NAS_UNAVAILABLE) {
+          this.reportError(error, '目录读取失败')
         } else {
           this.presentErrorMessage(readableUgreenError(error as Object) + '（路径：' + nextPath + '）', '目录读取失败')
           this.statusText = '目录读取失败'
@@ -15065,7 +15687,7 @@ struct Index {
         this.navigationPageIndexStack = pageIndexStack
         this.navigationPageHasMoreStack = pageHasMoreStack
         this.currentPath = previousPath
-        this.currentRootType = this.rootKind === 'personal' ? 4 : 3
+        this.currentRootType = this.rootKind === 'personal' ? this.personalRootEntriesType : 3
         this.setCurrentPageState(1, false)
         this.replaceEntries(incomingEntries)
         if (previousViewState !== null) {
@@ -17380,7 +18002,7 @@ struct Index {
   }
 
   private shouldAutoLoadViewerOriginal(): boolean {
-    if (this.networkClass === 'offline') {
+    if (this.networkClass === 'offline' || this.offlineCacheMode || !NasConnection.shared().canRequest()) {
       return false
     }
     return !this.networkPolicy.isMetered() || this.meteredAutoOriginal
@@ -20878,9 +21500,7 @@ struct Index {
   }
 
   private isInsideFloatingImportControl(windowX: number, windowY: number): boolean {
-    if (this.screen !== 'files' || this.currentPath.length === 0 || this.showSearch ||
-      this.selectionMode || this.contextMenuEntry !== null || this.showRenameDialog ||
-      this.showAudioPlayer || this.videoPlaybackUiVisible()) {
+    if (!this.shouldShowFloatingImportControl() || this.parentOverlayOwnsInteraction()) {
       return false
     }
     const rect = this.floatingImportRect
@@ -20937,7 +21557,7 @@ struct Index {
   }
 
   private isInsideBottomBarVisualHost(windowX: number, windowY: number): boolean {
-    if (!this.shouldShowAnyBottomBar() || this.viewerOwnsParentInteraction() ||
+    if (!this.shouldShowAnyBottomBar() || this.parentOverlayOwnsInteraction() ||
       this.bottomBarOffsetY > 20 || this.bottomBarOpacity < 0.1) {
       return false
     }
@@ -22256,11 +22876,13 @@ struct Index {
         }
       }, false)
     }
-    hilog.info(IMAGE_VIEWER_HILOG_DOMAIN, 'ThumbProbe', `[1-setPreviewUri] path=${path}, epochMode=${USE_GLOBAL_BITMAP_EPOCH}`)
+    if (THUMB_PROBE) {
+      hilog.info(IMAGE_VIEWER_HILOG_DOMAIN, 'ThumbProbe', `[1-setPreviewUri] path=${path}, epochMode=${USE_GLOBAL_BITMAP_EPOCH}`)
+    }
     if (USE_GLOBAL_BITMAP_EPOCH) {
       this.scheduleImageVisualNotify()
     } else {
-      this.notifyEntryChanged(path, 'grid')
+      this.notifyEntryChanged(path, this.fileViewMode)
     }
   }
 
@@ -22651,6 +23273,7 @@ struct Index {
     // content, while returning to a parent directory can render a known
     // thumbnail immediately.
     this.previewRequests = {}
+    this.pendingVisibleLoads.clear()
     // R3.2：rendered preview key 是 per-条目状态，换目录即作废。
     // 不做 LRU，目录切换清空即可（避免长期浏览大量目录后无限增长）。
     this.gridRenderedPreviewKey = {}
@@ -22708,12 +23331,16 @@ struct Index {
 
   private previewPriority(index: number, surface: ThumbnailSurfaceKind): number {
     let visibleStart = this.fileVisibleStartIndex
+    let visibleEnd = this.fileVisibleEndIndex
     if (surface === 'waterfall') {
       visibleStart = this.waterfallVisibleStartIndex
+      visibleEnd = this.waterfallVisibleEndIndex
     } else if (surface === 'list') {
       visibleStart = Math.max(0, visibleStart - 1)
+      visibleEnd = Math.max(visibleStart, visibleEnd - 1)
     }
-    return Math.abs(index - visibleStart)
+    if (index >= visibleStart && index <= visibleEnd) { return 0 }
+    return 1 + (index < visibleStart ? visibleStart - index : index - visibleEnd)
   }
 
   private resetFileListScroll(): void {
@@ -22783,6 +23410,7 @@ struct Index {
       return
     }
     if (this.isPreviewRequestActive(entry.path)) {
+      this.previewQueue.promote(entry.path + '#preview:' + this.previewGeneration.toString(), priority)
       // 🔬 重复请求被 token 去重挡下（验收用计数）。
       this.previewDuplicateBlockedCount += 1
       return
@@ -22978,6 +23606,7 @@ struct Index {
       if (task.status === 'failed') { return progress + ' · ' + (task.errorMessage || '上传失败') }
       if (task.status === 'completed') { return this.formatSize(task.size) + ' · 已上传' }
       if (task.status === 'waiting_wifi') { return progress + ' · 等待 WiFi（点击继续）' }
+      if (task.status === 'waiting_server') { return progress + ' · 等待 NAS 连接（点击重试）' }
       return progress + (task.status === 'paused' ? ' · 已暂停' : ' · 排队中')
     }
     const received = task.receivedBytes <= 0 ? '0 B' : this.formatSize(task.receivedBytes)
@@ -22987,6 +23616,8 @@ struct Index {
         return transfer + ' · 下载中'
       case 'waiting_wifi':
         return transfer + ' · 等待 WiFi'
+      case 'waiting_server':
+        return transfer + ' · 等待 NAS 连接'
       case 'paused':
         return transfer + ' · 已暂停'
       case 'failed':
@@ -23162,6 +23793,16 @@ struct Index {
   }
 
   private async logout(): Promise<void> {
+    this.albumConfirmationPending = false
+    this.albumReselectPending = false
+    this.showAlbumPicker = false
+    this.showAlbumUpload = false
+    this.showAlbumDetails = false
+    if (this.offlineProfileTimer !== 0) { clearTimeout(this.offlineProfileTimer); this.offlineProfileTimer = 0 }
+    if (this.nasRecoveryTimer !== 0) { clearTimeout(this.nasRecoveryTimer); this.nasRecoveryTimer = 0 }
+    this.offlineCacheMode = false
+    this.offlineProfile = null
+    this.nasRecoveryPending = false
     this.cancelFileTransition()
     this.clearSearchIfPresent()
     this.closeImageViewer()
@@ -23171,6 +23812,7 @@ struct Index {
     await this.ensureDownloadState()
     await this.downloadQueue.setReady(false)
     await this.uploadQueue.setReady(false)
+    await this.albumUpload.setReady(false)
     this.repository.logout()
     this.navigationRequestId += 1
     this.isNavigating = false

@@ -6,6 +6,10 @@ import { DownloadTaskRecord } from '../model/FileEntry'
 import { StorageBudget } from '../download/StorageBudget'
 import { UgreenRemoteRepository } from '../repository/UgreenRemoteRepository'
 import { NetworkPolicy } from '../core/network/NetworkPolicy'
+import { NasConnection, NasConnectionState } from '../core/network/NasConnection'
+import { UgreenError, UgreenErrorKind } from '../ugreen/UgreenErrors'
+import { TransferBackgroundManager } from '../transfer/TransferBackgroundManager'
+import { TransferProgress } from '../transfer/TransferProgress'
 
 export class UploadTaskRecord extends DownloadTaskRecord {
   uuid: string = ''
@@ -73,7 +77,24 @@ export class UploadQueueManager {
       this.publish()
       this.pump()
     })
+    NasConnection.shared().onChange((state: NasConnectionState): void => {
+      for (const task of this.snapshot()) {
+        if (state === 'online' && task.status === 'waiting_server') { task.status = 'queued' }
+        else if ((state === 'unavailable' || state === 'connecting') &&
+          (task.status === 'queued' || task.status === 'downloading')) { task.status = 'waiting_server' }
+      }
+      this.persist().catch(() => {})
+      this.publish()
+      this.pump()
+    })
     await this.persist()
+    TransferBackgroundManager.shared().onChange(() => { this.pump() })
+    TransferBackgroundManager.shared().onCancel(() => {
+      for (const task of this.snapshot()) {
+        if (task.status === 'queued' || task.status === 'downloading') { task.status = 'paused' }
+      }
+      this.persist().catch(() => {}); this.publish()
+    })
     this.publish()
   }
 
@@ -83,6 +104,11 @@ export class UploadQueueManager {
   }
   async setReady(value: boolean): Promise<void> {
     this.ready = value
+    if (value && NasConnection.shared().canRequest()) {
+      for (const task of this.snapshot()) {
+        if (task.status === 'waiting_server') { task.status = 'queued' }
+      }
+    }
     if (!value) {
       for (const task of this.tasks) {
         if (task.status === 'downloading' || task.status === 'queued') { task.status = 'paused' }
@@ -95,6 +121,7 @@ export class UploadQueueManager {
   }
 
   async enqueue(uri: string, dir: string, scope: string): Promise<void> {
+    await TransferBackgroundManager.shared().requestResume()
     if (this.repository === null || !this.ready || scope !== this.repository.cacheScopeHash()) {
       throw new Error('登录状态已改变，请重新选择上传文件')
     }
@@ -154,9 +181,18 @@ export class UploadQueueManager {
   async toggle(id: string): Promise<void> {
     const task = this.snapshot().find((item: UploadTaskRecord): boolean => item.id === id)
     if (task === undefined || task.importing || task.status === 'completed') { return }
+    if (task.status === 'waiting_server') {
+      await NasConnection.shared().retryNow()
+      this.pump()
+      return
+    }
     if (task.status === 'downloading' || task.status === 'queued') { task.status = 'paused' }
     else {
       if (!fileIo.accessSync(task.stagingPath)) { throw new Error('暂存不存在，请重新选择原文件') }
+      await TransferBackgroundManager.shared().requestResume()
+      if (!this.ready || this.repository === null || task.scope !== this.repository.cacheScopeHash()) {
+        throw new Error('登录状态已改变，请重新选择上传文件')
+      }
       // A deliberate tap can continue this task on a metered connection.
       task.manualMobileResume = true
       task.errorMessage = ''
@@ -185,9 +221,19 @@ export class UploadQueueManager {
 
   private pump(): void {
     if (!this.ready || this.running !== null || this.repository === null) { return }
+    if (!TransferBackgroundManager.shared().canRun()) { this.publish(); return }
     const task = this.snapshot().find((item: UploadTaskRecord): boolean => item.status === 'queued')
     if (task === undefined) { return }
-    if (this.network !== null && !this.network.isUnmetered() && !task.manualMobileResume) {
+    if (!NasConnection.shared().canRequest()) {
+      for (const queued of this.snapshot()) {
+        if (queued.status === 'queued') { queued.status = 'waiting_server' }
+      }
+      this.persist().catch(() => {})
+      this.publish()
+      return
+    }
+    if (this.network !== null && (this.network.current() === 'offline' ||
+      (!this.network.isUnmetered() && !task.manualMobileResume))) {
       task.status = 'waiting_wifi'
       this.publish()
       this.pump()
@@ -218,7 +264,10 @@ export class UploadQueueManager {
         let offset = await repository.uploadOffset(task.destinationRoot, task.uuid, task.size)
         task.receivedBytes = offset
         while (this.ready && task.status === 'downloading') {
-          if (this.network !== null && !this.network.isUnmetered() && !task.manualMobileResume) {
+          if (!TransferBackgroundManager.shared().canRun()) { task.status = 'queued'; break }
+          if (!NasConnection.shared().canRequest()) { task.status = 'waiting_server'; break }
+          if (this.network !== null && (this.network.current() === 'offline' ||
+            (!this.network.isUnmetered() && !task.manualMobileResume))) {
             task.status = 'waiting_wifi'
             break
           }
@@ -241,7 +290,11 @@ export class UploadQueueManager {
       await this.persist()
       if (task.status === 'completed') { StorageBudget.removeWhenUnused(task.stagingPath) }
     } catch (error) {
-      if (String(task.status) !== 'paused') {
+      if (String(task.status) !== 'paused' && error instanceof UgreenError &&
+        error.kind === UgreenErrorKind.NAS_UNAVAILABLE) {
+        task.status = NasConnection.shared().canRequest() ? 'queued' : 'waiting_server'
+        task.errorMessage = ''
+      } else if (String(task.status) !== 'paused' && String(task.status) !== 'waiting_server') {
         task.status = 'failed'
         task.errorMessage = String((error as Error).message || '上传失败')
       }
@@ -253,7 +306,24 @@ export class UploadQueueManager {
     }
   }
 
-  private publish(): void { this.listener(this.snapshot().slice()) }
+  private publish(): void {
+    const tasks = this.snapshot()
+    TransferBackgroundManager.shared().update('upload', tasks.map((task: UploadTaskRecord): TransferProgress => {
+      const value = new TransferProgress()
+      value.id = task.id; value.direction = 'upload'; value.bytes = task.size
+      value.doneBytes = task.status === 'completed' ? task.size : task.receivedBytes
+      value.done = task.status === 'completed' ? 1 : 0
+      value.skipped = task.skipped && value.done > 0 ? 1 : 0
+      value.state = this.ready ? task.status : 'cancelled'
+      value.failed = task.status === 'failed' ? 1 : 0
+      value.pending = !task.importing && (task.status === 'queued' || task.status === 'downloading')
+      value.active = this.ready && value.pending && NasConnection.shared().canRequest() &&
+        this.network !== null && this.network.current() !== 'offline' &&
+        (this.network.isUnmetered() || task.manualMobileResume)
+      return value
+    }))
+    this.listener(tasks.slice())
+  }
   private persist(): Promise<void> {
     const prefs = this.prefs
     if (prefs === null) { return Promise.resolve() }

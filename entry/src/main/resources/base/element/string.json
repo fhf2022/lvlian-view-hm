@@ -1,6 +1,10 @@
 {
   "string": [
     {
+      "name": "album_upload_reason",
+      "value": "用于读取你选择的本地图片文件夹，并将其中的图片上传至 NAS"
+    },
+    {
       "name": "module_desc",
       "value": "联文件 —— 远程管理你的私有云盘"
     },
@@ -14,7 +18,7 @@
     },
     {
       "name": "background_playback_reason",
-      "value": "用于视频播放时在后台持续播放"
+      "value": "用于上传、下载文件时在后台继续传输，以及视频后台播放"
     }
   ]
 }

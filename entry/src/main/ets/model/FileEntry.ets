@@ -36,6 +36,28 @@ export class FileEntry {
   // 缩略图/单项数据更新版本号：使 onDataChange(index) 时数据项具备可观察变化
   previewRevision: number = 0
 
+  /** Refresh descriptors without disconnecting an already mounted @ObjectLink. */
+  updateFrom(entry: FileEntry): void {
+    this.name = entry.name
+    this.path = entry.path
+    this.isDirectory = entry.isDirectory
+    this.size = entry.size
+    this.modifiedTime = entry.modifiedTime
+    this.createdTime = entry.createdTime
+    this.childCount = entry.childCount
+    this.rootType = entry.rootType
+    this.intranetShareId = entry.intranetShareId
+    this.thumbnailUrl = entry.thumbnailUrl
+    this.coverUrl = entry.coverUrl
+    this.mimeType = entry.mimeType
+    this.etag = entry.etag
+    this.checksum = entry.checksum
+    this.deletedTime = entry.deletedTime
+    this.recycleInPath = entry.recycleInPath
+    this.recycleSharePath = entry.recycleSharePath
+    // previewRevision belongs to the mounted instance, not the NAS response.
+  }
+
   clone(): FileEntry {
     const entry = new FileEntry()
     entry.name = this.name
@@ -111,7 +133,7 @@ export class DownloadDescriptor {
   }
 }
 
-export type DownloadTaskStatus = 'queued' | 'downloading' | 'paused' | 'waiting_wifi' |
+export type DownloadTaskStatus = 'queued' | 'downloading' | 'paused' | 'waiting_wifi' | 'waiting_server' |
   'completed' | 'failed'
 
 /**
