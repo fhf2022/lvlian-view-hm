@@ -21,7 +21,7 @@ const mocks={
  '@kit.LiveViewKit':{liveViewManager:kit},'@kit.BasicServicesKit':{},
  './TransferLiveViewAssets':{TransferLiveViewAssets:class {
   async create(context,value){ownedImages++;let released=false;
-   return {badge:{kind:'app-ring',percent:value.percent},ring:{kind:'direction-ring',direction:value.direction},
+   return {badge:{kind:'app-logo'},ring:{kind:'direction-ring',direction:value.direction},
     async release(){assert(!released);released=true;ownedImages--}}}
   async release(){releasedAssets++}
  }}
@@ -44,7 +44,7 @@ function defer(){let resolve;const promise=new Promise(r=>resolve=r);return {pro
  let manager=new Manager();manager.initialize(context);manager.update(summary());await settle(manager);
  let value=calls.at(-1).value;assert.equal(value.event,'PROGRESS');assert.equal(value.lifeCycleMode,1);
  assert.equal(value.liveViewData.primary.layoutData.layoutType,-1);assert.equal(value.liveViewData.primary.extensionData.pic.kind,'direction-ring');
- assert.equal(value.liveViewData.capsule.icon.kind,'app-ring');assert.equal(value.liveViewData.capsule.tailIcon.kind,'direction-ring');
+ assert.equal(value.liveViewData.capsule.icon.kind,'app-logo');assert.equal(value.liveViewData.capsule.tailIcon.kind,'direction-ring');
  assert.equal(value.liveViewData.capsule.backgroundColor,'#FFFFFFFF');assert.equal(value.liveViewData.capsule.isContentDisplayed,false);
  assert.equal(value.liveViewData.capsule.content,undefined);assert.equal(value.liveViewData.capsule.progress,42);
  const before=calls.length;for(let i=43;i<=78;i++)manager.update(summary({percent:i}));await settle(manager);
@@ -55,7 +55,7 @@ function defer(){let resolve;const promise=new Promise(r=>resolve=r);return {pro
  value=calls.at(-1).value;assert.equal(calls.at(-1).kind,'stop');assert.equal(value.liveViewData.capsule.status,-1);
  assert.equal(value.liveViewData.primary.keepTime,30);assert.equal(value.liveViewData.capsule.progress,100);assert.equal(ownedImages,0);
  await manager.destroy();assert.equal(timers.size,0);
- console.log('PASS: compact capsule retains both rings, omits duplicate words, switches white/black, coalesces progress and ends at 100%');
+ console.log('PASS: compact capsule uses the logo and right progress asset, omits duplicate words, switches white/black, coalesces progress and ends at 100%');
 
  manager=new Manager();manager.initialize(context);manager.setForeground(false);manager.update(summary());await settle(manager);
  assert(!manager.active);manager.setForeground(true);await settle(manager);assert(manager.active);

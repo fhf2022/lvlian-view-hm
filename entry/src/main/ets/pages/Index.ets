@@ -1,7 +1,8 @@
 import { StorageBudget } from '../download/StorageBudget'
 import { DownloadDestination } from '../download/DownloadDestination'
 import { TransferBackgroundManager } from '../transfer/TransferBackgroundManager'
-import { promptAction, uiMaterial, curves, window, LengthMetrics, FrameCallback, PiPWindow } from '@kit.ArkUI'
+import { promptAction, uiMaterial, curves, window, LengthMetrics, FrameCallback, PiPWindow,
+  CapsuleSegmentButtonV2, SegmentButtonV2Items } from '@kit.ArkUI'
 import { systemShare, harmonyShare } from '@kit.ShareKit'
 import { Context, Want, common, wantConstant, autoFillManager } from '@kit.AbilityKit'
 import { fileIo, fileUri, picker } from '@kit.CoreFileKit'
@@ -10,6 +11,7 @@ import { FloatingImportControl } from '../components/FloatingImportControl'
 import { AlbumUploadPicker } from '../components/AlbumUploadPicker'
 import { AlbumUploadSheet } from '../components/AlbumUploadSheet'
 import { AlbumUploadDetails } from '../components/AlbumUploadDetails'
+import { TransferTaskListRow } from '../components/TransferTaskListRow'
 import { AlbumUploadManager } from '../upload/AlbumUploadManager'
 import { AlbumUploadJob, LocalImageAlbum } from '../upload/AlbumUploadModel'
 import { LocalAlbumSource } from '../upload/LocalAlbumSource'
@@ -1112,6 +1114,9 @@ struct Index {
   @State pageWidthVp: number = 360
   @State pageHeightVp: number = 800
   @State transferDirection: string = 'download'
+  private transferDirectionItems: SegmentButtonV2Items = new SegmentButtonV2Items([
+    { text: '下载' }, { text: '上传' }
+  ])
   @State uploadTasks: UploadTaskRecord[] = []
   @State albumUploadJobs: AlbumUploadJob[] = []
   @State showAlbumPicker: boolean = false
@@ -1120,6 +1125,7 @@ struct Index {
   private albumConfirmationPending: boolean = false
   private albumReselectPending: boolean = false
   @State showAlbumDetails: boolean = false
+  private albumUploadActionsOpen: boolean = false
   @State albumDetailsId: string = ''
   @State albumDetailsName: string = ''
   @State albumUploadDestination: string = ''
@@ -3139,10 +3145,6 @@ struct Index {
         this.DownloadSpeedBall()
       }
 
-      if (this.screen === 'downloads') {
-        this.TransferDirectionControl()
-      }
-
       // Retain the control's docking state and native material while an overlay
       // covers it. Search/selection only hide it; they do not create a new ball.
       if (this.screen === 'files' && this.currentPath.length > 0) {
@@ -4100,7 +4102,7 @@ struct Index {
         ListItem() {
           Row()
             .width('100%')
-            .height(this.topSafeInset() + 120)
+            .height(this.fileContentTopInset())
         }
         .width('100%')
 
@@ -4126,7 +4128,15 @@ struct Index {
         }
         if (this.transferDirection === 'upload') {
           ForEach(this.albumUploadJobs, (job: AlbumUploadJob) => {
-            ListItem() { this.AlbumUploadTaskRow(job) }.width('100%')
+            ListItem() {
+              this.AlbumUploadTaskRow(job)
+            }
+            .width('100%')
+            .id('album-upload-task:' + job.id)
+            .onClick(() => this.activateAlbumUpload(job))
+            .priorityGesture(LongPressGesture({ repeat: false }).onAction(() => {
+              this.showAlbumUploadActions(job)
+            }))
           }, (job: AlbumUploadJob): string => job.id)
         }
         if (this.visibleTransferTasks().length === 0 &&
@@ -4191,45 +4201,86 @@ struct Index {
     if (job.state === 'waiting_server') { return '等待 NAS 恢复连接' }
     if (job.state === 'waiting_foreground') { return '回到应用前台后继续' }
     if (job.state === 'completed') { return '已完成' }
-    if (job.state === 'failed') { return job.error || '部分图片失败，可重试' }
+    if (job.state === 'failed') {
+      return job.failed > 0 ? '失败 ' + job.failed.toString() + ' 张，点击重试' : (job.error || '上传失败，点击重试')
+    }
     return job.state === 'running' ? '正在上传' : '等待上传'
+  }
+
+  private albumUploadTaskInfo(job: AlbumUploadJob): string {
+    if (job.state === 'building') { return this.albumUploadStatus(job) }
+    const count = job.state === 'completed' ? job.total.toString() + ' 张' :
+      Math.min(job.total, job.uploaded + job.skipped).toString() + '/' + job.total.toString() + ' 张'
+    return count + ' · ' + this.albumUploadStatus(job) +
+      (job.skipped > 0 ? ' · 跳过 ' + job.skipped.toString() : '')
+  }
+
+  private albumUploadTaskProgress(job: AlbumUploadJob): number {
+    if (job.state === 'completed') { return 100 }
+    if (job.bytes <= 0) { return 0 }
+    return Math.min(99, Math.max(0, (job.completedBytes + job.currentBytes) / job.bytes * 100))
+  }
+
+  private albumUploadTaskEntry(job: AlbumUploadJob): FileEntry {
+    const entry = new FileEntry()
+    entry.name = job.albumName; entry.path = job.destination; entry.isDirectory = true
+    return entry
+  }
+
+  private openAlbumUploadDetails(job: AlbumUploadJob): void {
+    this.albumDetailsId = job.id; this.albumDetailsName = job.albumName; this.showAlbumDetails = true
+  }
+
+  private activateAlbumUpload(job: AlbumUploadJob): void {
+    if (job.state === 'completed' || job.state === 'building') { this.openAlbumUploadDetails(job); return }
+    this.toggleAlbumUpload(job)
+  }
+
+  private albumUploadActionLabel(job: AlbumUploadJob): string {
+    if (job.state === 'running' || job.state === 'checking' || job.state === 'queued') { return '暂停' }
+    return job.state === 'failed' ? '重试失败项' : '继续'
   }
 
   @Builder
   AlbumUploadTaskRow(job: AlbumUploadJob): void {
-    Column({ space: 8 }) {
-      Text(job.albumName + ' · 图片文件夹上传').fontSize(16).fontWeight(FontWeight.Medium).width('100%').maxLines(2)
-      Text(this.albumUploadStatus(job)).fontSize(13).fontColor($r('app.color.text_secondary')).width('100%').maxLines(2)
-      Progress({ value: job.uploaded + job.skipped + job.failed, total: Math.max(1, job.total), type: ProgressType.Linear }).width('100%')
-      Text('共 ' + job.total.toString() + ' 张 · 已上传 ' + job.uploaded.toString() + ' · 跳过 ' + job.skipped.toString() + ' · 失败 ' + job.failed.toString())
-        .fontSize(12).fontColor($r('app.color.text_muted')).width('100%')
-      if (job.currentName) {
-        Text(job.currentName + ' · ' + Math.floor(job.currentSize > 0 ? job.currentBytes / job.currentSize * 100 : 0).toString() + '%')
-          .fontSize(12).fontColor($r('app.color.text_muted')).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
-      }
-      Text('目标：' + job.destination).fontSize(12).fontColor($r('app.color.text_muted')).width('100%').maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-      Row({ space: 12 }) {
-        if (job.state !== 'completed' && job.state !== 'building') {
-          Button(job.state === 'running' || job.state === 'checking' || job.state === 'queued' ? '暂停' : (job.state === 'failed' ? '重试失败项' : '继续'))
-            .fontSize(13).height(32).onClick(() => {
-              this.toggleAlbumUpload(job)
-            })
-        }
-        Button('明细').fontSize(13).height(32).onClick(() => {
-          this.albumDetailsId = job.id; this.albumDetailsName = job.albumName; this.showAlbumDetails = true
-        })
-        Button('移除').fontSize(13).height(32).enabled(job.state !== 'building').onClick(() => {
-          this.confirmRemoveAlbumUpload(job)
-        })
-      }
-    }.width('100%').alignItems(HorizontalAlign.Start).padding(16).backgroundColor($r('app.color.surface_card'))
-      .borderRadius(16).margin({ top: 8, bottom: 8 })
+    this.TransferTaskRow(this.albumUploadTaskEntry(job), job.albumName + ' · 图库文件夹',
+      this.albumUploadTaskInfo(job), this.albumUploadTaskProgress(job),
+      job.state === 'building' || job.state === 'checking' || (job.state === 'running' && job.bytes <= 0))
+  }
+
+  private async showAlbumUploadActions(job: AlbumUploadJob): Promise<void> {
+    if (this.albumUploadActionsOpen) { return }
+    this.albumUploadActionsOpen = true
+    const canToggle = job.state !== 'completed' && job.state !== 'building'
+    const canRemove = job.state !== 'building'
+    const colour = this.isDarkTheme ? '#FFFFFFFF' : '#536174'
+    const options: promptAction.ActionMenuOptions = {
+      title: job.albumName + ' · 图库文件夹',
+      buttons: canToggle ? [
+        { text: '明细', color: colour }, { text: this.albumUploadActionLabel(job), color: colour },
+        { text: '移除', color: '#D34D5C' }, { text: '取消', color: colour }
+      ] : (canRemove ? [
+        { text: '明细', color: colour }, { text: '移除', color: '#D34D5C' }, { text: '取消', color: colour }
+      ] : [{ text: '明细', color: colour }, { text: '取消', color: colour }]),
+      systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false)
+    }
+    let selected = -1
+    try { selected = (await this.getUIContext().getPromptAction().showActionMenu(options)).index }
+    catch (_) { return } // Dismissing the native action menu performs no task action.
+    finally { this.albumUploadActionsOpen = false }
+    if (this.screen !== 'downloads' || !this.albumUploadJobs.some((value: AlbumUploadJob): boolean => value.id === job.id)) { return }
+    if (selected === 0) { this.openAlbumUploadDetails(job) }
+    else if (canToggle && selected === 1 && job.state !== 'completed' && job.state !== 'building') {
+      await this.toggleAlbumUpload(job)
+    } else if (canRemove && selected === (canToggle ? 2 : 1)) { await this.confirmRemoveAlbumUpload(job) }
   }
 
   private async confirmRemoveAlbumUpload(job: AlbumUploadJob): Promise<void> {
-    const result = await promptAction.showDialog({ title: '移除图片文件夹上传任务',
+    HapticFeedback.warn()
+    const result = await this.getUIContext().getPromptAction().showDialog({ title: '移除图库文件夹上传记录？',
       message: '停止本批上传并移除任务记录，已上传到 NAS 的图片会保留。',
-      buttons: [{ text: '取消', color: '#536174' }, { text: '移除', color: '#B94739' }] })
+      buttons: [{ text: '取消', color: this.isDarkTheme ? '#FFFFFFFF' : '#536174' }, { text: '移除', color: '#D34D5C' }],
+      systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THICK, false) })
     if (result.index !== 1) { return }
     try { await this.albumUpload.remove(job.id) }
     catch (error) { this.showImmersiveToast((error as Error).message || '移除失败，请恢复 NAS 连接后重试') }
@@ -4307,50 +4358,47 @@ struct Index {
 
   @Builder
   AlbumUploadDetailsContent(): void {
-    AlbumUploadDetails({ manager: this.albumUpload, batchId: this.albumDetailsId, albumName: this.albumDetailsName })
+    AlbumUploadDetails({ manager: this.albumUpload, batchId: this.albumDetailsId, albumName: this.albumDetailsName,
+      total: this.albumUploadDetailsJob().total, failedCount: this.albumUploadDetailsJob().failed,
+      batchState: this.albumUploadDetailsJob().state, currentName: this.albumUploadDetailsJob().currentName,
+      currentBytes: this.albumUploadDetailsJob().currentBytes, currentSize: this.albumUploadDetailsJob().currentSize,
+      revision: this.albumUploadDetailsRevision() })
   }
 
-  @Builder
-  TransferDirectionSurface(): void {
-    Row({ space: 8 }) {
-      Button('下载', { type: ButtonType.Capsule })
-        .width(88).height(36).fontSize(15)
-        .fontColor(this.transferDirection === 'download'
-          ? $r('sys.color.font_emphasize') : $r('sys.color.font_primary'))
-        .fontWeight(this.transferDirection === 'download' ? FontWeight.Medium : FontWeight.Normal)
-        .backgroundColor(Color.Transparent)
-        .systemMaterial(this.transferControlMaterial())
-        .accessibilitySelected(this.transferDirection === 'download')
-        .onClick(() => { this.transferDirection = 'download' })
-      Button('上传', { type: ButtonType.Capsule })
-        .width(88).height(36).fontSize(15)
-        .fontColor(this.transferDirection === 'upload'
-          ? $r('sys.color.font_emphasize') : $r('sys.color.font_primary'))
-        .fontWeight(this.transferDirection === 'upload' ? FontWeight.Medium : FontWeight.Normal)
-        .backgroundColor(Color.Transparent)
-        .systemMaterial(this.transferControlMaterial())
-        .accessibilitySelected(this.transferDirection === 'upload')
-        .onClick(() => { this.transferDirection = 'upload' })
-    }.width(184).height(36)
+  private albumUploadDetailsJob(): AlbumUploadJob {
+    return this.albumUploadJobs.find((job: AlbumUploadJob): boolean => job.id === this.albumDetailsId) ?? new AlbumUploadJob()
   }
 
-  private transferControlMaterial(): uiMaterial.ImmersiveMaterial {
-    // A compact title host clips native material shadows at its rectangular bounds.
-    return new uiMaterial.ImmersiveMaterial({ style: uiMaterial.ImmersiveStyle.THIN,
-      applyShadow: false, colorInvert: true, interactive: true, lightEffect: { color: '#66FFFFFF' } })
+  private albumUploadDetailsRevision(): string {
+    const job = this.albumUploadDetailsJob()
+    return job.state + ':' + job.total.toString() + ':' + job.uploaded.toString() + ':' +
+      job.skipped.toString() + ':' + job.failed.toString() + ':' + job.currentName
   }
 
   @Builder
   TransferDirectionControl(): void {
-    Navigation() {}
-      .mode(NavigationMode.Stack).hideBackButton(true).hideToolBar(true)
-      .title({ builder: this.TransferDirectionSurface, height: 36 }, {
-        barStyle: BarStyle.STACK, paddingStart: LengthMetrics.vp(0), paddingEnd: LengthMetrics.vp(0),
-        backgroundColor: Color.Transparent
-      })
-      .width(184).height(36).backgroundColor(Color.Transparent).clip(false)
-      .position({ x: (this.pageWidthVp - 184) / 2, y: this.topSafeInset() + 72 })
-      .zIndex(15)
+    // Keep the official selector inside the existing Navigation title subtree:
+    // one material backplate, native selection/drag animation and accessibility.
+    CapsuleSegmentButtonV2({
+      items: this.transferDirectionItems,
+      selectedIndex: this.transferDirection === 'upload' ? 1 : 0,
+      $selectedIndex: (index: number): void => { this.transferDirection = index === 1 ? 'upload' : 'download' },
+      itemFontSize: LengthMetrics.fp(15), itemSelectedFontSize: LengthMetrics.fp(15),
+      // Match the home header's 40 vp controls: a 36 vp item inside a 2 vp frame.
+      buttonMinHeight: LengthMetrics.vp(40), itemMinHeight: LengthMetrics.vp(36),
+      buttonPadding: LengthMetrics.vp(2),
+      itemPadding: { top: LengthMetrics.vp(4), bottom: LengthMetrics.vp(4),
+        start: LengthMetrics.vp(12), end: LengthMetrics.vp(12) },
+      backgroundSystemMaterial: this.transferControlMaterial()
+    })
+      .width(132)
+      .height(40)
+      .id('transfer-direction-control')
+  }
+
+  private transferControlMaterial(): uiMaterial.ImmersiveMaterial {
+    return new uiMaterial.ImmersiveMaterial({ style: uiMaterial.ImmersiveStyle.THIN,
+      applyShadow: false, colorInvert: true, interactive: true, lightEffect: { color: '#66FFFFFF' } })
   }
 
   private async selectImportSource(source: string): Promise<void> {
@@ -4412,47 +4460,15 @@ struct Index {
 
   @Builder
   DownloadTaskRow(task: DownloadTaskRecord): void {
-    Row() {
-      Row() {
-        this.FileLeadingVisual(this.downloadTaskEntry(task))
-      }
-      .margin({ right: 8 })
-      Column() {
-        Text(task.name)
-          .fontSize(16)
-          .fontColor($r('app.color.text_primary'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-        Text(this.downloadTaskInfo(task))
-          .fontSize(12)
-          .fontColor($r('app.color.text_muted'))
-          .margin({ top: 4 })
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-      }
-      .alignItems(HorizontalAlign.Start)
-      .layoutWeight(1)
+    this.TransferTaskRow(this.downloadTaskEntry(task), task.name, this.downloadTaskInfo(task),
+      this.downloadTaskProgress(task), task.status === 'downloading' && task.size <= 0)
+  }
 
-      Progress({ value: this.downloadTaskProgress(task), total: 100, type: ProgressType.Ring })
-        .width(30)
-        .height(30)
-        .backgroundColor('#AAB3C1')
-        .color('#2E6BFF')
-        .style({
-          strokeWidth: 3,
-          enableSmoothEffect: false,
-          status: task.status === 'downloading' && task.size <= 0
-            ? ProgressStatus.LOADING : ProgressStatus.PROGRESSING
-        })
-        .margin({ left: 10, right: 8 })
+  @Builder
+  TransferTaskRow(entry: FileEntry, title: string, info: string, progress: number, loading: boolean): void {
+    TransferTaskListRow({ title: title, info: info, progress: progress, loading: loading }) {
+      this.FileLeadingVisual(entry)
     }
-    .width('100%')
-    .padding({ left: 16, right: 12, top: 12, bottom: 12 })
-    .border({
-      width: { bottom: 0.5 },
-      color: $r('app.color.divider'),
-      style: BorderStyle.Solid
-    })
   }
 
   @Builder
@@ -5296,13 +5312,13 @@ struct Index {
               }
             })
           } else {
-            // 下载页/设置页没有返回按钮，保留同样的侧边占位让标题保持居中，
-            // 与文件页顶栏的标题位置一致。
-            Blank().width(this.screen === 'downloads' ? 86 : 40)
+            // Settings retains the centred title; transfers use a leading title
+            // and a trailing segmented selector in the same row.
+            Blank().width(this.screen === 'downloads' ? 0 : 40)
           }
 
-          // 设置页的标题和共享/下载页完全一致：17vp 居中显示在顶栏渐变区上；
-          // 页面说明文字留在内容区，内容区不再重复标题。
+          // Transfers use a leading title beside the official capsule selector.
+          // Other root pages retain their centred 17vp title.
           Text(this.selectionMode ? this.selectionTitle() :
             (this.screen === 'settings' && this.showStorageSettings ? '缓存与存储' :
             (this.screen === 'settings' && this.showPlaybackSettings ? '播放与控制' :
@@ -5310,27 +5326,30 @@ struct Index {
             (this.screen === 'settings' && this.showRecycleBinSettings ? this.topTitle :
             (this.screen === 'settings' ? '设置' :
               (this.screen === 'downloads' ? '传输' : this.topTitle)))))))
-            .fontSize(this.selectionMode ? 22 : 17)
+            .fontSize(this.selectionMode || this.screen === 'downloads' ? 22 : 17)
             .fontWeight(FontWeight.Bold)
             .fontColor($r('app.color.text_primary'))
             .opacity(this.selectionMode ? 1 : this.topTitleOpacity)
             .layoutWeight(1)
-            .textAlign(this.selectionMode ? TextAlign.Start :
+            .textAlign(this.selectionMode || this.screen === 'downloads' ? TextAlign.Start :
               (this.screen === 'files' && this.currentPath.length > 0
                 ? TextAlign.Start : TextAlign.Center))
             .margin({ left: this.selectionMode ? 12 :
-              (this.screen === 'files' && this.currentPath.length > 0 ? 8 : 0) })
+              (this.screen === 'downloads' ? 4 :
+                (this.screen === 'files' && this.currentPath.length > 0 ? 8 : 0)) })
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
 
           if (this.screen === 'files') {
             this.FileTopActionCluster()
+          } else if (this.screen === 'downloads') {
+            this.TransferDirectionControl()
           } else if (this.showRecycleBinSettings) {
             // Mirrors the back button's 40vp slot on the left so the title stays
             // centred; the switcher itself lives in RecycleScopeToggle.
             this.RecycleScopeToggle()
           } else {
-            Blank().width(this.screen === 'downloads' ? 86 : 40)
+            Blank().width(40)
           }
         }
         .width('100%')

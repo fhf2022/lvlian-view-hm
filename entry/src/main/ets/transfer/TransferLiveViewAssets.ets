@@ -21,15 +21,27 @@ export class TransferLiveViewAssets {
     if (!this.logo) {
       const bytes = await context.resourceManager.getMediaContent($r('app.media.icon').id)
       const source = image.createImageSource(bytes.buffer as ArrayBuffer)
-      try { this.logo = await source.createPixelMap({ desiredSize: { width: 44, height: 44 } }) }
+      try { this.logo = await source.createPixelMap({ desiredSize: { width: 96, height: 96 } }) }
       finally { await source.release() }
     }
-    const badge = this.draw(value, true)
-    try { return new TransferLiveViewImages(badge, this.draw(value, false)) }
+    const badge = this.drawLogo()
+    try { return new TransferLiveViewImages(badge, this.draw(value)) }
     catch (error) { await badge.release(); throw error as Error }
   }
 
-  private draw(value: TransferLiveViewPresentation, badge: boolean): image.PixelMap {
+  private drawLogo(): image.PixelMap {
+    const pixels = image.createPixelMapSync(new ArrayBuffer(96 * 96 * 4), {
+      editable: true, pixelFormat: image.PixelMapFormat.RGBA_8888,
+      alphaType: image.AlphaType.PREMUL, size: { width: 96, height: 96 }
+    })
+    try {
+      const canvas = new drawing.Canvas(pixels)
+      if (this.logo) { canvas.drawImage(this.logo, 0, 0) }
+      return pixels
+    } catch (error) { pixels.release().catch(() => {}); throw error as Error }
+  }
+
+  private draw(value: TransferLiveViewPresentation): image.PixelMap {
     // 96x96 RGBA = 36 KiB, well below the API 26 192 KiB limit. All glyphs use (48,48).
     const pixels = image.createPixelMapSync(new ArrayBuffer(96 * 96 * 4), {
       editable: true, pixelFormat: image.PixelMapFormat.RGBA_8888,
@@ -48,27 +60,19 @@ export class TransferLiveViewAssets {
         canvas.drawArc({ left: 7, top: 7, right: 89, bottom: 89 }, -90, value.percent * 3.6)
       }
       canvas.detachPen()
-      if (badge && this.logo) {
-        canvas.save()
-        canvas.clipRoundRect(new drawing.RoundRect({ left: 26, top: 26, right: 70, bottom: 70 }, 11, 11),
-          drawing.ClipOp.INTERSECT, true)
-        canvas.drawImage(this.logo, 26, 26)
-        canvas.restore()
-      } else {
-        pen.setStrokeWidth(6); pen.setColor(value.dark ? 0xFFFFFFFF : 0xFF172033)
-        if (value.phase === 'failed') { pen.setColor(0xFFC48323) }
-        canvas.attachPen(pen)
-        if (value.phase === 'completed') {
-          canvas.drawLine(34, 48, 44, 58); canvas.drawLine(44, 58, 62, 38)
-        } else if (value.phase === 'paused') {
-          canvas.drawLine(40, 35, 40, 61); canvas.drawLine(56, 35, 56, 61)
-        } else if (value.phase === 'failed') {
-          canvas.drawLine(48, 33, 48, 52); canvas.drawLine(48, 62, 48, 62)
-        } else if (value.direction === 'both') {
-          this.arrow(canvas, 38, true, 12); this.arrow(canvas, 58, false, 12)
-        } else { this.arrow(canvas, 48, value.direction === 'upload', 15) }
-        canvas.detachPen()
-      }
+      pen.setStrokeWidth(6); pen.setColor(value.dark ? 0xFFFFFFFF : 0xFF172033)
+      if (value.phase === 'failed') { pen.setColor(0xFFC48323) }
+      canvas.attachPen(pen)
+      if (value.phase === 'completed') {
+        canvas.drawLine(34, 48, 44, 58); canvas.drawLine(44, 58, 62, 38)
+      } else if (value.phase === 'paused') {
+        canvas.drawLine(40, 35, 40, 61); canvas.drawLine(56, 35, 56, 61)
+      } else if (value.phase === 'failed') {
+        canvas.drawLine(48, 33, 48, 52); canvas.drawLine(48, 62, 48, 62)
+      } else if (value.direction === 'both') {
+        this.arrow(canvas, 38, true, 12); this.arrow(canvas, 58, false, 12)
+      } else { this.arrow(canvas, 48, value.direction === 'upload', 15) }
+      canvas.detachPen()
       return pixels
     } catch (error) { pixels.release().catch(() => {}); throw error as Error }
   }

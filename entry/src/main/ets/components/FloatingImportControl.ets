@@ -110,7 +110,7 @@ export struct FloatingImportControl {
     if (this.dragging) { return this.dragY }
     return this.safeTop + this.fraction * (this.maxY() - this.safeTop)
   }
-  private expandedSurfaceWidth(): number { return Math.min(236, this.viewportWidth - 16) }
+  private expandedSurfaceWidth(): number { return Math.min(180, this.viewportWidth - 16) }
   private surfaceWidth(): number { return this.expanded ? this.expandedSurfaceWidth() : 56 }
   private surfaceHeight(): number { return this.expanded ? 208 : 56 }
   private x(): number { return Math.max(8, Math.min(this.circleX(), this.viewportWidth - this.surfaceWidth() - 8)) }
@@ -201,7 +201,7 @@ export struct FloatingImportControl {
       Column() {
         this.ChoiceVisual($r('sys.symbol.folder'), '文件')
         this.ChoiceVisual($r('sys.symbol.picture_on_square'), '图库')
-        this.ChoiceVisual($r('sys.symbol.picture_on_square'), '图片文件夹内图片上传')
+        this.ChoiceVisual($r('sys.symbol.picture_on_square'), '图库文件夹')
         this.ChoiceVisual($r('sys.symbol.folder_badge_plus'), '新建文件夹')
       }
       .width(this.expandedSurfaceWidth())
@@ -360,7 +360,7 @@ export struct FloatingImportControl {
       Column() {
         this.ChoiceHitTarget('文件', 'files')
         this.ChoiceHitTarget('图库', 'gallery')
-        this.ChoiceHitTarget('图片文件夹内图片上传', 'album')
+        this.ChoiceHitTarget('图库文件夹', 'album')
         this.ChoiceHitTarget('新建文件夹', 'folder')
       }
       .width(this.expandedSurfaceWidth())
