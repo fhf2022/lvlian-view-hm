@@ -1,0 +1,50 @@
+name: 问题反馈
+description: 反馈文件浏览、图片、传输或界面问题
+title: "[问题] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先查看 README 和使用说明。附图或日志前，请遮住账号、云盘 ID、私人地址、文件名和访问令牌。
+  - type: input
+    id: version
+    attributes:
+      label: 应用版本与来源
+      description: 例如应用市场版本号，或自行构建所用的 commit。
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 使用环境
+      description: 设备型号、HarmonyOS 版本、NAS 型号及系统版本、局域网或远程访问；请勿填写私人 IP 或账号。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 打开……
+        2. 点击或滑动……
+        3. 出现……
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期表现
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际表现与复现频率
+      description: 是否每次出现；图片或传输问题可补充数量、大小、缓存及通知授权状态。
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 截图或日志（可选）
+      description: 请只附与问题有关、已去除私人信息的内容。
