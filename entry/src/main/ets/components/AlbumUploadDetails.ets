@@ -2,6 +2,7 @@ import { CapsuleSegmentButtonV2, LengthMetrics, SegmentButtonV2Items } from '@ki
 import { AlbumUploadItem, AlbumUploadState } from '../upload/AlbumUploadModel'
 import { AlbumUploadManager } from '../upload/AlbumUploadManager'
 import { TransferTaskListRow } from './TransferTaskListRow'
+import { HeaderStyle } from '../ui/HeaderStyle'
 
 @Component
 export struct AlbumUploadDetails {
@@ -100,10 +101,10 @@ export struct AlbumUploadDetails {
 
   build() {
     Column() {
-      Row({ space: 8 }) {
+      Row({ space: HeaderStyle.gap }) {
         Text(this.albumName + ' · 明细')
-          .fontSize(20)
-          .fontWeight(FontWeight.Medium)
+          .fontSize(HeaderStyle.titleSize)
+          .fontWeight(FontWeight.Bold)
           .fontColor($r('app.color.text_primary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -115,27 +116,33 @@ export struct AlbumUploadDetails {
             if (this.loading || this.failures === failures) { return }
             this.failures = failures; this.load(0)
           },
-          itemFontSize: LengthMetrics.fp(13), itemSelectedFontSize: LengthMetrics.fp(13),
-          buttonMinHeight: LengthMetrics.vp(36), itemMinHeight: LengthMetrics.vp(32) })
+          itemFontSize: LengthMetrics.fp(HeaderStyle.actionSize), itemSelectedFontSize: LengthMetrics.fp(HeaderStyle.actionSize),
+          buttonMinHeight: LengthMetrics.vp(HeaderStyle.controlHeight), itemMinHeight: LengthMetrics.vp(HeaderStyle.controlHeight - 4),
+          buttonPadding: LengthMetrics.vp(2),
+          itemPadding: { top: LengthMetrics.vp(4), bottom: LengthMetrics.vp(4),
+            start: LengthMetrics.vp(12), end: LengthMetrics.vp(12) } })
           .width(124)
+          .height(HeaderStyle.controlHeight)
           .enabled(!this.loading)
           .id('album-details-filter')
         Button({ type: ButtonType.Circle }) {
           SymbolGlyph($r('sys.symbol.arrow_clockwise'))
-            .fontSize(18)
+            .fontSize(HeaderStyle.iconSize)
             .fontColor([$r('app.color.text_primary')])
         }
-        .width(36)
-        .height(36)
+        .width(HeaderStyle.controlHeight)
+        .height(HeaderStyle.controlHeight)
         .backgroundColor(Color.Transparent)
         .enabled(!this.loading)
         .accessibilityText('刷新明细')
         .id('album-details-refresh')
         .onClick(() => this.load(this.pageOffset))
       }
-      // Reserve the native sheet close button's space on the right.
+      // Match the native close button's top inset and reserve its right-hand space.
       .width('100%')
-      .padding({ left: 16, right: 64, top: 12, bottom: 12 })
+      .padding({ left: HeaderStyle.sideInset,
+        right: HeaderStyle.sideInset + HeaderStyle.controlHeight + HeaderStyle.gap,
+        top: HeaderStyle.sheetTopPadding, bottom: HeaderStyle.topPadding })
       if (this.error.length > 0) {
         Text(this.error).fontSize(13).fontColor($r('app.color.album_upload_error'))
           .width('100%').padding({ left: 16, right: 16, bottom: 8 })

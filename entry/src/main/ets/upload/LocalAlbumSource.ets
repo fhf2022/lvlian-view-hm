@@ -4,17 +4,35 @@ import { dataSharePredicates } from '@kit.ArkData'
 import { util } from '@kit.ArkTS'
 import { AlbumUploadItem, AlbumUploadSource, LocalImageAlbum } from './AlbumUploadModel'
 
+/** Keeps permission recovery separate from album or NAS failures. */
+export class LocalAlbumPermissionError extends Error {
+  constructor(message: string = '需要允许读取图片') { super(message); this.name = 'LocalAlbumPermissionError' }
+}
+
 /** Native result sets are bounded to 200 objects per IPC, and always released. */
 export class LocalAlbumSource implements AlbumUploadSource {
   private context: common.UIAbilityContext
   constructor(context: common.UIAbilityContext) { this.context = context }
 
-  async requestPermission(): Promise<void> {
-    const result = await abilityAccessCtrl.createAtManager().requestPermissionsFromUser(this.context,
-      ['ohos.permission.READ_IMAGEVIDEO'])
-    if (result.authResults.length !== 1 || result.authResults[0] !== 0) {
-      throw new Error('需要允许读取本地图片，才能上传整个图片文件夹。你仍可通过“图库”手动选图。')
+  async requestPermission(allowSettings: boolean = false): Promise<void> {
+    const manager = abilityAccessCtrl.createAtManager()
+    const result = await manager.requestPermissionsFromUser(this.context, ['ohos.permission.READ_IMAGEVIDEO'])
+    if (result.errorReasons?.[0] === 4) {
+      throw new LocalAlbumPermissionError('请重新打开应用完成隐私授权')
     }
+    if (result.authResults.length === 1 && result.authResults[0] === abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED) {
+      return
+    }
+    if (result.authResults[0] !== abilityAccessCtrl.GrantStatus.PERMISSION_DENIED) {
+      throw new Error('图库授权请求无效，请检查应用权限配置')
+    }
+    // A fresh refusal ends this attempt. Only a previous refusal that prevents
+    // the ordinary dialog uses the official settings dialog on an explicit album action.
+    if (allowSettings && result.dialogShownResults?.[0] === false) {
+      const granted = await manager.requestPermissionOnSetting(this.context, ['ohos.permission.READ_IMAGEVIDEO'])
+      if (granted.length === 1 && granted[0] === abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED) { return }
+    }
+    throw new LocalAlbumPermissionError()
   }
 
   private async helper(): Promise<photoAccessHelper.PhotoAccessHelper> {

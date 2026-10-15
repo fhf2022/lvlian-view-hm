@@ -27,7 +27,7 @@ const mocks={
  }}
 };
 class Clock extends Date {static now(){return now}}
-function load(file){const exports={};const code=ts.transpileModule(fs.readFileSync('entry/src/main/ets/transfer/'+file+'.ets','utf8'),
+function load(file){const exports={};const code=ts.transpileModule(fs.readFileSync(file === 'TransferProgress' ? 'entry/src/main/ets/transfer/'+file+'.ets' : require('node:path').join(__dirname, '../src', file+'.ets'), 'utf8'),
  {compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText;
  vm.runInNewContext(code,{exports,require:name=>{assert(mocks[name],name);return mocks[name]},Date:Clock,console,
  AppStorage:{get:key=>state.get(key),setOrCreate:(key,value)=>state.set(key,value)},

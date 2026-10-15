@@ -1,3 +1,4 @@
+import { StartupAuthorization } from '../core/authorization/StartupAuthorization'
 import { StorageBudget } from '../download/StorageBudget'
 import { DownloadDestination } from '../download/DownloadDestination'
 import { TransferBackgroundManager } from '../transfer/TransferBackgroundManager'
@@ -12,6 +13,11 @@ import { AlbumUploadPicker } from '../components/AlbumUploadPicker'
 import { AlbumUploadSheet } from '../components/AlbumUploadSheet'
 import { AlbumUploadDetails } from '../components/AlbumUploadDetails'
 import { TransferTaskListRow } from '../components/TransferTaskListRow'
+import { HeaderStyle } from '../ui/HeaderStyle'
+import { FileRowStyle } from '../ui/FileRowStyle'
+import { TaskPanel, TaskPanelFooter, TaskPanelSection } from '../components/TaskPanel'
+import { TaskPanelStyle } from '../ui/TaskPanelStyle'
+import { DirectoryHeaderState } from '../ui/DirectoryHeaderState'
 import { AlbumUploadManager } from '../upload/AlbumUploadManager'
 import { AlbumUploadJob, LocalImageAlbum } from '../upload/AlbumUploadModel'
 import { LocalAlbumSource } from '../upload/LocalAlbumSource'
@@ -841,6 +847,12 @@ class RowHitArea {
 @Component
 struct Index {
   @State screen: RemoteScreen = 'login'
+  @State startupRestoring: boolean = true
+  @State startupAuthorized: boolean = false
+  @State startupAuthorizing: boolean = true
+  @State startupAuthorizationMessage: string = ''
+  private startupAuthorizationToken: number = 0
+  private applicationInitialized: boolean = false
   @State linkId: string = ''
   @State username: string = ''
   @State password: string = ''
@@ -890,6 +902,7 @@ struct Index {
   @State destinationTreeLoadingPath: string = ''
   @State destinationRootExpanded: boolean = true
   @State destinationLoading: boolean = false
+  @State destinationOperationRunning: boolean = false
   @State destinationPickerClosing: boolean = false
   @State destinationSelectedEntries: FileEntry[] = []
   @State destinationFolderDialog: boolean = false
@@ -1121,6 +1134,7 @@ struct Index {
   @State albumUploadJobs: AlbumUploadJob[] = []
   @State showAlbumPicker: boolean = false
   @State showAlbumUpload: boolean = false
+  @State albumUploadStarting: boolean = false
   @State albumUploadSelection: LocalImageAlbum = new LocalImageAlbum()
   private albumConfirmationPending: boolean = false
   private albumReselectPending: boolean = false
@@ -1136,6 +1150,7 @@ struct Index {
   @State importSelecting: boolean = false
   private uploadQueue: UploadQueueManager = new UploadQueueManager()
   @State showPageTransition: boolean = false
+  @State fileTransitionHeader: DirectoryHeaderState | null = null
   @State outgoingEntries: FileEntry[] = []
   @State showSearch: boolean = false
   @State searchQuery: string = ''
@@ -1461,7 +1476,6 @@ struct Index {
   private locateMaxBuildIndex: number = -1
   private locateImagePipelineCount: number = 0
   private isNavigating: boolean = false
-  private titleAnimationToken: number = 0
   private pageTransitionToken: number = 0
   private pageTransitionTimer: number = 0
   private pageTransitionFinishing: boolean = false
@@ -1603,6 +1617,32 @@ struct Index {
     lightEffect: { color: '#66FFFFFF' }
   })
   aboutToAppear(): void {
+    this.completeStartupAuthorization(false)
+  }
+
+  private async completeStartupAuthorization(retry: boolean): Promise<void> {
+    const token = ++this.startupAuthorizationToken
+    this.startupAuthorizing = true
+    this.startupAuthorizationMessage = ''
+    const gate = StartupAuthorization.shared()
+    const allowed = retry ? await gate.authorize(getContext(this) as common.UIAbilityContext) : await gate.waitForInitial()
+    if (token !== this.startupAuthorizationToken) { return }
+    this.startupAuthorizing = false
+    if (!allowed) { this.startupAuthorizationMessage = gate.message(); return }
+    this.startupAuthorized = true
+    if (!this.applicationInitialized) {
+      this.applicationInitialized = true
+      this.initializeApplication()
+      this.onPageShow()
+    }
+  }
+
+  private exitBeforeAuthorization(): void {
+    this.startupAuthorizationToken++
+    (getContext(this) as common.UIAbilityContext).terminateSelf().catch(() => {})
+  }
+
+  private initializeApplication(): void {
     // Ask the motor which presets it has before the first cue needs one, so
     // the very first long press does not fall back unnecessarily.
     HapticFeedback.prepare()
@@ -1682,6 +1722,7 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    this.startupAuthorizationToken++
     this.albumUpload.setForeground(false)
     this.gestureSharePageVisible = false
     NasConnection.shared().setForeground(false)
@@ -1834,6 +1875,7 @@ struct Index {
   }
 
   onPageHide(): void {
+    if (!this.startupAuthorized) { return }
     this.albumUpload.setForeground(false)
     this.gestureSharePageVisible = false
     NasConnection.shared().setForeground(false)
@@ -1844,6 +1886,7 @@ struct Index {
   }
 
   onPageShow(): void {
+    if (!this.startupAuthorized) { return }
     this.albumUpload.setForeground(!this.abilityInBackground)
     this.gestureSharePageVisible = true
     NasConnection.shared().setForeground(!this.abilityInBackground)
@@ -1859,6 +1902,7 @@ struct Index {
   }
 
   onAbilityBackgroundChanged(): void {
+    if (!this.startupAuthorized) { return }
     this.albumUpload.setForeground(this.gestureSharePageVisible && !this.abilityInBackground)
     NasConnection.shared().setForeground(this.gestureSharePageVisible && !this.abilityInBackground)
     if (!this.abilityInBackground) { this.scheduleNasRecovery() }
@@ -1870,6 +1914,7 @@ struct Index {
   }
 
   onTransferNavigationRequested(): void {
+    if (!this.startupAuthorized) { return }
     if (this.transferNavigationRequest <= this.transferNavigationHandled ||
       this.screen === 'login' || this.screen === 'otp') { return }
     if (this.isBusy && !this.isNavigating && !this.showPageTransition) { return }
@@ -2329,7 +2374,43 @@ struct Index {
   // TopFileOverlay. Keeping this in one helper prevents WaterFlow from
   // drifting away from the list/grid header geometry.
   private fileContentTopInset(): number {
-    return this.topSafeInset() + 76
+    return this.topSafeInset() + HeaderStyle.contentTopInset
+  }
+
+  private hasSettingsSubpage(): boolean {
+    return this.showStorageSettings || this.showPlaybackSettings || this.showViewSettings ||
+      this.showNetworkSettings || this.showRecycleBinSettings
+  }
+
+  private filePresentationPath(): string {
+    return this.fileTransitionHeader === null ? this.currentPath : this.fileTransitionHeader.path
+  }
+
+  private mainHeaderHasLeading(): boolean {
+    return this.screen === 'files' ? this.fileHeaderLeadingVisible() :
+      this.screen === 'settings' && this.hasSettingsSubpage()
+  }
+
+  private mainHeaderTitle(): string {
+    if (this.screen === 'files') {
+      return this.selectionMode ? this.selectionTitle() :
+        (this.fileTransitionHeader === null ? this.fileTitle(this.currentPath) : this.fileTransitionHeader.title)
+    }
+    if (this.screen === 'downloads') { return '传输' }
+    if (this.screen !== 'settings') { return this.topTitle }
+    if (this.showStorageSettings) { return '缓存与存储' }
+    if (this.showPlaybackSettings) { return '播放与控制' }
+    if (this.showViewSettings) { return '默认视图' }
+    if (this.showNetworkSettings) { return '网络与流量' }
+    return this.showRecycleBinSettings ? this.topTitle : '设置'
+  }
+
+  private closeSettingsSubpage(): void {
+    if (this.showStorageSettings) { this.closeStorageSettings() }
+    else if (this.showPlaybackSettings) { this.closePlaybackSettings() }
+    else if (this.showViewSettings) { this.closeViewSettings() }
+    else if (this.showNetworkSettings) { this.closeNetworkSettings() }
+    else if (this.showRecycleBinSettings) { this.recycleBackAction() }
   }
 
   private bottomSafeInset(): number {
@@ -2426,18 +2507,18 @@ struct Index {
       return true
     }
     if (this.screen === 'settings') {
-      return !this.showStorageSettings && !this.showPlaybackSettings &&
-        !this.showNetworkSettings && !this.showRecycleBinSettings
+      return !this.hasSettingsSubpage()
     }
     if (this.screen !== 'files') {
       return false
     }
     // 根目录（仅管理员可见的个人空间根、或共享空间根）
-    if (this.currentPath.length === 0) {
+    const path = this.filePresentationPath()
+    if (path.length === 0) {
       return true
     }
     // 用户个人空间主界面（用户根目录，如 /admin、/home/admin）
-    if (this.rootKind === 'personal' && this.isUserRootPath(this.currentPath)) {
+    if (this.rootKind === 'personal' && this.isUserRootPath(path)) {
       return true
     }
     return false
@@ -2477,7 +2558,7 @@ struct Index {
   // Parent chrome is retained beneath overlays. Only input ownership changes;
   // do not use these flags to unmount material hosts or change the bar's mode.
   private parentOverlayOwnsInteraction(): boolean {
-    return this.viewerOwnsParentInteraction() || this.showAudioPlayer ||
+    return !this.startupAuthorized || this.startupRestoring || this.viewerOwnsParentInteraction() || this.showAudioPlayer ||
       this.videoPlaybackUiVisible() || this.videoEntryTransitionActive ||
       this.contextMenuEntry !== null || this.showRenameDialog ||
       this.showDestinationPicker || this.showCreateFolderDialog ||
@@ -2485,7 +2566,7 @@ struct Index {
   }
 
   private shouldShowFloatingImportControl(): boolean {
-    return this.screen === 'files' && this.currentPath.length > 0 &&
+    return this.screen === 'files' && this.filePresentationPath().length > 0 &&
       !this.showSearch && !this.selectionMode
   }
 
@@ -2541,32 +2622,11 @@ struct Index {
     return kind === 'personal' ? '个人空间' : '共享空间'
   }
 
-  private updateTopTitle(title: string, animated: boolean = true): void {
-    const nextTitle = title.length > 0 ? title : '我的云盘'
-    this.titleAnimationToken += 1
-    const token = this.titleAnimationToken
-    if (!animated || this.topTitle === nextTitle) {
-      this.topTitle = nextTitle
-      this.topTitleOpacity = 1
-      return
-    }
-
-    this.getUIContext().animateTo({ duration: 45, curve: Curve.EaseIn }, () => {
-      if (token === this.titleAnimationToken) {
-        this.topTitleOpacity = 0
-      }
-    })
-    setTimeout((): void => {
-      if (token !== this.titleAnimationToken) {
-        return
-      }
-      this.topTitle = nextTitle
-      this.getUIContext().animateTo({ duration: 80, curve: Curve.EaseOut }, () => {
-        if (token === this.titleAnimationToken) {
-          this.topTitleOpacity = 1
-        }
-      })
-    }, 45)
+  private updateTopTitle(title: string): void {
+    // A title belongs to the route that is committed in this same turn.
+    // A delayed fade used to paint the previous page after its back control had changed.
+    this.topTitle = title.length > 0 ? title : '我的云盘'
+    this.topTitleOpacity = 1
   }
 
   private effectivePageWidth(): number {
@@ -2583,6 +2643,7 @@ struct Index {
       this.pageTransitionTimer = 0
     }
     this.showPageTransition = false
+    this.fileTransitionHeader = null
     this.pageOffsetX = 0
     this.outgoingPageOffsetX = 0
     this.transitionSnapshotOnTop = false
@@ -2598,6 +2659,7 @@ struct Index {
     this.cancelFileTransition()
     const token = this.pageTransitionToken
     const width = this.effectivePageWidth()
+    this.fileTransitionHeader = new DirectoryHeaderState(this.currentPath, this.rootKind === 'personal')
     this.outgoingEntries = outgoingEntries.slice()
     this.transitionFileEntryDataSource.replace(this.outgoingEntries)
     this.transitionSnapshotMode = this.fileViewMode
@@ -2614,7 +2676,7 @@ struct Index {
   }
 
   private animatePreparedFileTransition(token: number, direction: PageTransitionDirection,
-    incomingTitle: string): void {
+    incomingPath: string): void {
     if (token !== this.pageTransitionToken || !this.showPageTransition) {
       return
     }
@@ -2622,6 +2684,8 @@ struct Index {
     // The incoming page travels one full screen width while the outgoing
     // page travels half a screen width in the same duration. Linear motion
     // keeps the 1:1/2 speed ratio visible instead of hiding it in easing.
+    this.fileTransitionHeader = new DirectoryHeaderState(incomingPath, this.rootKind === 'personal')
+    this.updateTopTitle(this.fileTitle(incomingPath))
     const outgoingTarget = direction === 'push' ? -width * 0.5 : width * 0.5
     this.getUIContext().animateTo({
       duration: 180,
@@ -2634,9 +2698,6 @@ struct Index {
       if (token !== this.pageTransitionToken) {
         return
       }
-      // Match the selection-mode header: keep the same Text node visible and
-      // switch its content in the same animation transaction as the page.
-      this.updateTopTitle(incomingTitle, false)
       this.pageOffsetX = 0
       this.outgoingPageOffsetX = outgoingTarget
     })
@@ -2648,6 +2709,7 @@ struct Index {
     }
     this.pageTransitionTimer = 0
     this.showPageTransition = false
+    this.fileTransitionHeader = null
     this.pageOffsetX = 0
     this.outgoingPageOffsetX = 0
     this.transitionSnapshotOnTop = false
@@ -2660,12 +2722,6 @@ struct Index {
     }
   }
 
-  private startFileTransition(outgoingEntries: FileEntry[], direction: PageTransitionDirection,
-    incomingTitle: string): void {
-    const token = this.prepareFileTransition(outgoingEntries, direction)
-    this.postRenderFrame((): void => this.animatePreparedFileTransition(token, direction, incomingTitle))
-  }
-
   /**
    * Keep the outgoing lazy container intact for one submitted frame before
    * reloading the hidden incoming container. This follows ArkUI's documented
@@ -2673,7 +2729,7 @@ struct Index {
    * only after both surfaces have completed an initial frame.
    */
   private async transitionFileContent(outgoingEntries: FileEntry[], direction: PageTransitionDirection,
-    incomingTitle: string, outgoingState: DirectoryViewState | null, commitIncoming: () => void,
+    incomingPath: string, outgoingState: DirectoryViewState | null, commitIncoming: () => void,
     settleIncoming: (() => void) | null = null,
     resetPreviewOnFinish: boolean = false): Promise<boolean> {
     const token = this.prepareFileTransition(outgoingEntries, direction, false)
@@ -2711,7 +2767,7 @@ struct Index {
         return false
       }
     }
-    this.animatePreparedFileTransition(token, direction, incomingTitle)
+    this.animatePreparedFileTransition(token, direction, incomingPath)
     return true
   }
 
@@ -2837,6 +2893,7 @@ struct Index {
     this.outgoingPageOffsetX = 0
     this.traceStateWrite('StateWrite:cbf.showPageTransition')
     this.showPageTransition = false
+    this.fileTransitionHeader = null
     this.traceStateWrite('StateWrite:cbf.transitionSnapshotOnTop')
     this.transitionSnapshotOnTop = false
     this.traceStateWrite('StateWrite:cbf.transitionSnapshotMode')
@@ -2855,12 +2912,14 @@ struct Index {
    * do we replace the live data source and release the outgoing previews.
    */
   private async transitionBackFileContent(incomingEntries: FileEntry[], incomingState: DirectoryViewState | null,
-    incomingTitle: string, commitIncoming: () => void): Promise<boolean> {
+    incomingPath: string, commitIncoming: (preparedEntries: FileEntry[]) => void): Promise<boolean> {
     this.cancelFileTransition()
     const token = this.pageTransitionToken
     const width = this.effectivePageWidth()
+    this.fileTransitionHeader = new DirectoryHeaderState(this.currentPath, this.rootKind === 'personal')
     this.traceStateWrite('StateWrite:tbf.outgoingEntries')
-    this.outgoingEntries = incomingEntries.slice()
+    const preparedEntries = this.sortEntriesForDisplay(incomingEntries)
+    this.outgoingEntries = preparedEntries
     this.transitionFileEntryDataSource.replace(this.outgoingEntries)
     this.traceStateWrite('StateWrite:tbf.transitionSnapshotMode')
     this.transitionSnapshotMode = incomingState === null || incomingState.mode === 'waterfall'
@@ -2884,19 +2943,21 @@ struct Index {
     if (!await this.settleFileTransitionSnapshotBeforeReveal(token, incomingState)) {
       return false
     }
+    if (token !== this.pageTransitionToken || !this.showPageTransition) { return false }
 
+    this.fileTransitionHeader = new DirectoryHeaderState(incomingPath, this.rootKind === 'personal')
+    this.updateTopTitle(this.fileTitle(incomingPath))
     this.getUIContext().animateTo({
       duration: 180,
       curve: Curve.FastOutSlowIn,
       finishCallbackType: FinishCallbackType.REMOVED,
       onFinish: (): void => {
-        this.finishBackFileTransition(token, incomingState, commitIncoming)
+        this.finishBackFileTransition(token, incomingState, (): void => commitIncoming(preparedEntries))
       }
     }, () => {
       if (token !== this.pageTransitionToken) {
         return
       }
-      this.updateTopTitle(incomingTitle, false)
       this.pageOffsetX = width * 0.5
       this.outgoingPageOffsetX = 0
     })
@@ -2904,8 +2965,12 @@ struct Index {
   }
 
   onBackPress(): boolean {
+    if (!this.startupAuthorized) { this.exitBeforeAuthorization(); return true }
     if (this.showAlbumPicker) { this.albumConfirmationPending = false; this.showAlbumPicker = false; return true }
-    if (this.showAlbumUpload) { this.showAlbumUpload = false; return true }
+    if (this.showAlbumUpload) {
+      if (!this.albumUploadStarting) { this.showAlbumUpload = false }
+      return true
+    }
     if (this.showAlbumDetails) { this.showAlbumDetails = false; return true }
     if (this.importExpanded) {
       this.getUIContext().animateTo({ duration: 220, curve: Curve.EaseOut }, () => { this.importExpanded = false })
@@ -3268,6 +3333,33 @@ struct Index {
       this.DestinationFolderOverlay()
       this.ImageViewerDetailsOverlay()
       this.AlbumUploadOverlay()
+      if (!this.startupAuthorized || this.startupRestoring) {
+        Column({ space: 16 }) {
+          Image($r('app.media.icon')).width(76).height(76)
+            .objectFit(ImageFit.Contain).borderRadius(18).clip(true)
+            .accessibilityText('联文件应用图标').id('startup-app-logo')
+          if (this.startupAuthorizing || this.startupAuthorized) {
+            LoadingProgress().width(24).height(24).color('#2E6BFF')
+          } else {
+            Text(this.startupAuthorizationMessage).fontSize(14).fontColor($r('sys.color.font_secondary'))
+              .textAlign(TextAlign.Center).id('startup-authorization-message')
+            Button('查看隐私声明').height(48).padding({ left: 24, right: 24 })
+              .fontSize(16).backgroundColor($r('sys.color.comp_background_emphasize'))
+              .fontColor($r('sys.color.font_on_primary'))
+              .onClick(() => this.completeStartupAuthorization(true)).id('startup-authorization-retry')
+            Button('退出').height(40).fontSize(14).backgroundColor(Color.Transparent)
+              .fontColor($r('sys.color.font_secondary')).onClick(() => this.exitBeforeAuthorization())
+              .id('startup-authorization-exit')
+          }
+        }
+        .width('100%').height('100%')
+        .justifyContent(FlexAlign.Center).alignItems(HorizontalAlign.Center)
+        .backgroundColor($r('app.color.page_background'))
+        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+        .hitTestBehavior(HitTestMode.Block)
+        .id('startup-restoration-cover')
+        .zIndex(200)
+      }
     }
     .width('100%')
     .height('100%')
@@ -3607,12 +3699,12 @@ struct Index {
     Stack() {
       if (this.shouldReplaceViewerTransitionSource(entry)) {
         Blank()
-          .width(40)
-          .height(34)
+          .width(FileRowStyle.leadingWidth)
+          .height(FileRowStyle.leadingHeight)
       } else if (this.fileImageSourceAvailable(entry, surface)) {
         Image(this.fileImageSource(entry, surface))
-            .width(40)
-            .height(34)
+            .width(FileRowStyle.leadingWidth)
+            .height(FileRowStyle.leadingHeight)
             .orientation(this.fileImageSourceOrientation(entry, surface))
             .objectFit(ImageFit.Cover)
             .borderRadius(6)
@@ -3630,16 +3722,16 @@ struct Index {
             .height(22)
         }
       } else if (entry.isDirectory) {
-        this.FolderIcon(32)
+        this.FolderIcon(FileRowStyle.iconSize)
       } else {
         Image(this.fileIcon(entry))
-          .width(32)
-          .height(32)
+          .width(FileRowStyle.iconSize)
+          .height(FileRowStyle.iconSize)
           .objectFit(ImageFit.Contain)
       }
     }
-    .width(40)
-    .height(34)
+    .width(FileRowStyle.leadingWidth)
+    .height(FileRowStyle.leadingHeight)
     .borderRadius(6)
     .clip(true)
     .onAreaChange((_, area) => this.recordThumbnailArea(entry, index, surface, area))
@@ -3981,18 +4073,18 @@ struct Index {
                 Row() {
                   this.FileLeadingVisual(entry, index, 'list')
                 }
-                .margin({ right: 8 })
+                .margin({ right: FileRowStyle.leadingGap })
                 Column() {
                   Text(entry.name)
-                    .fontSize(16)
+                    .fontSize(FileRowStyle.titleSize)
                     .fontColor($r('app.color.text_primary'))
                     .maxLines(1)
                     .textOverflow({ overflow: TextOverflow.Ellipsis })
                   if (this.entryInfo(entry).length > 0) {
                     Text(this.entryInfo(entry))
-                      .fontSize(12)
+                      .fontSize(FileRowStyle.infoSize)
                       .fontColor($r('app.color.text_muted'))
-                      .margin({ top: 4 })
+                      .margin({ top: FileRowStyle.textGap })
                   }
                 }
                 .alignItems(HorizontalAlign.Start)
@@ -4006,7 +4098,8 @@ struct Index {
               }
               .width('100%')
               .alignItems(VerticalAlign.Center)
-              .padding({ left: 8, right: 8, top: 12, bottom: 12 })
+              .padding({ left: FileRowStyle.horizontalPadding, right: FileRowStyle.horizontalPadding,
+                top: FileRowStyle.verticalPadding, bottom: FileRowStyle.verticalPadding })
 
               if (index < this.entries.length - 1) {
                 Divider()
@@ -4116,7 +4209,7 @@ struct Index {
               Text(this.transferNotificationBlocked ? '通知未开启，当前仅前台传输' : (this.transferProtectionError.length > 0 ? this.transferProtectionError :
                 (this.transferProtectionActive ? '后台传输保护已开启，锁屏后可继续' : '正在申请后台传输保护'))
               )
-                .fontSize(12).fontColor($r('app.color.text_muted')).width('100%')
+                .fontSize(FileRowStyle.infoSize).fontColor($r('app.color.text_muted')).width('100%')
                 .id('transfer-background-status')
               if (this.transferNotificationBlocked) {
                 Button('开启通知').fontSize(13).height(36)
@@ -4310,8 +4403,12 @@ struct Index {
       })
     Column() {}.width(0).height(0)
       .bindSheet($$this.showAlbumUpload, this.AlbumUploadOverlayContent, {
-        height: SheetSize.FIT_CONTENT, dragBar: true, showClose: false,
-        backgroundColor: $r('app.color.page_background'),
+        height: SheetSize.FIT_CONTENT, dragBar: false, showClose: false,
+        radius: { topLeft: TaskPanelStyle.corner, topRight: TaskPanelStyle.corner },
+        backgroundColor: $r('app.color.task_panel_background'),
+        onWillDismiss: (action: DismissSheetAction): void => {
+          if (!this.albumUploadStarting) { action.dismiss(); this.showAlbumUpload = false }
+        },
         onDisappear: () => {
           if (!this.albumReselectPending) { return }
           this.albumReselectPending = false
@@ -4328,7 +4425,6 @@ struct Index {
   @Builder
   AlbumUploadPickerContent(): void {
     AlbumUploadPicker({ visible: $showAlbumPicker, safeTop: this.topSafeInset(), safeBottom: this.bottomSafeInset(),
-      viewportWidth: this.pageWidthVp,
       onSelected: (album: LocalImageAlbum): void => {
         this.albumUploadSelection = album
         this.albumConfirmationPending = this.albumUploadContextValid()
@@ -4343,16 +4439,29 @@ struct Index {
 
   @Builder
   AlbumUploadOverlayContent(): void {
-    AlbumUploadSheet({ visible: $showAlbumUpload, album: this.albumUploadSelection, destination: this.albumUploadDestination,
-      contentMaxHeight: Math.max(80, this.pageHeightVp * 0.85 - this.topSafeInset() - this.bottomSafeInset() - 140),
-      onReselect: (): void => { this.albumReselectPending = true; this.showAlbumUpload = false },
+    AlbumUploadSheet({ visible: $showAlbumUpload, album: this.albumUploadSelection,
+      destination: this.albumUploadDestination, starting: this.albumUploadStarting,
+      contentMaxHeight: Math.max(80, this.pageHeightVp * 0.85 - this.topSafeInset() - this.bottomSafeInset() -
+        TaskPanelStyle.compactChromeHeight),
+      onReselect: (): void => {
+        if (this.albumUploadStarting) { return }
+        this.albumReselectPending = true; this.showAlbumUpload = false
+      },
       onStart: async (album: LocalImageAlbum): Promise<void> => {
-        await this.albumUpload.create(album, this.albumUploadDestination, this.albumUploadRootType,
-          this.albumUploadScope, false)
-        this.showAlbumUpload = false
-        this.transferDirection = 'upload'
-        this.openDownloads()
-        this.showImmersiveToast('已创建图片文件夹上传任务')
+        if (this.albumUploadStarting || !this.albumUploadContextValid()) {
+          throw new Error('目标文件夹已变化，请重新选择')
+        }
+        const destination = this.albumUploadDestination
+        const rootType = this.albumUploadRootType
+        const scope = this.albumUploadScope
+        this.albumUploadStarting = true
+        try {
+          await this.albumUpload.create(album, destination, rootType, scope, false)
+          this.showAlbumUpload = false
+          this.transferDirection = 'upload'
+          this.openDownloads()
+          this.showImmersiveToast('已创建图片文件夹上传任务')
+        } finally { this.albumUploadStarting = false }
       } })
   }
 
@@ -4383,16 +4492,16 @@ struct Index {
       items: this.transferDirectionItems,
       selectedIndex: this.transferDirection === 'upload' ? 1 : 0,
       $selectedIndex: (index: number): void => { this.transferDirection = index === 1 ? 'upload' : 'download' },
-      itemFontSize: LengthMetrics.fp(15), itemSelectedFontSize: LengthMetrics.fp(15),
+      itemFontSize: LengthMetrics.fp(HeaderStyle.actionSize), itemSelectedFontSize: LengthMetrics.fp(HeaderStyle.actionSize),
       // Match the home header's 40 vp controls: a 36 vp item inside a 2 vp frame.
-      buttonMinHeight: LengthMetrics.vp(40), itemMinHeight: LengthMetrics.vp(36),
+      buttonMinHeight: LengthMetrics.vp(HeaderStyle.controlHeight), itemMinHeight: LengthMetrics.vp(HeaderStyle.controlHeight - 4),
       buttonPadding: LengthMetrics.vp(2),
       itemPadding: { top: LengthMetrics.vp(4), bottom: LengthMetrics.vp(4),
         start: LengthMetrics.vp(12), end: LengthMetrics.vp(12) },
       backgroundSystemMaterial: this.transferControlMaterial()
     })
       .width(132)
-      .height(40)
+      .height(HeaderStyle.controlHeight)
       .id('transfer-direction-control')
   }
 
@@ -4480,7 +4589,7 @@ struct Index {
       Stack() {
         Column({ space: 1 }) {
           SymbolGlyph($r('sys.symbol.arrow_down'))
-            .fontSize(16)
+            .fontSize(FileRowStyle.titleSize)
             .fontColor([$r('sys.color.icon_primary')])
           Text(this.formatSpeed(this.downloadSpeedBytesPerSecond))
             .fontSize(10)
@@ -5116,18 +5225,18 @@ struct Index {
                 Row() {
                   this.FileLeadingVisual(entry)
                 }
-                .margin({ right: 8 })
+                .margin({ right: FileRowStyle.leadingGap })
                 Column() {
                   Text(entry.name)
-                    .fontSize(16)
+                    .fontSize(FileRowStyle.titleSize)
                     .fontColor($r('app.color.text_primary'))
                     .maxLines(1)
                     .textOverflow({ overflow: TextOverflow.Ellipsis })
                   if (this.entryInfo(entry).length > 0) {
                     Text(this.entryInfo(entry))
-                      .fontSize(12)
+                      .fontSize(FileRowStyle.infoSize)
                       .fontColor($r('app.color.text_muted'))
-                      .margin({ top: 4 })
+                      .margin({ top: FileRowStyle.textGap })
                   }
                 }
                 .alignItems(HorizontalAlign.Start)
@@ -5138,7 +5247,8 @@ struct Index {
               }
               .width('100%')
               .alignItems(VerticalAlign.Center)
-              .padding({ left: 8, right: 8, top: 12, bottom: 12 })
+              .padding({ left: FileRowStyle.horizontalPadding, right: FileRowStyle.horizontalPadding,
+                top: FileRowStyle.verticalPadding, bottom: FileRowStyle.verticalPadding })
 
               if (index < snapshotEntries.length - 1) {
                 Divider()
@@ -5173,7 +5283,7 @@ struct Index {
       // 搜索时固定使用 136，避免输入字符时因条件判断导致高度跳变，进而重建标题栏引发软键盘强制收起。
       .title({
         builder: this.TopFileOverlay,
-        height: this.topSafeInset() + (this.showSearch ? 136 : 94)
+        height: this.topSafeInset() + (this.showSearch ? HeaderStyle.searchOverlayHeight : HeaderStyle.overlayHeight)
       }, {
         barStyle: BarStyle.STACK,
         paddingStart: LengthMetrics.vp(0),
@@ -5184,7 +5294,7 @@ struct Index {
       .width('100%')
       // 这层 Navigation 的高度就是标题区的裁切边界，同时决定内容区从哪里开始。
       // 搜索时固定 136，平时为 94。全程高度恒定，保证输入时不发生布局重建与失焦。
-      .height(this.topSafeInset() + (this.showSearch ? 136 : 94))
+      .height(this.topSafeInset() + (this.showSearch ? HeaderStyle.searchOverlayHeight : HeaderStyle.overlayHeight))
       .backgroundColor(Color.Transparent)
       .hitTestBehavior(HitTestMode.Transparent)
   }
@@ -5194,7 +5304,7 @@ struct Index {
     Stack({ alignContent: Alignment.TopStart }) {
       Row()
         .width('100%')
-        .height(this.topSafeInset() + 94)
+        .height(this.topSafeInset() + HeaderStyle.overlayHeight)
         .linearGradient({
           direction: GradientDirection.Bottom,
           colors: [
@@ -5217,18 +5327,18 @@ struct Index {
         .zIndex(1)
 
       if (this.showSearch) {
-        Row({ space: 8 }) {
+        Row({ space: HeaderStyle.gap }) {
           this.OfficialBackButton(() => {
             this.dismissKeyboard()
             this.closeSearch()
           })
           Search({ value: this.searchQuery, placeholder: '搜索文件', controller: this.searchController })
             .layoutWeight(1)
-            .height(40)
+            .height(HeaderStyle.controlHeight)
             .fontColor($r('sys.color.font_primary'))
             .placeholderColor($r('sys.color.font_secondary'))
             .backgroundColor(Color.Transparent)
-            .borderRadius(20)
+            .borderRadius(HeaderStyle.controlHeight / 2)
             .cancelButton({ style: CancelButtonStyle.INPUT })
             .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN, true))
             .monopolizeEvents(true)
@@ -5248,15 +5358,15 @@ struct Index {
                   .color($r('sys.color.icon_primary'))
               }
               Text(this.searchLoading ? '搜索中' : '搜索')
-                .fontSize(15)
+                .fontSize(HeaderStyle.actionSize)
                 .fontWeight(FontWeight.Medium)
                 .fontColor($r('sys.color.font_primary'))
             }
           }
             .type(ButtonType.Normal)
-            .height(40)
+            .height(HeaderStyle.controlHeight)
             .padding({ left: 12, right: 12 })
-            .borderRadius(20)
+            .borderRadius(HeaderStyle.controlHeight / 2)
             .backgroundColor(Color.Transparent)
             .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN, true))
             .hitTestBehavior(HitTestMode.Default)
@@ -5272,89 +5382,38 @@ struct Index {
         // Keep the search header in exactly the same layout box as the normal
         // file header. A shorter Row is centered by the parent Stack, which
         // makes the back button visibly drop when Search is opened.
-        .height(this.topSafeInset() + 94)
-        .padding({ left: 12, right: 12, top: this.topSafeInset() + 8, bottom: 30 })
+        .height(this.topSafeInset() + HeaderStyle.overlayHeight)
+        .padding({ left: HeaderStyle.sideInset, right: HeaderStyle.sideInset,
+          top: this.topSafeInset() + HeaderStyle.topPadding, bottom: HeaderStyle.bottomPadding })
         .zIndex(2)
         .hitTestBehavior(HitTestMode.Default)
       } else {
         Row() {
-          if (this.screen === 'files') {
-            // Keep one stable button node while entering/leaving selection.
-            // The symbol and action change inside the node; the container is
-            // never removed and recreated.
-            if (this.rootKind === 'shared' && this.currentPath.length === 0 &&
-              !this.selectionMode) {
-              // The shared-space root has no parent to return to. Keep the
-              // leading slot so the title remains centered, but remove the
-              // disabled glass circle that used to appear at the top-left.
-              Blank()
-                .width(86)
-                .height(40)
-            } else {
-              this.FileHeaderLeadingControl()
-            }
-          } else if ((this.screen === 'settings' &&
-            (this.showStorageSettings || this.showPlaybackSettings || this.showNetworkSettings ||
-              this.showRecycleBinSettings))) {
-            this.OfficialBackButton(() => {
-              if (this.showStorageSettings) {
-                this.closeStorageSettings()
-              } else if (this.showPlaybackSettings) {
-                this.closePlaybackSettings()
-              } else if (this.showNetworkSettings) {
-                this.closeNetworkSettings()
-              } else if (this.showRecycleBinSettings) {
-                // Pops one recycle level before it closes the page, so the
-                // header button and the system back key behave identically.
-                this.recycleBackAction()
-              } else {
-                this.openHome()
-              }
-            })
-          } else {
-            // Settings retains the centred title; transfers use a leading title
-            // and a trailing segmented selector in the same row.
-            Blank().width(this.screen === 'downloads' ? 0 : 40)
-          }
+          this.MainHeaderLeadingControl()
 
-          // Transfers use a leading title beside the official capsule selector.
-          // Other root pages retain their centred 17vp title.
-          Text(this.selectionMode ? this.selectionTitle() :
-            (this.screen === 'settings' && this.showStorageSettings ? '缓存与存储' :
-            (this.screen === 'settings' && this.showPlaybackSettings ? '播放与控制' :
-            (this.screen === 'settings' && this.showNetworkSettings ? '网络与流量' :
-            (this.screen === 'settings' && this.showRecycleBinSettings ? this.topTitle :
-            (this.screen === 'settings' ? '设置' :
-              (this.screen === 'downloads' ? '传输' : this.topTitle)))))))
-            .fontSize(this.selectionMode || this.screen === 'downloads' ? 22 : 17)
+          Text(this.mainHeaderTitle())
+            .fontSize(HeaderStyle.titleSize)
             .fontWeight(FontWeight.Bold)
             .fontColor($r('app.color.text_primary'))
-            .opacity(this.selectionMode ? 1 : this.topTitleOpacity)
             .layoutWeight(1)
-            .textAlign(this.selectionMode || this.screen === 'downloads' ? TextAlign.Start :
-              (this.screen === 'files' && this.currentPath.length > 0
-                ? TextAlign.Start : TextAlign.Center))
-            .margin({ left: this.selectionMode ? 12 :
-              (this.screen === 'downloads' ? 4 :
-                (this.screen === 'files' && this.currentPath.length > 0 ? 8 : 0)) })
+            .textAlign(TextAlign.Start)
+            .margin({ left: this.mainHeaderHasLeading() ? HeaderStyle.gap : 0, right: HeaderStyle.gap })
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .id('main-header-title')
 
           if (this.screen === 'files') {
             this.FileTopActionCluster()
           } else if (this.screen === 'downloads') {
             this.TransferDirectionControl()
-          } else if (this.showRecycleBinSettings) {
-            // Mirrors the back button's 40vp slot on the left so the title stays
-            // centred; the switcher itself lives in RecycleScopeToggle.
+          } else if (this.screen === 'settings' && this.showRecycleBinSettings) {
             this.RecycleScopeToggle()
-          } else {
-            Blank().width(40)
           }
         }
         .width('100%')
-        .height(this.topSafeInset() + 94)
-        .padding({ left: 12, right: 12, top: this.topSafeInset() + 8, bottom: 30 })
+        .height(this.topSafeInset() + HeaderStyle.overlayHeight)
+        .padding({ left: HeaderStyle.sideInset, right: HeaderStyle.sideInset,
+          top: this.topSafeInset() + HeaderStyle.topPadding, bottom: HeaderStyle.bottomPadding })
         .zIndex(2)
         .hitTestBehavior(HitTestMode.Default)
       }
@@ -5367,7 +5426,7 @@ struct Index {
           .zIndex(4)
       }
       if (this.showSearch) {
-        Row({ space: 8 }) {
+        Row({ space: HeaderStyle.gap }) {
           this.SearchScopeButton('本级', 'current')
           this.SearchScopeButton('跨级', 'descendants')
           if (this.searchLoading) {
@@ -5398,7 +5457,7 @@ struct Index {
     // Search controls may extend the overlay's transparent hit-test area,
     // but must never stretch the gradient background itself.
     // 搜索时固定 136（容纳那排 chip），平时回到 94。全程高度恒定，避免输入导致键盘收起。
-    .height(this.topSafeInset() + (this.showSearch ? 136 : 94))
+    .height(this.topSafeInset() + (this.showSearch ? HeaderStyle.searchOverlayHeight : HeaderStyle.overlayHeight))
     .backgroundColor(Color.Transparent)
     .clip(false)
     // The gradient is visual only. The root must not pass a touch started on
@@ -5443,19 +5502,19 @@ struct Index {
       Button() {
         Stack({ alignContent: Alignment.Center }) {
           Text('多选')
-            .fontSize(15)
+            .fontSize(HeaderStyle.actionSize)
             .fontColor($r('sys.color.font_primary'))
             .textAlign(TextAlign.Center)
             .width(104)
             .opacity(this.selectionMode ? 0 : 1)
           Text('全选')
-            .fontSize(16)
+            .fontSize(HeaderStyle.actionSize)
             .fontColor($r('sys.color.font_primary'))
             .textAlign(TextAlign.Center)
             .width(104)
             .opacity(this.selectionMode && !this.allEntriesSelected() ? 1 : 0)
           Text('取消全选')
-            .fontSize(16)
+            .fontSize(HeaderStyle.actionSize)
             .fontColor($r('sys.color.font_primary'))
             .textAlign(TextAlign.Center)
             .width(104)
@@ -5464,12 +5523,12 @@ struct Index {
         .width('100%')
         .height('100%')
       }
-      .fontSize(16)
+      .fontSize(HeaderStyle.actionSize)
       .fontColor($r('sys.color.font_primary'))
       .backgroundColor(Color.Transparent)
-      .borderRadius(20)
+      .borderRadius(HeaderStyle.controlHeight / 2)
       .width(this.topActionButtonWidth())
-      .height(40)
+      .height(HeaderStyle.controlHeight)
       .padding({ left: 0, right: 0, top: 0, bottom: 0 })
       .position({ x: this.topActionButtonX(), y: 0 })
       .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN, true))
@@ -5492,15 +5551,15 @@ struct Index {
       // hit testing while the persistent multi-select button moves over it.
       Button() {
         SymbolGlyph($r('sys.symbol.magnifyingglass'))
-          .fontSize(24)
+          .fontSize(HeaderStyle.iconSize)
           .fontColor([$r('sys.color.icon_primary')])
       }
       .type(ButtonType.Normal)
-      .width(40)
-      .height(40)
-      .borderRadius(20)
+      .width(HeaderStyle.controlHeight)
+      .height(HeaderStyle.controlHeight)
+      .borderRadius(HeaderStyle.controlHeight / 2)
       .backgroundColor(Color.Transparent)
-      .position({ x: 68, y: 0 })
+      .position({ x: 70, y: 0 })
       .opacity(this.selectionMode ? 0 : 1)
       .enabled(!this.selectionMode)
       .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN, true))
@@ -5510,7 +5569,7 @@ struct Index {
       .animation({ duration: 180, curve: Curve.FastOutSlowIn })
     }
     .width(110)
-    .height(40)
+    .height(HeaderStyle.controlHeight)
   }
 
   @Builder
@@ -6783,7 +6842,7 @@ struct Index {
     const disappear = TransitionEffect.move(TransitionEdge.BOTTOM)
       .combine(TransitionEffect.opacity(0))
       .animation({
-        duration: 240,
+        duration: 180,
         curve: Curve.EaseIn
       })
     return TransitionEffect.asymmetric(appear, disappear)
@@ -6877,13 +6936,13 @@ struct Index {
   OfficialBackButton(action: () => void): void {
     Button() {
       SymbolGlyph($r('sys.symbol.chevron_backward'))
-        .fontSize(24)
+        .fontSize(HeaderStyle.iconSize)
         .fontColor([$r('sys.color.icon_primary')])
     }
     .type(ButtonType.Normal)
-    .width(40)
-    .height(40)
-    .borderRadius(20)
+    .width(HeaderStyle.controlHeight)
+    .height(HeaderStyle.controlHeight)
+    .borderRadius(HeaderStyle.controlHeight / 2)
     .backgroundColor(Color.Transparent)
     .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN))
     .overlay(this.ImportLightOverlay, { align: Alignment.Center })
@@ -6893,58 +6952,51 @@ struct Index {
   }
 
   @Builder
-  FileHeaderLeadingControl(): void {
+  MainHeaderLeadingControl(): void {
     Stack({ alignContent: Alignment.Center }) {
-      // 只有存在返回目标（进入了子目录）或多选态时才画这个圆形按钮。
-      // 以前是无条件画、靠把图标 opacity 设成 0 来“隐藏”，但按钮的沉浸材质
-      // 仍会画出一个空的圆盘——深色模式下就是标题栏左上角那个看着像黑点的圆圈。
-      // 要隐藏就整个不渲染，别留底色。外层 Stack 的宽度不变，布局不受影响。
-      if (this.fileHeaderLeadingVisible()) {
-        Button() {
-          Stack({ alignContent: Alignment.Center }) {
-            // Keep one glyph node and replace its symbol directly. Cross-fading
-            // two stacked glyphs produced a bright/blank frame during selection.
-            SymbolGlyph(this.selectionMode
-              ? $r('sys.symbol.xmark') : $r('sys.symbol.chevron_backward'))
-              .fontSize(24)
-              .fontColor([$r('sys.color.icon_primary')])
-          }
-          .width('100%')
-          .height('100%')
-        }
-        .type(ButtonType.Normal)
-        .width(40)
-        .height(40)
-        .borderRadius(20)
-        .backgroundColor(Color.Transparent)
-        .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN))
-        .overlay(this.ImportLightOverlay, { align: Alignment.Center })
-        .hitTestBehavior(HitTestMode.Default)
-        .monopolizeEvents(true)
-        .onClick(() => {
-          if (this.selectionMode) {
-            this.exitSelectionMode()
-          } else if (this.currentPath.length > 0) {
-            this.goBack()
-          }
-        })
+      // Retain the native material node across root/child and file/settings switches.
+      // Hidden removes painting as well as input; opacity alone leaves native material visible.
+      Button() {
+        SymbolGlyph(this.screen === 'files' && this.selectionMode
+          ? $r('sys.symbol.xmark') : $r('sys.symbol.chevron_backward'))
+          .fontSize(HeaderStyle.iconSize)
+          .fontColor([$r('sys.color.icon_primary')])
       }
+      .type(ButtonType.Normal)
+      .width(HeaderStyle.controlHeight)
+      .height(HeaderStyle.controlHeight)
+      .borderRadius(HeaderStyle.controlHeight / 2)
+      .backgroundColor(Color.Transparent)
+      .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN))
+      .overlay(this.ImportLightOverlay, { align: Alignment.Center })
+      .visibility(this.mainHeaderHasLeading() ? Visibility.Visible : Visibility.Hidden)
+      .hitTestBehavior(this.mainHeaderHasLeading() ? HitTestMode.Default : HitTestMode.BLOCK_DESCENDANTS)
+      .monopolizeEvents(true)
+      .id('main-header-leading')
+      .onClick(() => {
+        if (this.screen === 'files') {
+          if (this.selectionMode) { this.exitSelectionMode() }
+          else if (this.currentPath.length > 0) { this.goBack() }
+        } else if (this.screen === 'settings') {
+          this.closeSettingsSubpage()
+        }
+      })
     }
-    .width(this.fileHeaderLeadingWidth())
-    .height(40)
+    .width(this.mainHeaderHasLeading() ? HeaderStyle.controlHeight : 0)
+    .height(HeaderStyle.controlHeight)
   }
 
   @Builder
   SelectionCloseButton(action: () => void): void {
     Button() {
       SymbolGlyph($r('sys.symbol.xmark'))
-        .fontSize(24)
+        .fontSize(HeaderStyle.iconSize)
         .fontColor([$r('sys.color.icon_primary')])
     }
     .type(ButtonType.Normal)
-    .width(40)
-    .height(40)
-    .borderRadius(20)
+    .width(HeaderStyle.controlHeight)
+    .height(HeaderStyle.controlHeight)
+    .borderRadius(HeaderStyle.controlHeight / 2)
     .backgroundColor(Color.Transparent)
     .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN))
     .hitTestBehavior(HitTestMode.Default)
@@ -7395,379 +7447,115 @@ struct Index {
   @Builder
   DestinationPickerOverlay(): void {
     Stack({ alignContent: Alignment.TopStart }) {
-      // Restore the original sheet backdrop. The status-bar area remains
-      // dimmed/blurred while the file-management surface starts below the
-      // top safe area with rounded top corners.
-      // 关闭时必须跟着淡出：面板是瞬间消失的，若遮罩原地不动，剩下的 Thick 强模糊
-      // 盖在浅色文件页上就是一片奶白（用户看到的"白屏"），而且会僵持到 260ms 后才
-      // 突然消失。
-      Column()
-        .width('100%')
-        .height('100%')
-        .backgroundColor(this.isDarkTheme ? '#42000000' : '#26000000')
-        .backgroundBlurStyle(BlurStyle.Thick, {
-          colorMode: ThemeColorMode.SYSTEM,
-          adaptiveColor: AdaptiveColor.DEFAULT
-        })
-        .opacity(this.destinationPickerClosing ? 0 : 1)
-        .animation({ duration: 180, curve: Curve.EaseOut })
-        .hitTestBehavior(HitTestMode.None)
-
-      Button() {
-        Row()
-          .width(1)
-          .height(1)
+      Button() {}.type(ButtonType.Normal).width('100%').height('100%')
+        .padding(0).borderRadius(0).backgroundColor(Color.Transparent).stateEffect(false)
+        .hitTestBehavior(HitTestMode.Block).onClick(() => this.closeDestinationPicker())
+      if (!this.destinationPickerClosing) {
+        TaskPanel({ title: '选择目标文件夹', idPrefix: 'destination-picker', safeTop: this.topSafeInset(),
+          hasFooter: true, showAuxiliary: true, auxiliaryLabel: '新建文件夹',
+          auxiliaryEnabled: !this.destinationLoading, closeEnabled: !this.destinationOperationRunning,
+          onClose: (): void => { this.closeDestinationPicker() },
+          onAuxiliary: (): void => { this.openDestinationFolderDialog() },
+          content: (): void => { this.DestinationPickerContent() },
+          footer: (): void => { this.DestinationPickerFooter() } })
+          .id('destinationPickerSurface').transition(this.destinationPickerSurfaceTransition())
       }
-      .type(ButtonType.Normal)
-      .width('100%')
-      .height('100%')
-      .padding(0)
-      .borderRadius(0)
-      .backgroundColor(Color.Transparent)
-      .stateEffect(false)
-      .hitTestBehavior(HitTestMode.Block)
-      .onClick(() => this.closeDestinationPicker())
-
-      Column() {
-        Blank()
-          .height(this.topSafeInset())
-          .hitTestBehavior(HitTestMode.None)
-
-        if (!this.destinationPickerClosing) {
-          Stack({ alignContent: Alignment.TopStart }) {
-          // Keep the material on a sibling background layer. Applying it to
-          // the content Column blurs the destination rows together with the sheet.
-          Column()
-            .width('100%')
-            .height('100%')
-            // The destination list is the hard file-management surface. Only
-            // the controls and the bottom operation capsule use glass.
-            .backgroundColor($r('app.color.surface_card'))
-            .hitTestBehavior(HitTestMode.None)
-
-          Column() {
-            Row() {
-              this.DestinationCloseButton(() => this.closeDestinationPicker())
-              Text('选择路径')
-                .fontSize(24)
-                .fontWeight(FontWeight.Bold)
-                .fontColor($r('app.color.text_primary'))
-                .layoutWeight(1)
-                .margin({ left: 8 })
-              Row({ space: 8 }) {
-                this.DestinationCircleButton($r('sys.symbol.folder_badge_plus'),
-                  () => this.openDestinationFolderDialog())
-                this.DestinationCircleButton($r('sys.symbol.checkmark'),
-                  () => this.confirmDestinationOperation(), true)
-              }
-            }
-            .width('100%')
-            .height(60)
-            .padding({ left: 16, right: 16 })
-
-            Stack({ alignContent: Alignment.TopStart }) {
-              if (this.destinationLoading) {
-                Row() {
-                  LoadingProgress()
-                    .width(24)
-                    .height(24)
-                    .color('#2E6BFF')
-                  Text('正在读取目录…')
-                    .fontSize(14)
-                    .fontColor($r('app.color.text_secondary'))
-                    .margin({ left: 8 })
-                }
-                .width('100%')
-                .height('100%')
-                .justifyContent(FlexAlign.Center)
-              } else {
-                Scroll() {
-                  Column() {
-                    this.DestinationCloudRootRow()
-                    if (this.destinationRootExpanded) {
-                      Column() {
-                        ForEach(this.destinationTreeRows, (row: DestinationTreeRow) => {
-                          this.DestinationTreeRowView(row)
-                        }, (row: DestinationTreeRow): string => row.entry.path)
-                        if (this.destinationTreeRows.length === 0) {
-                          Text('当前目录没有可选文件夹')
-                            .fontSize(14)
-                            .fontColor($r('app.color.text_muted'))
-                            .width('100%')
-                            .textAlign(TextAlign.Center)
-                            .padding({ top: 30, bottom: 30 })
-                        }
-                      }
-                      .width('100%')
-                      .id('destinationFolderList_' + this.destinationUserRootPath())
-                      .transition(this.destinationFolderListTransition())
-                    }
-                  }
-                  .width('100%')
-                  .alignItems(HorizontalAlign.Start)
-                  .justifyContent(FlexAlign.Start)
-                  // A short Scroll child is otherwise centered by ArkUI.
-                  // Keep the file rows at the top while allowing large
-                  // directories to grow beyond the viewport and scroll.
-                  .constraintSize({ minHeight: '100%' })
-                }
-                .width('100%')
-                .height('100%')
-                .padding({ bottom: this.bottomSafeInset() + 124 })
-                .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
-                .scrollBar(BarState.Auto)
-              }
-
-              Column() {
-                Row() {
-                  this.DestinationToastVisual()
-                  Text((this.destinationOperation === 'copy' ? '复制 ' : '移动 ') +
-                    this.destinationSelectedEntries.length.toString() + ' 项到 ' +
-                    this.destinationDisplayName())
-                    .fontSize(18)
-                    .fontWeight(FontWeight.Medium)
-                    .fontColor($r('app.color.text_primary'))
-                    .layoutWeight(1)
-                    .maxLines(1)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    .margin({ left: 16 })
-                }
-                .width('calc(100% - 32vp)')
-                .height(64)
-                .padding({ left: 20, right: 20 })
-                .borderRadius(32)
-                .systemMaterial(this.bottomCapsuleMaterial)
-              }
-              .width('100%')
-              .height('100%')
-              .justifyContent(FlexAlign.End)
-              .alignItems(HorizontalAlign.Center)
-              .padding({ bottom: this.bottomSafeInset() + 32 })
-              .hitTestBehavior(HitTestMode.None)
-            }
-            .width('100%')
-            .layoutWeight(1)
-          }
-          .width('100%')
-          .height('100%')
-          .padding({ top: 8 })
-          .hitTestBehavior(HitTestMode.Default)
-        }
-        .width('100%')
-        // The panel occupies the remaining area after the top safe inset.
-        // Using height('100%') here together with the Blank above makes the
-        // children exceed the parent and causes ArkUI to recenter the content.
-        .layoutWeight(1)
-        .backgroundColor($r('app.color.surface_card'))
-        .borderRadius({ topLeft: 30, topRight: 30 })
-        .id('destinationPickerSurface')
-        .transition(this.destinationPickerSurfaceTransition())
-          .clip(true)
-        }
-      }
-      .width('100%')
-      .height('100%')
-      .hitTestBehavior(HitTestMode.Default)
-    }
-    .width('100%')
-    .height('100%')
-    .hitTestBehavior(HitTestMode.Default)
+    }.width('100%').height('100%').hitTestBehavior(HitTestMode.Default)
   }
 
   @Builder
-  DestinationCloseButton(action: () => void): void {
-    Button() {
-      SymbolGlyph($r('sys.symbol.xmark'))
-        .fontSize(24)
-        .fontColor([$r('sys.color.icon_primary')])
+  DestinationPickerContent(): void {
+    TaskPanelSection({ fillHeight: true, paddingSize: 0 }) {
+      Stack() {
+        if (this.destinationLoading) {
+          LoadingProgress().width(24).height(24).color($r('sys.color.comp_background_emphasize'))
+            .accessibilityText(this.destinationOperationRunning ? '处理中' : '读取目录')
+        } else {
+          Scroll() {
+            Column() {
+              this.DestinationCloudRootRow()
+              if (this.destinationRootExpanded) {
+                ForEach(this.destinationTreeRows, (row: DestinationTreeRow) => {
+                  this.DestinationTreeRowView(row)
+                }, (row: DestinationTreeRow): string => row.entry.path)
+                if (this.destinationTreeRows.length === 0) {
+                  Text('暂无文件夹').fontSize(14).fontColor($r('sys.color.font_secondary'))
+                    .width('100%').textAlign(TextAlign.Center).padding(24)
+                }
+              }
+            }.width('100%').alignItems(HorizontalAlign.Start)
+          }.width('100%').height('100%').scrollBar(BarState.Auto).edgeEffect(EdgeEffect.Spring)
+            .align(Alignment.TopStart)
+            .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(16) })
+        }
+      }.width('100%').height('100%')
     }
-    .type(ButtonType.Normal)
-    .width(40)
-    .height(40)
-    .borderRadius(20)
-    .backgroundColor(Color.Transparent)
-    .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN))
-    .hitTestBehavior(HitTestMode.Default)
-    .monopolizeEvents(true)
-    .stateEffect(true)
-    .onClick(action)
   }
 
   @Builder
-  DestinationCircleButton(icon: Resource, action: () => void, enabled: boolean = true): void {
-    Button() {
-      SymbolGlyph(icon)
-        .fontSize(24)
-        .fontColor([$r('sys.color.icon_primary')])
-    }
-    .type(ButtonType.Normal)
-    .width(40)
-    .height(40)
-    .borderRadius(20)
-    .backgroundColor(Color.Transparent)
-    .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN))
-    .hitTestBehavior(HitTestMode.Default)
-    .monopolizeEvents(true)
-    .stateEffect(true)
-    .enabled(enabled)
-    .onClick(action)
+  DestinationPickerFooter(): void {
+    TaskPanelFooter({ label: this.destinationOperationRunning ? '处理中…' :
+      (this.destinationOperation === 'copy' ? '复制 ' : '移动 ') +
+        this.destinationSelectedEntries.length.toString() + ' 项到此处',
+      actionId: 'destination-picker-confirm', busy: this.destinationOperationRunning,
+      actionEnabled: !this.destinationLoading && !this.destinationPickerClosing &&
+        this.destinationSelectedEntries.length > 0 && this.destinationPath.length > 0,
+      summaryTitle: this.destinationDisplayName(), summaryValue: this.destinationPath,
+      safeBottom: this.bottomSafeInset(), onAction: (): void => { this.confirmDestinationOperation() } })
   }
 
   @Builder
   DestinationStorageVisual(): void {
-    Image($r('app.media.private_cloud'))
-      .width(38)
-      .height(38)
-      .objectFit(ImageFit.Contain)
+    Image($r('app.media.private_cloud')).width(FileRowStyle.iconSize).height(FileRowStyle.iconSize).objectFit(ImageFit.Contain)
   }
 
   @Builder
   DestinationCloudRootRow(): void {
     Column() {
-      Row() {
-        Blank()
-          .width('7.4%')
-        this.DestinationStorageVisual()
-        Text('我的云盘')
-          .fontSize(20)
-          .fontColor($r('app.color.text_primary'))
-          .layoutWeight(1)
-          .margin({ left: 16 })
-        SymbolGlyph(this.destinationRootExpanded
-          ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_forward'))
-          .fontSize(18)
-          .fontColor([$r('sys.color.icon_secondary')])
-        Blank()
-          .width('7.2%')
-      }
-      .width('100%')
-      .alignItems(VerticalAlign.Center)
-      .padding({ top: 12, bottom: 12 })
-      .onClick(() => this.toggleDestinationRoot())
-      Row() {
-        Blank()
-          .width('17.6%')
-        Divider()
-          .layoutWeight(1)
-          .strokeWidth(0.5)
-          .color($r('app.color.divider'))
-        Blank()
-          .width('7.2%')
-      }
-      .width('100%')
-      .height(1)
-      .hitTestBehavior(HitTestMode.None)
-    }
-      .width('100%')
+      Row({ space: FileRowStyle.leadingGap }) {
+        Stack() { this.DestinationStorageVisual() }.width(FileRowStyle.leadingWidth).height(FileRowStyle.leadingHeight)
+        Text('我的云盘').fontSize(FileRowStyle.titleSize).fontWeight(FontWeight.Medium)
+          .fontColor($r('sys.color.font_primary')).layoutWeight(1)
+        SymbolGlyph(this.destinationRootExpanded ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_forward'))
+          .fontSize(18).fontColor([$r('sys.color.icon_secondary')]).width(24)
+      }.width('100%').padding({ left: FileRowStyle.horizontalPadding, right: FileRowStyle.horizontalPadding,
+        top: FileRowStyle.verticalPadding, bottom: FileRowStyle.verticalPadding })
+        .backgroundColor(this.destinationPath === this.destinationUserRootPath()
+          ? $r('app.color.surface_selected') : Color.Transparent)
+        .onClick(() => this.toggleDestinationRoot()).id('destination-picker-root')
+      Divider().strokeWidth(0.5).color($r('app.color.divider')).margin({ left: 56, right: FileRowStyle.horizontalPadding })
+    }.width('100%')
   }
 
   @Builder
   DestinationTreeRowView(row: DestinationTreeRow): void {
     Column() {
-      Row() {
-        Blank()
-          .width(40 + row.depth * 28)
-        this.DestinationFolderVisual(row.entry)
-        Column() {
-          Text(row.entry.name)
-            .fontSize(16)
-            .fontColor($r('app.color.text_primary'))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
+      Row({ space: FileRowStyle.leadingGap }) {
+        Stack() { this.FolderIcon(FileRowStyle.iconSize) }.width(FileRowStyle.leadingWidth).height(FileRowStyle.leadingHeight)
+        Column({ space: FileRowStyle.textGap }) {
+          Text(row.entry.name).fontSize(FileRowStyle.titleSize).fontColor($r('sys.color.font_primary'))
+            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           if (this.destinationEntryInfo(row.entry).length > 0) {
-            Text(this.destinationEntryInfo(row.entry))
-              .fontSize(12)
-              .fontColor($r('app.color.text_muted'))
-              .margin({ top: 4 })
+            Text(this.destinationEntryInfo(row.entry)).fontSize(FileRowStyle.infoSize).fontColor($r('sys.color.font_secondary'))
+              .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           }
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-        .margin({ left: 16 })
-        SymbolGlyph(row.expanded
-          ? $r('sys.symbol.chevron_down')
-          : $r('sys.symbol.chevron_forward'))
-          .fontSize(18)
-          .fontColor([$r('sys.color.icon_secondary')])
-        Blank()
-          .width('7.2%')
-      }
-      .width('100%')
-      .alignItems(VerticalAlign.Center)
-      .padding({ top: 12, bottom: 12 })
-      .onClick(() => this.toggleDestinationFolder(row.entry))
-
+        }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+        SymbolGlyph(row.expanded ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_forward'))
+          .fontSize(18).fontColor([$r('sys.color.icon_secondary')]).width(24)
+      }.width('100%').padding({ left: FileRowStyle.horizontalPadding + (row.depth + 1) * 24, right: FileRowStyle.horizontalPadding,
+        top: FileRowStyle.verticalPadding, bottom: FileRowStyle.verticalPadding })
+        .backgroundColor(this.destinationPath === row.entry.path ? $r('app.color.surface_selected') : Color.Transparent)
+        .onClick(() => this.toggleDestinationFolder(row.entry))
       if (row.loading) {
         Row() {
-          LoadingProgress()
-            .width(18)
-            .height(18)
-            .color('#2E6BFF')
-          Text('正在读取目录…')
-            .fontSize(13)
-            .fontColor($r('app.color.text_secondary'))
-            .margin({ left: 8 })
-        }
-        .width('100%')
-        .padding({
-          left: 40 + row.depth * 28 + 48,
-          top: 0,
-          bottom: 8
-        })
+          LoadingProgress().width(18).height(18).color($r('sys.color.comp_background_emphasize'))
+            .accessibilityText('读取目录')
+        }.width('100%').padding({ left: 56 + (row.depth + 1) * 24, bottom: 8 })
       }
-
-      Row() {
-        Blank()
-          .width(76 + row.depth * 28)
-        Divider()
-          .layoutWeight(1)
-          .strokeWidth(0.5)
-          .color($r('app.color.divider'))
-        Blank()
-          .width('7.2%')
-      }
-      .width('100%')
-      .height(1)
-      .hitTestBehavior(HitTestMode.None)
-    }
-    .width('100%')
-    .id('destinationTreeRow_' + row.entry.path)
-    .transition(this.destinationFolderListTransition())
-  }
-
-  @Builder
-  DestinationFolderVisual(entry: DestinationEntry): void {
-    Stack() {
-      this.FolderIcon(32)
-    }
-    .width('6.2%')
-    .height(34)
-    .alignContent(Alignment.Center)
-  }
-
-  @Builder
-  DestinationToastVisual(): void {
-    Stack() {
-      if (this.destinationSelectedEntries.length > 0 &&
-        this.destinationSelectedEntries[0].isDirectory) {
-        this.FolderIcon(52)
-      } else if (this.destinationSelectedEntries.length > 0 &&
-        this.previewUri(this.destinationSelectedEntries[0]).length > 0) {
-        Image(this.previewUri(this.destinationSelectedEntries[0]))
-          .width(52)
-          .height(44)
-          .orientation(ImageRotateOrientation.AUTO)
-          .objectFit(ImageFit.Contain)
-          .borderRadius(6)
-      } else if (this.destinationSelectedEntries.length > 0) {
-        Image(this.fileIcon(this.destinationSelectedEntries[0]))
-          .width(44)
-          .height(44)
-          .objectFit(ImageFit.Contain)
-      }
-    }
-    .width(52)
-    .height(44)
+      Divider().strokeWidth(0.5).color($r('app.color.divider'))
+        .margin({ left: 56 + (row.depth + 1) * 24, right: FileRowStyle.horizontalPadding })
+    }.width('100%').id('destinationTreeRow_' + row.entry.path)
+      .transition(this.destinationFolderListTransition())
   }
 
   @Builder
@@ -10237,7 +10025,7 @@ struct Index {
       .mode(NavigationMode.Stack)
       .hideBackButton(true)
       .hideToolBar(true)
-      .title({ builder: this.ImageViewerTopOverlay, height: this.topSafeInset() + 94 }, {
+      .title({ builder: this.ImageViewerTopOverlay, height: this.topSafeInset() + HeaderStyle.overlayHeight }, {
         barStyle: BarStyle.STACK,
         paddingStart: LengthMetrics.vp(0),
         paddingEnd: LengthMetrics.vp(0),
@@ -10246,7 +10034,7 @@ struct Index {
       .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM],
         [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
       .width('100%')
-      .height(this.topSafeInset() + 94)
+      .height(this.topSafeInset() + HeaderStyle.overlayHeight)
       .backgroundColor(Color.Transparent)
       .hitTestBehavior(HitTestMode.Transparent)
   }
@@ -10256,7 +10044,7 @@ struct Index {
     Stack() {
       Row()
         .width('100%')
-        .height(this.topSafeInset() + 94)
+        .height(this.topSafeInset() + HeaderStyle.overlayHeight)
         .linearGradient({
           direction: GradientDirection.Bottom,
           colors: [
@@ -10277,27 +10065,28 @@ struct Index {
         })
         .hitTestBehavior(HitTestMode.None)
 
-      Row() {
+      Row({ space: HeaderStyle.gap }) {
         Button() {
           SymbolGlyph($r('sys.symbol.chevron_backward'))
-            .fontSize(24)
+            .fontSize(HeaderStyle.iconSize)
             .fontColor([$r('sys.color.icon_primary')])
         }
           .type(ButtonType.Normal)
-          .width(40)
-          .height(40)
-          .borderRadius(20)
+          .width(HeaderStyle.controlHeight)
+          .height(HeaderStyle.controlHeight)
+          .borderRadius(HeaderStyle.controlHeight / 2)
           .backgroundColor(Color.Transparent)
           .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN))
           .hitTestBehavior(HitTestMode.Default)
           .monopolizeEvents(true)
           .onClick(() => this.closeImageViewer())
         Text(this.viewerHeaderTitle)
-          .fontSize(17)
+          .fontSize(HeaderStyle.titleSize)
           .fontWeight(FontWeight.Bold)
           .fontColor($r('app.color.text_primary'))
+          .id('image-header-title')
           .layoutWeight(1)
-          .textAlign(TextAlign.Center)
+          .textAlign(TextAlign.Start)
           .maxLines(1)
         if (this.isSearchViewer()) {
           Button() {
@@ -10312,8 +10101,8 @@ struct Index {
             .padding({ left: 10, right: 10 })
           }
           .type(ButtonType.Normal)
-          .height(34)
-          .borderRadius(17)
+          .height(HeaderStyle.controlHeight)
+          .borderRadius(HeaderStyle.controlHeight / 2)
           .backgroundColor(Color.Transparent)
           .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN))
           .hitTestBehavior(HitTestMode.Default)
@@ -10324,17 +10113,16 @@ struct Index {
             }
           })
           .onClick(() => this.triggerLocateFromViewer())
-        } else {
-          Blank().width(40)
         }
       }
       .width('100%')
-      .height(this.topSafeInset() + 94)
-      .padding({ left: 12, right: 12, top: this.topSafeInset() + 8, bottom: 30 })
+      .height(this.topSafeInset() + HeaderStyle.overlayHeight)
+      .padding({ left: HeaderStyle.sideInset, right: HeaderStyle.sideInset,
+        top: this.topSafeInset() + HeaderStyle.topPadding, bottom: HeaderStyle.bottomPadding })
       .hitTestBehavior(HitTestMode.Default)
     }
     .width('100%')
-    .height(this.topSafeInset() + 94)
+    .height(this.topSafeInset() + HeaderStyle.overlayHeight)
     .hitTestBehavior(HitTestMode.None)
   }
 
@@ -10905,7 +10693,7 @@ struct Index {
       // Keep the title builder and its height stable during window rotation.
       // Move the safe-area inset outside Navigation so AVCastPicker keeps its
       // native node instead of rebuilding with the title configuration.
-      .title({ builder: this.VideoPlayerHeaderContent, height: 76 }, {
+      .title({ builder: this.VideoPlayerHeaderContent, height: HeaderStyle.overlayHeight }, {
         barStyle: BarStyle.STACK,
         paddingStart: LengthMetrics.vp(0),
         paddingEnd: LengthMetrics.vp(0),
@@ -10914,7 +10702,7 @@ struct Index {
       .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM],
         [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
       .width('100%')
-      .height(76)
+      .height(HeaderStyle.overlayHeight)
       .margin({ top: this.videoTopInset() })
       .backgroundColor(Color.Transparent)
       .opacity(this.videoChromeVisible ? 1 : 0)
@@ -10926,23 +10714,25 @@ struct Index {
 
   @Builder
   VideoPlayerHeaderContent(): void {
-    Row({ space: 8 }) {
+    Row({ space: HeaderStyle.gap }) {
     Button() {
       SymbolGlyph($r('sys.symbol.chevron_backward'))
-        .fontSize(24)
+        .fontSize(HeaderStyle.iconSize)
         .fontColor([$r('sys.color.font_on_primary')])
     }
       .type(ButtonType.Normal)
-      .width(40)
-      .height(40)
-      .borderRadius(20)
+      .width(HeaderStyle.controlHeight)
+      .height(HeaderStyle.controlHeight)
+      .borderRadius(HeaderStyle.controlHeight / 2)
       .backgroundColor(Color.Transparent)
       .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true, '#44202020'))
       .onClick(() => this.closeVideoPlayer(true))
     Text(this.videoEntry === null ? '' : (this.videoEntry as FileEntry).name)
-      .fontSize(17)
+      .fontSize(HeaderStyle.titleSize)
       .fontWeight(FontWeight.Bold)
       .fontColor($r('sys.color.font_on_primary'))
+      .textAlign(TextAlign.Start)
+      .id('video-header-title')
       .layoutWeight(1)
       .maxLines(1)
       .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -10950,16 +10740,16 @@ struct Index {
       // Keep the supplied PiP artwork as a hand-drawn vector asset.  The
       // SVG has no raster background, so it stays crisp at every density.
       Image($r('app.media.video_pip_icon'))
-        .width(24)
-        .height(24)
+        .width(HeaderStyle.iconSize)
+        .height(HeaderStyle.iconSize)
         .objectFit(ImageFit.Contain)
         .syncLoad(true)
     }
       .type(ButtonType.Normal)
-      .width(40)
-      .height(40)
+      .width(HeaderStyle.controlHeight)
+      .height(HeaderStyle.controlHeight)
       .backgroundColor(Color.Transparent)
-      .borderRadius(20)
+      .borderRadius(HeaderStyle.controlHeight / 2)
       .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true, '#44202020'))
       .enabled(this.videoSurfaceReady && this.videoPrepared &&
         !this.videoPipCreating && !this.isBusy)
@@ -10974,26 +10764,27 @@ struct Index {
         customPicker: this.VideoCastIcon,
         onStateChange: (state: AVCastPickerState): void => this.handleVideoCastPickerState(state)
       })
-        .width(24)
-        .height(24)
+        .width(HeaderStyle.iconSize)
+        .height(HeaderStyle.iconSize)
         .backgroundColor(Color.Transparent)
     }
-      .width(40)
-      .height(40)
-      .borderRadius(20)
+      .width(HeaderStyle.controlHeight)
+      .height(HeaderStyle.controlHeight)
+      .borderRadius(HeaderStyle.controlHeight / 2)
       .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true, '#44202020'))
     }
       .width('100%')
-      .height(76)
-      .padding({ left: 12, right: 12, top: 8, bottom: 28 })
+      .height(HeaderStyle.overlayHeight)
+      .padding({ left: HeaderStyle.sideInset, right: HeaderStyle.sideInset,
+        top: HeaderStyle.topPadding, bottom: HeaderStyle.bottomPadding })
       .zIndex(3)
   }
 
   @Builder
   VideoCastIcon(): void {
     Image($r('app.media.video_cast_icon'))
-      .width(24)
-      .height(24)
+      .width(HeaderStyle.iconSize)
+      .height(HeaderStyle.iconSize)
       .objectFit(ImageFit.Contain)
       .fillColor(this.videoCasting
         ? $r('sys.color.icon_emphasize') : $r('sys.color.font_on_primary'))
@@ -11511,7 +11302,7 @@ struct Index {
         this.selectedBottomTab = 'home'
         this.currentPath = ''
         this.replaceEntries([])
-        this.updateTopTitle('个人空间', false)
+        this.updateTopTitle('个人空间')
         this.updateBottomBarVisibility(false)
         try {
           await this.handleLogin(true)
@@ -11524,6 +11315,10 @@ struct Index {
       }
     } catch (_) {
       // Login remains available with empty fields if local preferences are unavailable.
+    } finally {
+      // Submit the restored destination beneath the opaque launch surface before revealing it.
+      await this.nextRenderFrame()
+      this.startupRestoring = false
     }
   }
 
@@ -11625,7 +11420,7 @@ struct Index {
     this.navigationPageHasMoreStack = []
     this.replaceEntries(cached)
     this.applyPreferredViewMode()
-    this.updateTopTitle(this.fileTitle(this.currentPath), false)
+    this.updateTopTitle(this.fileTitle(this.currentPath))
     this.screen = 'files'
     this.updateBottomBarVisibility(false)
     return true
@@ -11998,7 +11793,7 @@ struct Index {
     this.errorText = ''
     this.statusText = ''
     this.showSearch = true
-    this.updateTopTitle(this.fileTitle(this.currentPath), false)
+    this.updateTopTitle(this.fileTitle(this.currentPath))
     this.updateBottomBarVisibility(true)
     const offset = this.searchScrollOffset
     setTimeout((): void => {
@@ -12068,7 +11863,7 @@ struct Index {
       this.fileViewMode = session.originViewState.mode
       this.replaceEntries(session.originEntries.slice())
       this.resetPreviewState(false)
-      this.updateTopTitle(this.fileTitle(this.currentPath), false)
+      this.updateTopTitle(this.fileTitle(this.currentPath))
       this.restoreDirectoryViewState(session.originViewState)
     }
   }
@@ -13405,7 +13200,7 @@ struct Index {
       this.setCurrentPageState(Math.max(1, Math.ceil(targetEntries.length / 200)), false)
       this.replaceEntries(targetEntries, false, true)
       this.applyPreferredViewMode()
-      this.updateTopTitle(this.fileTitle(targetParent), false)
+      this.updateTopTitle(this.fileTitle(targetParent))
       this.updateBottomBarVisibility(true)
       this.updateDirectoryCount(targetParent, snapshot.totalCount >= 0
         ? snapshot.totalCount : targetEntries.length)
@@ -13739,11 +13534,8 @@ struct Index {
     this.searchSession.targetParentPath = entry.path
     this.searchSession.targetNavigationDepth = this.navigationStack.length
 
-    this.showSearch = false
-    this.updateBottomBarVisibility(true)
-
-    const outgoingEntries = this.entries.slice()
-    const outgoingViewState = this.captureDirectoryViewState()
+    const requestId = ++this.navigationRequestId
+    this.isNavigating = true
     this.isBusy = true
     this.statusText = '正在打开文件夹…'
     try {
@@ -13758,20 +13550,32 @@ struct Index {
       query.ascending = this.fileSortAscending
       const nextEntries = DirectoryTimelinePolicy.query(nextSnapshot.entries, query)
 
+      if (requestId !== this.navigationRequestId || !this.showSearch || this.searchSession === null) { return }
+      // The outgoing surface is Search, not the origin directory. Reveal the ready target
+      // in one commit instead of briefly painting a reconstructed file-page snapshot.
+      this.captureSearchSession()
+      this.dismissKeyboard()
+      this.cancelFileTransition()
       this.currentPath = nextPath
       this.currentRootType = nextRootType
       this.setCurrentPageState(1, false)
-      this.replaceEntries(nextEntries)
+      this.replaceEntries(nextEntries, false, true)
+      this.applyPreferredViewMode()
       this.updateDirectoryCount(nextPath, nextEntries.length)
       this.resetPreviewState()
-      this.startFileTransition(outgoingEntries, 'push', this.fileTitle(nextPath))
-      this.isBusy = false
+      this.updateTopTitle(this.fileTitle(nextPath))
+      this.showSearch = false
+      this.updateBottomBarVisibility(true)
       this.statusText = ''
     } catch (error) {
+      if (requestId !== this.navigationRequestId || !this.showSearch) { return }
       this.reportError(error as Object, '打开文件夹失败')
       this.statusText = '打开失败'
-      this.isBusy = false
-      this.restoreSearchSession()
+    } finally {
+      if (requestId === this.navigationRequestId) {
+        this.isNavigating = false
+        this.isBusy = false
+      }
     }
   }
 
@@ -13841,6 +13645,7 @@ struct Index {
       return
     }
     this.clearSearchIfPresent()
+    this.showViewSettings = false
     this.showStorageSettings = false
     this.showNetworkSettings = false
     this.showPlaybackSettings = false
@@ -13852,7 +13657,7 @@ struct Index {
     this.statusText = ''
     this.selectedBottomTab = 'settings'
     this.screen = 'settings'
-    this.updateTopTitle('设置', true)
+    this.updateTopTitle('设置')
     this.updateBottomBarVisibility(true)
   }
 
@@ -13860,12 +13665,13 @@ struct Index {
     if (this.isBusy || this.screen !== 'settings') {
       return
     }
+    this.showViewSettings = false
     this.showStorageSettings = true
     this.showNetworkSettings = false
     this.showPlaybackSettings = false
     this.ensureCacheState()
     this.errorText = ''
-    this.updateTopTitle('缓存与存储', true)
+    this.updateTopTitle('缓存与存储')
     this.updateBottomBarVisibility(true)
   }
 
@@ -13880,7 +13686,7 @@ struct Index {
     this.showViewSettings = true
     this.ensureViewState()
     this.errorText = ''
-    this.updateTopTitle('默认视图', true)
+    this.updateTopTitle('默认视图')
     this.updateBottomBarVisibility(true)
   }
 
@@ -13890,7 +13696,7 @@ struct Index {
     }
     this.showViewSettings = false
     this.errorText = ''
-    this.updateTopTitle('设置', true)
+    this.updateTopTitle('设置')
     this.updateBottomBarVisibility(true)
   }
 
@@ -13904,7 +13710,7 @@ struct Index {
     this.showViewSettings = false
     this.ensurePlaybackState()
     this.errorText = ''
-    this.updateTopTitle('播放与控制', true)
+    this.updateTopTitle('播放与控制')
     this.updateBottomBarVisibility(true)
   }
 
@@ -13916,7 +13722,7 @@ struct Index {
     this.showNetworkSettings = false
     this.showPlaybackSettings = false
     this.errorText = ''
-    this.updateTopTitle('设置', true)
+    this.updateTopTitle('设置')
     this.updateBottomBarVisibility(true)
   }
 
@@ -13928,7 +13734,7 @@ struct Index {
     this.showStorageSettings = false
     this.showNetworkSettings = false
     this.errorText = ''
-    this.updateTopTitle('设置', true)
+    this.updateTopTitle('设置')
     this.updateBottomBarVisibility(true)
   }
 
@@ -13936,12 +13742,13 @@ struct Index {
     if (this.isBusy || this.screen !== 'settings') {
       return
     }
+    this.showViewSettings = false
     this.showStorageSettings = false
     this.showNetworkSettings = true
     this.showPlaybackSettings = false
     this.ensureNetworkState()
     this.errorText = ''
-    this.updateTopTitle('网络与流量', true)
+    this.updateTopTitle('网络与流量')
     this.updateBottomBarVisibility(true)
   }
 
@@ -13953,7 +13760,7 @@ struct Index {
     this.showStorageSettings = false
     this.showPlaybackSettings = false
     this.errorText = ''
-    this.updateTopTitle('设置', true)
+    this.updateTopTitle('设置')
     this.updateBottomBarVisibility(true)
   }
 
@@ -13963,6 +13770,7 @@ struct Index {
     if (this.isBusy || this.screen !== 'settings') {
       return
     }
+    this.showViewSettings = false
     this.showStorageSettings = false
     this.showPlaybackSettings = false
     this.showNetworkSettings = false
@@ -13973,7 +13781,7 @@ struct Index {
     this.recycleEntries = []
     this.recycleStack = []
     this.recycleBlockedShares = []
-    this.updateTopTitle('回收站', true)
+    this.updateTopTitle('回收站')
     this.updateBottomBarVisibility(true)
     this.reloadRecycleEntries()
   }
@@ -13995,7 +13803,7 @@ struct Index {
     this.recycleBlockedShares = []
     this.errorText = ''
     this.statusText = ''
-    this.updateTopTitle('设置', true)
+    this.updateTopTitle('设置')
     this.updateBottomBarVisibility(true)
   }
 
@@ -14206,13 +14014,12 @@ struct Index {
   }
 
   /**
-   * Keeps the title in step with the drill-down through the existing
-   * updateTopTitle(), so the fade animation and its token stay in charge.
+   * Commits the recycle title together with its current navigation depth.
    */
   private updateRecycleTitle(): void {
     const current = this.recycleCurrentPath()
     if (current.length === 0) {
-      this.updateTopTitle('回收站', true)
+      this.updateTopTitle('回收站')
       return
     }
     const repository = UgreenRemoteRepository.recycleRepositoryPath(this.recycleShareOfPath(current))
@@ -14220,7 +14027,7 @@ struct Index {
     let relative = current.startsWith(prefix) ? current.slice(prefix.length) : current
     relative = relative.replace(/^\/+|\/+$/g, '')
     this.updateTopTitle(relative.length > 0
-      ? '回收站 · ' + relative.split('/').join(' / ') : '回收站', true)
+      ? '回收站 · ' + relative.split('/').join(' / ') : '回收站')
   }
 
   /** The folder a recycled item was deleted from, for the row's subtitle. */
@@ -14358,28 +14165,26 @@ struct Index {
     this.recycleEntries = remaining
   }
 
-  private openHome(): void {
-    // Directory reads and the short page transition are safe to cancel when
-    // the user explicitly taps Home. Keep destructive/storage operations
-    // protected by isBusy.
-    if (this.isBusy && !this.isNavigating && !this.showPageTransition) {
-      return
-    }
-    this.navigationRequestId += 1
-    this.isNavigating = false
-    this.cancelFileTransition()
-    this.isBusy = false
+  private enterFileScreen(kind: RootKind): void {
     this.clearSearchIfPresent()
     this.closeActionMenu()
     this.showStorageSettings = false
     this.showPlaybackSettings = false
     this.showNetworkSettings = false
+    this.showViewSettings = false
     this.leaveRecycleBinIfOpen()
-    this.selectedBottomTab = 'home'
+    this.rootKind = kind
+    this.selectedBottomTab = kind === 'personal' ? 'home' : 'shared'
     this.screen = 'files'
-    this.showRoot('personal')
-    // The Home tab is the user's personal landing directory, matching the
-    // post-login default (/home/<username>), not the intermediate /home list.
+  }
+
+  private openHome(): void {
+    if (this.isBusy && !this.isNavigating && !this.showPageTransition) { return }
+    this.navigationRequestId += 1
+    this.isNavigating = false
+    this.cancelFileTransition()
+    this.isBusy = false
+    this.closeActionMenu()
     this.openDefaultPersonalDirectory()
   }
 
@@ -14389,6 +14194,7 @@ struct Index {
     }
     this.clearSearchIfPresent()
     this.closeActionMenu()
+    this.showViewSettings = false
     this.showStorageSettings = false
     this.showPlaybackSettings = false
     this.showNetworkSettings = false
@@ -14408,6 +14214,7 @@ struct Index {
     this.isBusy = false
     this.clearSearchIfPresent()
     this.closeActionMenu()
+    this.showViewSettings = false
     this.showStorageSettings = false
     this.showPlaybackSettings = false
     this.showNetworkSettings = false
@@ -14417,7 +14224,7 @@ struct Index {
     this.selectedBottomTab = 'downloads'
     this.screen = 'downloads'
     this.importExpanded = false
-    this.updateTopTitle('传输', false)
+    this.updateTopTitle('传输')
     this.updateBottomBarVisibility(true)
     this.ensureDownloadState()
     this.ensureVideoState()
@@ -15340,57 +15147,54 @@ struct Index {
     this.isNavigating = false
     this.photosPreindexHomePath = ''
     const root = await this.repository.getRoot()
+    const accountName = this.username.trim()
+    const defaultDirectory = root.personal.find((entry: FileEntry): boolean =>
+      entry.isDirectory && entry.name.trim().toLowerCase() === accountName.toLowerCase())
+    const personalPath = defaultDirectory !== undefined
+      ? (defaultDirectory.path.length > 0 ? defaultDirectory.path : '/' + defaultDirectory.name)
+      : (accountName.length > 0 ? '/home/' + accountName : '')
+    let nextPath = ''
+    let nextRootType = root.personalRootType
+    let nextEntries = root.personal
+    let nextPageIndex = 1
+    let nextPageHasMore = false
+    let nextTotalCount = -1
+    if (personalPath.length > 0) {
+      try {
+        const page = await this.repository.listPage(personalPath, 3, 1)
+        nextPath = personalPath
+        nextRootType = 3
+        nextEntries = page.entries
+        nextPageIndex = page.pageIndex
+        nextPageHasMore = page.hasMore
+        nextTotalCount = page.totalCount
+      } catch (_) {
+        // If the user's directory is unavailable, commit the usable root once.
+      }
+    }
     this.directoryCounts = {}
     this.directoryCountRequests = {}
     this.personalRoots = root.personal
     this.sharedRoots = root.shared
     this.rootKind = 'personal'
     this.selectedBottomTab = 'home'
-    // 个人空间的 root_type 随账号角色不同（管理员 4、普通账号 2），
-    // 用根列表实际取到的那个值，别写死 4——否则普通账号在根这一层列目录会 1301。
-    this.currentRootType = root.personalRootType
     this.personalRootEntriesType = root.personalRootType
-    this.currentPath = ''
-    this.updateTopTitle('个人空间', false)
-    this.navigationStack = []
+    this.currentRootType = nextRootType
+    this.currentPath = nextPath
+    this.navigationStack = nextPath.length > 0 ? [''] : []
     this.navigationEntryStack = []
     this.navigationRootTypeStack = []
     this.navigationViewStateStack = []
     this.navigationPageIndexStack = []
     this.navigationPageHasMoreStack = []
-    this.setCurrentPageState(1, false)
-    this.replaceEntries(this.personalRoots)
+    this.setCurrentPageState(nextPageIndex, nextPageHasMore)
+    this.replaceEntries(nextEntries)
+    this.updateTopTitle(this.fileTitle(nextPath))
     this.resetPreviewState()
-
-    // 登录后的默认落点统一为【用户根】✓：优先用服务端给的同名目录路径；
-    // 拿不到就直接用 /home/<用户名> ✓ —— 非管理员与管理员都停在同一级 ✓
-    const defaultDirectory = this.findDefaultPersonalDirectory()
-    const accountName = this.username.trim()
-    const personalPath = defaultDirectory !== null
-      ? (defaultDirectory.path.length > 0 ? defaultDirectory.path : '/' + defaultDirectory.name)
-      : (accountName.length > 0 ? '/home/' + accountName : '')
-    if (personalPath.length > 0) {
-      try {
-        const personalPage = await this.repository.listPage(personalPath, 3, 1)
-        this.navigationStack = ['']
-        this.navigationEntryStack = []
-        this.navigationRootTypeStack = []
-        this.navigationViewStateStack = []
-        this.navigationPageIndexStack = []
-        this.navigationPageHasMoreStack = []
-        this.currentPath = personalPath
-        this.currentRootType = 3
-        this.setCurrentPageState(personalPage.pageIndex, personalPage.hasMore)
-        this.replaceEntries(personalPage.entries)
-        this.updateTopTitle(this.fileTitle(personalPath), false)
-        this.updateDirectoryCount(personalPath, personalPage.totalCount >= 0
-          ? personalPage.totalCount : personalPage.entries.length)
-        this.resetPreviewState()
-        this.statusText = '个人目录'
-        this.schedulePhotosPreindex(personalPath)
-      } catch (_) {
-        // 个人目录暂时不可读时仍停留在可用的个人根目录。
-      }
+    if (nextPath.length > 0) {
+      this.updateDirectoryCount(nextPath, nextTotalCount >= 0 ? nextTotalCount : nextEntries.length)
+      this.statusText = '个人目录'
+      this.schedulePhotosPreindex(nextPath)
     }
   }
 
@@ -15446,6 +15250,8 @@ struct Index {
       ? (defaultDirectory.path.length > 0 ? defaultDirectory.path : '/' + defaultDirectory.name)
       : (accountName.length > 0 ? '/home/' + accountName : '')
     if (personalPath.length === 0) {
+      this.enterFileScreen('personal')
+      this.showRoot('personal')
       return
     }
     const requestId = this.navigationRequestId
@@ -15459,6 +15265,7 @@ struct Index {
       if (requestId !== this.navigationRequestId) {
         return
       }
+      this.enterFileScreen('personal')
       this.navigationStack = ['']
       this.navigationEntryStack = []
       this.navigationRootTypeStack = []
@@ -15471,7 +15278,7 @@ struct Index {
       this.replaceEntries(personalPage.entries)
       // 首页这条加载路径以前不下发默认视图 ✗ → 默认设了网格也要"进二级目录再返回"才生效 ✓
       this.applyPreferredViewMode()
-      this.updateTopTitle(this.fileTitle(personalPath), false)
+      this.updateTopTitle(this.fileTitle(personalPath))
       this.updateBottomBarVisibility(true)
       this.updateDirectoryCount(personalPath, personalPage.totalCount >= 0
         ? personalPage.totalCount : personalPage.entries.length)
@@ -15479,7 +15286,10 @@ struct Index {
       this.statusText = '个人目录'
       this.schedulePhotosPreindex(personalPath)
     } catch (_) {
-      // Keep the /home root visible when the personal directory is unavailable.
+      if (requestId === this.navigationRequestId) {
+        this.enterFileScreen('personal')
+        this.showRoot('personal')
+      }
     } finally {
       if (requestId === this.navigationRequestId) {
         this.isNavigating = false
@@ -15504,7 +15314,7 @@ struct Index {
     this.replaceEntries(kind === 'personal' ? this.personalRoots : this.sharedRoots)
     // 首页/共享这两个根目录也走这里 —— 以前这条路径不下发默认视图 ✗ 所以永远是列表 ✓
     this.applyPreferredViewMode()
-    this.updateTopTitle(this.fileTitle('', kind), true)
+    this.updateTopTitle(this.fileTitle('', kind))
     this.updateBottomBarVisibility(true)
     this.resetPreviewState()
     this.statusText = kind === 'personal' ? '个人空间' : '共享空间'
@@ -15572,7 +15382,7 @@ struct Index {
       // transition owns input until its finish callback releases isBusy.
       this.isNavigating = false
       const transitioned = await this.transitionFileContent(outgoingEntries, 'push',
-        this.fileTitle(nextPath), outgoingViewState, (): void => {
+        nextPath, outgoingViewState, (): void => {
         this.navigationStack = this.navigationStack.concat([this.currentPath])
         this.navigationEntryStack = this.navigationEntryStack.concat([this.entries.slice()])
         this.navigationRootTypeStack = this.navigationRootTypeStack.concat([this.currentRootType])
@@ -15698,7 +15508,7 @@ struct Index {
       this.isBusy = true
       const incomingEntries = this.rootKind === 'personal' ? this.personalRoots : this.sharedRoots
       await this.transitionBackFileContent(incomingEntries, previousViewState,
-        this.fileTitle('', this.rootKind), (): void => {
+        '', (preparedEntries: FileEntry[]): void => {
         this.navigationStack = stack
         this.navigationEntryStack = entryStack
         this.navigationRootTypeStack = rootTypeStack
@@ -15708,7 +15518,7 @@ struct Index {
         this.currentPath = previousPath
         this.currentRootType = this.rootKind === 'personal' ? this.personalRootEntriesType : 3
         this.setCurrentPageState(1, false)
-        this.replaceEntries(incomingEntries)
+        this.replaceEntries(preparedEntries, false, true)
         if (previousViewState !== null) {
           this.fileViewMode = previousViewState.mode
         }
@@ -15724,7 +15534,7 @@ struct Index {
     if (previousEntries !== null) {
       this.isBusy = true
       await this.transitionBackFileContent(previousEntries, previousViewState,
-        this.fileTitle(previousPath), (): void => {
+        previousPath, (preparedEntries: FileEntry[]): void => {
         this.navigationStack = stack
         this.navigationEntryStack = entryStack
         this.navigationRootTypeStack = rootTypeStack
@@ -15737,7 +15547,7 @@ struct Index {
         // Determine the parent directory type before selecting its view mode.
         // Using the child's album flag here can remount List/Grid during the
         // position restore and reset the parent Scroller to the top.
-        this.replaceEntries(previousEntries)
+        this.replaceEntries(preparedEntries, false, true)
         if (previousViewState !== null) {
           this.fileViewMode = previousViewState.mode
         }
@@ -15751,7 +15561,7 @@ struct Index {
     try {
       const loadedPage = await this.repository.listPage(previousPath, previousRootType, 1)
       await this.transitionBackFileContent(loadedPage.entries, previousViewState,
-        this.fileTitle(previousPath), (): void => {
+        previousPath, (preparedEntries: FileEntry[]): void => {
         this.navigationStack = stack
         this.navigationEntryStack = entryStack
         this.navigationRootTypeStack = rootTypeStack
@@ -15761,7 +15571,7 @@ struct Index {
         this.currentPath = previousPath
         this.currentRootType = previousRootType
         this.setCurrentPageState(loadedPage.pageIndex, loadedPage.hasMore)
-        this.replaceEntries(loadedPage.entries)
+        this.replaceEntries(preparedEntries, false, true)
         if (previousViewState !== null) {
           this.fileViewMode = previousViewState.mode
         }
@@ -16179,7 +15989,7 @@ struct Index {
 
   private beginDestinationPickerForEntries(operation: DestinationOperation,
     entries: FileEntry[]): void {
-    if (this.isBusy) {
+    if (this.isBusy || this.destinationOperationRunning) {
       return
     }
     this.destinationPickerCloseToken += 1
@@ -16196,16 +16006,18 @@ struct Index {
     this.destinationTreeLoadingPath = ''
     this.destinationRootExpanded = true
     this.destinationPickerClosing = false
+    this.destinationOperationRunning = false
     this.showDestinationPicker = true
     this.closeActionMenu()
     this.loadDestinationEntries()
   }
 
   private closeDestinationPicker(): void {
-    if (this.destinationLoading || this.destinationPickerClosing) {
+    if (this.destinationOperationRunning || this.destinationPickerClosing) {
       return
     }
     this.destinationPickerClosing = true
+    this.destinationLoading = false
     const closeToken = ++this.destinationPickerCloseToken
     this.destinationLoadToken += 1
     this.destinationTreeRequestToken += 1
@@ -16225,7 +16037,7 @@ struct Index {
       this.destinationRootExpanded = true
       this.destinationSelectedEntries = []
       this.destinationFolderText = ''
-      // 与遮罩淡出（180ms）对齐，别让空等拖出一截白。
+      // Release the input layer after the 180 ms card exit completes.
     }, 200)
   }
 
@@ -16371,6 +16183,7 @@ struct Index {
   }
 
   private toggleDestinationRoot(): void {
+    if (this.destinationOperationRunning || this.destinationPickerClosing) { return }
     const rootPath = this.destinationUserRootPath()
     this.destinationPathStack = []
     this.destinationPath = rootPath
@@ -16384,6 +16197,7 @@ struct Index {
   }
 
   private goDestinationBack(): void {
+    if (this.destinationOperationRunning || this.destinationPickerClosing) { return }
     if (this.destinationTreeLoadingPath.length > 0) {
       return
     }
@@ -16435,6 +16249,7 @@ struct Index {
     }
     const parent = this.destinationPath.replace(/[\\/]$/, '')
     const path = parent.length > 0 ? parent + '/' + name : '/' + name
+    this.destinationOperationRunning = true
     this.destinationLoading = true
     try {
       await this.repository.createFolder(path)
@@ -16451,6 +16266,7 @@ struct Index {
     } catch (error) {
       this.reportError(error as Object, '新建文件夹失败')
     } finally {
+      this.destinationOperationRunning = false
       this.destinationLoading = false
     }
   }
@@ -16687,6 +16503,7 @@ struct Index {
         }
       }
     }
+    this.destinationOperationRunning = true
     this.destinationLoading = true
     this.errorText = ''
     try {
@@ -16701,10 +16518,12 @@ struct Index {
       HapticFeedback.success()
       this.showImmersiveToast(this.statusText)
       this.destinationLoading = false
+      this.destinationOperationRunning = false
       this.closeDestinationPicker()
     } catch (error) {
       this.reportError(error as Object, this.destinationOperation === 'copy' ? '复制失败' : '移动失败')
     } finally {
+      this.destinationOperationRunning = false
       this.destinationLoading = false
     }
   }
@@ -20663,7 +20482,7 @@ struct Index {
     this.replaceEntries(origin.entries.slice())
     this.resetPreviewState(false)
     this.restoreDirectoryViewState(origin.viewState)
-    this.updateTopTitle(origin.topTitle, false)
+    this.updateTopTitle(origin.topTitle)
     this.topTitleOpacity = origin.topTitleOpacity
     this.errorText = ''
   }
@@ -21721,11 +21540,8 @@ struct Index {
   }
 
   private fileHeaderLeadingVisible(): boolean {
-    return this.selectionMode || this.currentPath.length > 0
-  }
-
-  private fileHeaderLeadingWidth(): number {
-    return this.fileHeaderLeadingVisible() ? 40 : 86
+    return this.selectionMode || (this.fileTransitionHeader === null
+      ? this.currentPath.length > 0 : this.fileTransitionHeader.hasBack)
   }
 
   private topActionButtonWidth(): number {

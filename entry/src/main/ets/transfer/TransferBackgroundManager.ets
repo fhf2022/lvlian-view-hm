@@ -5,10 +5,11 @@ import { preferences } from '@kit.ArkData'
 import { BusinessError } from '@kit.BasicServicesKit'
 import { TransferProgress, summarizeTransfers } from './TransferProgress'
 import { NasConnection } from '../core/network/NasConnection'
-import { TransferLiveViewManager } from './TransferLiveViewManager'
-import { transferEndPhase } from './TransferLiveViewPresentation'
 
-/** One system-owned data-transfer notification; all queues publish bounded snapshots. */
+/** One system-owned data-transfer notification; all queues publish bounded snapshots.
+ * The system LIVE_VIEW slot below belongs to Background Tasks Kit. It must keep
+ * receiving progress; no Live View Kit entitlement or custom capsule is used.
+ */
 export class TransferBackgroundManager {
   private static instance: TransferBackgroundManager = new TransferBackgroundManager()
   static shared(): TransferBackgroundManager { return TransferBackgroundManager.instance }
@@ -31,16 +32,11 @@ export class TransferBackgroundManager {
   private lastPublished: number = 0
   private listeners: (() => void)[] = []
   private cancelListeners: (() => void)[] = []
-  private liveView: TransferLiveViewManager = new TransferLiveViewManager()
-  private liveSession: boolean = false
-  private sessionCancelled: boolean = false
   private cancel = (info: backgroundTaskManager.ContinuousTaskCancelInfo): void => {
     if (info.id !== this.taskId) { return }
     this.taskId = -1; this.notificationId = -1; this.healthy = false
     this.blocked = true; this.attempted = true
     this.status('后台传输保护已停止，点击任务可继续')
-    this.liveView.finish(summarizeTransfers(Array.from(this.session.values())), 'paused')
-    this.liveSession = false
     console.info('[TransferProtection] cancelled reason=' + info.reason.toString())
     for (const listener of this.cancelListeners.slice()) { listener() }
     this.changed()
@@ -53,7 +49,6 @@ export class TransferBackgroundManager {
     }
     if (this.context) { return }
     this.context = context; this.destroyed = false; this.foreground = true
-    this.liveView.initialize(context)
     this.attempted = false; this.blocked = false
     this.status('')
     notificationManager.isNotificationEnabled().then((enabled: boolean): void => {
@@ -76,7 +71,6 @@ export class TransferBackgroundManager {
   async requestResume(): Promise<void> {
     await this.requestNotificationPermission()
     this.blocked = false; this.attempted = false
-    this.liveView.requestResume()
     this.schedule()
   }
   // Called after loadContent completes, and shared with explicit transfer actions.
@@ -134,11 +128,9 @@ export class TransferBackgroundManager {
   }
   setForeground(value: boolean): void {
     this.foreground = value
-    this.liveView.setForeground(value)
     if (value && !this.blocked && this.taskId < 0) { this.attempted = false }
     this.changed(); this.schedule()
   }
-  setDarkTheme(value: boolean): void { this.liveView.setDarkTheme(value) }
   update(source: string, tasks: TransferProgress[]): void {
     this.sources.set(source, tasks)
     for (const task of tasks) {
@@ -150,7 +142,7 @@ export class TransferBackgroundManager {
         source + ':' + task.id === key)) {
         const previous = this.session.get(key)
         if (previous && previous.done < previous.count) {
-          this.session.delete(key); this.sessionCancelled = true
+          this.session.delete(key)
         }
       }
     }
@@ -181,14 +173,8 @@ export class TransferBackgroundManager {
   private async reconcile(): Promise<void> {
     if (!this.context || this.destroyed) { return }
     if (!this.wanted()) {
-      const tasks = Array.from(this.session.values())
-      const summary = summarizeTransfers(tasks)
-      if (this.liveSession) {
-        this.liveView.finish(summary, this.sessionCancelled ? 'cancelled' : transferEndPhase(tasks, summary), tasks)
-        this.liveSession = false
-      }
       await this.stop()
-      this.session.clear(); this.sessionCancelled = false; this.attempted = false
+      this.session.clear(); this.attempted = false
       AppStorage.setOrCreate('transferProgressText', '')
       if (!this.blocked) { this.status('') }
       return
@@ -253,8 +239,6 @@ export class TransferBackgroundManager {
       this.lastPublished = Date.now()
       const becameHealthy = !this.healthy
       this.healthy = true; this.status('')
-      this.liveView.update(current)
-      this.liveSession = true
       if (becameHealthy) {
         console.info('[TransferProtection] ready task=' + this.taskId.toString() +
           ' notification=' + this.notificationId.toString())
@@ -262,8 +246,6 @@ export class TransferBackgroundManager {
       }
     } catch (error) {
       await this.stop()
-      this.liveView.finish(summarizeTransfers(Array.from(this.session.values())), 'paused')
-      this.liveSession = false
       this.attempted = true
       this.status('进度通知不可用，退后台后暂停；回到前台可继续')
       this.changed()
@@ -296,10 +278,8 @@ export class TransferBackgroundManager {
     this.listeners = []; this.cancelListeners = []
     this.cleanup = this.queue.catch(() => {}).then(async (): Promise<void> => {
       await this.stop()
-      await this.liveView.destroy()
-      this.liveSession = false
       try { backgroundTaskManager.off('continuousTaskCancel', this.cancel) } catch (_) {}
-      this.sources.clear(); this.session.clear(); this.sessionCancelled = false; this.context = null
+      this.sources.clear(); this.session.clear(); this.context = null
       this.cleanup = null
       AppStorage.setOrCreate('transferProgressText', '')
     })

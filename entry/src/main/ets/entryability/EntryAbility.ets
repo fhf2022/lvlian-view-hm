@@ -2,6 +2,7 @@ import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want 
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import { TransferBackgroundManager } from '../transfer/TransferBackgroundManager';
+import { StartupAuthorization } from '../core/authorization/StartupAuthorization';
 
 const DOMAIN = 0x0000;
 
@@ -35,7 +36,6 @@ export default class EntryAbility extends UIAbility {
   private applySystemBars(win: window.Window, colorMode: ConfigurationConstant.ColorMode): void {
     const isDark = colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
     AppStorage.setOrCreate('isDarkTheme', isDark);
-    TransferBackgroundManager.shared().setDarkTheme(isDark);
     win.setWindowSystemBarProperties({
       // 透明系统栏必须和应用背景统一，否则上下会出现明显色带。
       statusBarColor: '#00FFFFFF',
@@ -48,7 +48,7 @@ export default class EntryAbility extends UIAbility {
   }
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
-    TransferBackgroundManager.shared().initialize(this.context);
+    StartupAuthorization.shared().prepare();
     AppStorage.setOrCreate('transferNavigationRequest', want.parameters?.transferEntry === true ? 1 : 0);
     AppStorage.setOrCreate('abilityInBackground', false);
     try {
@@ -88,7 +88,7 @@ export default class EntryAbility extends UIAbility {
         return;
       }
       hilog.info(DOMAIN, 'testTag', 'Succeeded in loading the content.');
-      TransferBackgroundManager.shared().requestNotificationPermission().catch(() => {});
+      StartupAuthorization.shared().beginInitial(this.context).catch(() => {});
     });
   }
 

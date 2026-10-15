@@ -24,10 +24,6 @@ const mocks={'@kit.AbilityKit':{wantAgent:{OperationType:{START_ABILITY:1},WantA
 function load(name){const exports={};const js=ts.transpileModule(fs.readFileSync('entry/src/main/ets/'+name+'.ets','utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText;
  vm.runInNewContext(js,{exports,require:name=>{assert(mocks[name],name);return mocks[name]},AppStorage:{setOrCreate:(key,value)=>storage.set(key,value)},console,setTimeout,clearTimeout,Date});return exports}
 const progress=load('transfer/TransferProgress');mocks['./TransferProgress']=progress;
-mocks['./TransferLiveViewPresentation']=load('transfer/TransferLiveViewPresentation');
-mocks['./TransferLiveViewManager']={TransferLiveViewManager:class {
- initialize(){} setForeground(){} setDarkTheme(){} requestResume(){} update(){} finish(){} async destroy(){}
-}};
 const {TransferBackgroundManager:Manager}=load('transfer/TransferBackgroundManager');
 const {VideoBackgroundTaskManager:Video}=load('media/VideoBackgroundTaskManager');
 const context={abilityInfo:{bundleName:'cn.fhf.linkfiles',name:'EntryAbility'}};
@@ -38,7 +34,7 @@ const cancel=id=>{for(const callback of [...events])callback({id,reason:1})};
 (async()=>{
  let manager=new Manager();manager.initialize(context);let cancelled=0;manager.onCancel(()=>cancelled++);
  manager.update('album',[task('old',{active:false,pending:false,done:1,doneBytes:100}),task('new')]);await settle(manager);
- assert.equal(starts.length,1);assert.equal(notifications.at(-1).template.data.progressValue,25);assert.match(storage.get('transferProgressText'),/0\/1/);
+ assert.equal(starts.length,1);assert.equal(notifications.at(-1).template.data.progressValue,25);assert.deepEqual(Array.from(starts[0].request.backgroundTaskModes),[system.BackgroundTaskMode.MODE_DATA_TRANSFER]);assert.equal(notifications.at(-1).content.notificationContentType,8);assert.equal(notifications.at(-1).content.systemLiveView.capsule,undefined);assert.match(storage.get('transferProgressText'),/0\/1/);
  manager.setForeground(false);assert.equal(manager.canRun(),true);await settle(manager);
  const video=new Video();video.setPlaying(context,true);await video.queue;const videoId=starts.at(-1).id;
  manager.update('album',[]);await settle(manager);assert.equal(manager.canRun(),false);assert(!stops.includes(videoId));

@@ -91,6 +91,18 @@
     {
       "name": "surface_selected",
       "value": "#EAF1FF"
+    },
+    {
+      "name": "task_panel_background",
+      "value": "#F1F3F5"
+    },
+    {
+      "name": "task_panel_control_background",
+      "value": "#E6E8EB"
+    },
+    {
+      "name": "task_panel_content_background",
+      "value": "#FFFFFF"
     }
   ]
 }
