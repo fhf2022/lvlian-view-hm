@@ -5,6 +5,7 @@
   <p>ArkTS · ArkUI · HarmonyOS API 26 · 手机 / 平板 / 2in1</p>
   <p>
     <a href="https://github.com/fhf2022/lvlian-view-hm/releases/latest">下载正式版</a> ·
+    <a href="https://appgallery.huawei.com/link/invite-test-wap?taskId=a27ff0f8be31418852bb4465b727395f&amp;invitationCode=684SbeAJ8ao">加入邀请测试</a> ·
     <a href="docs/USER_GUIDE.md">使用说明</a> ·
     <a href="docs/DEVELOPMENT.md">开发与构建</a> ·
     <a href="docs/README.md">文档目录</a> ·
@@ -36,6 +37,8 @@
 1. 准备一台可访问的绿联 NAS，确认云盘 ID、NAS 账号及目录访问权限。
 2. 在华为应用市场搜索「联文件」获取已上架版本，或从 [GitHub Releases](https://github.com/fhf2022/lvlian-view-hm/releases/latest) 获取正式签名包。自行构建请参考[开发说明](docs/DEVELOPMENT.md)；仓库源码可能领先于应用市场版本。
 3. 首次打开完成隐私确认后登录。图库读取授权用于整相册上传；通知授权用于显示后台传输进度。
+
+体验测试版本：点击[华为应用市场邀请测试](https://appgallery.huawei.com/link/invite-test-wap?taskId=a27ff0f8be31418852bb4465b727395f&invitationCode=684SbeAJ8ao)，按页面提示参与。
 
 上传单个或多个文件：进入 NAS 目标文件夹，点击悬浮加号，选择文件或图片。
 
