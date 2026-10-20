@@ -3,11 +3,13 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import { TransferBackgroundManager } from '../transfer/TransferBackgroundManager';
 import { StartupAuthorization } from '../core/authorization/StartupAuthorization';
+import { ContinuationManager } from '../continuation/ContinuationManager';
 
 const DOMAIN = 0x0000;
 
 export default class EntryAbility extends UIAbility {
   private mainWindow: window.Window | null = null;
+  private contentLoaded: boolean = false;
 
   private updateAvoidArea(type: window.AvoidAreaType, area: window.AvoidArea): void {
     if (type === window.AvoidAreaType.TYPE_SYSTEM) {
@@ -49,6 +51,11 @@ export default class EntryAbility extends UIAbility {
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     StartupAuthorization.shared().prepare();
+    ContinuationManager.shared().initialize(this.context);
+    if (launchParam.launchReason === AbilityConstant.LaunchReason.CONTINUATION) {
+      ContinuationManager.shared().receive(want);
+      this.context.restoreWindowStage(new LocalStorage());
+    }
     AppStorage.setOrCreate('transferNavigationRequest', want.parameters?.transferEntry === true ? 1 : 0);
     AppStorage.setOrCreate('abilityInBackground', false);
     try {
@@ -60,6 +67,7 @@ export default class EntryAbility extends UIAbility {
   }
 
   onDestroy(): void {
+    ContinuationManager.shared().destroy();
     TransferBackgroundManager.shared().destroy().catch(() => {});
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onDestroy');
   }
@@ -82,8 +90,13 @@ export default class EntryAbility extends UIAbility {
       hilog.error(DOMAIN, 'EntryAbility', 'Failed to get main window: %{public}s', JSON.stringify(err));
     });
 
+    // Hot continuation retains Index and its transfer managers. Re-loading the
+    // page would reset queues, navigation and media state underneath restoration.
+    if (this.contentLoaded) { return; }
+    this.contentLoaded = true;
     windowStage.loadContent('pages/Index', (err) => {
       if (err.code) {
+        this.contentLoaded = false;
         hilog.error(DOMAIN, 'testTag', 'Failed to load the content. Cause: %{public}s', JSON.stringify(err));
         return;
       }
@@ -92,9 +105,18 @@ export default class EntryAbility extends UIAbility {
     });
   }
 
+  onWindowStageRestore(windowStage: window.WindowStage): void {
+    this.onWindowStageCreate(windowStage);
+  }
+
+  onContinue(wantParam: Record<string, Object>): Promise<AbilityConstant.OnContinueResult> {
+    return ContinuationManager.shared().export(wantParam);
+  }
+
   onWindowStageDestroy(): void {
     // Main window is destroyed, release UI related resources
     this.mainWindow = null;
+    this.contentLoaded = false;
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onWindowStageDestroy');
   }
 
@@ -119,6 +141,11 @@ export default class EntryAbility extends UIAbility {
   }
 
   onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    if (launchParam.launchReason === AbilityConstant.LaunchReason.CONTINUATION) {
+      ContinuationManager.shared().receive(want);
+      this.context.restoreWindowStage(new LocalStorage());
+      return;
+    }
     if (want.parameters?.transferEntry === true) {
       const previous = AppStorage.get<number>('transferNavigationRequest') ?? 0;
       AppStorage.setOrCreate('transferNavigationRequest', previous + 1);

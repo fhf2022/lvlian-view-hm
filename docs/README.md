@@ -20,6 +20,7 @@
 | [图库文件夹上传](ALBUM_UPLOAD.md) | 系统相册选择、固定清单、冲突策略、续传、版本演进 |
 | [后台传输与总进度](BACKGROUND_TRANSFER_PLAN.md) | dataTransfer 保护、通知授权、进度聚合、故障降级和验证范围 |
 | [NAS 中断与恢复](NAS_CONNECTION_RECOVERY.md) | 不可达状态、缓存浏览、任务保留、恢复与重试 |
+| [跨设备接续（开发版）](CONTINUATION.md) | 第一版范围、账号检查、目录快照、任务保留和待验证的双机行为 |
 | [查看器返回时的界面保留](PARENT_CHROME_RETENTION.md) | 图片、视频返回时底栏等元素的生命周期 |
 | [连续多选修复](file-selection-fix.md) | 区间反转、命中和拖选交互的实现记录 |
 | [图片返回覆盖层实验](viewer-return-overlay-poc.md) | 共享元素返回动画的历史验证 |

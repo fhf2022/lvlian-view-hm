@@ -1,11 +1,13 @@
 import { StartupAuthorization } from '../core/authorization/StartupAuthorization'
+import { ContinuationManager, ContinuationPage, ContinuationAccountRequired } from '../continuation/ContinuationManager'
+import { ContinuationPolicy, ContinuationSnapshot } from '../continuation/ContinuationModel'
 import { StorageBudget } from '../download/StorageBudget'
 import { DownloadDestination } from '../download/DownloadDestination'
 import { TransferBackgroundManager } from '../transfer/TransferBackgroundManager'
 import { promptAction, uiMaterial, curves, window, LengthMetrics, FrameCallback, PiPWindow,
   CapsuleSegmentButtonV2, SegmentButtonV2Items } from '@kit.ArkUI'
 import { systemShare, harmonyShare } from '@kit.ShareKit'
-import { Context, Want, common, wantConstant, autoFillManager } from '@kit.AbilityKit'
+import { Context, Want, common, wantConstant, autoFillManager, bundleManager } from '@kit.AbilityKit'
 import { fileIo, fileUri, picker } from '@kit.CoreFileKit'
 import { photoAccessHelper } from '@kit.MediaLibraryKit'
 import { FloatingImportControl } from '../components/FloatingImportControl'
@@ -846,9 +848,28 @@ class RowHitArea {
 @Entry
 @Component
 struct Index {
-  @State screen: RemoteScreen = 'login'
-  @State startupRestoring: boolean = true
-  @State startupAuthorized: boolean = false
+  @StorageProp('continuationPending') continuationPending: boolean = false
+  @StorageProp('continuationWaitingForAccount') continuationWaitingForAccount: boolean = false
+  @StorageProp('continuationMessage') @Watch('onContinuationMessage') continuationMessage: string = ''
+  @State @Watch('onContinuationSceneChanged') continuationSending: boolean = false
+  @State @Watch('onContinuationSceneChanged') continuationDialogCount: number = 0
+  private continuationAncestorAnchors: Map<string, string> = new Map()
+  private continuationPendingDeletes: Set<string> = new Set()
+  private continuationPage: ContinuationPage = {
+    available: (): boolean => this.continuationAvailable(),
+    accountIdentity: (): string => this.linkId.trim().toLowerCase() + '|' + this.repository.sessionIdentity(),
+    canReceive: (): boolean => this.continuationCanReceive(),
+    capture: (): ContinuationSnapshot => this.captureContinuation(),
+    sending: (active: boolean): void => { this.continuationSending = active },
+    pauseSourceVideo: async (): Promise<void> => { await this.videoPlaybackManager.pause() },
+    resumeSourceVideo: async (): Promise<void> => { await this.videoPlaybackManager.play() },
+    restore: async (snapshot: ContinuationSnapshot, valid: () => boolean): Promise<void> => {
+      await this.restoreContinuation(snapshot, valid)
+    }
+  }
+  @State @Watch('onContinuationSceneChanged') screen: RemoteScreen = 'login'
+  @State @Watch('onContinuationSceneChanged') startupRestoring: boolean = true
+  @State @Watch('onContinuationSceneChanged') startupAuthorized: boolean = false
   @State startupAuthorizing: boolean = true
   @State startupAuthorizationMessage: string = ''
   private startupAuthorizationToken: number = 0
@@ -860,7 +881,7 @@ struct Index {
   @State baseUrl: string = ''
   @State statusText: string = ''
   @State errorText: string = ''
-  @State isBusy: boolean = false
+  @State @Watch('onContinuationSceneChanged') isBusy: boolean = false
   @State trustDevice: boolean = false
   @State autoLogin: boolean = false
   @State rememberAddress: boolean = false
@@ -885,7 +906,7 @@ struct Index {
   @State meteredDownloadContinue: boolean = false
   @State downloadTasks: DownloadTaskRecord[] = []
   @State downloadSpeedBytesPerSecond: number = 0
-  @State contextMenuVisible: boolean = false
+  @State @Watch('onContinuationSceneChanged') contextMenuVisible: boolean = false
   @State contextMenuEntry: FileEntry | null = null
   @State contextMenuLayout: ContextMenuPreviewLayout = new ContextMenuPreviewLayout()
   @State contextMenuPreviewSurface: string = 'list'
@@ -893,7 +914,7 @@ struct Index {
   // shell (anchor, preview, lifecycle) is shared with the file manager; only
   // the row list inside it differs, so this decides which rows are rendered.
   @State contextMenuContext: string = 'files'
-  @State showDestinationPicker: boolean = false
+  @State @Watch('onContinuationSceneChanged') showDestinationPicker: boolean = false
   @State destinationOperation: DestinationOperation = 'copy'
   @State destinationPath: string = ''
   @State destinationEntries: DestinationEntry[] = []
@@ -902,7 +923,7 @@ struct Index {
   @State destinationTreeLoadingPath: string = ''
   @State destinationRootExpanded: boolean = true
   @State destinationLoading: boolean = false
-  @State destinationOperationRunning: boolean = false
+  @State @Watch('onContinuationSceneChanged') destinationOperationRunning: boolean = false
   @State destinationPickerClosing: boolean = false
   @State destinationSelectedEntries: FileEntry[] = []
   @State destinationFolderDialog: boolean = false
@@ -913,15 +934,16 @@ struct Index {
   @State selectedEntryCount: number = 0
   private fileSelection: FileSelectionModel = new FileSelectionModel()
   private selectedEntriesCache: FileEntry[] | null = null
-  @State showSelectionMoreMenu: boolean = false
+  @State @Watch('onContinuationSceneChanged') showSelectionMoreMenu: boolean = false
   @State renameEntry: FileEntry | null = null
   @State renameText: string = ''
-  @State showRenameDialog: boolean = false
+  @State @Watch('onContinuationSceneChanged') showRenameDialog: boolean = false
   @State showStorageSettings: boolean = false
   @State showNetworkSettings: boolean = false
   @State showPlaybackSettings: boolean = false
   @State showViewSettings: boolean = false
   @State showRecycleBinSettings: boolean = false
+  @State appVersionName: string = ''
   // UGOS keeps one recycle repository per first-level folder, so the signed-in
   // user's own folder and the shared folders are genuinely disjoint sets with
   // different permission rules — a shared folder's bin is the administrator's
@@ -942,8 +964,8 @@ struct Index {
   @State @Watch('onGestureShareStateChanged') viewerImageEntry: FileEntry | null = null
   @State viewerInteractionUnlocked: boolean = true
   @State viewerBlocksFileContent: boolean = false
-  @State viewerClosing: boolean = false
-  @State viewerReturnOverlayVisible: boolean = false
+  @State @Watch('onContinuationSceneChanged') viewerClosing: boolean = false
+  @State @Watch('onContinuationSceneChanged') viewerReturnOverlayVisible: boolean = false
   @State viewerReturnOverlayX: number = 0
   @State viewerReturnOverlayY: number = 0
   @State viewerReturnOverlayWidth: number = 0
@@ -968,8 +990,8 @@ struct Index {
   // popup must not clear the sheet content before its dismissal completes.
   @State viewerOverlayEntry: FileEntry | null = null
   @State imageDetailsEntry: FileEntry | null = null
-  @State showImageMoreMenu: boolean = false
-  @State showImageDetails: boolean = false
+  @State @Watch('onContinuationSceneChanged') showImageMoreMenu: boolean = false
+  @State @Watch('onContinuationSceneChanged') showImageDetails: boolean = false
   @State viewerLastNavigationDirection: number = 1
   // Pixel/geometry metadata is kept in a private identity map. The previous
   // @State record was copied in full for every visible-row callback, so the
@@ -997,7 +1019,7 @@ struct Index {
   private imageAnalyzerListenerBound: boolean = false
   // 长按识别文字的判定定时器（见 armImageLongPressWatch）。
   private imageLongPressTimer: number = 0
-  @State imageScale: number = 1
+  @State @Watch('onContinuationSceneChanged') imageScale: number = 1
   @State imageSavedScale: number = 1
   @State imageOffsetX: number = 0
   @State imageOffsetY: number = 0
@@ -1026,17 +1048,17 @@ struct Index {
   @State viewerSurfaceOpacity: number = 1
   // The entry animation is limited to the image that was tapped. The normal
   // viewer swiper animation uses viewerTransitionActive and remains separate.
-  @State viewerEntryTransitionActive: boolean = false
+  @State @Watch('onContinuationSceneChanged') viewerEntryTransitionActive: boolean = false
   @State viewerEntryTransitionPath: string = ''
   @State viewerTransitionKind: ViewerTransitionKind = 'none'
   @State viewerTransitionLayer: ViewerImageLayer = 'thumbnail'
   @State viewerGeometryBound: boolean = false
-  @State viewerFallbackEntryActive: boolean = false
+  @State @Watch('onContinuationSceneChanged') viewerFallbackEntryActive: boolean = false
   // Keep the viewer capsule size stable across device rotation. Only its
   // bottom-safe-area position should be recalculated by the new layout.
   @State viewerBottomBarWidthVp: number = 0
-  @State viewerTransitionActive: boolean = false
-  @State showAudioPlayer: boolean = false
+  @State @Watch('onContinuationSceneChanged') viewerTransitionActive: boolean = false
+  @State @Watch('onContinuationSceneChanged') showAudioPlayer: boolean = false
   @State audioEntry: FileEntry | null = null
   @State audioLocalPath: string = ''
   @State audioPlaying: boolean = false
@@ -1048,10 +1070,10 @@ struct Index {
   @State backgroundAudioPlayback: boolean = true
   @State videoBackgroundAutoPip: boolean = false
   @State autoPlayOnOpen: boolean = true
-  @State showVideoPlayer: boolean = false
-  @State videoOverlayClosing: boolean = false
+  @State @Watch('onContinuationSceneChanged') showVideoPlayer: boolean = false
+  @State @Watch('onContinuationSceneChanged') videoOverlayClosing: boolean = false
   @State videoChromeVisible: boolean = true
-  @State videoEntryTransitionActive: boolean = false
+  @State @Watch('onContinuationSceneChanged') videoEntryTransitionActive: boolean = false
   @State videoEntryTransitionPath: string = ''
   @State videoTransitionKind: ViewerTransitionKind = 'none'
   @State videoOverlayOpacity: number = 1
@@ -1069,17 +1091,17 @@ struct Index {
   @State videoPlaying: boolean = false
   @State videoFastPlaybackActive: boolean = false
   @State videoMuted: boolean = false
-  @State videoPrepared: boolean = false
+  @State @Watch('onContinuationSceneChanged') videoPrepared: boolean = false
   @State videoFirstFrame: boolean = false
   @State videoSurfaceReady: boolean = false
-  @State videoOrientationChanging: boolean = false
+  @State @Watch('onContinuationSceneChanged') videoOrientationChanging: boolean = false
   @State videoLandscape: boolean = false
-  @State videoControlPending: boolean = false
+  @State @Watch('onContinuationSceneChanged') videoControlPending: boolean = false
   @State videoWidthPx: number = 0
   @State videoHeightPx: number = 0
   @State videoBufferingPercent: number = 0
-  @State videoPipActive: boolean = false
-  @State videoPipBackgrounded: boolean = false
+  @State @Watch('onContinuationSceneChanged') videoPipActive: boolean = false
+  @State @Watch('onContinuationSceneChanged') videoPipBackgrounded: boolean = false
   private videoSeekDragging: boolean = false
   private videoSeekPending: boolean = false
   private videoSeekTargetMs: number = 0
@@ -1088,8 +1110,8 @@ struct Index {
   private videoOpeningPath: string = ''
   private videoReconcileDirectoryKey: string = ''
   private videoReconciledEntries: Record<string, boolean> = {}
-  @State videoPipCreating: boolean = false
-  @State videoCasting: boolean = false
+  @State @Watch('onContinuationSceneChanged') videoPipCreating: boolean = false
+  @State @Watch('onContinuationSceneChanged') videoCasting: boolean = false
   @State videoTransferStates: Record<string, VideoTransferState> = {}
   @State previewCanonicalPaths: Record<string, boolean> = {}
   // Waterfall identity maps stay private so a recycled FlowItem does not
@@ -1132,13 +1154,13 @@ struct Index {
   ])
   @State uploadTasks: UploadTaskRecord[] = []
   @State albumUploadJobs: AlbumUploadJob[] = []
-  @State showAlbumPicker: boolean = false
-  @State showAlbumUpload: boolean = false
+  @State @Watch('onContinuationSceneChanged') showAlbumPicker: boolean = false
+  @State @Watch('onContinuationSceneChanged') showAlbumUpload: boolean = false
   @State albumUploadStarting: boolean = false
   @State albumUploadSelection: LocalImageAlbum = new LocalImageAlbum()
   private albumConfirmationPending: boolean = false
   private albumReselectPending: boolean = false
-  @State showAlbumDetails: boolean = false
+  @State @Watch('onContinuationSceneChanged') showAlbumDetails: boolean = false
   private albumUploadActionsOpen: boolean = false
   @State albumDetailsId: string = ''
   @State albumDetailsName: string = ''
@@ -1146,13 +1168,13 @@ struct Index {
   private albumUploadRootType: number = 0
   private albumUploadScope: string = ''
   private albumUpload: AlbumUploadManager = new AlbumUploadManager()
-  @State importExpanded: boolean = false
-  @State importSelecting: boolean = false
+  @State @Watch('onContinuationSceneChanged') importExpanded: boolean = false
+  @State @Watch('onContinuationSceneChanged') importSelecting: boolean = false
   private uploadQueue: UploadQueueManager = new UploadQueueManager()
-  @State showPageTransition: boolean = false
+  @State @Watch('onContinuationSceneChanged') showPageTransition: boolean = false
   @State fileTransitionHeader: DirectoryHeaderState | null = null
   @State outgoingEntries: FileEntry[] = []
-  @State showSearch: boolean = false
+  @State @Watch('onContinuationSceneChanged') showSearch: boolean = false
   @State searchQuery: string = ''
   private searchDraft: string = ''
   private searchController: SearchController = new SearchController()
@@ -1175,11 +1197,11 @@ struct Index {
   private directoryViewModeOverrides: Record<string, FileViewMode> = {}
   @State fileSortKey: FileSortKey = 'time'
   @State fileSortAscending: boolean = false
-  @State directoryTimeline: DirectoryTimeline = new DirectoryTimeline()
+  @State @Watch('onContinuationSceneChanged') directoryTimeline: DirectoryTimeline = new DirectoryTimeline()
   @State timelineFocusTime: number = 0
-  @State timelineIndexing: boolean = false
-  @State showFileSortMenu: boolean = false
-  @State showCreateFolderDialog: boolean = false
+  @State @Watch('onContinuationSceneChanged') timelineIndexing: boolean = false
+  @State @Watch('onContinuationSceneChanged') showFileSortMenu: boolean = false
+  @State @Watch('onContinuationSceneChanged') showCreateFolderDialog: boolean = false
   @State newFolderText: string = ''
   @State bottomBarOffsetY: number = 0
   @State bottomBarOpacity: number = 1
@@ -1569,7 +1591,7 @@ struct Index {
     this.downloadSpeedBytesPerSecond = speed
   }
   @State private nasState: NasConnectionState = 'unknown'
-  @State private offlineCacheMode: boolean = false
+  @State @Watch('onContinuationSceneChanged') private offlineCacheMode: boolean = false
   private offlineProfile: OfflineAccountProfile | null = null
   private personalRootEntriesType: number = 4
   private offlineProfileTimer: number = 0
@@ -1617,7 +1639,182 @@ struct Index {
     lightEffect: { color: '#66FFFFFF' }
   })
   aboutToAppear(): void {
+    ContinuationManager.shared().attach(this.continuationPage)
     this.completeStartupAuthorization(false)
+  }
+
+  private async showTrackedDialog(options: promptAction.ShowDialogOptions): Promise<promptAction.ShowDialogSuccessResponse> {
+    this.continuationDialogCount++
+    try {
+      return await this.getUIContext().getPromptAction().showDialog(options)
+    } finally {
+      this.continuationDialogCount = Math.max(0, this.continuationDialogCount - 1)
+    }
+  }
+
+  private onContinuationSceneChanged(): void {
+    ContinuationManager.shared().refresh()
+    this.onContinuationMessage()
+  }
+
+  private onContinuationMessage(): void {
+    if (this.startupAuthorized && !this.startupRestoring && this.continuationMessage !== '') {
+      const message = this.continuationMessage
+      AppStorage.setOrCreate('continuationMessage', '')
+      this.showImmersiveToast(message)
+    }
+  }
+
+  private continuationOperationIdle(): boolean {
+    return this.startupAuthorized && !this.startupRestoring && this.continuationDialogCount === 0 &&
+      !this.isBusy && !this.isNavigating &&
+      !this.selectionMode && !this.showSearch && this.searchSession === null &&
+      !this.showPageTransition && !this.contextMenuVisible && this.contextMenuEntry === null &&
+      !this.showDestinationPicker && !this.destinationOperationRunning && !this.destinationFolderDialog &&
+      !this.showRenameDialog && !this.showCreateFolderDialog && !this.showAlbumPicker &&
+      !this.showAlbumUpload && !this.showAlbumDetails && !this.importSelecting && !this.importExpanded &&
+      !this.showFileSortMenu && !this.showSelectionMoreMenu && !this.showAudioPlayer &&
+      !this.viewerClosePending && !this.viewerClosing && !this.viewerReturnOverlayVisible &&
+      !this.viewerEntryTransitionActive && !this.viewerTransitionActive && !this.viewerFallbackEntryActive &&
+      !this.imageDismissDragging && !this.showImageDetails && !this.showImageMoreMenu &&
+      !this.videoOverlayClosing && !this.videoEntryTransitionActive && !this.videoCasting &&
+      !this.videoPipActive && !this.videoPipBackgrounded && !this.videoPipCreating && !this.videoCastPreparing &&
+      !this.videoSeekDragging && !this.videoControlPending && !this.videoOrientationChanging &&
+      this.continuationPendingDeletes.size === 0
+  }
+
+  private continuationAvailable(): boolean {
+    if (!this.continuationOperationIdle() || this.continuationSending || this.continuationPending ||
+      this.screen !== 'files' || this.offlineCacheMode || this.repository.sessionIdentity() === '' ||
+      this.entries.length > ContinuationPolicy.MAX_ENTRIES || this.fileContentTouchActive ||
+      this.fileContentScrolling || this.loadingNextPage || this.timelineIndexing ||
+      (this.currentPath !== '' && (this.currentPageHasMore || !this.directoryTimeline.complete ||
+        this.indexedDirectoryKey !== this.currentRootType.toString() + ':' + this.currentPath))) { return false }
+    if (this.showImageViewer) {
+      const entry = this.committedViewerEntry()
+      return this.viewerInteractionUnlocked && entry !== null &&
+        ContinuationPolicy.directChild(this.currentPath, entry.path) && this.imageScale === 1
+    }
+    if (this.showVideoPlayer) {
+      return this.videoPrepared && !this.videoSeekPending && this.videoEntry !== null &&
+        ContinuationPolicy.directChild(this.currentPath, this.videoEntry.path)
+    }
+    return true
+  }
+
+  private continuationCanReceive(): boolean {
+    return this.continuationOperationIdle() && !this.continuationSending &&
+      !this.fileContentTouchActive && !this.fileContentScrolling &&
+      !this.showImageViewer && !this.showVideoPlayer &&
+      (this.screen === 'files' || this.screen === 'login' || this.screen === 'otp')
+  }
+
+  private captureContinuation(): ContinuationSnapshot {
+    const snapshot = new ContinuationSnapshot()
+    const state = snapshot.state
+    const identity = this.repository.sessionIdentity()
+    state.nasId = this.linkId.trim().toLowerCase()
+    state.userId = identity.substring(identity.lastIndexOf('|') + 1)
+    state.rootKind = this.rootKind; state.path = this.currentPath; state.rootType = this.currentRootType
+    state.view = this.fileViewMode; state.sort = this.fileSortKey; state.ascending = this.fileSortAscending
+    const items = this.fileViewMode === 'waterfall' ? this.waterfallEntries : this.entries
+    let first = this.fileViewMode === 'waterfall' ? this.waterfallVisibleStartIndex : this.fileVisibleStartIndex
+    if (this.fileViewMode === 'list') { first-- }
+    const firstEntry = items[Math.max(0, Math.min(first, items.length - 1))]
+    state.anchor = firstEntry === undefined ? '' : firstEntry.path
+    if (this.showImageViewer) {
+      state.scene = 'image'; state.target = this.committedViewerEntry()?.path ?? ''
+      state.anchor = state.target
+    } else if (this.showVideoPlayer) {
+      state.scene = 'video'; state.target = this.videoEntry?.path ?? ''
+      state.anchor = state.target; state.positionMs = Math.max(0, Math.floor(this.videoCurrentMs))
+      state.playing = this.videoPlaying
+    }
+    snapshot.entries = this.entries.slice()
+    return snapshot
+  }
+
+  private async restoreContinuation(snapshot: ContinuationSnapshot, valid: () => boolean): Promise<void> {
+    const state = snapshot.state
+    ContinuationPolicy.validate(state)
+    if (!ContinuationPolicy.sameAccount(state, this.linkId, this.repository.sessionIdentity()) ||
+      this.screen === 'login' || this.screen === 'otp' || this.offlineCacheMode) {
+      throw new ContinuationAccountRequired('请先登录相同 NAS 和账号')
+    }
+    const identity = this.repository.sessionIdentity()
+    const request = this.navigationRequestId
+    const unchanged = (): boolean => valid() && identity === this.repository.sessionIdentity() &&
+      request === this.navigationRequestId && this.continuationCanReceive()
+    // The target's authenticated network request is authoritative for permissions.
+    // Transferred metadata must never supply an endpoint or authorize a file operation.
+    const roots = await this.repository.getRootWithCache(true)
+    const visibleRoots = state.rootKind === 'personal' ? roots.personal : roots.shared
+    const ancestors = ContinuationPolicy.ancestors(state.path, visibleRoots)
+    if (state.path !== '') { await this.repository.listPage(state.path, 3, 1, true) }
+    if (!unchanged()) { throw new Error('接续期间页面或账号已经变化') }
+    const query = new DirectoryQuery()
+    query.path = state.path; query.rootType = state.path === ''
+      ? (state.rootKind === 'personal' ? roots.personalRootType : 3) : 3
+    query.sortKey = state.sort; query.ascending = state.ascending
+    const entries = state.path === '' ? visibleRoots.slice() : snapshot.entries
+    const target = entries.find((entry: FileEntry): boolean => entry.path === state.target)
+    if (state.scene !== 'directory' && (target === undefined || target.isDirectory ||
+      (state.scene === 'image' ? !this.isImage(target) : !this.isVideo(target)))) {
+      throw new Error('接续文件类型无效')
+    }
+    const ordered = DirectoryTimelinePolicy.query(entries, query)
+    const timeline = DirectoryTimelinePolicy.build(entries, true)
+    if (!unchanged()) { throw new Error('接续已取消') }
+    // All fallible network/identity work has finished. Commit one complete page
+    // under the opaque cover; never expose a partially restored home header.
+    this.navigationRequestId++
+    this.directoryIndexRequestToken++
+    this.pendingDirectoryIndexSnapshot = null
+    this.discardSearchSession()
+    this.continuationAncestorAnchors.clear()
+    ancestors.forEach((parent: string, index: number): void => {
+      this.continuationAncestorAnchors.set(parent, index + 1 < ancestors.length ? ancestors[index + 1] : state.path)
+    })
+    this.personalRoots = roots.personal; this.sharedRoots = roots.shared
+    this.personalRootEntriesType = roots.personalRootType
+    this.navigationStack = ancestors
+    this.navigationEntryStack = []
+    this.navigationRootTypeStack = ancestors.map((path: string): number => path === ''
+      ? (state.rootKind === 'personal' ? roots.personalRootType : 3) : 3)
+    this.navigationViewStateStack = ancestors.map((): DirectoryViewState => {
+      return { mode: this.defaultFileViewMode, offset: null, anchor: null }
+    })
+    this.navigationPageIndexStack = ancestors.map((): number => 1)
+    this.navigationPageHasMoreStack = ancestors.map((): boolean => false)
+    this.rootKind = state.rootKind
+    this.selectedBottomTab = state.rootKind === 'personal' ? 'home' : 'shared'
+    this.screen = 'files'; this.currentPath = state.path; this.currentRootType = query.rootType
+    this.fileSortKey = state.sort; this.fileSortAscending = state.ascending
+    this.indexedDirectoryKey = query.rootType.toString() + ':' + state.path
+    this.indexedDirectoryContentSignature = DirectoryTimelinePolicy.contentSignature(entries)
+    this.directoryTimeline = timeline; this.timelineIndexing = false
+    this.setCurrentPageState(Math.max(1, Math.ceil(entries.length / 200)), false)
+    this.replaceEntries(ordered, false, true)
+    this.fileViewMode = state.path === '' ? 'list' :
+      (state.view === 'waterfall' && !this.currentDirectoryIsPhotoAlbum ? 'grid' : state.view)
+    this.updateTopTitle(this.fileTitle(state.path))
+    this.topTitleOpacity = 1
+    this.updateBottomBarVisibility(false)
+    this.resetTimelineInteraction()
+    this.resetPreviewState(false)
+    await this.nextRenderFrame()
+    await this.nextRenderFrame()
+    if (!valid()) { return }
+    const anchor = this.entries.find((entry: FileEntry): boolean => entry.path === state.anchor)
+    if (anchor !== undefined) { this.scrollToLocatedEntry(anchor) }
+    await this.nextRenderFrame()
+    if (!valid()) { return }
+    if (state.scene === 'image' && target !== undefined) {
+      await this.openImageViewer(target, undefined, true, valid)
+    } else if (state.scene === 'video' && target !== undefined) {
+      await this.openVideoPlayer(target, state.positionMs, state.playing, valid)
+    }
+    await this.nextRenderFrame()
   }
 
   private async completeStartupAuthorization(retry: boolean): Promise<void> {
@@ -1643,6 +1840,12 @@ struct Index {
   }
 
   private initializeApplication(): void {
+    try {
+      this.appVersionName = bundleManager.getBundleInfoForSelfSync(
+        bundleManager.BundleFlag.GET_BUNDLE_INFO_DEFAULT).versionName
+    } catch (_) {
+      hilog.warn(0x0000, 'LinkFiles', 'Unable to read app version')
+    }
     // Ask the motor which presets it has before the first cue needs one, so
     // the very first long press does not fall back unnecessarily.
     HapticFeedback.prepare()
@@ -1722,6 +1925,7 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    ContinuationManager.shared().detach(this.continuationPage)
     this.startupAuthorizationToken++
     this.albumUpload.setForeground(false)
     this.gestureSharePageVisible = false
@@ -1917,6 +2121,7 @@ struct Index {
     if (!this.startupAuthorized) { return }
     if (this.transferNavigationRequest <= this.transferNavigationHandled ||
       this.screen === 'login' || this.screen === 'otp') { return }
+    if (this.continuationPending || this.continuationSending) { ContinuationManager.shared().cancel() }
     if (this.isBusy && !this.isNavigating && !this.showPageTransition) { return }
     this.transferNavigationHandled = this.transferNavigationRequest
     if (this.showVideoPlayer) { this.closeVideoPlayer() }
@@ -2040,6 +2245,7 @@ struct Index {
   }
 
   private onGestureShareStateChanged(): void {
+    this.onContinuationSceneChanged()
     this.syncGestureShareRegistration()
   }
 
@@ -2965,6 +3171,9 @@ struct Index {
   }
 
   onBackPress(): boolean {
+    if (this.continuationPending || this.continuationSending) {
+      ContinuationManager.shared().cancel(); return true
+    }
     if (!this.startupAuthorized) { this.exitBeforeAuthorization(); return true }
     if (this.showAlbumPicker) { this.albumConfirmationPending = false; this.showAlbumPicker = false; return true }
     if (this.showAlbumUpload) {
@@ -3333,6 +3542,32 @@ struct Index {
       this.DestinationFolderOverlay()
       this.ImageViewerDetailsOverlay()
       this.AlbumUploadOverlay()
+      if (this.startupAuthorized && !this.startupRestoring && this.continuationPending &&
+        this.continuationWaitingForAccount) {
+        Row({ space: 12 }) {
+          Text('接续需要登录相同的 NAS 和账号').fontSize(14).layoutWeight(1)
+            .fontColor($r('sys.color.font_primary'))
+          Button('取消').fontSize(14).height(36)
+            .onClick(() => ContinuationManager.shared().cancel())
+        }
+        .padding(16).width('100%').backgroundColor($r('app.color.page_background'))
+        .position({ x: 0, y: this.topSafeInset() + HeaderStyle.overlayHeight }).zIndex(190)
+      }
+      if (this.startupAuthorized && !this.startupRestoring &&
+        ((this.continuationPending && !this.continuationWaitingForAccount) || this.continuationSending)) {
+        Column({ space: 16 }) {
+          Image($r('app.media.icon')).width(76).height(76).objectFit(ImageFit.Contain).borderRadius(18)
+          LoadingProgress().width(24).height(24).color('#2E6BFF')
+          Text(this.continuationSending ? '正在准备接续…' : '正在接续…')
+            .fontSize(14).fontColor($r('sys.color.font_secondary'))
+          Button('取消').height(40).fontSize(14).backgroundColor(Color.Transparent)
+            .fontColor($r('sys.color.font_secondary')).onClick(() => ContinuationManager.shared().cancel())
+        }
+        .width('100%').height('100%').justifyContent(FlexAlign.Center).alignItems(HorizontalAlign.Center)
+        .backgroundColor($r('app.color.page_background'))
+        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+        .hitTestBehavior(HitTestMode.Block).zIndex(190).id('continuation-restoration-cover')
+      }
       if (!this.startupAuthorized || this.startupRestoring) {
         Column({ space: 16 }) {
           Image($r('app.media.icon')).width(76).height(76)
@@ -3413,6 +3648,7 @@ struct Index {
         this.noteUserInteraction()
       } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
         this.fileContentTouchActive = false
+        ContinuationManager.shared().refresh()
         this.lastUserInteractionMonotonic = this.getMonotonicNow()
         this.requestViewerCleanup()
       }
@@ -4370,7 +4606,7 @@ struct Index {
 
   private async confirmRemoveAlbumUpload(job: AlbumUploadJob): Promise<void> {
     HapticFeedback.warn()
-    const result = await this.getUIContext().getPromptAction().showDialog({ title: '移除图库文件夹上传记录？',
+    const result = await this.showTrackedDialog({ title: '移除图库文件夹上传记录？',
       message: '停止本批上传并移除任务记录，已上传到 NAS 的图片会保留。',
       buttons: [{ text: '取消', color: this.isDarkTheme ? '#FFFFFFFF' : '#536174' }, { text: '移除', color: '#D34D5C' }],
       systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THICK, false) })
@@ -4546,7 +4782,7 @@ struct Index {
       }
       if (uris.length === 0) { return }
       // Reading starts after the system picker has returned and the user confirms the destination.
-      const confirmation = await this.getUIContext().getPromptAction().showDialog({ title: '上传 ' + uris.length + ' 个文件',
+      const confirmation = await this.showTrackedDialog({ title: '上传 ' + uris.length + ' 个文件',
         message: '上传到：' + target + '\n保留原文件，同名文件跳过。',
         buttons: [{ text: '取消', color: '#536174' }, { text: '上传', color: '#2E6BFF' }],
         systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THICK, false) })
@@ -5630,6 +5866,14 @@ struct Index {
           .clip(true)
           .backgroundColor($r('app.color.surface_card'))
           .opacity(this.isBusy ? 0.5 : 1)
+
+          if (this.appVersionName.length > 0) {
+            Text('版本 ' + this.appVersionName)
+              .fontSize(12)
+              .fontColor($r('app.color.text_tertiary'))
+              .width('100%')
+              .textAlign(TextAlign.Center)
+          }
         }
         .width('100%')
         .alignItems(HorizontalAlign.Start)
@@ -9327,6 +9571,7 @@ struct Index {
     // 修复缩略图一直占位：仅在无真实手势触控时结束滚动状态并 flush pending queue
     if (!this.fileContentTouchActive) {
       this.fileContentScrolling = false
+      ContinuationManager.shared().refresh()
       flushedCount = this.flushPendingVisibleLoads()
     }
 
@@ -11009,7 +11254,7 @@ struct Index {
 
   private async showErrorDialog(message: string, title: string): Promise<void> {
     try {
-      await this.getUIContext().getPromptAction().showDialog({
+      await this.showTrackedDialog({
         title: title,
         message: message,
         buttons: [
@@ -14083,7 +14328,7 @@ struct Index {
       return
     }
     HapticFeedback.warn()
-    const response = await this.getUIContext().getPromptAction().showDialog({
+    const response = await this.showTrackedDialog({
       title: '永久删除？',
       message: '「' + entry.name + '」会被永久删除，之后无法恢复。',
       buttons: [
@@ -14112,7 +14357,7 @@ struct Index {
       return
     }
     HapticFeedback.warn()
-    const response = await this.getUIContext().getPromptAction().showDialog({
+    const response = await this.showTrackedDialog({
       title: '清空当前目录？',
       message: this.recycleEntries.length.toString() + ' 项会被永久删除，之后无法恢复。',
       buttons: [
@@ -14710,6 +14955,7 @@ struct Index {
       console.info('[TapTrace] scroll-start')
     }
     this.fileContentScrolling = true
+    ContinuationManager.shared().refresh()
     this.noteUserInteraction()
     let currentOffsetY = 0
     try {
@@ -14735,6 +14981,7 @@ struct Index {
     }
     this.closeSessionActive = false
     this.fileContentScrolling = false
+    ContinuationManager.shared().refresh()
     this.lastUserInteractionMonotonic = this.getMonotonicNow()
     this.requestViewerCleanup()
     let currentOffsetY = 0
@@ -15506,6 +15753,7 @@ struct Index {
     }
     if (previousPath.length === 0) {
       this.isBusy = true
+      const childAnchor = this.continuationAncestorAnchors.get('')
       const incomingEntries = this.rootKind === 'personal' ? this.personalRoots : this.sharedRoots
       await this.transitionBackFileContent(incomingEntries, previousViewState,
         '', (preparedEntries: FileEntry[]): void => {
@@ -15525,6 +15773,11 @@ struct Index {
         this.applyPreferredViewMode()
         this.updateBottomBarVisibility(true)
       })
+      if (childAnchor !== undefined) {
+        this.continuationAncestorAnchors.delete('')
+        const child = this.entries.find((entry: FileEntry): boolean => entry.path === childAnchor)
+        if (child !== undefined) { this.scrollToLocatedEntry(child) }
+      }
       return
     }
 
@@ -15558,9 +15811,25 @@ struct Index {
     }
 
     this.isBusy = true
+    const returnIdentity = this.repository.sessionIdentity()
+    const returnRequest = this.navigationRequestId
     try {
+      const childAnchor = this.continuationAncestorAnchors.get(previousPath)
       const loadedPage = await this.repository.listPage(previousPath, previousRootType, 1)
-      await this.transitionBackFileContent(loadedPage.entries, previousViewState,
+      let loadedEntries = loadedPage.entries
+      if (childAnchor !== undefined) {
+        const snapshot = await this.repository.ensureDirectoryIndex(previousPath, previousRootType)
+        if (!snapshot.timeline.complete) { throw new Error('父目录尚未加载完整') }
+        const query = new DirectoryQuery()
+        query.path = previousPath; query.rootType = previousRootType
+        query.sortKey = this.fileSortKey; query.ascending = this.fileSortAscending
+        loadedEntries = DirectoryTimelinePolicy.query(snapshot.entries, query)
+        loadedPage.pageIndex = Math.max(1, Math.ceil(loadedEntries.length / 200))
+        loadedPage.hasMore = false
+      }
+      if (returnIdentity !== this.repository.sessionIdentity() || returnRequest !== this.navigationRequestId ||
+        this.screen !== 'files') { return }
+      await this.transitionBackFileContent(loadedEntries, previousViewState,
         previousPath, (preparedEntries: FileEntry[]): void => {
         this.navigationStack = stack
         this.navigationEntryStack = entryStack
@@ -15580,10 +15849,15 @@ struct Index {
         this.updateDirectoryCount(previousPath, loadedPage.totalCount >= 0
           ? loadedPage.totalCount : loadedPage.entries.length)
       })
+      if (childAnchor !== undefined) {
+        this.continuationAncestorAnchors.delete(previousPath)
+        const child = this.entries.find((entry: FileEntry): boolean => entry.path === childAnchor)
+        if (child !== undefined) { this.scrollToLocatedEntry(child) }
+      }
     } catch (error) {
       this.reportError(error as Object, '返回目录失败')
     } finally {
-      if (!this.showPageTransition) {
+      if (!this.showPageTransition && returnRequest === this.navigationRequestId) {
         this.isBusy = false
       }
     }
@@ -15975,7 +16249,7 @@ struct Index {
     if (entry.isDirectory && entry.childCount >= 0) {
       lines.splice(1, 0, '项目：' + entry.childCount.toString() + ' 项')
     }
-    await this.getUIContext().getPromptAction().showDialog({
+    await this.showTrackedDialog({
       title: entry.name,
       message: lines.join('\n'),
       buttons: [{ text: '知道了', color: this.isDarkTheme ? '#FFFFFFFF' : '#536174' }],
@@ -16569,7 +16843,8 @@ struct Index {
     this.imageVisualEpoch += 1
   }
 
-  private async openImageViewer(entry: FileEntry, customImageEntries?: FileEntry[]): Promise<void> {
+  private async openImageViewer(entry: FileEntry, customImageEntries?: FileEntry[],
+    continuationOpen: boolean = false, continuationValid: (() => boolean) | null = null): Promise<void> {
     this.tapTraceBegin('openImageViewer ' + entry.name)
     this.cancelViewerCleanupTimer()
     if (this.isBusy || this.viewerClosePending || entry.isDirectory) {
@@ -16595,6 +16870,7 @@ struct Index {
       }
       this.captureViewerReturnScrollPosition()
       const persistedState = await this.loadPersistedImageDisplayState(imageEntries)
+      if (continuationValid !== null && !continuationValid()) { throw new Error('Continuation cancelled') }
       this.tapTrace('after-persistedState')
       this.viewerGeneration += 1
       const openingGeneration = this.viewerGeneration
@@ -16619,6 +16895,7 @@ struct Index {
       // Prefer cached original metadata, falling back to the thumbnail before
       // mounting, including the persisted base-orientation swap.
       await this.primeViewerFrameWindow(imageEntries, initialIndex, 2)
+      if (continuationValid !== null && !continuationValid()) { throw new Error('Continuation cancelled') }
       this.tapTrace('after-primeFrameWindow')
       this.ensureViewerImageFrame(entry)
       this.tapTrace('after-ensureFrame')
@@ -16644,11 +16921,12 @@ struct Index {
       // local thumbnail is unavailable we intentionally use the ordinary
       // no-geometry transition instead of inventing a frame.
       await this.ensureViewerPreviewBitmap(entry)
+      if (continuationValid !== null && !continuationValid()) { throw new Error('Continuation cancelled') }
       this.tapTrace('after-ensurePreviewBitmap')
       // Commit the source-only frame first. The following hierarchy swap is
       // the sole state change inside animateTo, so one Image leaves the file
       // surface at exactly the moment its viewer counterpart is inserted.
-      this.startViewerEntryTransition(entry)
+      if (!continuationOpen) { this.startViewerEntryTransition(entry) }
       this.tapTrace('after-startTransition',
         'sharedElement=' + this.viewerEntryTransitionActive.toString())
       this.logViewerDiagnostic(this.viewerEntryTransitionActive
@@ -16729,6 +17007,7 @@ struct Index {
         this.postRenderFrame((): void => this.closeImageViewer())
         return
       }
+      if (continuationValid !== null && !continuationValid()) { throw new Error('Continuation cancelled') }
       this.enableImageViewerAutoRotation()
       // Mount the viewer and its ring before doing any local original work.
       // A cache hit has no HTTP byte progress, so it stays gray during local
@@ -16748,8 +17027,14 @@ struct Index {
       this.showImageViewer = false
       this.viewerSurfaceOpacity = 1
       this.viewerFallbackEntryActive = false
+      if (continuationValid !== null && !continuationValid()) {
+        this.viewerGeneration++
+        this.viewerBlocksFileContent = false
+        this.statusText = ''
+      } else {
       this.reportError(error as Object, '图片预览失败')
       this.statusText = '图片预览失败'
+      }
     } finally {
       this.isBusy = false
       // 打开期间被挡下的点击在这里补上
@@ -18869,7 +19154,7 @@ struct Index {
     this.closeImageMoreMenu()
     this.closeImageDetails()
     HapticFeedback.warn()
-    const response = await this.getUIContext().getPromptAction().showDialog({
+    const response = await this.showTrackedDialog({
       title: '删除图片？',
       message: '图片会移入云盘回收站，可在云盘中恢复。',
       buttons: [
@@ -18997,7 +19282,8 @@ struct Index {
    * coordinates their lifetime and renders a poster until the first real
    * video frame arrives.
    */
-  private async openVideoPlayer(entry: FileEntry): Promise<void> {
+  private async openVideoPlayer(entry: FileEntry, continuationPosition: number = -1,
+    continuationPlaying: boolean = true, continuationValid: (() => boolean) | null = null): Promise<void> {
     if (this.isBusy || entry.isDirectory) {
       return
     }
@@ -19017,6 +19303,7 @@ struct Index {
     this.videoPosterFixedOrientation = openingSurface === 'none'
       ? ImageRotateOrientation.AUTO : this.fileImageSourceOrientation(entry, openingSurface)
     await this.ensurePlaybackState()
+    if (continuationValid !== null && !continuationValid()) { return }
 
     const playerAlreadyVisible = this.showVideoPlayer && this.videoEntry !== null
     const token = this.videoOpenToken + 1
@@ -19039,7 +19326,9 @@ struct Index {
         await this.videoTransferManager.releaseSource(entry)
         return
       }
-      const position = await this.videoTransferManager.playbackPosition(entry)
+      if (continuationValid !== null && !continuationValid()) { throw new Error('Continuation cancelled') }
+      const position = continuationPosition >= 0 ? continuationPosition :
+        await this.videoTransferManager.playbackPosition(entry)
       if (this.videoPosterUri.length === 0) {
         this.videoPosterUri = this.previewUri(entry)
       }
@@ -19129,6 +19418,7 @@ struct Index {
           this.videoCurrentMs = this.videoDurationMs > 0
             ? Math.min(this.videoDurationMs, Math.max(0, actualMs)) : Math.max(0, actualMs)
           this.videoTimelineReady = this.videoDurationMs > 0
+          ContinuationManager.shared().refresh()
           this.videoTransferManager.savePlaybackPosition(entry, this.videoCurrentMs)
             .catch((): void => {})
           this.updateVideoMediaSession(true)
@@ -19212,7 +19502,8 @@ struct Index {
           this.updateVideoMediaSession(true)
           this.reportError(error, '视频播放失败')
         }
-      }, this.autoPlayOnOpen)
+      }, continuationPosition >= 0 ? continuationPlaying : this.autoPlayOnOpen)
+      if (continuationValid !== null && !continuationValid()) { throw new Error('Continuation cancelled') }
       if (token !== this.videoOpenToken) {
         return
       }
@@ -19220,7 +19511,7 @@ struct Index {
         this.videoChromeVisible = true
         this.showVideoPlayer = true
       } else {
-        const useGeometryTransition = this.startVideoEntryTransition(entry)
+        const useGeometryTransition = continuationPosition < 0 && this.startVideoEntryTransition(entry)
         this.videoChromeVisible = false
         this.videoOverlayOpacity = useGeometryTransition ? 1 : 0
         if (useGeometryTransition) {
@@ -19252,6 +19543,7 @@ struct Index {
           })
         }
       }
+      if (continuationValid !== null && !continuationValid()) { throw new Error('Continuation cancelled') }
       this.revealVideoSurfaceIfReady(entry)
       this.videoOpeningPath = ''
       if (this.videoCloseRequested) {
@@ -19296,8 +19588,13 @@ struct Index {
         this.destroyVideoPipController()
         this.syncVideoBackgroundTask()
         this.videoMediaSession.close().catch((): void => {})
+        if (continuationValid !== null && !continuationValid()) {
+          await this.videoTransferManager.releaseSource(entry)
+          this.statusText = ''
+        } else {
         this.reportError(error as Object, '视频播放失败')
         this.statusText = '视频播放失败'
+        }
       }
     } finally {
       if (token === this.videoOpenToken) {
@@ -20906,7 +21203,7 @@ struct Index {
       return true
     }
     const sizeText = entry.size > 0 ? this.formatSize(entry.size) : '大小未知'
-    const response = await this.getUIContext().getPromptAction().showDialog({
+    const response = await this.showTrackedDialog({
       title: '使用移动网络下载？',
       message: entry.name + ' · ' + sizeText,
       buttons: [
@@ -21667,7 +21964,7 @@ struct Index {
     if (this.networkClass === 'offline') {
       return false
     }
-    const response = await this.getUIContext().getPromptAction().showDialog({
+    const response = await this.showTrackedDialog({
       title: '使用移动网络分享？',
       message: entries.length.toString() + ' 个文件需要先缓存到本机',
       buttons: [
@@ -21730,7 +22027,7 @@ struct Index {
     }
     this.closeSelectionMoreMenu()
     HapticFeedback.warn()
-    const response = await this.getUIContext().getPromptAction().showDialog({
+    const response = await this.showTrackedDialog({
       title: '删除 ' + entries.length.toString() + ' 项？',
       message: '所选项目会移入云盘回收站，可在云盘中恢复。',
       buttons: [
@@ -22069,7 +22366,7 @@ struct Index {
     }
     this.closeActionMenu()
     HapticFeedback.warn()
-    const response = await this.getUIContext().getPromptAction().showDialog({
+    const response = await this.showTrackedDialog({
       title: '删除文件？',
       message: '文件会移入云盘回收站，可在云盘中恢复。',
       buttons: [
@@ -22129,6 +22426,7 @@ struct Index {
     }
     for (const entry of entries) {
       this.pendingDeleteEntryPaths[this.directoryEntryKey(entry.path, rootType)] = true
+      this.continuationPendingDeletes.add(this.directoryEntryKey(entry.path, rootType))
     }
     return true
   }
@@ -22136,7 +22434,9 @@ struct Index {
   private finishDeleteOperation(entry: FileEntry, rootType: number, deleted: boolean): void {
     const key = this.directoryEntryKey(entry.path, rootType)
     this.pendingDeleteEntryPaths[key] = false
+    this.continuationPendingDeletes.delete(key)
     this.locallyDeletedEntryPaths[key] = deleted
+    ContinuationManager.shared().refresh()
   }
 
   private isDeletePending(path: string, rootType: number): boolean {
@@ -23378,7 +23678,7 @@ struct Index {
   private async confirmRemoveDownloadTask(task: DownloadTaskRecord): Promise<void> {
     if (task.id.startsWith('upload:')) {
       HapticFeedback.warn()
-      const response = await this.getUIContext().getPromptAction().showDialog({ title: '移除上传记录？',
+      const response = await this.showTrackedDialog({ title: '移除上传记录？',
         message: task.status === 'completed' ? '只移除记录，保留云盘中的文件。' :
           '清理此次上传的本地暂存与云盘断点；原文件不受影响。',
         buttons: [{ text: '取消', color: '#536174' }, { text: '移除', color: '#D34D5C' }],
@@ -23393,7 +23693,7 @@ struct Index {
       ? '只移除下载记录，不会删除系统下载目录中的文件。'
       : '会删除当前未完成的临时文件，已下载的部分不能保留。'
     HapticFeedback.warn()
-    const response = await this.getUIContext().getPromptAction().showDialog({
+    const response = await this.showTrackedDialog({
       title: '移除下载记录？',
       message: message,
       buttons: [
@@ -23605,7 +23905,7 @@ struct Index {
       return
     }
     HapticFeedback.warn()
-    const response = await this.getUIContext().getPromptAction().showDialog({
+    const response = await this.showTrackedDialog({
       title: '退出账号？',
       message: '退出后将清除当前登录会话，自动登录也会关闭。',
       buttons: [
