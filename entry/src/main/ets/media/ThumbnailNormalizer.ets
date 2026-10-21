@@ -15,7 +15,7 @@ export interface PreparedThumbnail {
 export class ThumbnailNormalizer {
   async prepare(bytes: Uint8Array, entryPath: string, sourceName: string,
     cacheDirectory: string, cacheLimitBytes: number, profile: ThumbnailProfile,
-    cacheKey: string): Promise<PreparedThumbnail | null> {
+    cacheKey: string, normalizeEmbeddedArtwork: boolean = false): Promise<PreparedThumbnail | null> {
     const startedAt = Date.now()
     let source: image.ImageSource | null = null
     let pixelMap: image.PixelMap | null = null
@@ -35,7 +35,7 @@ export class ThumbnailNormalizer {
       // ArkUI Image renders these files correctly while ImageSource's metadata
       // decoder rejects this NAS encoding. Keep the server thumbnail as-is;
       // ImageFit.Cover performs visual cropping without changing its geometry.
-      if (profile === 'list' && this.hasImageSignature(bytes) &&
+      if (!normalizeEmbeddedArtwork && profile === 'list' && this.hasImageSignature(bytes) &&
         bytes.byteLength <= ThumbnailPolicy.SERVER_THUMBNAIL_MAX_BYTES) {
         const metrics: ThumbnailMetrics = {
           path: entryPath,
@@ -54,7 +54,7 @@ export class ThumbnailNormalizer {
       const sourceFile = fileIo.openSync(outputPath, fileIo.OpenMode.READ_ONLY)
       sourceFd = sourceFile.fd
       source = image.createImageSource(sourceFd)
-      const sourceInfo = source.getImageInfoSync()
+      const sourceInfo = normalizeEmbeddedArtwork ? await source.getImageInfo() : source.getImageInfoSync()
       const sourceWidth = Math.max(1, sourceInfo.size.width)
       const sourceHeight = Math.max(1, sourceInfo.size.height)
       let outputBytes = bytes
@@ -70,7 +70,7 @@ export class ThumbnailNormalizer {
           sampleSize: ThumbnailPolicy.sampleSize(sourceWidth, sourceHeight, profile),
           editable: false
         })
-        const outputInfo = pixelMap.getImageInfoSync()
+        const outputInfo = normalizeEmbeddedArtwork ? await pixelMap.getImageInfo() : pixelMap.getImageInfoSync()
         outputWidth = Math.max(1, outputInfo.size.width)
         outputHeight = Math.max(1, outputInfo.size.height)
         outputPixelBytes = pixelMap.getPixelBytesNumber()

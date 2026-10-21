@@ -17,43 +17,101 @@ export class AudioPlaybackManager {
   private durationListener: AudioDurationListener | null = null
   private stateListener: AudioStateListener | null = null
   private errorListener: AudioErrorListener | null = null
+  private operation: number = 0
+  private cancelInitialization: (() => void) | null = null
+  private pendingSeek: number = -1
+  private seekTimer: number = -1
 
   async open(path: string, onTime: AudioTimeListener, onDuration: AudioDurationListener,
     onState: AudioStateListener, onError: AudioErrorListener): Promise<void> {
+    const token = this.operation + 1
     await this.release()
-
+    if (token !== this.operation) { return }
     const player = await media.createAVPlayer()
-    const sourceFile = await fileIo.open(path, fileIo.OpenMode.READ_ONLY)
+    let sourceFile: fileIo.File
+    try {
+      sourceFile = await fileIo.open(path, fileIo.OpenMode.READ_ONLY)
+    } catch (error) {
+      await player.release().catch(() => {})
+      throw error as Error
+    }
+    if (token !== this.operation) {
+      await player.release().catch(() => {})
+      fileIo.closeSync(sourceFile.fd)
+      return
+    }
     this.player = player
     this.sourceFd = sourceFile.fd
     this.timeListener = onTime
     this.durationListener = onDuration
     this.stateListener = onState
     this.errorListener = onError
+    let initialized: (() => void) | null = null
 
     player.on('stateChange', (state: media.AVPlayerState) => {
+      if (this.player !== player || token !== this.operation) { return }
+      if (state === 'initialized') { initialized?.() }
       if (this.stateListener !== null) {
         this.stateListener(state)
       }
     })
     player.on('timeUpdate', (timeMs: number) => {
+      if (this.player !== player || token !== this.operation) { return }
+      if (this.pendingSeek >= 0) { return }
       if (this.timeListener !== null) {
         this.timeListener(timeMs)
       }
     })
+    player.on('seekDone', (timeMs: number) => {
+      if (this.player !== player || token !== this.operation || this.pendingSeek < 0) { return }
+      // A rapid second seek may precede the first seekDone event.
+      if (Math.abs(timeMs - this.pendingSeek) > 1500) { return }
+      this.clearSeek()
+      this.timeListener?.(timeMs)
+    })
     player.on('durationUpdate', (durationMs: number) => {
+      if (this.player !== player || token !== this.operation) { return }
       if (this.durationListener !== null) {
         this.durationListener(durationMs)
       }
     })
     player.on('error', (error) => {
+      if (this.player !== player || token !== this.operation) { return }
+      this.cancelInitialization?.()
       if (this.errorListener !== null) {
         this.errorListener(error as Object)
       }
     })
 
-    player.url = 'fd://' + this.sourceFd.toString()
-    await player.prepare()
+    try {
+      // MediaKit accepts prepare only after the initialized state event.
+      // A slow source assignment must also be cancellable when Back is tapped.
+      await new Promise<void>((resolve: () => void, reject: (error: Error) => void): void => {
+        let finished = false
+        const timer = setTimeout((): void => { this.cancelInitialization?.() }, 15000)
+        initialized = (): void => {
+          if (finished) { return }
+          finished = true; clearTimeout(timer); this.cancelInitialization = null; resolve()
+        }
+        this.cancelInitialization = (): void => {
+          if (finished) { return }
+          finished = true; clearTimeout(timer); this.cancelInitialization = null
+          reject(new Error('音频准备已取消或超时'))
+        }
+        try {
+          player.url = 'fd://' + this.sourceFd.toString()
+          if (player.state === 'initialized') { initialized() }
+        } catch (error) {
+          this.cancelInitialization()
+        }
+      })
+      if (this.player !== player || token !== this.operation) { return }
+      await player.prepare()
+    } catch (error) {
+      if (this.player === player) { await this.release() }
+      throw error as Error
+    }
+    if (this.player !== player || token !== this.operation) { return }
     if (player.duration > 0 && this.durationListener !== null) {
       this.durationListener(player.duration)
     }
@@ -96,11 +154,24 @@ export class AudioPlaybackManager {
     }
     if (this.player.state === 'prepared' || this.player.state === 'playing' ||
       this.player.state === 'paused' || this.player.state === 'completed') {
-      this.player.seek(Math.max(0, Math.floor(timeMs)))
+      if (!Number.isFinite(timeMs)) { return }
+      const target = Math.min(this.player.duration, Math.max(0, Math.floor(timeMs)))
+      this.clearSeek()
+      this.pendingSeek = target
+      const player = this.player
+      this.seekTimer = setTimeout((): void => {
+        if (this.player !== player) { return }
+        this.clearSeek()
+        this.timeListener?.(Math.max(0, player.currentTime))
+      }, 2000)
+      try { player.seek(target) } catch (_) { this.clearSeek() }
     }
   }
 
   async release(): Promise<void> {
+    this.operation++
+    this.clearSeek()
+    this.cancelInitialization?.()
     const player = this.player
     const sourceFd = this.sourceFd
     this.player = null
@@ -126,5 +197,10 @@ export class AudioPlaybackManager {
         // The player may already have closed the descriptor.
       }
     }
+  }
+
+  private clearSeek(): void {
+    if (this.seekTimer >= 0) { clearTimeout(this.seekTimer); this.seekTimer = -1 }
+    this.pendingSeek = -1
   }
 }

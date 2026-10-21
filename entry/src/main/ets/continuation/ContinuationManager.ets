@@ -25,6 +25,8 @@ class ContinuationData {
 
 /** Owns native transport independently of page/window recreation and transfer queues. */
 export class ContinuationManager {
+  // 1.0.10 is the first release containing the continuation receiver.
+  private static readonly MIN_PEER_VERSION: number = 1000010
   private static instance: ContinuationManager = new ContinuationManager()
   static shared(): ContinuationManager { return ContinuationManager.instance }
   private context: common.UIAbilityContext | null = null
@@ -108,7 +110,7 @@ export class ContinuationManager {
       this.incomingId !== '' || typeof wantParam.targetDevice !== 'string' || wantParam.targetDevice === '') {
       return AbilityConstant.OnContinueResult.REJECT
     }
-    if (typeof wantParam.version !== 'number' || wantParam.version < 1000009) {
+    if (typeof wantParam.version !== 'number' || wantParam.version < ContinuationManager.MIN_PEER_VERSION) {
       this.message('请先更新另一台设备上的联文件')
       return AbilityConstant.OnContinueResult.MISMATCH
     }

@@ -8,6 +8,8 @@ import { RemoteFileSignature } from '../media/MediaLocalStore'
 import { ThumbnailNormalizer } from '../media/ThumbnailNormalizer'
 import { ThumbnailProfile } from '../media/ThumbnailPolicy'
 import { ThumbnailCacheStore } from '../media/ThumbnailCacheStore'
+import { AudioArtworkReader } from '../media/AudioArtworkReader'
+import { MediaPreviewManager } from '../media/MediaPreviewManager'
 import { DirectoryMetadataPage, DirectoryMetadataSnapshot, DirectoryMetadataStore } from './DirectoryMetadataStore'
 import { NetworkPolicy } from '../core/network/NetworkPolicy'
 import { NasConnection } from '../core/network/NasConnection'
@@ -81,6 +83,7 @@ export class UgreenRemoteRepository {
   private thumbnailNormalizer: ThumbnailNormalizer = new ThumbnailNormalizer()
   private thumbnailCacheStore: ThumbnailCacheStore = new ThumbnailCacheStore()
   private thumbnailRequests: Map<string, Promise<string>> = new Map<string, Promise<string>>()
+  private audioArtworkMisses: Map<string, number> = new Map<string, number>()
   private networkPolicy: NetworkPolicy = NetworkPolicy.shared()
   private meteredBackgroundRefreshAllowed: boolean = false
   private backgroundRefreshTimers: Record<string, number> = {}
@@ -109,6 +112,7 @@ export class UgreenRemoteRepository {
   }
 
   async clearThumbnailCache(): Promise<void> {
+    this.audioArtworkMisses.clear()
     await this.thumbnailCacheStore.clear()
   }
 
@@ -857,6 +861,73 @@ export class UgreenRemoteRepository {
     profile: ThumbnailProfile = 'list'): Promise<string> {
     return await this.client.withReconnect(() =>
       this.prepareThumbnailOnce(entry, cacheDirectory, maxBytes, profile))
+  }
+
+  /** Local extraction or bounded NAS tag ranges, never a whole-song icon download. */
+  async prepareAudioThumbnail(entry: FileEntry, localPath: string, cacheDirectory: string,
+    maxBytes: number): Promise<string> {
+    const identity = this.thumbnailIdentityKey(entry, 'list')
+    const existing = await this.thumbnailCacheStore.find(identity, entry.name + '.thumbnail')
+    if (existing.length > 0) { return existing }
+    if (localPath.length === 0 && !NasConnection.shared().canRequest()) { return '' }
+    const key = identity + ':embedded-audio'
+    // A cached original can succeed even when a previous remote tag was unsupported.
+    const attemptKey = key + (localPath.length > 0 ? ':local' : ':remote')
+    if ((this.audioArtworkMisses.get(attemptKey) ?? 0) > Date.now()) { return '' }
+    const pending = this.thumbnailRequests.get(attemptKey)
+    if (pending !== undefined) { return await pending }
+    const scope = this.sessionIdentity()
+    const request = this.extractAudioThumbnail(entry, localPath, cacheDirectory, maxBytes, key)
+    this.thumbnailRequests.set(attemptKey, request)
+    try {
+      const path = await request
+      if (scope !== this.sessionIdentity()) { return '' }
+      if (path.length > 0) {
+        await this.thumbnailCacheStore.register(identity, path)
+      } else {
+        this.audioArtworkMisses.set(attemptKey, Date.now() + 5 * 60 * 1000)
+        if (this.audioArtworkMisses.size > 512) {
+          this.audioArtworkMisses.delete(this.audioArtworkMisses.keys().next().value)
+        }
+      }
+      return path
+    } catch (_) {
+      // Transient network/decoder failures remain retryable on the next appearance.
+      return ''
+    } finally {
+      if (this.thumbnailRequests.get(attemptKey) === request) { this.thumbnailRequests.delete(attemptKey) }
+    }
+  }
+
+  private async extractAudioThumbnail(entry: FileEntry, localPath: string, cacheDirectory: string,
+    maxBytes: number, key: string): Promise<string> {
+    if (localPath.length > 0) {
+      return await new MediaPreviewManager().fromLocal(entry, localPath, cacheDirectory, maxBytes, key)
+    }
+    if (!/\.(mp3|flac|m4a|aac)$/i.test(entry.name) || entry.size <= 0 ||
+      !NasConnection.shared().canRequest()) { return '' }
+    const scope = this.sessionIdentity()
+    const descriptor = await this.downloadDescriptor(entry.path)
+    const deadline = Date.now() + 8000
+    let rangeFailed = false
+    const reader = new AudioArtworkReader(entry.size, async (offset: number, length: number): Promise<Uint8Array> => {
+      if (scope !== this.sessionIdentity() || !NasConnection.shared().canRequest() || Date.now() > deadline) {
+        rangeFailed = true
+        throw new Error('Audio tag cancelled')
+      }
+      try {
+        return (await this.transport.requestBinaryRange(descriptor.url, offset, length, descriptor.headers, 3000)).bytes
+      } catch (_) {
+        rangeFailed = true
+        throw new Error('Audio tag range unavailable')
+      }
+    })
+    const bytes = await reader.read()
+    if (rangeFailed) { throw new Error('Audio tag read interrupted') }
+    if (bytes.length === 0 || scope !== this.sessionIdentity()) { return '' }
+    const prepared = await this.thumbnailNormalizer.prepare(bytes, entry.path, entry.name + '.audio.preview.jpg',
+      cacheDirectory, maxBytes, 'list', key, true)
+    return prepared?.path ?? ''
   }
 
   private async prepareThumbnailOnce(entry: FileEntry, cacheDirectory: string, maxBytes: number,

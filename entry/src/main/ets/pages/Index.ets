@@ -41,6 +41,10 @@ import { CacheManager } from '../download/CacheManager'
 import { DownloadQueueManager } from '../download/DownloadQueueManager'
 import { UserFileManager } from '../download/UserFileManager'
 import { AudioPlaybackManager } from '../media/AudioPlaybackManager'
+import { AudioPlayerPage } from '../components/AudioPlayerPage'
+import { AudioCoverRect, AudioLyricLine, AudioPlayerPolicy, AudioPlayMode } from '../media/AudioPlayerPolicy'
+import { AudioMetadataReader } from '../media/AudioMetadataReader'
+import { AudioSessionManager } from '../media/AudioSessionManager'
 import { VideoPlaybackManager } from '../media/VideoPlaybackManager'
 import {
   VideoCastPlaybackSnapshot,
@@ -86,6 +90,7 @@ type RootKind = 'personal' | 'shared'
 type BottomTab = 'home' | 'shared' | 'downloads' | 'settings'
 type PageTransitionDirection = 'push' | 'pop'
 type FileViewMode = 'list' | 'grid' | 'waterfall'
+type DefaultViewKind = 'file' | 'photo' | 'audio'
 type FileSortKey = 'name' | 'type' | 'time' | 'size'
 type SearchReturnMode = 'none' | 'directory' | 'image' | 'audio' | 'video' | 'download'
 type FileAction = 'share' | 'openWith' | 'quickView' | 'multiSelect' | 'download' |
@@ -525,6 +530,32 @@ struct WaterfallThumbCell {
  *    不能再提一层 @Builder（历史上提取 @Builder 导致过场动画消失）。
  * ⚠️ 结果对象复用同一个实例（build 内会问 3~4 次，不能每次分配）。
  */
+@Component
+struct AudioFileLeadingCell {
+  @ObjectLink entry: FileEntry
+  resolve: (entry: FileEntry) => string = (): string => ''
+
+  private source(): string {
+    const revision = this.entry.previewRevision
+    return revision >= 0 ? this.resolve(this.entry) : ''
+  }
+
+  build() {
+    if (this.source().length > 0) {
+      Image(this.source())
+        .width(FileRowStyle.leadingWidth)
+        .height(FileRowStyle.leadingHeight)
+        .objectFit(ImageFit.Cover)
+        .borderRadius(6)
+    } else {
+      Image($r('sys.media.ohos_ic_normal_white_grid_audio'))
+        .width(FileRowStyle.iconSize)
+        .height(FileRowStyle.iconSize)
+        .objectFit(ImageFit.Contain)
+    }
+  }
+}
+
 @Component
 struct GridThumbCell {
   @ObjectLink entry: FileEntry
@@ -1064,6 +1095,46 @@ struct Index {
   @State audioPlaying: boolean = false
   @State audioCurrentMs: number = 0
   @State audioDurationMs: number = 0
+  @State audioTitle: string = ''
+  @State audioArtist: string = ''
+  @State audioCover: string = ''
+  @State audioMode: AudioPlayMode = 'order'
+  @State audioLyrics: AudioLyricLine[] = []
+  @State audioControlPending: boolean = false
+  @State showAudioQueue: boolean = false
+  @State audioOpening: boolean = false
+  @State audioClosing: boolean = false
+  @State audioPageOpacity: number = 1
+  @State audioCoverHidden: boolean = false
+  @State audioTransitionCoverScale: number = 0
+  @State audioFlightVisible: boolean = false
+  @State audioFlightX: number = 0
+  @State audioFlightY: number = 0
+  @State audioFlightWidth: number = 0
+  @State audioFlightHeight: number = 0
+  @State audioFlightRadius: number = 16
+  @State audioFlightOpacity: number = 1
+  @State audioFlightBaseSize: number = 320
+  private audioReturnHiddenPath: string = ''
+  private audioFlightSource: ResourceStr = ''
+  private audioCoverRect: AudioCoverRect = new AudioCoverRect()
+  private audioCoverVisibleRatio: number = 0
+  private audioThumbnailFrames: Map<string, AudioCoverRect> = new Map()
+  private audioThumbnailVisibility: Map<string, number> = new Map()
+  private audioOpenToken: number = 0
+  private audioEntryCloseRequested: boolean = false
+  private audioEntryTransitionResolve: (() => void) | null = null
+  private audioOriginSurface: ThumbnailSurfaceKind = 'none'
+  private audioOriginKey: string = ''
+  private audioOriginScope: string = ''
+  private audioQueue: FileEntry[] = []
+  private audioQueueSource: FileEntryDataSource = new FileEntryDataSource()
+  private audioQueueScroller: Scroller = new Scroller()
+  private audioSession: AudioSessionManager = new AudioSessionManager()
+  private audioSessionUpdatedAt: number = 0
+  private audioOwnsBusy: boolean = false
+  private audioPageOriginX: number = 0
+  private audioPageOriginY: number = 0
   // Playback preferences are kept separate from cache/network settings so
   // each settings page has one responsibility.
   @State backgroundVideoPlayback: boolean = true
@@ -1184,14 +1255,16 @@ struct Index {
   @State searchHistory: string[] = []
   @State searchHistoryExpanded: boolean = false
   @State fileViewMode: FileViewMode = 'list'
-  // 设置里的默认视图（方案 A：每次进目录都按默认，工具栏的手动切换不记录）。
-  // 无图目录只有 列表/网格；有图目录多一个 瀑布流。
+  // Defaults are separate for ordinary, photo/video and audio directories.
+  // Toolbar changes remain per-directory overrides for this app session only.
   @State defaultFileViewMode: FileViewMode = 'list'
   @State defaultPhotoViewMode: FileViewMode = 'grid'
+  @State defaultAudioViewMode: FileViewMode = 'list'
   // This is derived from the metadata already loaded for the current
   // directory. It deliberately does not trigger a second directory scan.
   // 当前目录是不是「图片目录」（全部都是图片/视频才为真）——决定用哪套呈现方式
   @State currentDirectoryIsPhotoAlbum: boolean = false
+  @State currentDirectoryIsAudioAlbum: boolean = false
   // 每个目录【本次运行期间】临时切过的视图模式（右下角按钮切的）。
   // 只存内存：进子目录再返回仍然保持，重启应用就回到设置里的默认值。
   private directoryViewModeOverrides: Record<string, FileViewMode> = {}
@@ -1946,6 +2019,7 @@ struct Index {
     this.viewerPrefetchCoordinator?.onViewerClosed()
     this.cancelViewerCleanupTimer()
     this.drainPendingViewerCleanupOnDisappear()
+    this.closeAudioPlayer(true)
     this.closeVideoPlayer()
     this.releaseImageAnalyzer()
     this.disableGestureShare()
@@ -2178,9 +2252,11 @@ struct Index {
     }
 
     if (this.showAudioPlayer && this.audioPlaying && !this.backgroundAudioPlayback) {
+      const token = this.audioOpenToken
       this.audioManager.pause().then((): void => {
-        if (this.playbackBackgroundActive) {
+        if (token === this.audioOpenToken && this.playbackBackgroundActive) {
           this.audioPlaying = false
+          this.updateAudioSession(true)
         }
       }).catch((error: Object): void => {
         console.warn('[UgreenAudio] background pause failed: ' + JSON.stringify(error))
@@ -3213,6 +3289,8 @@ struct Index {
       this.closeImageViewer()
       return true
     }
+    if (this.showAudioQueue) { this.showAudioQueue = false; return true }
+    if (this.audioClosing) { return true }
     if (this.showAudioPlayer) {
       this.closeAudioPlayer()
       return true
@@ -3531,8 +3609,9 @@ struct Index {
         this.ViewerReturnOverlay()
       }
       if (this.showAudioPlayer && this.audioEntry !== null) {
-        this.AudioPlayerOverlay(this.audioEntry as FileEntry)
+        this.AudioPlayerOverlay()
       }
+      if (this.audioFlightVisible) { this.AudioCoverFlight() }
       if (this.showVideoPlayer && this.videoEntry !== null) {
         this.VideoPlayerOverlay(this.videoEntry as FileEntry)
       }
@@ -3937,6 +4016,10 @@ struct Index {
         Blank()
           .width(FileRowStyle.leadingWidth)
           .height(FileRowStyle.leadingHeight)
+      } else if (this.isAudio(entry)) {
+        // List rows use in-place observed revisions like the grid. A value
+        // builder alone can stay on its initial icon after artwork arrives.
+        AudioFileLeadingCell({ entry: entry, resolve: (item: FileEntry): string => this.previewUri(item) })
       } else if (this.fileImageSourceAvailable(entry, surface)) {
         Image(this.fileImageSource(entry, surface))
             .width(FileRowStyle.leadingWidth)
@@ -4401,7 +4484,7 @@ struct Index {
       .onScrollStart((): void => this.onFileContentScrollStart())
       .onScrollStop((): void => this.onFileContentScrollStop())
       .onDidScroll((): void => this.onDragSelectionContentScrolled())
-      .onAreaChange((_, area) => this.recordDragSelectionViewport('list', area))
+      .onAreaChange((_, area) => this.recordFileScrollViewport('list', area))
       .onReachEnd(() => this.loadNextDirectoryPage())
       .padding({ left: 0, right: 0 })
       .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
@@ -5199,7 +5282,7 @@ struct Index {
     .onScrollStart((): void => this.onFileContentScrollStart())
     .onScrollStop((): void => this.onFileContentScrollStop())
     .onDidScroll((): void => this.onDragSelectionContentScrolled())
-    .onAreaChange((_, area) => this.recordDragSelectionViewport('grid', area))
+    .onAreaChange((_, area) => this.recordFileScrollViewport('grid', area))
     .onReachEnd(() => this.loadNextDirectoryPage())
     .width('100%')
     .layoutWeight(1)
@@ -5365,7 +5448,7 @@ struct Index {
     .onDidScroll((): void => this.onDragSelectionContentScrolled())
     .onReachEnd(() => this.loadNextDirectoryPage())
     .onAreaChange((_, area) => {
-      this.recordDragSelectionViewport('waterfall', area)
+      this.recordFileScrollViewport('waterfall', area)
       if (typeof area.width === 'number' && area.width > 0) {
         const columns = this.waterfallColumnCount()
         // 20 = 左右内边距，8 = 列间距；(columns - 1) 个间距
@@ -6251,23 +6334,24 @@ struct Index {
 
   /** 一个分段选择器：当前值高亮。 */
   @Builder
-  ViewModeSegment(photo: boolean) {
+  ViewModeSegment(kind: DefaultViewKind) {
     // 注意：当前值必须在 builder 内部读（this.xxx），不能当参数传进来 ——
     // @Builder 的值传参在状态变化时不会重建，高亮会停在旧值上。
     Row({ space: 8 }) {
-      ForEach(photo ? this.photoViewModeOptions() : this.fileViewModeOptions(),
+      ForEach(kind === 'photo' ? this.photoViewModeOptions() : this.fileViewModeOptions(),
         (mode: FileViewMode) => {
         Text(mode === 'list' ? '列表' : (mode === 'grid' ? '网格' : '瀑布流'))
           .fontSize(14)
-          .fontColor((photo ? this.defaultPhotoViewMode : this.defaultFileViewMode) === mode
+          .fontColor(this.defaultViewMode(kind) === mode
             ? Color.White : $r('app.color.text_secondary'))
           .textAlign(TextAlign.Center)
           .layoutWeight(1)
           .height(34)
           .borderRadius(17)
-          .backgroundColor((photo ? this.defaultPhotoViewMode : this.defaultFileViewMode) === mode
+          .backgroundColor(this.defaultViewMode(kind) === mode
             ? '#2E6BFF' : $r('app.color.surface_card'))
-          .onClick(() => { this.setDefaultViewMode(photo, mode) })
+          .onClick(() => { this.setDefaultViewMode(kind, mode) })
+          .id('default-view-' + kind + '-' + mode)
       }, (mode: FileViewMode) => mode)
     }
     .width('100%')
@@ -6288,11 +6372,11 @@ struct Index {
             .fontSize(15)
             .fontColor($r('app.color.text_primary'))
             .width('100%')
-          Text('没有图片的目录用这个')
+          Text('普通文件与混合目录用这个')
             .fontSize(12)
             .fontColor($r('app.color.text_tertiary'))
             .width('100%')
-          this.ViewModeSegment(false)
+          this.ViewModeSegment('file')
         }
         .width('100%')
         .padding(14)
@@ -6308,7 +6392,23 @@ struct Index {
             .fontSize(12)
             .fontColor($r('app.color.text_tertiary'))
             .width('100%')
-          this.ViewModeSegment(true)
+          this.ViewModeSegment('photo')
+        }
+        .width('100%')
+        .padding(14)
+        .borderRadius(16)
+        .backgroundColor($r('app.color.surface_card'))
+
+        Column({ space: 10 }) {
+          Text('音频目录的默认视图')
+            .fontSize(15)
+            .fontColor($r('app.color.text_primary'))
+            .width('100%')
+          Text('纯音频目录用这个')
+            .fontSize(12)
+            .fontColor($r('app.color.text_tertiary'))
+            .width('100%')
+          this.ViewModeSegment('audio')
         }
         .width('100%')
         .padding(14)
@@ -9464,6 +9564,7 @@ struct Index {
 
   private recordThumbnailArea(entry: FileEntry, index: number,
     surface: ThumbnailSurfaceKind, area: Area): void {
+    if (this.isAudio(entry)) { this.recordAudioThumbnailArea(entry, surface, area); return }
     if (!this.isImage(entry) || !this.thumbnailSurfaceIsCurrent(surface) ||
       typeof area.width !== 'number' || typeof area.height !== 'number' ||
       typeof area.globalPosition.x !== 'number' || typeof area.globalPosition.y !== 'number') {
@@ -9507,6 +9608,10 @@ struct Index {
 
   private recordThumbnailVisibility(entry: FileEntry, index: number,
     surface: ThumbnailSurfaceKind, ratio: number): void {
+    if (this.isAudio(entry)) {
+      if (this.thumbnailSurfaceIsCurrent(surface)) { this.audioThumbnailVisibility.set(entry.path, ratio) }
+      return
+    }
     if (!this.isImage(entry) || !this.thumbnailSurfaceIsCurrent(surface)) {
       return
     }
@@ -9603,6 +9708,7 @@ struct Index {
   }
 
   private shouldReplaceViewerTransitionSource(entry: FileEntry): boolean {
+    if (this.audioReturnHiddenPath === entry.path) { return true }
     // A shared element must leave the source hierarchy when its target is
     // inserted. Keeping the video thumbnail Image mounted (and merely
     // clearing its id) makes the opening hierarchy contain two real images,
@@ -10699,115 +10805,95 @@ struct Index {
   }
 
   @Builder
-  AudioPlayerOverlay(entry: FileEntry): void {
-    Column() {
-      Row() {
-        Text('音频播放')
-          .fontSize(19)
-          .fontWeight(FontWeight.Bold)
-          .fontColor(Color.White)
-          .layoutWeight(1)
-        Text('×')
-          .fontSize(30)
-          .fontColor($r('app.color.text_secondary'))
-          .onClick(() => this.closeAudioPlayer())
-      }
-      .width('100%')
-      .width('92%')
-      .padding({ left: 16, right: 16, top: 10, bottom: 10 })
-      .borderRadius(24)
-      .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, false, '#66101828'))
-      .margin({ top: 12 })
-
-      Column({ space: 14 }) {
-        if (this.previewUri(entry).length > 0) {
-          Image(this.previewUri(entry))
-            .width(190)
-            .height(190)
-            .orientation(ImageRotateOrientation.AUTO)
-            .objectFit(ImageFit.Cover)
-            .borderRadius(26)
-        } else {
-          SymbolGlyph($r('sys.symbol.doc_text'))
-            .fontSize(78)
-            .fontColor([$r('sys.color.icon_secondary')])
-        }
-        Text(entry.name)
-          .fontSize(20)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(Color.White)
-          .maxLines(2)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .textAlign(TextAlign.Center)
-        Text('来自云盘的音频 · 已准备播放')
-          .fontSize(13)
-          .fontColor($r('app.color.text_faint'))
-      }
-      .width('88%')
-      .layoutWeight(1)
-      .justifyContent(FlexAlign.Center)
-
-      Column({ space: 10 }) {
-        Row() {
-          Text(this.formatPlaybackTime(this.audioCurrentMs))
-            .fontSize(12)
-            .fontColor($r('app.color.text_secondary'))
-            .layoutWeight(1)
-          Text(this.formatPlaybackTime(this.audioDurationMs))
-            .fontSize(12)
-            .fontColor($r('app.color.text_secondary'))
-        }
-        .width('100%')
-        Slider({
-          value: Math.min(this.audioCurrentMs, Math.max(1, this.audioDurationMs)),
-          min: 0,
-          max: Math.max(1, this.audioDurationMs)
-        })
-          .width('100%')
-          .onChange((value: number) => this.seekAudio(value))
-        Row({ space: 10 }) {
-          Button('重置')
-            .layoutWeight(1)
-            .height(44)
-            .fontSize(14)
-            .fontColor($r('app.color.text_secondary'))
-            .backgroundColor(Color.Transparent)
-            .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THIN))
-            .enabled(!this.isBusy)
-            .onClick(() => this.rewindAudio())
-          Button(this.audioPlaying ? '暂停' : '播放')
-            .layoutWeight(1)
-            .height(44)
-            .fontSize(15)
-            .fontWeight(FontWeight.Medium)
-            .fontColor(Color.White)
-            .backgroundColor(Color.Transparent)
-            .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THIN, true, '#552E6BFF'))
-            .enabled(!this.isBusy)
-            .onClick(() => this.toggleAudio())
-          Button('保存 Download')
-            .layoutWeight(1)
-            .height(44)
-            .fontSize(13)
-            .fontColor($r('app.color.text_secondary'))
-            .backgroundColor(Color.Transparent)
-            .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THIN))
-            .enabled(!this.isBusy)
-            .onClick(() => this.cacheToLocal(entry))
-        }
-        .width('100%')
-      }
-      .width('92%')
-      .padding(16)
-      .borderRadius(28)
-      .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.REGULAR, false))
-      .margin({ bottom: 22 })
+  AudioPlayerOverlay(): void {
+    Stack() {
+      AudioPlayerPage({ cover: this.audioCover.length > 0 ? this.audioCover : $r('sys.media.ohos_ic_normal_white_grid_audio'),
+        title: this.audioTitle, artist: this.audioArtist,
+        format: AudioPlayerPolicy.format(this.audioEntry?.name ?? ''),
+        playing: this.audioPlaying, opening: this.audioOpening, coverScale: this.audioTransitionCoverScale,
+        busy: this.isBusy || this.audioControlPending || this.audioOpening || this.audioClosing,
+        positionMs: this.audioCurrentMs, durationMs: this.audioDurationMs, playMode: this.audioMode,
+        lyrics: this.audioLyrics, safeTop: this.topSafeInset(), safeBottom: this.bottomSafeInset(),
+        dark: this.isDarkTheme, coverHidden: this.audioCoverHidden,
+        onBack: () => this.closeAudioPlayer(), onToggle: () => this.toggleAudio(),
+        onPrevious: () => this.skipAudio(-1), onNext: () => this.skipAudio(1),
+        onMode: () => this.cycleAudioMode(), onQueue: () => this.openAudioQueue(),
+        onDownload: () => { if (this.audioEntry !== null) { this.cacheToLocal(this.audioEntry) } },
+        onMore: () => { if (this.audioEntry !== null) { this.showAudioActions(this.audioEntry) } },
+        onShare: () => { if (this.audioEntry !== null) { this.shareViewerImage(this.audioEntry) } },
+        onSeek: (value: number) => this.seekAudio(value),
+        onCoverArea: (area: Area) => this.recordAudioCoverArea(area),
+        onCoverVisibility: (ratio: number) => { this.audioCoverVisibleRatio = ratio },
+        backButton: () => { this.OfficialBackButton(() => this.closeAudioPlayer()) } })
     }
-    .width('100%')
-    .height('100%')
-    .backgroundColor('#101828')
-    .id('audio-overlay-root')
-    .zIndex(30)
+    .width('100%').height('100%').zIndex(30).id('audio-overlay-root')
+    .opacity(this.audioPageOpacity)
+    .onAreaChange((_old: Area, area: Area) => {
+      this.audioPageOriginX = Number(area.globalPosition.x)
+      this.audioPageOriginY = Number(area.globalPosition.y)
+    })
+    .hitTestBehavior(this.audioClosing ? HitTestMode.BLOCK_DESCENDANTS : HitTestMode.Default)
+    .bindSheet($$this.showAudioQueue, this.AudioQueueContent, {
+      height: SheetSize.LARGE, dragBar: true, showClose: false,
+      backgroundColor: $r('app.color.task_panel_background'),
+      onAppear: () => {
+        const index = this.audioQueue.findIndex((item: FileEntry) => item.path === this.audioEntry?.path)
+        if (index >= 0) { this.audioQueueScroller.scrollToIndex(index, false, ScrollAlign.CENTER) }
+      }
+    })
+  }
+
+  @Builder
+  AudioQueueContent(): void {
+    TaskPanel({ title: '播放列表', idPrefix: 'audio-queue',
+      onClose: () => { this.showAudioQueue = false },
+      content: () => { this.AudioQueueList() } })
+  }
+
+  @Builder
+  AudioQueueList(): void {
+        List({ scroller: this.audioQueueScroller }) {
+          LazyForEach(this.audioQueueSource, (item: FileEntry) => {
+            ListItem() {
+              Row({ space: 12 }) {
+                SymbolGlyph(item.path === this.audioEntry?.path ? $r('sys.symbol.speaker_wave_2_fill') :
+                  $r('sys.symbol.music_note_list')).fontSize(22).fontColor([$r('sys.color.icon_secondary')])
+                Text(AudioPlayerPolicy.title(item.name)).fontSize(16).layoutWeight(1).maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis }).fontColor($r('sys.color.font_primary'))
+              }
+              .width('100%').height(FileRowStyle.leadingHeight + FileRowStyle.verticalPadding * 2)
+              .padding({ left: 12, right: 12 })
+              .onClick(() => {
+                if (this.isBusy || this.audioClosing) { return }
+                this.showAudioQueue = false
+                this.openAudioPlayer(item, true)
+              })
+            }
+          }, (item: FileEntry) => item.path)
+        }.width('100%').height('100%').scrollBar(BarState.Auto)
+          .contentEndOffset(this.bottomSafeInset() + 16)
+  }
+
+  @Builder
+  AudioCoverFlight(): void {
+    Stack({ alignContent: Alignment.TopStart }) {
+      Stack() {
+        // Keep the artwork square and animate its render scale. Animating an
+        // Image's layout size alone crops its final-sized content mid-flight.
+        Image(this.audioFlightSource).width(this.audioFlightBaseSize).height(this.audioFlightBaseSize)
+          .draggable(false)
+          .objectFit(ImageFit.Cover).syncLoad(true)
+          .scale({ x: Math.max(this.audioFlightWidth, this.audioFlightHeight) / this.audioFlightBaseSize,
+            y: Math.max(this.audioFlightWidth, this.audioFlightHeight) / this.audioFlightBaseSize })
+          .hitTestBehavior(HitTestMode.None)
+      }
+      .width(this.audioFlightWidth).height(this.audioFlightHeight)
+      .renderFit(RenderFit.CENTER).borderRadius(this.audioFlightRadius).clip(true)
+      .position({ x: this.audioFlightX, y: this.audioFlightY }).opacity(this.audioFlightOpacity)
+      .hitTestBehavior(HitTestMode.BLOCK_DESCENDANTS)
+    }
+    .width('100%').height('100%').zIndex(31).id('audio-cover-flight-overlay')
+    .hitTestBehavior(HitTestMode.BLOCK_DESCENDANTS)
   }
 
   @Builder
@@ -12121,9 +12207,14 @@ struct Index {
     }
   }
 
-  /** 设置里的默认视图：纯图片/视频相册目录用「图片默认」，否则用「文件默认」。 */
+  private defaultViewMode(kind: DefaultViewKind): FileViewMode {
+    if (kind === 'photo') { return this.defaultPhotoViewMode }
+    return kind === 'audio' ? this.defaultAudioViewMode : this.defaultFileViewMode
+  }
+
   private preferredViewMode(): FileViewMode {
-    return this.currentDirectoryIsPhotoAlbum ? this.defaultPhotoViewMode : this.defaultFileViewMode
+    return this.defaultViewMode(this.currentDirectoryIsPhotoAlbum ? 'photo' :
+      (this.currentDirectoryIsAudioAlbum ? 'audio' : 'file'))
   }
 
   private async ensureViewState(): Promise<void> {
@@ -12134,11 +12225,20 @@ struct Index {
       this.viewPreferences = await preferences.getPreferences(getContext(this), 'ugreen-view-settings')
       const storedFile = await this.viewPreferences.get('default_file_mode', 'list')
       const storedPhoto = await this.viewPreferences.get('default_photo_mode', 'grid')
+      // Audio starts in list mode independently of the ordinary-file default.
+      const storedAudio = await this.viewPreferences.get('default_audio_mode', '')
       if (storedFile === 'list' || storedFile === 'grid') {
         this.defaultFileViewMode = storedFile
       }
       if (storedPhoto === 'list' || storedPhoto === 'grid' || storedPhoto === 'waterfall') {
         this.defaultPhotoViewMode = storedPhoto
+      }
+      this.defaultAudioViewMode = storedAudio === 'list' || storedAudio === 'grid'
+        ? storedAudio : 'list'
+      if (storedAudio !== 'list' && storedAudio !== 'grid') {
+        // Persist the initial audio choice once; saved user choices stay intact.
+        await this.viewPreferences.put('default_audio_mode', this.defaultAudioViewMode)
+        await this.viewPreferences.flush()
       }
       this.applyPreferredViewMode()
     } catch (error) {
@@ -12146,19 +12246,16 @@ struct Index {
     }
   }
 
-  private async setDefaultViewMode(photo: boolean, mode: FileViewMode): Promise<void> {
-    if (photo) {
-      this.defaultPhotoViewMode = mode
-    } else {
-      this.defaultFileViewMode = mode
-    }
-    this.applyPreferredViewMode()
+  private async setDefaultViewMode(kind: DefaultViewKind, mode: FileViewMode): Promise<void> {
+    if (kind !== 'photo' && mode === 'waterfall') { return }
     try {
       await this.ensureViewState()
-      if (this.viewPreferences === null) {
-        return
-      }
-      await this.viewPreferences.put(photo ? 'default_photo_mode' : 'default_file_mode', mode)
+      if (kind === 'photo') { this.defaultPhotoViewMode = mode }
+      else if (kind === 'audio') { this.defaultAudioViewMode = mode }
+      else { this.defaultFileViewMode = mode }
+      this.applyPreferredViewMode()
+      if (this.viewPreferences === null) { return }
+      await this.viewPreferences.put('default_' + kind + '_mode', mode)
       await this.viewPreferences.flush()
     } catch (error) {
       console.warn('[UgreenView] save preferences failed: ' + JSON.stringify(error))
@@ -12640,7 +12737,7 @@ struct Index {
    * 下一轮就会把"已经画对的格子"再批量 notify 一次。
    */
   private resolveGridImageStateInto(entry: FileEntry, state: GridImageState): GridImageState {
-    state.hidden = this.viewerReturnHiddenPath === entry.path
+    state.hidden = this.viewerReturnHiddenPath === entry.path || this.audioReturnHiddenPath === entry.path
     const source: image.PixelMap | string = this.fileImageSource(entry, 'grid')
     const isUri = typeof source === 'string'
     state.source = source
@@ -17129,7 +17226,7 @@ struct Index {
       state.decodeState === 'displayed' ? 'original' : 'thumbnail'
   }
 
-  private scrollViewerReturnSourceIntoView(entry: FileEntry): boolean {
+  private scrollMediaReturnSourceIntoView(entry: FileEntry): boolean {
     try {
       if (this.showSearch) {
         const searchIndex = this.searchResults.findIndex((item: FileEntry): boolean => {
@@ -17154,10 +17251,10 @@ struct Index {
       const childIndex = this.fileViewMode === 'list' ? index + 1 : index
       const scroller = this.fileViewMode === 'waterfall'
         ? this.waterfallScroller : this.fileListScroller
-      this.scrollItemIntoContentBand(scroller, childIndex)
+      this.scrollItemIntoContentBand(scroller, childIndex, 0, false)
       return true
     } catch (error) {
-      console.warn('[UgreenViewer] position return source failed: ' + JSON.stringify(error))
+      console.warn('[UgreenMedia] position return source failed: ' + JSON.stringify(error))
       return false
     }
   }
@@ -17171,7 +17268,7 @@ struct Index {
    * 返回动画会飞到一个被遮挡的矩形。
    */
   private scrollItemIntoContentBand(scroller: Scroller, childIndex: number,
-    attempt: number = 0): void {
+    attempt: number = 0, retryOnMissing: boolean = true): void {
     let itemY = 0
     let itemHeight = 0
     let hasRect = false
@@ -17195,16 +17292,25 @@ struct Index {
           scroller.scrollToIndex(childIndex, false, ScrollAlign.AUTO)
         } catch (_) {
         }
-        setTimeout((): void => {
-          this.scrollItemIntoContentBand(scroller, childIndex, attempt + 1)
-        }, 48)
+        // Media returns retry from their bounded rendered-frame loop. Only
+        // the explicit file locator needs an independent delayed retry.
+        if (retryOnMissing) {
+          setTimeout((): void => {
+            this.scrollItemIntoContentBand(scroller, childIndex, attempt + 1)
+          }, 48)
+        }
       }
       return
     }
-    // 列表视口从状态栏下方开始，所以可视带上沿就是顶栏高度本身（topSafeInset+94
-    // 减去视口起点 topSafeInset）。
-    const bandTop = 94
-    const bandBottom = this.pageHeightVp - this.floatingBarContentInset(0) - this.topSafeInset()
+    // getItemRect is relative to the actual scroll container. Safe-area
+    // expansion can put its origin at 0 instead of below the status bar; use
+    // the measured viewport shared with drag selection, not a fixed 94 vp.
+    const viewportY = this.fileScrollViewport.y
+    const viewportHeight = this.fileScrollViewport.height > 0
+      ? this.fileScrollViewport.height : this.pageHeightVp
+    const bandTop = Math.max(0, this.fileContentTopInset() - viewportY)
+    const bandBottom = Math.max(bandTop, Math.min(this.pageHeightVp, viewportY + viewportHeight) -
+      this.floatingBarContentInset(0) - viewportY)
     let delta = 0
     if (itemY < bandTop) {
       delta = itemY - bandTop
@@ -17221,28 +17327,43 @@ struct Index {
     }
   }
 
-  private async prepareViewerReturnSource(entry: FileEntry): Promise<boolean> {
-    if (!this.scrollViewerReturnSourceIntoView(entry)) {
-      this.viewerReturnReadyPath = ''
-      return false
+  /** Shared image/audio return preparation. Never use the explicit file locator here. */
+  private async prepareMediaReturnSource(entry: FileEntry, isCurrent: () => boolean,
+    sourceReady: () => boolean, prepareSource?: () => Promise<void>): Promise<boolean> {
+    if (!isCurrent()) { return false }
+    // Match the Grid image return overlay: use mounted geometry only. A
+    // missing target fades out without moving or rebuilding the file grid.
+    if (this.screen === 'files' && !this.showSearch && this.fileViewMode === 'grid') {
+      return sourceReady()
     }
-    // A page reached by Swiper may not have been the opening source.  Decode
-    // its local preview before binding the return id so the target Image uses
-    // the same PixelMap as the viewer, never a URI-decoded substitute.
-    await this.ensureViewerPreviewBitmap(entry)
+    if (!this.scrollMediaReturnSourceIntoView(entry)) { return false }
+    if (prepareSource !== undefined) { await prepareSource() }
     for (let frame = 0; frame < IMAGE_RETURN_MOUNT_FRAME_LIMIT; frame += 1) {
       await this.nextRenderFrame()
-      if (!this.showImageViewer || this.viewerImageEntry === null ||
-        this.viewerImageEntry.path !== entry.path) {
-        return false
-      }
-      if (this.hasViewerTransitionSource(entry, true)) {
-        this.viewerReturnReadyPath = entry.path
-        return true
+      if (!isCurrent()) { return false }
+      if (sourceReady()) { return true }
+      // A post-frame callback can still see the pre-scroll rect. Allow the
+      // following layout to commit before applying another minimal correction;
+      // otherwise the same scrollBy delta can be submitted twice.
+      if (frame % 2 === 1 && frame + 1 < IMAGE_RETURN_MOUNT_FRAME_LIMIT) {
+        this.scrollMediaReturnSourceIntoView(entry)
       }
     }
-    this.viewerReturnReadyPath = ''
+    // No independent timers survive this bounded preparation, so the first
+    // file-page gesture cannot be overridden by a late scroll correction.
     return false
+  }
+
+  private async prepareViewerReturnSource(entry: FileEntry): Promise<boolean> {
+    const isCurrent = (): boolean => this.showImageViewer && this.viewerImageEntry !== null &&
+      this.viewerImageEntry.path === entry.path
+    const ready = await this.prepareMediaReturnSource(entry, isCurrent,
+      (): boolean => this.hasViewerTransitionSource(entry, true),
+      // Swiper can return to another image. Prepare its shared preview bitmap
+      // before binding the return id; audio uses its already displayed cover.
+      async (): Promise<void> => { await this.ensureViewerPreviewBitmap(entry) })
+    if (isCurrent()) { this.viewerReturnReadyPath = ready ? entry.path : '' }
+    return ready
   }
 
   private releaseViewerVisualSession(entries: FileEntry[]): void {
@@ -19215,64 +19336,198 @@ struct Index {
     }
   }
 
-  private async openAudioPlayer(entry: FileEntry): Promise<void> {
-    if (this.isBusy || entry.isDirectory) {
-      return
-    }
+  private async openAudioPlayer(entry: FileEntry, keepQueue: boolean = false): Promise<void> {
+    if (this.isBusy || this.audioOpening || this.audioClosing || entry.isDirectory) { return }
     this.closeActionMenu()
-    if (!await this.confirmMeteredDownload(entry)) {
-      return
-    }
+    if (!await this.confirmMeteredDownload(entry)) { return }
     await this.ensurePlaybackState()
+    if (this.isBusy || this.audioOpening || this.audioClosing) { return }
+    const token = ++this.audioOpenToken
+    const scope = this.repository.sessionIdentity()
+    const valid = (): boolean => token === this.audioOpenToken && !this.audioEntryCloseRequested &&
+      scope === this.repository.sessionIdentity()
+    const opening = !this.showAudioPlayer
     this.isBusy = true
+    this.audioOwnsBusy = true
     this.errorText = ''
     this.statusText = '正在准备音频…'
+    if (!keepQueue || !this.showAudioPlayer) {
+      const candidates = this.showSearch ? this.searchResults : this.entries
+      this.audioQueue = candidates.filter((item: FileEntry): boolean => !item.isDirectory && this.isAudio(item))
+      if (!this.audioQueue.some((item: FileEntry): boolean => item.path === entry.path)) { this.audioQueue = [entry] }
+      this.audioQueueSource.replace(this.audioQueue)
+      this.audioOriginSurface = this.currentThumbnailSurface()
+      this.audioOriginKey = this.currentRootType.toString() + ':' + this.currentPath
+      this.audioOriginScope = scope
+    }
+    this.audioEntry = entry
+    this.audioTitle = AudioPlayerPolicy.title(entry.name)
+    this.audioArtist = ''
+    this.audioCover = this.previewUri(entry)
+    this.audioLyrics = []
+    // Switching tracks keeps this mounted cover's layout. ArkUI only reports
+    // a new area when geometry changes, so retain the last measured frame.
+    if (opening) {
+      this.audioCoverRect = new AudioCoverRect()
+      this.audioCoverVisibleRatio = 0
+    }
+    this.audioEntryCloseRequested = false
+    this.audioOpening = opening
+    this.audioTransitionCoverScale = opening ? 0.95 : 0
+    this.audioPageOpacity = opening ? 0 : 1; this.audioCoverHidden = opening
+    this.audioCurrentMs = 0; this.audioDurationMs = 0; this.audioPlaying = false
+    this.showAudioPlayer = true
+    // Downloading/preparing the audio proceeds in parallel with the visual
+    // transition. Only the optional artwork hand-off waits for the flight.
+    const entryTransition = opening ? this.animateOpenAudioPlayer(entry, token, scope) : Promise.resolve()
     try {
+      await this.audioManager.release()
+      await this.audioSession.close()
       const localPath = await this.ensureCachedFile(entry)
-      const coverPath = await this.mediaPreviewManager.fromLocal(entry, localPath,
-        this.thumbnailDirectory, this.thumbnailCacheLimitBytes)
-      if (coverPath.length > 0) {
-        this.setPreviewUri(entry, fileUri.getUriFromPath(coverPath), coverPath)
-      }
-      this.audioEntry = entry
+      if (!valid()) { return }
       this.audioLocalPath = localPath
-      this.audioCurrentMs = 0
-      this.audioDurationMs = 0
-      this.audioPlaying = false
-      this.showAudioPlayer = true
-      await this.audioManager.open(
-        localPath,
-        (timeMs: number) => this.audioCurrentMs = Math.max(0, timeMs),
-        (durationMs: number) => this.audioDurationMs = Math.max(0, durationMs),
-        (state: string) => {
+      await this.audioManager.open(localPath,
+        (timeMs: number): void => {
+          if (!valid()) { return }
+          this.audioCurrentMs = Math.max(0, timeMs)
+          this.updateAudioSession()
+        },
+        (durationMs: number): void => {
+          if (valid()) { this.audioDurationMs = Math.max(0, durationMs); this.updateAudioSession(true) }
+        },
+        (state: string): void => {
+          if (!valid()) { return }
           this.audioPlaying = state === 'playing'
           if (state === 'completed') {
             this.audioCurrentMs = this.audioDurationMs
+            setTimeout((): void => { if (valid() && !this.audioClosing) { this.skipAudio(1, true) } }, 0)
           }
+          this.updateAudioSession(true)
         },
-        (error: Object) => {
+        (error: Object): void => {
+          if (!valid()) { return }
+          this.audioPlaying = false; this.updateAudioSession(true)
           this.reportError(error, '音频播放错误')
-          this.statusText = '音频播放错误'
-          this.audioPlaying = false
-        }
-      )
-      if (this.autoPlayOnOpen) {
+        })
+      if (!valid()) { return }
+      await this.audioSession.open(getContext(this) as common.UIAbilityContext, entry.path,
+        this.audioTitle, this.audioArtist, this.audioCover, {
+          play: () => this.setAudioPlaying(true), pause: () => this.setAudioPlaying(false),
+          stop: () => this.closeAudioPlayer(), next: () => this.skipAudio(1),
+          previous: () => this.skipAudio(-1), seek: (position: number) => this.seekAudio(position),
+          loopMode: (mode: AudioPlayMode): void => { this.audioMode = mode; this.updateAudioSession(true) }
+        })
+      if (!valid()) { return }
+      this.updateAudioSession(true)
+      if (this.autoPlayOnOpen && (!this.playbackBackgroundActive || this.backgroundAudioPlayback)) {
         await this.audioManager.play()
-        this.statusText = '正在播放：' + entry.name
-      } else {
-        this.statusText = '已准备：' + entry.name
       }
+      if (!valid()) { return }
+      this.statusText = ''
+      // Artwork/tags are optional and settle after playback is usable. No
+      // thumbnail or metadata decoder failure is allowed to stop an audio file.
+      this.prepareAudioPresentation(entry, localPath, token, scope, entryTransition)
     } catch (error) {
-      await this.audioManager.release()
-      this.showAudioPlayer = false
-      this.audioEntry = null
-      this.audioLocalPath = ''
-      this.audioPlaying = false
-      this.reportError(error as Object, '音频播放失败')
-      this.statusText = '音频播放失败'
+      if (valid()) {
+        await this.audioManager.release()
+        this.finishCloseAudioPlayer(false)
+        this.reportError(error as Object, '音频播放失败')
+      }
     } finally {
-      this.isBusy = false
+      if (token === this.audioOpenToken && this.audioOwnsBusy) {
+        this.audioOwnsBusy = false
+        this.isBusy = false
+      }
     }
+  }
+
+  private async prepareAudioPresentation(entry: FileEntry, localPath: string,
+    token: number, scope: string, entryTransition: Promise<void> = Promise.resolve()): Promise<void> {
+    const valid = (): boolean => token === this.audioOpenToken && !this.audioClosing &&
+      !this.audioEntryCloseRequested && scope === this.repository.sessionIdentity() && this.audioEntry?.path === entry.path
+    await entryTransition
+    if (!valid()) { return }
+    const info = await AudioMetadataReader.read(localPath)
+    if (!valid()) { return }
+    if (info.title.length > 0) { this.audioTitle = info.title }
+    this.audioArtist = info.artist
+    try {
+      const coverPath = await this.repository.prepareAudioThumbnail(entry, localPath,
+        this.thumbnailDirectory, this.thumbnailCacheLimitBytes)
+      if (!valid()) { return }
+      if (coverPath.length > 0) {
+        this.audioCover = fileUri.getUriFromPath(coverPath)
+        this.setPreviewUri(entry, this.audioCover, coverPath)
+      }
+    } catch (_) {}
+    if (!valid()) { return }
+    await this.audioSession.setMetadata(this.audioTitle, this.audioArtist, info.album, this.audioCover)
+    if (!valid()) { return }
+    this.updateAudioSession(true)
+    const lyric = AudioPlayerPolicy.lyricEntry(entry, this.showSearch ? this.searchResults : this.entries)
+    if (lyric !== undefined) {
+      try {
+        const path = await this.ensureCachedFile(lyric)
+        if (!valid() || (await fileIo.stat(path)).size > 256 * 1024) { return }
+        const text = await fileIo.readText(path, { length: 256 * 1024 })
+        if (valid()) { this.audioLyrics = AudioPlayerPolicy.parseLyrics(text) }
+      } catch (_) {}
+    }
+  }
+
+  private updateAudioSession(force: boolean = false): void {
+    if (!this.showAudioPlayer || this.audioClosing) { return }
+    const now = Date.now()
+    if (!force && now - this.audioSessionUpdatedAt < 500) { return }
+    this.audioSessionUpdatedAt = now
+    this.audioSession.update(this.audioPlaying, this.audioCurrentMs, this.audioDurationMs, this.backgroundAudioPlayback,
+      this.audioMode)
+  }
+
+  private async setAudioPlaying(playing: boolean): Promise<void> {
+    if (this.audioEntry === null || this.audioOpening || this.audioClosing || this.isBusy || this.audioControlPending) { return }
+    if (playing && this.playbackBackgroundActive && !this.backgroundAudioPlayback) { return }
+    const token = this.audioOpenToken
+    this.audioControlPending = true
+    try {
+      if (playing) { await this.audioManager.play() } else { await this.audioManager.pause() }
+      if (token !== this.audioOpenToken) { return }
+      this.audioPlaying = playing
+      this.updateAudioSession(true)
+    } catch (error) {
+      if (token === this.audioOpenToken) { this.reportError(error as Object, '音频操作失败') }
+    } finally {
+      if (token === this.audioOpenToken) { this.audioControlPending = false }
+    }
+  }
+
+  private cycleAudioMode(): void {
+    this.audioMode = this.audioMode === 'order' ? 'repeat' : (this.audioMode === 'repeat' ? 'shuffle' : 'order')
+    this.updateAudioSession(true)
+    this.showImmersiveToast(this.audioMode === 'order' ? '顺序循环' : (this.audioMode === 'repeat' ? '单曲循环' : '随机播放'))
+  }
+
+  private skipAudio(direction: number, completed: boolean = false): void {
+    if (this.audioOpening || this.audioClosing || this.isBusy || this.audioEntry === null) { return }
+    const index = this.audioQueue.findIndex((item: FileEntry): boolean => item.path === this.audioEntry?.path)
+    const next = AudioPlayerPolicy.nextIndex(this.audioQueue.length, index, direction, this.audioMode, completed)
+    if (next >= 0) { this.openAudioPlayer(this.audioQueue[next], true) }
+  }
+
+  private openAudioQueue(): void {
+    if (!this.audioOpening && !this.audioClosing) { this.showAudioQueue = true }
+  }
+
+  private async showAudioActions(entry: FileEntry): Promise<void> {
+    if (this.isBusy || this.audioOpening || this.audioClosing) { return }
+    const token = this.audioOpenToken
+    const result = await this.getUIContext().getPromptAction().showActionMenu({
+      title: entry.name, buttons: [{ text: '文件详情', color: '#2E6BFF' },
+        { text: '用其他应用打开', color: '#2E6BFF' }]
+    }).catch((): promptAction.ActionMenuSuccessResponse => { return { index: -1 } })
+    if (token !== this.audioOpenToken || this.audioClosing) { return }
+    if (result.index === 0) { await this.showEntryDetails(entry) }
+    if (result.index === 1) { await this.openWithOtherApp(entry) }
   }
 
   /**
@@ -21023,58 +21278,235 @@ struct Index {
     this.updateVideoMediaSession(true)
   }
 
-  private closeAudioPlayer(): void {
-    const shouldRestoreSearch = this.searchSession !== null && this.searchSession.returnMode === 'audio'
-    this.showAudioPlayer = false
-    this.audioEntry = null
-    this.audioLocalPath = ''
-    this.audioPlaying = false
-    this.audioCurrentMs = 0
-    this.audioDurationMs = 0
-    this.audioManager.release()
-    if (shouldRestoreSearch) {
-      this.restoreSearchSession()
-    }
+  private recordAudioCoverArea(area: Area): void {
+    if (this.audioClosing) { return }
+    const rect = new AudioCoverRect()
+    rect.x = Number(area.globalPosition.x) - this.audioPageOriginX
+    rect.y = Number(area.globalPosition.y) - this.audioPageOriginY
+    rect.width = Number(area.width); rect.height = Number(area.height); rect.radius = 16
+    this.audioCoverRect = rect
   }
 
-  private async toggleAudio(): Promise<void> {
-    if (this.isBusy || this.audioEntry === null) {
-      return
-    }
+  /** One cover owner from the mounted thumbnail to the measured player cover. */
+  private async animateOpenAudioPlayer(entry: FileEntry, token: number, scope: string): Promise<void> {
+    const valid = (): boolean => token === this.audioOpenToken && !this.audioClosing && this.showAudioPlayer &&
+      scope === this.repository.sessionIdentity() && this.audioEntry?.path === entry.path
+    const source = this.audioThumbnailFrames.get(entry.path)
+    const sourceTop = this.showSearch ? this.topSafeInset() + 124 : this.fileContentTopInset()
+    const hasSource = source !== undefined && AudioPlayerPolicy.returnTarget(source,
+      this.audioThumbnailVisibility.get(entry.path) ?? 0, sourceTop,
+      this.pageHeightVp - this.bottomSafeInset() - 8, this.pageWidthVp)
+    // Copy the source before hiding it: its mounted placeholder may report a
+    // different area while the transition is being prepared.
+    const iconSize = this.audioOriginSurface === 'list' || this.audioOriginSurface === 'search' ? 32 : 48
+    const start = source === undefined ? new AudioCoverRect() :
+      AudioPlayerPolicy.thumbnailRect(source, this.audioCover.length > 0, iconSize)
     try {
-      if (this.audioPlaying) {
-        await this.audioManager.pause()
-      } else {
-        await this.audioManager.play()
+      let previous = new AudioCoverRect()
+      for (let attempt = 0; attempt < 4 && valid(); attempt++) {
+        await this.nextRenderFrame()
+        const current = this.audioCoverRect
+        if (current.width > 0 && current.height > 0 && previous.width > 0 &&
+          Math.abs(current.x - previous.x) < 0.5 && Math.abs(current.y - previous.y) < 0.5 &&
+          Math.abs(current.width - previous.width) < 0.5 && Math.abs(current.height - previous.height) < 0.5) { break }
+        previous = current
+        if (current.width <= 0 || current.height <= 0) {
+          await new Promise<void>((resolve: () => void): void => { setTimeout(resolve, 16) })
+        }
       }
-    } catch (error) {
-      this.reportError(error as Object, '音频操作失败')
-      this.statusText = '音频操作失败'
+      if (!valid()) { return }
+      const end = this.audioCoverRect
+      const hasTarget = end.width > 0 && end.height > 0 && end.x >= -1 && end.y >= -1 &&
+        end.y + end.height <= this.pageHeightVp + 1 &&
+        end.x + end.width <= this.pageWidthVp + 1 &&
+        [end.x, end.y, end.width, end.height].every((value: number): boolean => Number.isFinite(value))
+      const flying = hasSource && hasTarget
+      if (flying) {
+        this.audioFlightSource = this.audioCover.length > 0 ? this.audioCover : this.fileIcon(entry)
+        this.audioFlightBaseSize = Math.max(end.width, end.height, start.width, start.height, 1)
+        this.audioFlightX = start.x - this.audioPageOriginX; this.audioFlightY = start.y - this.audioPageOriginY
+        this.audioFlightWidth = start.width; this.audioFlightHeight = start.height
+        this.audioFlightRadius = start.radius; this.audioFlightOpacity = 1
+        this.audioReturnHiddenPath = entry.path
+        this.notifyEntryChanged(entry.path, this.audioOriginSurface)
+        this.audioFlightVisible = true
+        await this.nextRenderFrame()
+      } else {
+        this.audioCoverHidden = false
+      }
+      if (!valid()) { return }
+      const duration = flying ? IMAGE_GEOMETRY_TRANSITION_DURATION : IMAGE_FALLBACK_TRANSITION_DURATION
+      await new Promise<void>((resolve: () => void): void => {
+        let finished = false
+        const finish = (): void => {
+          if (finished) { return }
+          finished = true; clearTimeout(timer)
+          if (this.audioEntryTransitionResolve === finish) { this.audioEntryTransitionResolve = null }
+          resolve()
+        }
+        const timer = setTimeout(finish, duration + 160)
+        this.audioEntryTransitionResolve = finish
+        this.getUIContext().animateTo({ duration: duration, curve: Curve.FastOutSlowIn, onFinish: finish }, (): void => {
+          this.audioPageOpacity = 1
+          if (flying) {
+            // The live cover retains its paused scale during the flight. A
+            // cached track may already be playing, without moving this target.
+            this.audioFlightX = end.x + end.width * 0.025
+            this.audioFlightY = end.y + end.height * 0.025
+            this.audioFlightWidth = end.width * 0.95; this.audioFlightHeight = end.height * 0.95
+            this.audioFlightRadius = end.radius * 0.95
+          }
+        })
+      })
+    } catch (_) {
+      // Missing geometry or a discarded window must not strand an invisible page.
+    } finally {
+      if (token === this.audioOpenToken && this.showAudioPlayer && scope !== this.repository.sessionIdentity()) {
+        this.finishCloseAudioPlayer(false)
+      }
+      if (valid()) {
+        this.audioEntryTransitionResolve?.()
+        this.audioEntryTransitionResolve = null
+        const hidden = this.audioReturnHiddenPath
+        this.audioReturnHiddenPath = ''
+        this.audioCoverHidden = false; this.audioPageOpacity = 1; this.audioOpening = false
+        if (!this.audioEntryCloseRequested) { this.audioTransitionCoverScale = 0 }
+        this.audioFlightVisible = false; this.audioFlightSource = ''
+        if (hidden.length > 0) { this.notifyEntryChanged(hidden, this.audioOriginSurface) }
+        if (this.audioEntryCloseRequested) { void this.beginCloseAudioPlayer() }
+      }
     }
   }
 
-  private async rewindAudio(): Promise<void> {
-    if (this.isBusy || this.audioEntry === null) {
-      return
-    }
-    try {
-      await this.audioManager.rewind()
-      this.audioCurrentMs = 0
-      this.audioPlaying = false
-      this.statusText = '已回到音频开头'
-    } catch (error) {
-      this.reportError(error as Object, '音频重置失败')
-      this.statusText = '音频重置失败'
+  private recordAudioThumbnailArea(entry: FileEntry, surface: ThumbnailSurfaceKind, area: Area): void {
+    if (!this.thumbnailSurfaceIsCurrent(surface)) { return }
+    const existing = this.audioThumbnailFrames.get(entry.path) ?? new AudioCoverRect()
+    existing.x = Number(area.globalPosition.x)
+    existing.y = Number(area.globalPosition.y)
+    existing.width = Number(area.width); existing.height = Number(area.height)
+    existing.radius = surface === 'grid' ? 0 : 6
+    this.audioThumbnailFrames.set(entry.path, existing)
+    if (this.audioThumbnailFrames.size > 256) {
+      const oldest = this.audioThumbnailFrames.keys().next().value as string
+      this.audioThumbnailFrames.delete(oldest); this.audioThumbnailVisibility.delete(oldest)
     }
   }
+
+  private closeAudioPlayer(immediate: boolean = false): void {
+    if (immediate) {
+      this.audioOpenToken++
+      this.finishCloseAudioPlayer(false)
+      return
+    }
+    if (!this.showAudioPlayer || this.audioClosing) { return }
+    if (this.audioOpening) {
+      // Match the image viewer: retain an early Back request until the cover
+      // hand-off, then reverse from the actual cover instead of its end value.
+      this.audioEntryCloseRequested = true
+      this.audioManager.release().catch(() => {})
+      this.audioSession.close().catch(() => {})
+      return
+    }
+    void this.beginCloseAudioPlayer()
+  }
+
+  private async beginCloseAudioPlayer(): Promise<void> {
+    const entry = this.audioEntry
+    if (entry === null || this.audioClosing) { return }
+    const token = ++this.audioOpenToken
+    this.audioEntryCloseRequested = false
+    this.audioClosing = true
+    this.showAudioQueue = false
+    this.audioControlPending = false
+    if (this.audioOwnsBusy) { this.isBusy = false; this.audioOwnsBusy = false }
+    this.audioManager.release().catch(() => {})
+    this.audioSession.close().catch(() => {})
+    const matchingOrigin = (): boolean => this.audioOriginScope === this.repository.sessionIdentity() &&
+      this.audioOriginSurface === this.currentThumbnailSurface() &&
+      this.audioOriginKey === this.currentRootType.toString() + ':' + this.currentPath
+    const isCurrent = (): boolean => token === this.audioOpenToken && this.audioClosing &&
+      this.showAudioPlayer && this.audioEntry?.path === entry.path && matchingOrigin()
+    let target: AudioCoverRect | undefined = undefined
+    const targetTop = this.showSearch ? this.topSafeInset() + 124 : this.fileContentTopInset()
+    const targetBottom = this.pageHeightVp - this.bottomSafeInset() - 8
+    const sourceReady = (): boolean => {
+      target = this.audioThumbnailFrames.get(entry.path)
+      return target !== undefined && AudioPlayerPolicy.returnTarget(target,
+        this.audioThumbnailVisibility.get(entry.path) ?? 0, targetTop, targetBottom, this.pageWidthVp)
+    }
+    const returnReady = await this.prepareMediaReturnSource(entry, isCurrent, sourceReady)
+    if (token !== this.audioOpenToken) { return }
+    const frame = this.audioCoverRect
+    const hasFrame = (this.audioCoverVisibleRatio >= 0.999 || this.audioTransitionCoverScale > 0) &&
+      frame.width > 0 && frame.height > 0 &&
+      frame.x >= -1 && frame.x + frame.width <= this.pageWidthVp + 1 &&
+      [frame.x, frame.y, frame.width, frame.height].every((value: number): boolean => Number.isFinite(value))
+    const hasTarget = returnReady && isCurrent()
+    const iconSize = this.audioOriginSurface === 'list' || this.audioOriginSurface === 'search' ? 32 : 48
+    const landing = target === undefined ? new AudioCoverRect() :
+      AudioPlayerPolicy.thumbnailRect(target, this.audioCover.length > 0, iconSize)
+    this.audioFlightSource = this.audioCover.length > 0 ? this.audioCover : this.fileIcon(entry)
+    this.audioFlightBaseSize = Math.max(frame.width, frame.height, landing.width, landing.height, 1)
+    const coverScale = this.audioTransitionCoverScale > 0 ? this.audioTransitionCoverScale :
+      (this.audioPlaying ? 1.05 : 0.95)
+    this.audioFlightX = frame.x + frame.width * (1 - coverScale) / 2
+    this.audioFlightY = frame.y + frame.height * (1 - coverScale) / 2
+    this.audioFlightWidth = frame.width * coverScale; this.audioFlightHeight = frame.height * coverScale
+    this.audioFlightRadius = frame.radius * coverScale; this.audioFlightOpacity = 1
+    if (hasFrame && hasTarget) {
+      this.audioReturnHiddenPath = entry.path
+      this.notifyEntryChanged(entry.path, this.audioOriginSurface)
+      this.audioCoverHidden = true
+      this.audioFlightVisible = true
+      await this.nextRenderFrame()
+    }
+    if (token !== this.audioOpenToken) { return }
+    await new Promise<void>((resolve: () => void): void => {
+      this.getUIContext().animateTo({ duration: hasFrame && hasTarget ? IMAGE_GEOMETRY_TRANSITION_DURATION :
+        IMAGE_FALLBACK_TRANSITION_DURATION, curve: Curve.FastOutSlowIn, onFinish: resolve }, (): void => {
+        this.audioPageOpacity = 0
+        if (hasFrame && hasTarget && target !== undefined) {
+          this.audioFlightX = landing.x - this.audioPageOriginX
+          this.audioFlightY = landing.y - this.audioPageOriginY
+          this.audioFlightWidth = landing.width; this.audioFlightHeight = landing.height
+          this.audioFlightRadius = landing.radius
+        }
+      })
+    })
+    if (token !== this.audioOpenToken) { return }
+    const restoreSearch = this.searchSession !== null && this.searchSession.returnMode === 'audio'
+    this.finishCloseAudioPlayer(restoreSearch)
+  }
+
+  private finishCloseAudioPlayer(restoreSearch: boolean): void {
+    this.audioEntryTransitionResolve?.()
+    this.audioEntryTransitionResolve = null
+    this.audioOpening = false; this.audioEntryCloseRequested = false
+    this.audioTransitionCoverScale = 0
+    const hidden = this.audioReturnHiddenPath
+    this.audioReturnHiddenPath = ''
+    if (hidden.length > 0) { this.notifyEntryChanged(hidden, this.audioOriginSurface) }
+    this.audioFlightVisible = false
+    this.audioFlightSource = ''
+    this.showAudioPlayer = false; this.showAudioQueue = false
+    this.audioClosing = false; this.audioCoverHidden = false; this.audioPageOpacity = 1
+    this.audioEntry = null; this.audioLocalPath = ''; this.audioCover = ''; this.audioLyrics = []
+    this.audioPlaying = false; this.audioCurrentMs = 0; this.audioDurationMs = 0
+    this.audioControlPending = false
+    if (this.audioOwnsBusy) { this.audioOwnsBusy = false; this.isBusy = false }
+    this.audioManager.release().catch(() => {})
+    this.audioSession.close().catch(() => {})
+    if (restoreSearch) { this.restoreSearchSession() }
+  }
+
+  private async toggleAudio(): Promise<void> { await this.setAudioPlaying(!this.audioPlaying) }
 
   private seekAudio(value: number): void {
-    if (this.audioDurationMs <= 0) {
-      return
-    }
+    if (!Number.isFinite(value) || this.audioDurationMs <= 0 || this.audioOpening || this.audioClosing || this.isBusy) { return }
     const timeMs = Math.min(this.audioDurationMs, Math.max(0, Math.floor(value)))
     this.audioCurrentMs = timeMs
     this.audioManager.seek(timeMs)
+    this.updateAudioSession(true)
   }
 
   private async openWithOtherApp(entry: FileEntry): Promise<void> {
@@ -21293,7 +21725,7 @@ struct Index {
   private dragSelectionPanActive: boolean = false
   private dragSurface: string = ''
   private lastHitIndex: number = -1
-  private dragSelectionViewport: BottomBarTouchRect = new BottomBarTouchRect()
+  private fileScrollViewport: BottomBarTouchRect = new BottomBarTouchRect()
   private dragSelectionPointerId: number = -1
   private dragSelectionX: number = 0
   private dragSelectionY: number = 0
@@ -21422,7 +21854,7 @@ struct Index {
   }
 
   private updateDragSelectionHit(): void {
-    const viewport = this.dragSelectionViewport
+    const viewport = this.fileScrollViewport
     const top = this.dragSelectionBandTop()
     const bottom = this.dragSelectionBandBottom()
     const x = viewport.width > 0
@@ -21475,24 +21907,24 @@ struct Index {
     this.applyDragRange(index)
   }
 
-  private recordDragSelectionViewport(surface: string, area: Area): void {
+  private recordFileScrollViewport(surface: string, area: Area): void {
     if (surface !== this.activeListSurface() || typeof area.width !== 'number' ||
       typeof area.height !== 'number' || typeof area.globalPosition.x !== 'number' ||
       typeof area.globalPosition.y !== 'number') {
       return
     }
-    this.dragSelectionViewport.x = area.globalPosition.x
-    this.dragSelectionViewport.y = area.globalPosition.y
-    this.dragSelectionViewport.width = area.width
-    this.dragSelectionViewport.height = area.height
+    this.fileScrollViewport.x = area.globalPosition.x
+    this.fileScrollViewport.y = area.globalPosition.y
+    this.fileScrollViewport.width = area.width
+    this.fileScrollViewport.height = area.height
   }
 
   private dragSelectionBandTop(): number {
-    return Math.max(this.dragSelectionViewport.y, this.fileContentTopInset() + 18)
+    return Math.max(this.fileScrollViewport.y, this.fileContentTopInset() + 18)
   }
 
   private dragSelectionBandBottom(): number {
-    return this.dragSelectionViewport.y + this.dragSelectionViewport.height - this.floatingBarContentInset(0)
+    return this.fileScrollViewport.y + this.fileScrollViewport.height - this.floatingBarContentInset(0)
   }
 
   private dragSelectionScroller(): Scroller {
@@ -23036,6 +23468,7 @@ struct Index {
     this.endDragSelection()
     this.selectedEntriesCache = null
     this.currentDirectoryIsPhotoAlbum = this.isPhotoAlbumDirectory(this.entries)
+    this.currentDirectoryIsAudioAlbum = this.isAudioAlbumDirectory(this.entries)
     // 这里只做「无图目录不能停在瀑布流」的兜底。默认视图的下发只在进/回目录时
     // （restore/settleDirectoryViewState）—— 绝不能放这里：replaceEntries 在加载、
     // 排序、刷新、分页追加时都会跑，在这里改模式会反复启停瀑布流管线、拖垮加载。
@@ -23235,6 +23668,7 @@ struct Index {
     this.endDragSelection()
     this.selectedEntriesCache = null
     this.currentDirectoryIsPhotoAlbum = this.isPhotoAlbumDirectory(this.entries)
+    this.currentDirectoryIsAudioAlbum = this.isAudioAlbumDirectory(this.entries)
     this.fileEntryDataSource.append(appended)
     this.syncWaterfallEntries(this.entries, true)
     this.rebuildTimelineIndexes()
@@ -23326,6 +23760,11 @@ struct Index {
       }
     }
     return true
+  }
+
+  private isAudioAlbumDirectory(entries: FileEntry[]): boolean {
+    return entries.length > 0 && entries.every((entry: FileEntry): boolean =>
+      !entry.isDirectory && this.isAudio(entry))
   }
 
   /**
@@ -23626,6 +24065,12 @@ struct Index {
       } catch (error) {
         console.warn('[UgreenPreview] server thumbnail failed: ' + entry.path + ': ' +
           JSON.stringify(error))
+      }
+      if (thumbnailPath.length === 0 && this.isAudio(entry) && generation === this.previewGeneration &&
+        this.isPathGenerationValid(entry.path, pathToken)) {
+        const localPath = CacheManager.findExisting(this.cacheDirectory, entry.name, this.originalCacheKey(entry))
+        thumbnailPath = await this.repository.prepareAudioThumbnail(entry, localPath,
+          this.thumbnailDirectory, this.thumbnailCacheLimitBytes)
       }
       if (generation !== this.previewGeneration || !this.isPathGenerationValid(entry.path, pathToken)) {
         this.imageTelemetry.recordStaleCompletion(entry.path, 'generationMismatch')
@@ -23941,7 +24386,7 @@ struct Index {
     this.cancelFileTransition()
     this.clearSearchIfPresent()
     this.closeImageViewer()
-    this.closeAudioPlayer()
+    this.closeAudioPlayer(true)
     this.closeVideoPlayer()
     await this.videoTransferManager.flush()
     await this.ensureDownloadState()

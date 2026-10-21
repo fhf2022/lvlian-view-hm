@@ -1,0 +1,28 @@
+LinkFiles audio playback interface attribution
+=============================================
+
+Portions of the playback interface and four transport SVG icons are adapted
+from RzdPai/RzdMusic, commit 5ec7e494220cc589e4395958251e26b8e18f8e5d:
+https://github.com/RzdPai/RzdMusic
+
+Upstream UI files:
+features/player/src/main/ets/view/PlaybackPage.ets
+features/player/src/main/ets/view/MusicPlayInfoBlock.ets
+features/player/src/main/ets/view/ControlAreaComponent.ets
+features/player/src/main/ets/view/TopAreaComponent.ets
+features/player/src/main/resources/base/media/ic_public_{play,pause,forward,next}.svg
+
+Copyright (c) 2026 Huawei Device Co., Ltd.
+Upstream base: MusicHome multi-device music example.
+Copyright (c) 2024-2026 Huawei Device Co., Ltd.
+License: Apache License 2.0 (RzdMusic-Apache-2.0.txt in this directory).
+
+Modified 2026-10-20 for LinkFiles: isolated the playback layout into a
+presentational component, replaced global stores with parameters/callbacks,
+removed favorites/comments/mini bar, adapted back navigation and cover return,
+and connected LinkFiles' existing NAS cache and native player.
+
+No RzdMusic music sources, account modules, comments, AMLL lyric engine,
+recognition scripts, WebViews, models, services or dependencies are included.
+LinkFiles' local lyric parsing, queue policy, metadata reader, native media
+bridge and transitions are independent project implementations.

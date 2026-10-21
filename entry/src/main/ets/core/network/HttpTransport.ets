@@ -127,7 +127,7 @@ export class HttpTransport {
    * the file at the requested offset and corrupt the sparse .part file.
    */
   async requestBinaryRange(url: string, start: number, length: number,
-    headers: Record<string, string> = {}): Promise<BinaryRangeResult> {
+    headers: Record<string, string> = {}, readTimeoutMs: number = 120000): Promise<BinaryRangeResult> {
     const safeStart = Math.max(0, Math.floor(start))
     const safeLength = Math.max(1, Math.floor(length))
     const attempt = NasConnection.shared().begin(url)
@@ -215,7 +215,7 @@ export class HttpTransport {
         method: http.RequestMethod.GET,
         header: requestHeaders,
         connectTimeout: 6000,
-        readTimeout: 120000,
+        readTimeout: readTimeoutMs,
         usingCache: false
       })
       const status = Number(responseCode)

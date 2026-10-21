@@ -24,7 +24,7 @@ export class MediaPreviewManager {
   }
 
   async fromLocal(entry: FileEntry, localPath: string,
-    cacheDirectory: string, cacheLimitBytes: number): Promise<string> {
+    cacheDirectory: string, cacheLimitBytes: number, identity: string = ''): Promise<string> {
     const kind = this.kind(entry)
     if (kind.length === 0 || localPath.length === 0) {
       return ''
@@ -33,7 +33,7 @@ export class MediaPreviewManager {
       return await this.createImagePreview(entry, localPath, cacheDirectory, cacheLimitBytes)
     }
     return await this.extractAndCache(entry, kind, cacheDirectory, cacheLimitBytes,
-      localPath, '', {})
+      localPath, identity)
   }
 
   /**
@@ -86,9 +86,9 @@ export class MediaPreviewManager {
   }
 
   private async extractAndCache(entry: FileEntry, kind: PreviewKind,
-    cacheDirectory: string, cacheLimitBytes: number, localPath: string, remoteUrl: string,
-    headers: Record<string, string>): Promise<string> {
-    const cacheKey = entry.path + ':media-preview:' + kind
+    cacheDirectory: string, cacheLimitBytes: number, localPath: string, identity: string): Promise<string> {
+    const cacheKey = (identity || localPath) + ':media-preview-v2:' + kind + ':' +
+      entry.modifiedTime.toString() + ':' + entry.size.toString()
     const fileName = entry.name + '.' + kind + '.preview.jpg'
     const existingPath = CacheManager.findExisting(cacheDirectory, fileName, cacheKey)
     if (existingPath.length > 0) {
@@ -100,16 +100,12 @@ export class MediaPreviewManager {
     let sourceFd: number = -1
     try {
       extractor = await media.createAVMetadataExtractor()
-      if (remoteUrl.length > 0) {
-        extractor.setUrlSource(remoteUrl, headers)
-      } else {
-        const sourceFile = fileIo.openSync(localPath, fileIo.OpenMode.READ_ONLY)
-        sourceFd = sourceFile.fd
-        extractor.fdSrc = {
-          fd: sourceFd,
-          offset: 0,
-          length: fileIo.statSync(localPath).size
-        }
+      const sourceFile = fileIo.openSync(localPath, fileIo.OpenMode.READ_ONLY)
+      sourceFd = sourceFile.fd
+      extractor.fdSrc = {
+        fd: sourceFd,
+        offset: 0,
+        length: fileIo.statSync(localPath).size
       }
 
       if (kind === 'audio') {
@@ -122,6 +118,9 @@ export class MediaPreviewManager {
       if (pixelMap === null) {
         return ''
       }
+      const info = await pixelMap.getImageInfo()
+      const scale = Math.min(1, 512 / Math.max(info.size.width, info.size.height))
+      if (scale < 1) { await pixelMap.scale(scale, scale) }
       const packer = image.createImagePacker()
       try {
         const encoded = await packer.packToData(pixelMap, {
