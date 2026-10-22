@@ -24,6 +24,7 @@ export interface VideoCastPlaybackSnapshot {
 
 /** A small, immutable snapshot of the MediaKit player exposed to AVSession. */
 export interface VideoMediaPlaybackSnapshot {
+  playbackRate: number
   playing: boolean
   prepared: boolean
   completed: boolean
@@ -480,7 +481,7 @@ export class VideoMediaSessionManager {
     snapshot: VideoMediaPlaybackSnapshot): Promise<void> {
     const state: avSession.AVPlaybackState = {
       state: this.playbackState(snapshot),
-      speed: 1,
+      speed: snapshot.playbackRate,
       position: {
         elapsedTime: Math.max(0, Math.floor(snapshot.positionMs)),
         updateTime: Date.now()

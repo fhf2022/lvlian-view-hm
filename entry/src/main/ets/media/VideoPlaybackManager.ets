@@ -35,6 +35,11 @@ export class VideoPlaybackManager {
   private currentTimeHintMs: number = 0
   private cachedDurationHintMs: number = 0
   private completionReported: boolean = false
+  private cancelRate: (() => void) | null = null
+  private stateWaiter: ((state: media.AVPlayerState) => void) | null = null
+  private seekWaiter: ((requestedMs: number) => void) | null = null
+  private cancelStateWait: (() => void) | null = null
+  private cancelSeekWait: (() => void) | null = null
 
   async open(handle: VideoSourceHandle, positionMs: number,
     callbacks: VideoPlaybackCallbacks, autoPlay: boolean = true): Promise<void> {
@@ -58,6 +63,7 @@ export class VideoPlaybackManager {
         return
       }
       console.info('[UgreenVideo] player state=' + state)
+      this.stateWaiter?.(state)
       if (state === 'completed') {
         this.completionReported = true
       } else if (state === 'playing') {
@@ -101,6 +107,7 @@ export class VideoPlaybackManager {
       const actualMs = Math.max(0, player.currentTime)
       this.currentTimeHintMs = actualMs
       this.callbacks.onSeekDone(Math.max(0, requestedMs), actualMs)
+      this.seekWaiter?.(requestedMs)
     })
     player.on('durationUpdate', (durationMs: number): void => {
       if (generation !== this.generation || this.callbacks === null) {
@@ -194,18 +201,40 @@ export class VideoPlaybackManager {
     this.player.setVolume(muted ? 0 : 1)
   }
 
-  setPlaybackRate(rate: number): boolean {
-    if (this.player === null || !this.isPlayableState(this.player.state)) {
-      return false
+  async setPlaybackRate(rate: number): Promise<void> {
+    const player = this.player
+    if (player === null || !this.isPlayableState(player.state) ||
+      !Number.isFinite(rate) || rate < 0.25 || rate > 4) {
+      throw new Error('当前无法调整播放倍速')
     }
-    try {
-      // API 20+ accepts a continuous rate from 0.125x through 4x.
-      this.player.setPlaybackRate(Math.min(4, Math.max(0.125, rate)))
-      return true
-    } catch (error) {
-      console.warn('[UgreenVideo] set playback rate failed: ' + JSON.stringify(error))
-      return false
-    }
+    this.cancelRate?.()
+    const generation = this.generation
+    await new Promise<void>((resolve, reject): void => {
+      let finished = false
+      const finish = (error: Error | null): void => {
+        if (finished) { return }
+        finished = true
+        clearTimeout(timer)
+        try { player.off('playbackRateDone', onDone) } catch (error) {
+          console.warn('[UgreenVideo] remove rate callback failed: ' + String(error))
+        }
+        this.cancelRate = null
+        if (error === null) { resolve() } else { reject(error) }
+      }
+      const onDone = (actualRate: number): void => {
+        if (generation === this.generation && player === this.player && Math.abs(actualRate - rate) < 0.001) {
+          finish(null)
+        }
+      }
+      const timer = setTimeout(() => finish(new Error('倍速设置超时')), 2000)
+      this.cancelRate = () => finish(new Error('倍速请求已取消'))
+      try {
+        player.on('playbackRateDone', onDone)
+        player.setPlaybackRate(rate)
+      } catch (error) {
+        finish(new Error('倍速设置失败：' + String(error)))
+      }
+    })
   }
 
   currentTime(): number {
@@ -221,6 +250,9 @@ export class VideoPlaybackManager {
 
   async release(): Promise<void> {
     this.generation += 1
+    this.cancelStateWait?.()
+    this.cancelSeekWait?.()
+    this.cancelRate?.()
     const player = this.player
     const sourceFd = this.sourceFd
     this.player = null
@@ -422,14 +454,15 @@ export class VideoPlaybackManager {
         }
         settled = true
         clearTimeout(timeoutId)
-        player.off('stateChange', onState)
+        this.stateWaiter = null
+        this.cancelStateWait = null
         if (error === null) {
           resolve()
         } else {
           reject(error)
         }
       }
-      const onState = (state: media.AVPlayerState, _reason: media.StateChangeReason): void => {
+      const onState = (state: media.AVPlayerState): void => {
         console.info('[UgreenVideo] wait initialized state=' + state)
         if (state === 'initialized') {
           finish(null)
@@ -449,7 +482,10 @@ export class VideoPlaybackManager {
           finish(new Error('视频播放器已切换'))
         }
       }, 30000)
-      player.on('stateChange', onState)
+      // AVPlayer keeps one callback per event. Temporary waiters must not
+      // replace or unregister the permanent playback state listener.
+      this.stateWaiter = onState
+      this.cancelStateWait = () => finish(new Error('视频播放器已切换'))
       if (player.state === 'initialized') {
         finish(null)
       }
@@ -466,7 +502,8 @@ export class VideoPlaybackManager {
         }
         settled = true
         clearTimeout(timeoutId)
-        player.off('seekDone', onSeekDone)
+        this.seekWaiter = null
+        this.cancelSeekWait = null
         if (error === null) {
           resolve()
         } else {
@@ -485,7 +522,8 @@ export class VideoPlaybackManager {
         }
         finish(new Error('视频恢复播放位置超时'))
       }, 30000)
-      player.on('seekDone', onSeekDone)
+      this.seekWaiter = onSeekDone
+      this.cancelSeekWait = () => finish(new Error('视频播放器已切换'))
       player.seek(targetMs)
     })
   }

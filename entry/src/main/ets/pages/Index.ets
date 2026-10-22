@@ -29,6 +29,7 @@ import { UploadQueueManager, UploadTaskRecord } from '../upload/UploadQueueManag
 import { preferences, uniformTypeDescriptor as utd } from '@kit.ArkData'
 import { image } from '@kit.ImageKit'
 import { media } from '@kit.MediaKit'
+import { audio, AVVolumePanel } from '@kit.AudioKit'
 import { AVCastPicker, AVCastPickerState, avSession } from '@kit.AVSessionKit'
 import { visionImageAnalyzer } from '@kit.VisionKit'
 import { hilog, hiTraceMeter } from '@kit.PerformanceAnalysisKit'
@@ -46,6 +47,9 @@ import { AudioCoverRect, AudioLyricLine, AudioPlayerPolicy, AudioPlayMode } from
 import { AudioMetadataReader } from '../media/AudioMetadataReader'
 import { AudioSessionManager } from '../media/AudioSessionManager'
 import { VideoPlaybackManager } from '../media/VideoPlaybackManager'
+import { VideoPlayerControls } from '../components/VideoPlayerControls'
+import { PlayerGestures } from '../media/PlayerGestures'
+import { PlayerBrightness } from '../media/PlayerBrightness'
 import {
   VideoCastPlaybackSnapshot,
   VideoMediaPlaybackSnapshot,
@@ -1161,6 +1165,16 @@ struct Index {
   @State videoTimelineReady: boolean = false
   @State videoPlaying: boolean = false
   @State videoFastPlaybackActive: boolean = false
+  @State videoGestureFeedback: string = ''
+  @State videoGestureSeeking: boolean = false
+  @State videoGesturePositionMs: number = 0
+  @State @Watch('onContinuationSceneChanged') videoGestureActive: boolean = false
+  @State videoSystemVolume: number | undefined = undefined
+  @State videoPlaybackRate: number = 1
+  @State @Watch('onContinuationSceneChanged') videoRatePending: boolean = false
+  @State @Watch('onContinuationSceneChanged') videoRatePanel: boolean = false
+  private videoPreferredRate: number = 1
+  private videoRateRequestToken: number = 0
   @State videoMuted: boolean = false
   @State @Watch('onContinuationSceneChanged') videoPrepared: boolean = false
   @State videoFirstFrame: boolean = false
@@ -1173,7 +1187,7 @@ struct Index {
   @State videoBufferingPercent: number = 0
   @State @Watch('onContinuationSceneChanged') videoPipActive: boolean = false
   @State @Watch('onContinuationSceneChanged') videoPipBackgrounded: boolean = false
-  private videoSeekDragging: boolean = false
+  @State @Watch('onContinuationSceneChanged') videoSeekDragging: boolean = false
   private videoSeekPending: boolean = false
   private videoSeekTargetMs: number = 0
   private videoCloseRequested: boolean = false
@@ -1295,6 +1309,31 @@ struct Index {
   private downloadQueue: DownloadQueueManager = new DownloadQueueManager()
   private audioManager: AudioPlaybackManager = new AudioPlaybackManager()
   private videoPlaybackManager: VideoPlaybackManager = new VideoPlaybackManager()
+  private videoBrightness: PlayerBrightness = new PlayerBrightness()
+  private videoChromeTimer: number = -1
+  private videoControlsTouchActive: boolean = false
+  private videoVolumeManager: audio.AudioVolumeManager | null = null
+  private videoVolumeMin: number = 0
+  private videoVolumeMax: number = 15
+  private videoGestureStartMs: number = 0
+  private videoVolumeChanged = (event: audio.StreamVolumeEvent): void => {
+    if (this.videoSystemVolume !== undefined) { this.videoSystemVolume = event.volume }
+  }
+  private videoGestures: PlayerGestures = new PlayerGestures({
+    tap: () => this.handleVideoSingleTap(),
+    togglePlay: () => { this.revealVideoChrome(); this.handleVideoDoubleTap() },
+    seek: (value: number) => this.seekVideo(value),
+    rate: (rate: number) => { this.setVideoPlaybackRate(rate, true) },
+    brightness: (value: number) => this.setVideoGestureBrightness(value),
+    volume: (value: number) => {
+      this.videoSystemVolume = Math.round(this.videoVolumeMin + (this.videoVolumeMax - this.videoVolumeMin) * value / 100)
+    },
+    preview: (kind: string, value: number) => this.previewVideoGesture(kind, value),
+    active: (active: boolean) => {
+      this.videoGestureActive = active
+      if (active) { this.clearVideoChromeTimer() } else { this.scheduleVideoChromeHide() }
+    }
+  })
   private videoMediaSession: VideoMediaSessionManager = new VideoMediaSessionManager()
   private videoBackgroundTask: VideoBackgroundTaskManager = new VideoBackgroundTaskManager()
   private videoTransferManager: VideoTransferManager = new VideoTransferManager()
@@ -1307,7 +1346,7 @@ struct Index {
   // XComponent surface dimensions are physical pixels. Keep the last layout
   // area in vp so a window rotation can recompute a centered, aspect-preserved
   // surface without stretching the decoded video frame.
-  private videoViewportWidthVp: number = 0
+  @State videoViewportWidthVp: number = 0
   private videoViewportHeightVp: number = 0
   private videoSurfaceWidthPx: number = 0
   private videoSurfaceHeightPx: number = 0
@@ -1752,7 +1791,8 @@ struct Index {
       !this.imageDismissDragging && !this.showImageDetails && !this.showImageMoreMenu &&
       !this.videoOverlayClosing && !this.videoEntryTransitionActive && !this.videoCasting &&
       !this.videoPipActive && !this.videoPipBackgrounded && !this.videoPipCreating && !this.videoCastPreparing &&
-      !this.videoSeekDragging && !this.videoControlPending && !this.videoOrientationChanging &&
+      !this.videoSeekDragging && !this.videoGestureActive && !this.videoControlPending && !this.videoOrientationChanging &&
+      !this.videoRatePending && !this.videoRatePanel &&
       this.continuationPendingDeletes.size === 0
   }
 
@@ -2219,6 +2259,8 @@ struct Index {
       this.videoPipRestoring = false
       this.restoreVideoPipOrigin()
       this.videoPipBackgrounded = false
+      this.observeVideoVolume()
+      this.revealVideoChrome()
       this.updateBottomBarVisibility(true)
       this.updateVideoMediaSession(true)
     })
@@ -2231,9 +2273,14 @@ struct Index {
     this.playbackBackgroundActive = isBackground
     if (!isBackground) {
       this.videoWasPlayingBeforeHide = false
+      if (this.showVideoPlayer && !this.videoPipBackgrounded) {
+        this.observeVideoVolume()
+        this.revealVideoChrome()
+      }
       return
     }
 
+    this.suspendVideoInteractions()
     this.videoWasPlayingBeforeHide = this.showVideoPlayer && this.videoPlaying
     // Explicit PiP is already a background playback mode. Do not let the
     // page-hide callback immediately pause the same player while the system
@@ -3295,6 +3342,7 @@ struct Index {
       this.closeAudioPlayer()
       return true
     }
+    if (this.videoRatePanel) { this.videoRatePanel = false; this.scheduleVideoChromeHide(); return true }
     if (this.videoPlaybackUiVisible()) {
       this.closeVideoPlayer(true)
       return true
@@ -4486,6 +4534,7 @@ struct Index {
       .onDidScroll((): void => this.onDragSelectionContentScrolled())
       .onAreaChange((_, area) => this.recordFileScrollViewport('list', area))
       .onReachEnd(() => this.loadNextDirectoryPage())
+      .contentEndOffset(this.floatingBarContentInset())
       .padding({ left: 0, right: 0 })
       .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
       }
@@ -4575,16 +4624,11 @@ struct Index {
             )
           }, (task: DownloadTaskRecord): string => task.id)
 
-          ListItem() {
-            Row()
-              .width('100%')
-              .height(this.floatingBarContentInset())
-          }
-          .width('100%')
         }
       }
       .width('100%')
       .layoutWeight(1)
+      .contentEndOffset(this.floatingBarContentInset())
       .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
       .linearGradientBlur(9, {
         fractionStops: [
@@ -5332,9 +5376,18 @@ struct Index {
   }
 
   @Builder
+  FileContentEndSpace(): void {
+    Row().width('100%').height(this.floatingBarContentInset())
+      .hitTestBehavior(HitTestMode.None).accessibilityLevel('no')
+  }
+
+  @Builder
   WaterfallFileList(): void {
     WaterFlow({
       scroller: this.waterfallScroller,
+      // WaterFlow has no contentEndOffset; its scrollable footer uses the
+      // same inset as List/Grid without changing the FlowItem indexes.
+      footer: () => { this.FileContentEndSpace() },
       layoutMode: WaterFlowLayoutMode.SLIDING_WINDOW
     }) {
       LazyForEach(this.waterfallDataSource, (entry: FileEntry, index: number) => {
@@ -5583,6 +5636,7 @@ struct Index {
         }
         .width('100%')
         .layoutWeight(1)
+        .contentEndOffset(this.floatingBarContentInset())
         .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
       }
     }
@@ -10811,7 +10865,7 @@ struct Index {
         title: this.audioTitle, artist: this.audioArtist,
         format: AudioPlayerPolicy.format(this.audioEntry?.name ?? ''),
         playing: this.audioPlaying, opening: this.audioOpening, coverScale: this.audioTransitionCoverScale,
-        busy: this.isBusy || this.audioControlPending || this.audioOpening || this.audioClosing,
+        busy: this.audioPageBusy(),
         positionMs: this.audioCurrentMs, durationMs: this.audioDurationMs, playMode: this.audioMode,
         lyrics: this.audioLyrics, safeTop: this.topSafeInset(), safeBottom: this.bottomSafeInset(),
         dark: this.isDarkTheme, coverHidden: this.audioCoverHidden,
@@ -10819,7 +10873,11 @@ struct Index {
         onPrevious: () => this.skipAudio(-1), onNext: () => this.skipAudio(1),
         onMode: () => this.cycleAudioMode(), onQueue: () => this.openAudioQueue(),
         onDownload: () => { if (this.audioEntry !== null) { this.cacheToLocal(this.audioEntry) } },
-        onMore: () => { if (this.audioEntry !== null) { this.showAudioActions(this.audioEntry) } },
+        onDetails: () => {
+          if (this.audioEntry !== null && !this.audioPageBusy() && this.continuationDialogCount === 0) {
+            this.showEntryDetails(this.audioEntry)
+          }
+        },
         onShare: () => { if (this.audioEntry !== null) { this.shareViewerImage(this.audioEntry) } },
         onSeek: (value: number) => this.seekAudio(value),
         onCoverArea: (area: Area) => this.recordAudioCoverArea(area),
@@ -10942,39 +11000,30 @@ struct Index {
               .color('#2E6BFF')
         }
 
-        // XComponent can consume touch events itself. A transparent sibling
-        // owns one exclusive group. Long press wins while the finger remains
-        // down; among taps, double tap remains before single tap so playback
-        // never also toggles the chrome. Transparent preserves normal surface
-        // input outside recognized gestures.
+        // The same gesture state machine as HarmonyCast owns this surface.
+        // Header and bottom controls are higher siblings and consume their own input.
         Column()
           .width('100%')
           .height('100%')
           .backgroundColor(Color.Transparent)
           .hitTestBehavior(HitTestMode.Transparent)
-          .gesture(
-            GestureGroup(
-              GestureMode.Exclusive,
-              LongPressGesture({ fingers: 1, repeat: false, duration: 500 })
-                .onAction(() => this.beginVideoFastPlayback())
-                .onActionEnd(() => this.endVideoFastPlayback())
-                .onActionCancel(() => this.endVideoFastPlayback()),
-              TapGesture({ count: 2, distanceThreshold: 8 })
-                .onAction(() => this.handleVideoDoubleTap()),
-              TapGesture({ count: 1, distanceThreshold: 8 })
-                .onAction(() => this.handleVideoSingleTap())
-            )
-          )
+          .id('video-gesture-surface').accessibilityText('视频手势控制区')
+          .onTouch((event: TouchEvent) => this.handleVideoTouch(event))
 
-        if (this.videoFastPlaybackActive) {
-          Text('2.0×')
+        if (this.videoGestureFeedback.length > 0) {
+          Text(this.videoGestureFeedback)
             .fontSize(16)
             .fontWeight(FontWeight.Bold)
             .fontColor(Color.White)
             .padding({ left: 14, right: 14, top: 7, bottom: 7 })
             .borderRadius(18)
             .backgroundColor('#66000000')
+            .draggable(false).id('video-gesture-feedback')
             .hitTestBehavior(HitTestMode.None)
+        }
+        if (this.videoSystemVolume !== undefined) {
+          AVVolumePanel({ volumeLevel: this.videoSystemVolume })
+            .width(0).height(0).hitTestBehavior(HitTestMode.None).accessibilityLevel('no')
         }
       }
         .width('100%')
@@ -10989,11 +11038,12 @@ struct Index {
 
       if (!this.videoPipBackgrounded) {
         Stack({ alignContent: Alignment.Bottom }) {
-          this.VideoPlayerGlassBar(entry)
+          this.VideoPlayerControlBar(entry)
         }
           .width('100%')
           .height('100%')
           .zIndex(2)
+          .id('video-controls-overlay')
           .opacity(this.videoChromeVisible ? 1 : 0)
           .translate({ x: 0, y: this.videoChromeVisible ? 0 : 18, z: 0 })
           .hitTestBehavior(this.videoChromeVisible
@@ -11041,6 +11091,10 @@ struct Index {
       .hitTestBehavior(this.videoChromeVisible
         ? HitTestMode.Transparent : HitTestMode.BLOCK_DESCENDANTS)
       .zIndex(3)
+      .onTouch((event: TouchEvent) => {
+        if (event.type === TouchType.Down) { this.handleVideoControlInteraction(true) }
+        else if (event.type === TouchType.Up || event.type === TouchType.Cancel) { this.handleVideoControlInteraction(false) }
+      })
   }
 
   @Builder
@@ -11123,151 +11177,39 @@ struct Index {
   }
 
   @Builder
-  VideoPlayerGlassBar(entry: FileEntry): void {
-    Tabs({ barPosition: BarPosition.End }) {
-      TabContent() {}.tabBar(this.VideoPlayerTabBar)
+  VideoPlayerControlBar(entry: FileEntry): void {
+    Column({ space: 4 }) {
+      if (this.videoTransferError(entry).length > 0) {
+        Text(this.videoStatusText(entry)).fontSize(12).fontColor('#FFFF8A8A')
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
+      }
+      VideoPlayerControls({ controlWidth: Math.max(128, this.videoViewportWidthVp - 32),
+        positionMs: this.videoGestureSeeking ? this.videoGesturePositionMs : this.videoCurrentMs,
+        durationMs: this.videoDurationMs,
+        bufferedMs: this.videoBufferedTimelineMs(), rate: this.videoCasting ? 1 : this.videoPlaybackRate,
+        playing: this.videoPlaying, isEnabled: this.videoPrepared && !this.isBusy,
+        timelineReady: this.videoTimelineReady, rotating: this.videoOrientationChanging,
+        landscape: this.videoLandscape, rateEnabled: !this.videoCasting,
+        ratePending: this.videoRatePending, ratePanel: this.videoRatePanel,
+        onToggle: () => this.toggleVideo(), onSeek: (value: number) => this.seekVideo(value),
+        onSeeking: (active: boolean) => {
+          this.videoSeekDragging = active
+          if (active) { this.clearVideoChromeTimer() } else { this.scheduleVideoChromeHide() }
+        },
+        onInteraction: (active: boolean) => this.handleVideoControlInteraction(active),
+        onRate: (rate: number) => this.setVideoPlaybackRate(rate),
+        onRatePanel: (visible: boolean) => {
+          this.videoRatePanel = visible
+          if (visible) { this.cancelVideoGestures(); this.clearVideoChromeTimer() }
+          else { this.scheduleVideoChromeHide() }
+        },
+        onRotate: () => { this.videoRatePanel = false; this.rotateVideoInterface() } })
     }
-      .vertical(false)
-      .scrollable(false)
-      .barOverlap(true)
-      .barHeight(this.videoTransferError(entry).length > 0 ? 80 : 56)
-      .barWidth(Math.max(240, this.pageWidthVp - 24))
-      .barFloatingStyle({ barBottomMargin: 40, maskColor: Color.Transparent,
-        systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, false, '#66202020') })
-      .width('100%')
-      .height((this.videoTransferError(entry).length > 0 ? 80 : 56) + 80)
-      .margin({ bottom: this.videoBottomInset() + 8 - 40 })
-      .clip(false)
+      .width(Math.max(128, this.videoViewportWidthVp - 32))
+      .margin({ bottom: this.videoBottomInset() })
       .hitTestBehavior(HitTestMode.Default)
   }
 
-  @Builder
-  VideoPlayerTabBar(): void {
-    if (this.videoEntry !== null) {
-      this.VideoPlayerBarContent(this.videoEntry as FileEntry)
-    }
-  }
-
-  @Builder
-  VideoPlayerBarContent(entry: FileEntry): void {
-    Column({ space: 4 }) {
-      Row({ space: 4 }) {
-        // Keep playback controls at the leading edge, as in the official
-        // video controller.  A previous-video action is intentionally not
-        // exposed; only the next item is available when the window is
-        // landscape.
-        Button() {
-          SymbolGlyph(this.videoPlaying
-            ? $r('sys.symbol.pause') : $r('sys.symbol.play'))
-            .fontSize(24)
-            .fontColor([$r('sys.color.font_on_primary')])
-        }
-          .type(ButtonType.Normal)
-          .width(40)
-          .height(40)
-          .backgroundColor(Color.Transparent)
-          .enabled(this.videoPrepared && !this.isBusy && !this.videoControlPending)
-          .onClick(() => this.toggleVideo())
-
-        if (this.videoLandscape) {
-          Button() {
-            SymbolGlyph($r('sys.symbol.chevron_forward'))
-              .fontSize(24)
-              .fontColor([$r('sys.color.font_on_primary')])
-          }
-            .type(ButtonType.Normal)
-            .width(36)
-            .height(40)
-            .backgroundColor(Color.Transparent)
-            .enabled(this.videoSibling(1) !== null && !this.isBusy)
-            .onClick(() => this.switchVideo(1))
-        }
-
-        Text(this.formatPlaybackTime(this.videoCurrentMs))
-          .fontSize(11)
-          .fontColor($r('sys.color.font_on_primary'))
-          .width(40)
-        // Keep the native AVPlayer buffer visible behind the playback
-        // thumb, following the official network-video example.  The
-        // buffering callback reports an estimated duration ahead of the
-        // playhead, which VideoPlaybackManager converts to this absolute
-        // timeline percentage.
-        Stack({ alignContent: Alignment.Center }) {
-          Slider({
-            value: this.videoBufferedTimelineMs(),
-            min: 0,
-            max: Math.max(1, this.videoDurationMs),
-            direction: Axis.Horizontal,
-            // Keep the buffer and seek layers on the same track geometry.
-            // SliderStyle.NONE removes the thumb's layout inset, so a
-            // stacked NONE/OutSet pair leaves a visible extra segment at
-            // the leading edge.
-            style: SliderStyle.OutSet
-          })
-            .trackColor('#55FFFFFF')
-            .selectedColor('#66FFFFFF')
-            .blockColor(Color.Transparent)
-            .blockBorderColor(Color.Transparent)
-            .trackThickness(4)
-            .enabled(false)
-
-          Slider({
-            value: this.videoTimelineReady
-              ? Math.min(this.videoCurrentMs, Math.max(1, this.videoDurationMs)) : 0,
-            min: 0,
-            max: Math.max(1, this.videoDurationMs),
-            direction: Axis.Horizontal,
-            style: SliderStyle.OutSet
-          })
-            .trackColor(Color.Transparent)
-            .selectedColor('#2E6BFF')
-            .trackThickness(4)
-            .opacity(this.videoTimelineReady ? 1 : 0)
-            .enabled(this.videoTimelineReady && this.videoDurationMs > 0)
-            .onChange((value: number, mode: SliderChangeMode) =>
-              this.seekVideo(value, mode))
-        }
-          .layoutWeight(1)
-          Text(this.formatPlaybackTime(this.videoDurationMs))
-          .fontSize(11)
-          .fontColor($r('sys.color.font_on_primary'))
-          .width(40)
-          .textAlign(TextAlign.End)
-
-        Button() {
-          SymbolGlyph($r('sys.symbol.screen_rotation'))
-            .fontSize(24)
-            .fontColor([$r('sys.color.font_on_primary')])
-        }
-          .type(ButtonType.Normal)
-          .width(40)
-          .height(40)
-          .backgroundColor(Color.Transparent)
-          .enabled(!this.isBusy && !this.videoOrientationChanging)
-          .onClick(() => this.rotateVideoInterface())
-      }
-      .width('100%')
-      .alignItems(VerticalAlign.Center)
-
-      if (this.videoTransferError(entry).length > 0) {
-        Text(this.videoStatusText(entry))
-          .fontSize(12)
-          .fontColor('#FFFF8A8A')
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-      }
-    }
-      .width('100%')
-      .padding({ left: 8, right: 8, top: 8, bottom: 8 })
-  }
-
-  /**
-   * The app's standard immersive material.
-   *
-   * `applyShadow: false` is only for a surface that fills its container edge to
-   * edge - a shadow there spills outside and gets hard-cut, drawing an outline.
-   * The long-press menu uses it; everything else keeps the shadow.
-   */
   private immersiveMaterial(style: uiMaterial.ImmersiveStyle, interactive: boolean = true,
     materialColor: string = '', applyShadow: boolean = true): uiMaterial.Material {
     const options: uiMaterial.ImmersiveOptions = {
@@ -16349,7 +16291,7 @@ struct Index {
     await this.showTrackedDialog({
       title: entry.name,
       message: lines.join('\n'),
-      buttons: [{ text: '知道了', color: this.isDarkTheme ? '#FFFFFFFF' : '#536174' }],
+      buttons: [{ text: '确定', color: '#2E6BFF' }],
       systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THICK, false)
     })
   }
@@ -19484,8 +19426,14 @@ struct Index {
       this.audioMode)
   }
 
+  private audioPageBusy(): boolean {
+    // Short play/pause requests only serialize commands. Do not propagate
+    // them into every Button.enabled state and flash the disabled styling.
+    return this.isBusy || this.audioOpening || this.audioClosing
+  }
+
   private async setAudioPlaying(playing: boolean): Promise<void> {
-    if (this.audioEntry === null || this.audioOpening || this.audioClosing || this.isBusy || this.audioControlPending) { return }
+    if (this.audioEntry === null || this.audioPageBusy() || this.audioControlPending) { return }
     if (playing && this.playbackBackgroundActive && !this.backgroundAudioPlayback) { return }
     const token = this.audioOpenToken
     this.audioControlPending = true
@@ -19508,7 +19456,7 @@ struct Index {
   }
 
   private skipAudio(direction: number, completed: boolean = false): void {
-    if (this.audioOpening || this.audioClosing || this.isBusy || this.audioEntry === null) { return }
+    if (this.audioPageBusy() || this.audioControlPending || this.audioEntry === null) { return }
     const index = this.audioQueue.findIndex((item: FileEntry): boolean => item.path === this.audioEntry?.path)
     const next = AudioPlayerPolicy.nextIndex(this.audioQueue.length, index, direction, this.audioMode, completed)
     if (next >= 0) { this.openAudioPlayer(this.audioQueue[next], true) }
@@ -19516,18 +19464,6 @@ struct Index {
 
   private openAudioQueue(): void {
     if (!this.audioOpening && !this.audioClosing) { this.showAudioQueue = true }
-  }
-
-  private async showAudioActions(entry: FileEntry): Promise<void> {
-    if (this.isBusy || this.audioOpening || this.audioClosing) { return }
-    const token = this.audioOpenToken
-    const result = await this.getUIContext().getPromptAction().showActionMenu({
-      title: entry.name, buttons: [{ text: '文件详情', color: '#2E6BFF' },
-        { text: '用其他应用打开', color: '#2E6BFF' }]
-    }).catch((): promptAction.ActionMenuSuccessResponse => { return { index: -1 } })
-    if (token !== this.audioOpenToken || this.audioClosing) { return }
-    if (result.index === 0) { await this.showEntryDetails(entry) }
-    if (result.index === 1) { await this.openWithOtherApp(entry) }
   }
 
   /**
@@ -19561,6 +19497,10 @@ struct Index {
     if (continuationValid !== null && !continuationValid()) { return }
 
     const playerAlreadyVisible = this.showVideoPlayer && this.videoEntry !== null
+    this.cancelVideoGestures(false)
+    this.clearVideoChromeTimer()
+    this.videoRatePanel = false
+    this.videoSystemVolume = undefined
     const token = this.videoOpenToken + 1
     this.videoOpenToken = token
     this.isBusy = true
@@ -19605,6 +19545,7 @@ struct Index {
       this.videoCurrentMs = position
       this.videoTimelineReady = false
       this.videoFastPlaybackActive = false
+      this.resetVideoRateState()
       this.videoSeekDragging = false
       this.videoSeekPending = position > 0
       this.videoSeekTargetMs = Math.max(0, position)
@@ -19634,7 +19575,7 @@ struct Index {
             this.videoEntry.path !== entry.path) {
             return
           }
-          if (this.videoSeekDragging || this.videoSeekPending) {
+          if (this.videoSeekDragging || this.videoGestureSeeking || this.videoSeekPending) {
             return
           }
           this.videoCurrentMs = Math.max(0, timeMs)
@@ -19688,7 +19629,7 @@ struct Index {
           } else if (state === 'paused' || state === 'completed' ||
             state === 'stopped' || state === 'released' || state === 'error') {
             this.videoPlaying = false
-            this.endVideoFastPlayback()
+            this.cancelVideoGestures()
           }
           this.syncVideoBackgroundTask()
           this.updateVideoPipControlStatus()
@@ -19807,6 +19748,7 @@ struct Index {
         return
       }
       this.enableVideoPlayerAutoRotation()
+      this.observeVideoVolume()
       this.startVideoMediaSession(entry)
       this.syncVideoBackgroundTask()
       this.statusText = '正在准备视频…'
@@ -19834,6 +19776,7 @@ struct Index {
         this.videoFirstFrame = false
         this.videoTimelineReady = false
         this.videoFastPlaybackActive = false
+        this.resetVideoRateState()
         this.videoSeekDragging = false
         this.videoSeekPending = false
         this.videoSeekTargetMs = 0
@@ -19854,12 +19797,14 @@ struct Index {
     } finally {
       if (token === this.videoOpenToken) {
         this.isBusy = false
+        this.scheduleVideoChromeHide()
       }
     }
   }
 
   private videoMediaSessionSnapshot(): VideoMediaPlaybackSnapshot {
     return {
+      playbackRate: this.videoCasting ? 1 : this.videoPlaybackRate,
       playing: this.videoPlaying,
       prepared: this.videoPrepared,
       completed: this.videoDurationMs > 0 && this.videoCurrentMs >= this.videoDurationMs,
@@ -20044,10 +19989,15 @@ struct Index {
   }
 
   private handleVideoViewportArea(widthVp: number, heightVp: number): void {
+    if (this.videoViewportWidthVp !== widthVp || this.videoViewportHeightVp !== heightVp) {
+      this.cancelVideoGestures()
+      this.videoRatePanel = false
+    }
     this.videoViewportWidthVp = widthVp
     this.videoViewportHeightVp = heightVp
     this.videoLandscape = widthVp > heightVp
     this.updateVideoSurfaceRect()
+    this.scheduleVideoChromeHide()
   }
 
   /**
@@ -20250,7 +20200,7 @@ struct Index {
   }
 
   private closeVideoPlayer(animated: boolean = false): void {
-    this.endVideoFastPlayback()
+    this.suspendVideoInteractions()
     if (animated) {
       if (this.videoOverlayClosing) {
         return
@@ -20314,6 +20264,7 @@ struct Index {
     this.videoCurrentMs = 0
     this.videoTimelineReady = false
     this.videoFastPlaybackActive = false
+    this.resetVideoRateState()
     this.videoSeekDragging = false
     this.videoSeekPending = false
     this.videoSeekTargetMs = 0
@@ -20576,6 +20527,8 @@ struct Index {
     if (this.isBusy || this.videoEntry === null || this.videoOrientationChanging) {
       return
     }
+    this.cancelVideoGestures()
+    this.clearVideoChromeTimer()
     const token = this.videoOrientationToken + 1
     this.videoOrientationToken = token
     this.videoOrientationChanging = true
@@ -20610,6 +20563,7 @@ struct Index {
       .then((): void => {
         if (token === this.videoOrientationToken) {
           this.videoOrientationChanging = false
+          this.revealVideoChrome()
         }
       })
   }
@@ -20656,12 +20610,128 @@ struct Index {
     }
   }
 
-  /**
-   * Handles the double-tap gesture on the media surface. The gesture itself
-   * is the official ArkUI TapGesture; playback is routed through the same
-   * control path as the bottom-bar button so local playback and remote
-   * casting stay in sync.
-   */
+  private observeVideoVolume(): void {
+    if (this.videoVolumeManager !== null) { return }
+    try {
+      const manager = audio.getAudioManager().getVolumeManager()
+      manager.on('streamVolumeChange', audio.StreamUsage.STREAM_USAGE_MOVIE, this.videoVolumeChanged)
+      this.videoVolumeManager = manager
+    } catch (error) { console.warn('[UgreenVideo] observe volume failed: ' + String(error)) }
+  }
+
+  private suspendVideoInteractions(): void {
+    this.cancelVideoGestures()
+    this.videoControlsTouchActive = false
+    this.clearVideoChromeTimer()
+    this.videoRatePanel = false
+    try { this.videoVolumeManager?.off('streamVolumeChange', this.videoVolumeChanged) } catch (error) {
+      console.warn('[UgreenVideo] stop volume observation failed: ' + String(error))
+    }
+    this.videoVolumeManager = null
+    this.videoSystemVolume = undefined
+    this.videoBrightness.restore().catch((error: Object) => {
+      console.warn('[UgreenVideo] restore brightness failed: ' + String(error))
+    })
+  }
+
+  private handleVideoTouch(event: TouchEvent): void {
+    if (event.type === TouchType.Cancel || event.touches.length > 1 ||
+      !this.showVideoPlayer || !this.videoPrepared || this.isBusy || this.videoOverlayClosing ||
+      this.videoEntryTransitionActive || this.videoPipBackgrounded || this.playbackBackgroundActive ||
+      this.videoRatePanel || this.videoControlsTouchActive || this.videoOrientationChanging) {
+      this.cancelVideoGestures()
+      return
+    }
+    const point = event.touches[0] ?? event.changedTouches[0]
+    if (!point) { return }
+    if (event.type === TouchType.Down) {
+      let volume = 50
+      try {
+        const manager = this.videoVolumeManager ?? audio.getAudioManager().getVolumeManager()
+        const stream = audio.StreamUsage.STREAM_USAGE_MOVIE
+        this.videoVolumeMin = manager.getMinVolumeByStream(stream)
+        this.videoVolumeMax = manager.getMaxVolumeByStream(stream)
+        volume = (manager.getVolumeByStream(stream) - this.videoVolumeMin) /
+          Math.max(1, this.videoVolumeMax - this.videoVolumeMin) * 100
+      } catch (error) { console.warn('[UgreenVideo] read volume failed: ' + String(error)) }
+      let brightness = 50
+      try {
+        const current = this.videoPlayerWindow?.getWindowProperties().brightness ?? -1
+        if (current >= 0) { brightness = current * 100 }
+      } catch (error) { console.warn('[UgreenVideo] read brightness failed: ' + String(error)) }
+      this.videoGestureStartMs = this.videoCurrentMs
+      this.videoGestures.down(point.x, point.y, { width: this.videoViewportWidthVp,
+        positionMs: this.videoCurrentMs, durationMs: this.videoTimelineReady ? this.videoDurationMs : 0,
+        rate: this.videoPlaybackRate, playing: this.videoPlaying && !this.videoCasting && !this.videoRatePending &&
+          !this.videoControlPending, brightness, volume })
+    } else if (event.type === TouchType.Move) {
+      this.videoGestures.move(point.x, point.y)
+    } else if (event.type === TouchType.Up) {
+      this.videoGestures.up()
+    }
+  }
+
+  private previewVideoGesture(kind: string, value: number): void {
+    this.videoGestureSeeking = kind === 'seek'
+    if (kind === 'seek') {
+      this.videoGesturePositionMs = value
+      const seconds = Math.round((value - this.videoGestureStartMs) / 1000)
+      this.videoGestureFeedback = (seconds >= 0 ? '+' : '') + seconds + ' 秒'
+    } else if (kind === 'brightness') {
+      this.videoGestureFeedback = '亮度 ' + Math.round(value) + '%'
+    } else if (kind === 'speed') {
+      this.videoFastPlaybackActive = true
+      this.videoGestureFeedback = '2× 加速'
+      HapticFeedback.longPress()
+    } else {
+      this.videoGestureFeedback = ''
+      this.videoFastPlaybackActive = false
+    }
+  }
+
+  private setVideoGestureBrightness(value: number): void {
+    if (this.videoPlayerWindow === null) { return }
+    this.videoBrightness.set(this.videoPlayerWindow, value).catch((error: Object) => {
+      console.warn('[UgreenVideo] set brightness failed: ' + String(error))
+    })
+  }
+
+  private cancelVideoGestures(restoreRate: boolean = true): void {
+    this.videoGestures.cancel(restoreRate)
+  }
+
+  private handleVideoControlInteraction(active: boolean): void {
+    this.videoControlsTouchActive = active
+    if (active) { this.cancelVideoGestures(); this.clearVideoChromeTimer() }
+    else { this.scheduleVideoChromeHide() }
+  }
+
+  private clearVideoChromeTimer(): void {
+    if (this.videoChromeTimer >= 0) { clearTimeout(this.videoChromeTimer); this.videoChromeTimer = -1 }
+  }
+
+  private scheduleVideoChromeHide(): void {
+    this.clearVideoChromeTimer()
+    if (!this.showVideoPlayer || !this.videoChromeVisible || this.videoOverlayClosing ||
+      this.videoEntryTransitionActive || this.videoPipBackgrounded || this.playbackBackgroundActive ||
+      this.videoRatePanel || this.videoSeekDragging || this.videoGestureActive || this.videoControlsTouchActive || this.videoOrientationChanging ||
+      this.videoRatePending || this.videoControlPending || this.isBusy) { return }
+    const token = this.videoOpenToken
+    this.videoChromeTimer = setTimeout(() => {
+      this.videoChromeTimer = -1
+      if (token !== this.videoOpenToken || !this.showVideoPlayer || this.videoOverlayClosing ||
+        this.videoRatePanel || this.videoSeekDragging || this.videoGestureActive || this.videoControlsTouchActive || this.playbackBackgroundActive ||
+        this.videoPipBackgrounded || this.videoOrientationChanging || this.videoRatePending || this.videoControlPending) { return }
+      this.getUIContext().animateTo({ duration: 180, curve: Curve.EaseOut }, () => { this.videoChromeVisible = false })
+    }, 4000)
+  }
+
+  private revealVideoChrome(): void {
+    if (!this.showVideoPlayer || this.videoOverlayClosing || this.videoPipBackgrounded) { return }
+    this.videoChromeVisible = true
+    this.scheduleVideoChromeHide()
+  }
+
   private async handleVideoDoubleTap(): Promise<void> {
     if (this.isBusy || !this.videoPrepared || this.videoEntry === null ||
       this.videoControlPending) {
@@ -20680,6 +20750,7 @@ struct Index {
       this.videoPipBackgrounded || this.videoEntry === null) {
       return
     }
+    if (this.videoRatePanel) { this.videoRatePanel = false; this.scheduleVideoChromeHide(); return }
     const visible = !this.videoChromeVisible
     this.getUIContext().animateTo({
       duration: visible ? 220 : 180,
@@ -20687,28 +20758,43 @@ struct Index {
     }, (): void => {
       this.videoChromeVisible = visible
     })
+    if (visible) { this.scheduleVideoChromeHide() } else { this.clearVideoChromeTimer() }
   }
 
-  private beginVideoFastPlayback(): void {
-    if (!this.showVideoPlayer || this.videoOverlayClosing || this.videoPipBackgrounded ||
-      this.videoEntry === null || !this.videoPrepared || !this.videoPlaying ||
-      this.videoCasting || this.videoControlPending || this.videoFastPlaybackActive) {
-      return
-    }
-    if (this.videoPlaybackManager.setPlaybackRate(2)) {
-      this.videoFastPlaybackActive = true
-      // The "2x" badge is small and the finger is over the video, so the long
-      // press gets the same recognition cue every other long press gets.
-      HapticFeedback.longPress()
-    }
+  private resetVideoRateState(): void {
+    this.videoRateRequestToken++
+    this.videoPreferredRate = 1
+    this.videoPlaybackRate = 1
+    this.videoRatePending = false
+    this.videoRatePanel = false
   }
 
-  private endVideoFastPlayback(): void {
-    if (!this.videoFastPlaybackActive) {
-      return
+  private async setVideoPlaybackRate(rate: number, temporary: boolean = false): Promise<void> {
+    if (!this.showVideoPlayer || !this.videoPrepared || this.videoCasting ||
+      this.isBusy || !Number.isFinite(rate) || rate < 0.25 || rate > 4) { return }
+    const token = this.videoOpenToken
+    const request = ++this.videoRateRequestToken
+    this.videoRatePending = true
+    this.clearVideoChromeTimer()
+    try {
+      await this.videoPlaybackManager.setPlaybackRate(rate)
+      if (token !== this.videoOpenToken || request !== this.videoRateRequestToken || this.videoCasting) { return }
+      this.videoPlaybackRate = rate
+      if (!temporary) { this.videoPreferredRate = rate }
+      this.updateVideoMediaSession(true)
+      console.info('[UgreenVideo] playback rate=' + rate)
+    } catch (error) {
+      if (token === this.videoOpenToken && request === this.videoRateRequestToken) {
+        if (temporary && this.videoFastPlaybackActive) { this.cancelVideoGestures(false) }
+        console.warn('[UgreenVideo] playback rate failed: ' + String(error))
+        this.showImmersiveToast('倍速调整失败')
+      }
+    } finally {
+      if (token === this.videoOpenToken && request === this.videoRateRequestToken) {
+        this.videoRatePending = false
+        this.scheduleVideoChromeHide()
+      }
     }
-    this.videoPlaybackManager.setPlaybackRate(1)
-    this.videoFastPlaybackActive = false
   }
 
   private async toggleVideo(): Promise<void> {
@@ -20716,48 +20802,36 @@ struct Index {
       this.videoControlPending) {
       return
     }
-    if (this.videoCasting) {
-      const shouldPause = this.videoPlaying
-      this.videoControlPending = true
-      try {
-        await this.videoMediaSession.sendCastControl({
-          command: shouldPause ? 'pause' : 'play'
-        })
-        this.videoPlaying = !shouldPause
-        this.syncVideoBackgroundTask()
-        this.updateVideoPipControlStatus()
-        this.updateVideoMediaSession(true)
-      } catch (error) {
-        this.reportError(error as Object, '视频操作失败')
-        this.statusText = '投播操作失败'
-      } finally {
-        this.videoControlPending = false
-      }
-      return
-    }
-    const playerState = this.videoPlaybackManager.state()
-    // Read the MediaKit state at the point of the click instead of trusting a
-    // possibly one-frame-old @State value. This is important when the player
-    // sends `playing` just before the controller is rendered.
+    const token = this.videoOpenToken
+    const casting = this.videoCasting
+    const current = (): boolean => token === this.videoOpenToken && this.showVideoPlayer
+    // Local and cast controls share command ownership and completion. Native
+    // player state can be newer than the rendered playing flag at click time.
+    const playerState = casting ? null : this.videoPlaybackManager.state()
     const shouldPause = playerState === 'playing' ||
       (playerState === null && this.videoPlaying)
     this.videoControlPending = true
     try {
-      if (shouldPause) {
+      if (casting) {
+        await this.videoMediaSession.sendCastControl({ command: shouldPause ? 'pause' : 'play' })
+      } else if (shouldPause) {
         await this.videoPlaybackManager.pause()
-        this.videoPlaying = false
       } else {
         await this.videoPlaybackManager.play()
-        this.videoPlaying = true
       }
+      if (!current() || casting !== this.videoCasting) { return }
+      this.videoPlaying = !shouldPause
       this.syncVideoBackgroundTask()
       this.updateVideoPipControlStatus()
       this.updateVideoMediaSession(true)
     } catch (error) {
-      this.reportError(error as Object, '视频操作失败')
-      this.statusText = '视频操作失败'
+      if (current() && casting === this.videoCasting) {
+        this.reportError(error as Object, '视频操作失败')
+        this.statusText = casting ? '投播操作失败' : '视频操作失败'
+      }
     } finally {
-      this.videoControlPending = false
+      // An old command must not change a newly opened video's state/guard.
+      if (current()) { this.videoControlPending = false; this.scheduleVideoChromeHide() }
     }
   }
 
@@ -20777,20 +20851,12 @@ struct Index {
     this.videoPlaybackManager.setMuted(this.videoMuted)
   }
 
-  private seekVideo(value: number, mode?: SliderChangeMode): void {
+  private seekVideo(value: number): void {
     if (!this.videoPrepared || this.videoDurationMs <= 0) {
       return
     }
     const timeMs = Math.min(this.videoDurationMs, Math.max(0, Math.floor(value)))
     this.videoCurrentMs = timeMs
-    if (mode === SliderChangeMode.Begin || mode === SliderChangeMode.Moving) {
-      // During the drag the thumb is the source of truth. Issuing one seek
-      // per pointer move makes 100 ms timeUpdate callbacks pull it backwards.
-      this.videoSeekDragging = true
-      this.videoSeekPending = false
-      this.videoSeekTargetMs = timeMs
-      return
-    }
     this.videoSeekDragging = false
     this.videoSeekPending = true
     this.videoSeekTargetMs = timeMs
@@ -20879,9 +20945,13 @@ struct Index {
 
   private handleVideoCastPickerState(state: AVCastPickerState): void {
     console.info('[UgreenVideo] AVCastPicker state=' + state.toString())
+    if (this.showVideoPlayer) {
+      this.handleVideoControlInteraction(state === AVCastPickerState.STATE_APPEARING)
+    }
   }
 
   private async toggleVideoPip(): Promise<void> {
+    this.videoRatePanel = false
     if (this.isBusy || !this.showVideoPlayer || !this.videoSurfaceReady ||
       this.videoPipCreating || this.videoPipStarting || this.videoPipStopping) {
       return
@@ -20958,6 +21028,7 @@ struct Index {
     if (!this.showVideoPlayer || this.videoPipBackgrounded) {
       return
     }
+    this.suspendVideoInteractions()
     this.videoPipHideOnStart = false
     this.videoPipBackgrounded = true
     // The player remains alive and the original XComponent stays mounted in a
@@ -21191,6 +21262,8 @@ struct Index {
     }
     const entry = this.videoEntry
     const token = this.videoOpenToken
+    this.videoRatePanel = false
+    this.cancelVideoGestures()
     this.videoCastPreparing = true
     this.videoWasPlayingBeforeCast = this.videoPlaying
     this.videoCasting = true
@@ -21215,6 +21288,7 @@ struct Index {
     } catch (error) {
       this.videoCasting = false
       this.syncVideoBackgroundTask()
+      this.setVideoPlaybackRate(this.videoPreferredRate)
       this.statusText = '投播失败，已恢复本地播放'
       console.warn('[UgreenVideo] cast start failed: ' + JSON.stringify(error))
       if (this.videoWasPlayingBeforeCast && this.showVideoPlayer &&
@@ -21237,6 +21311,7 @@ struct Index {
     // when the route is disconnected.
     const shouldResume = this.videoPlaying
     this.videoCasting = false
+    this.setVideoPlaybackRate(this.videoPreferredRate)
     this.videoWasPlayingBeforeCast = false
     this.syncVideoBackgroundTask()
     if (!shouldResume || !this.showVideoPlayer || this.videoEntry === null) {

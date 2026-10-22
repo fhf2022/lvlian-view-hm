@@ -65,7 +65,7 @@ export struct AudioPlayerPage {
   @Event onMode: () => void = () => {}
   @Event onQueue: () => void = () => {}
   @Event onDownload: () => void = () => {}
-  @Event onMore: () => void = () => {}
+  @Event onDetails: () => void = () => {}
   @Event onSeek: (value: number) => void = () => {}
   @Event onCoverArea: (area: Area) => void = () => {}
   @Event onCoverVisibility: (ratio: number) => void = () => {}
@@ -277,6 +277,9 @@ export struct AudioPlayerPage {
         Image(this.playing ? $r('app.media.audio_pause') : $r('app.media.audio_play'))
           .width(this.playSize()).height(this.playSize())
           .objectFit(ImageFit.Contain).fillColor(this.foreground())
+          // Both SVGs are tiny bundled assets. Commit the new raster in the
+          // same frame instead of briefly clearing the previous async source.
+          .syncLoad(true)
           .draggable(false).hitTestBehavior(HitTestMode.None)
       }
     }
@@ -318,7 +321,7 @@ export struct AudioPlayerPage {
           .width(40).height(40)
           .draggable(false).hoverEffect(HoverEffect.None).id('audio-control-音频输出设备')
         this.Glyph($r('sys.symbol.arrow_down_circle'), '下载', () => this.onDownload(), 22)
-        this.Glyph($r('sys.symbol.dot_grid_1x2_circle'), '更多', () => this.onMore(), 22)
+        this.Glyph($r('sys.symbol.info_circle'), '详情', () => this.onDetails(), 22)
       }
       .width('100%').justifyContent(FlexAlign.SpaceBetween).padding({ top: this.shortWide() ? 12 : 24 })
     }
