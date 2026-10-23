@@ -25,6 +25,16 @@ export class CacheManager {
   private static thumbnailInventory: Map<string, CachedFile> | null = null
   private static thumbnailInventoryBytes: number = 0
   private static thumbnailInventoryVersion: number = 0
+  private static removalListeners: Set<(path: string) => void> = new Set()
+
+  static onRemoved(listener: (path: string) => void): void { CacheManager.removalListeners.add(listener) }
+  static offRemoved(listener: (path: string) => void): void { CacheManager.removalListeners.delete(listener) }
+  static reportRemoved(path: string): void {
+    CacheManager.forgetThumbnail(path)
+    for (const listener of CacheManager.removalListeners) {
+      try { listener(path) } catch (_) { console.warn('[UgreenCache] removal listener failed') }
+    }
+  }
 
   /** Called by the persistent store's separate trimming policy after a deletion. */
   static invalidateThumbnailInventory(): void {
@@ -157,7 +167,7 @@ export class CacheManager {
     } catch (error) {
       try {
         fileIo.unlinkSync(targetPath)
-        CacheManager.forgetThumbnail(targetPath)
+        CacheManager.reportRemoved(targetPath)
       } catch (_) { CacheManager.invalidateThumbnailInventory() }
       throw error as Error
     } finally {
@@ -180,7 +190,7 @@ export class CacheManager {
       for (const item of CacheManager.listFiles(directory)) {
         try {
           fileIo.unlinkSync(item.path)
-          CacheManager.forgetThumbnail(item.path)
+          CacheManager.reportRemoved(item.path)
           StorageBudget.sync(item.path)
           removedBytes += item.size
         } catch (_) {
@@ -206,7 +216,7 @@ export class CacheManager {
         }
         try {
           fileIo.unlinkSync(item.path)
-          CacheManager.forgetThumbnail(item.path)
+          CacheManager.reportRemoved(item.path)
           StorageBudget.sync(item.path)
           removedBytes += item.size
         } catch (_) {
@@ -223,10 +233,11 @@ export class CacheManager {
     const operation = CacheManager.writeQueue.then((): void => {
       try {
         fileIo.unlinkSync(path)
-        CacheManager.forgetThumbnail(path)
+        CacheManager.reportRemoved(path)
         StorageBudget.sync(path)
       } catch (_) {
-        // Cache entries are disposable and may already have been evicted.
+        // Missing files must invalidate their aliases too.
+        if (!CacheManager.exists(path)) { CacheManager.reportRemoved(path) }
       }
     })
     CacheManager.writeQueue = operation.catch((): void => {})
@@ -285,7 +296,8 @@ export class CacheManager {
       }
       try {
         fileIo.unlinkSync(item.path)
-          StorageBudget.sync(item.path)
+        CacheManager.reportRemoved(item.path)
+        StorageBudget.sync(item.path)
         projected -= item.size
       } catch (_) {
         // Keep going so another old cache file can still be evicted.
@@ -353,13 +365,13 @@ export class CacheManager {
       if (item.path === targetPath || protectedPaths.indexOf(item.path) >= 0) { continue }
       try {
         await fileIo.unlink(item.path)
-        CacheManager.forgetThumbnail(item.path)
+        CacheManager.reportRemoved(item.path)
         projected -= item.size
       } catch (_) {
         // Reconcile files reclaimed outside our lane; keep real IO failures
         // accounted for so admission never silently exceeds the soft limit.
         try { await fileIo.stat(item.path) } catch (_) {
-          CacheManager.forgetThumbnail(item.path)
+          CacheManager.reportRemoved(item.path)
           projected -= item.size
         }
       }

@@ -37,19 +37,22 @@ export class UserFileManager {
       photoType: isVideo ? photoAccessHelper.PhotoType.VIDEO : photoAccessHelper.PhotoType.IMAGE,
       subtype: photoAccessHelper.PhotoSubtype.DEFAULT
     }]
-    const targetUris = await helper.showAssetsCreationDialog([sourceUri], configs)
-    if (targetUris.length === 0) {
-      throw new UgreenError(UgreenErrorKind.UNKNOWN, '已取消保存到图库')
-    }
-    const sourceFile = await fileIo.open(sourcePath, fileIo.OpenMode.READ_ONLY)
-    const targetFile = await fileIo.open(targetUris[0], fileIo.OpenMode.WRITE_ONLY)
+    let sourceFile: fileIo.File | null = null
+    let targetFile: fileIo.File | null = null
     try {
+      const targetUris = await helper.showAssetsCreationDialog([sourceUri], configs)
+      if (targetUris.length === 0) {
+        throw new UgreenError(UgreenErrorKind.UNKNOWN, '已取消保存到图库')
+      }
+      sourceFile = await fileIo.open(sourcePath, fileIo.OpenMode.READ_ONLY)
+      targetFile = await fileIo.open(targetUris[0], fileIo.OpenMode.WRITE_ONLY)
       await fileIo.copyFile(sourceFile.fd, targetFile.fd)
+      return targetUris[0]
     } finally {
-      fileIo.closeSync(sourceFile.fd)
-      fileIo.closeSync(targetFile.fd)
+      if (targetFile !== null) { try { fileIo.closeSync(targetFile.fd) } catch (_) {} }
+      if (sourceFile !== null) { try { fileIo.closeSync(sourceFile.fd) } catch (_) {} }
+      try { await helper.release() } catch (_) {}
     }
-    return targetUris[0]
   }
 
   private static joinUri(directoryUri: string, name: string): string {

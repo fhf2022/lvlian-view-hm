@@ -41,6 +41,9 @@ export class MediaLocalRecord {
   modifiedTime: number = 0
   etag: string = ''
   checksum: string = ''
+  transferEtag: string = ''
+  transferChecksum: string = ''
+  transferValidator: string = ''
   cachePath: string = ''
   partPath: string = ''
   durablePath: string = ''
@@ -151,6 +154,9 @@ export class MediaLocalStore {
         record.modifiedTime = this.numberValue(value['modifiedTime'])
         record.etag = this.stringValue(value['etag'])
         record.checksum = this.stringValue(value['checksum'])
+        record.transferEtag = this.stringValue(value['transferEtag'])
+        record.transferChecksum = this.stringValue(value['transferChecksum'])
+        record.transferValidator = this.stringValue(value['transferValidator'])
         record.cachePath = this.stringValue(value['cachePath'])
         record.partPath = this.stringValue(value['partPath'])
         record.durablePath = this.stringValue(value['durablePath'])
@@ -215,6 +221,9 @@ export class MediaLocalStore {
     result.modifiedTime = source.modifiedTime
     result.etag = source.etag
     result.checksum = source.checksum
+    result.transferEtag = source.transferEtag
+    result.transferChecksum = source.transferChecksum
+    result.transferValidator = source.transferValidator
     result.cachePath = source.cachePath
     result.partPath = source.partPath
     result.durablePath = source.durablePath

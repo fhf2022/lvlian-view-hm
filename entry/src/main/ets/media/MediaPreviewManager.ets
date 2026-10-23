@@ -15,12 +15,12 @@ type PreviewKind = 'image' | 'video' | 'audio' | ''
  * present in the app cache.
  */
 export class MediaPreviewManager {
-  cachedImagePreview(entry: FileEntry, cacheDirectory: string): string {
-    if (this.kind(entry) !== 'image' || cacheDirectory.length === 0) {
+  cachedImagePreview(entry: FileEntry, cacheDirectory: string, identity: string): string {
+    if (this.kind(entry) !== 'image' || cacheDirectory.length === 0 || identity.length === 0) {
       return ''
     }
     return CacheManager.findExistingFast(cacheDirectory, this.imagePreviewFileName(entry),
-      this.imagePreviewCacheKey(entry))
+      this.imagePreviewCacheKey(identity))
   }
 
   async fromLocal(entry: FileEntry, localPath: string,
@@ -30,7 +30,8 @@ export class MediaPreviewManager {
       return ''
     }
     if (kind === 'image') {
-      return await this.createImagePreview(entry, localPath, cacheDirectory, cacheLimitBytes)
+      if (identity.length === 0) { return '' }
+      return await this.createImagePreview(entry, localPath, cacheDirectory, cacheLimitBytes, identity)
     }
     return await this.extractAndCache(entry, kind, cacheDirectory, cacheLimitBytes,
       localPath, identity)
@@ -42,10 +43,10 @@ export class MediaPreviewManager {
    * decoded PixelMap to the list profile budget.
    */
   private async createImagePreview(entry: FileEntry, localPath: string,
-    cacheDirectory: string, cacheLimitBytes: number): Promise<string> {
+    cacheDirectory: string, cacheLimitBytes: number, identity: string): Promise<string> {
     const preservesAlpha = this.shouldPreserveAlpha(entry.name)
     const fileName = this.imagePreviewFileName(entry)
-    const cacheKey = this.imagePreviewCacheKey(entry)
+    const cacheKey = this.imagePreviewCacheKey(identity)
     const existingPath = CacheManager.findExisting(cacheDirectory, fileName, cacheKey)
     if (existingPath.length > 0) {
       return existingPath
@@ -185,8 +186,7 @@ export class MediaPreviewManager {
     return entry.name + '.image.preview.' + (this.shouldPreserveAlpha(entry.name) ? 'png' : 'jpg')
   }
 
-  private imagePreviewCacheKey(entry: FileEntry): string {
-    return entry.path + ':media-preview:image-v5-imagekit-canonical:' + entry.modifiedTime.toString() + ':' +
-      entry.size.toString()
+  private imagePreviewCacheKey(identity: string): string {
+    return identity + ':media-preview:image-v6-imagekit-canonical'
   }
 }

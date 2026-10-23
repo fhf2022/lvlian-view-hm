@@ -39,7 +39,7 @@ export class ThumbnailCacheStore {
 
   private directory: string = ''
   private indexPath: string = ''
-  private items: Record<string, ThumbnailCacheItem> = {}
+  private items: Map<string, ThumbnailCacheItem> = new Map()
   private initPromise: Promise<void> | null = null
   private writeQueue: Promise<void> = Promise.resolve()
   private persistTimer: number = 0
@@ -47,9 +47,17 @@ export class ThumbnailCacheStore {
   private accessPersistTimer: number = 0
   private accessPersistDirty: boolean = false
   private itemCount: number = 0
+  private keysByPath: Map<string, Set<string>> = new Map()
+  private removed = (path: string): void => {
+    const keys = this.keysByPath.get(path)
+    if (keys === undefined) { return }
+    this.removeKeys(Array.from(keys))
+    this.schedulePersist()
+  }
 
   async initialize(context: Context): Promise<void> {
     if (this.initPromise === null) {
+      CacheManager.onRemoved(this.removed)
       this.initPromise = this.open(context)
     }
     await this.initPromise
@@ -69,7 +77,7 @@ export class ThumbnailCacheStore {
     if (cacheKey.length === 0 || this.directory.length === 0) {
       return ''
     }
-    const indexed = this.items[cacheKey]
+    const indexed = this.items.get(cacheKey)
     if (indexed === undefined) {
       return ''
     }
@@ -81,7 +89,7 @@ export class ThumbnailCacheStore {
     if (cacheKey.length === 0 || fileName.length === 0 || this.directory.length === 0) {
       return ''
     }
-    const indexed = this.items[cacheKey]
+    const indexed = this.items.get(cacheKey)
     if (indexed !== undefined && CacheManager.exists(indexed.path)) {
       // Keep logical access time in memory. A later cache write or limit
       // maintenance persists it; a read hit must not serialize the complete
@@ -115,16 +123,19 @@ export class ThumbnailCacheStore {
     } catch (_) {
       return
     }
-    const isNewKey = this.items[cacheKey] === undefined
-    this.items[cacheKey] = {
+    const previous = this.items.get(cacheKey)
+    const isNewKey = previous === undefined || previous.path !== path
+    if (previous !== undefined && previous.path !== path) { this.removeKeys([cacheKey]) }
+    this.items.set(cacheKey, {
       path: path,
       lastAccessAt: Date.now(),
       size: size
-    }
+    })
     if (isNewKey) {
       this.itemCount += 1
     }
-    this.trimIndex()
+    this.indexPathKey(path, cacheKey)
+    await this.trimIndex()
     this.schedulePersist()
   }
 
@@ -149,8 +160,9 @@ export class ThumbnailCacheStore {
     if (this.directory.length > 0) {
       await CacheManager.clear(this.directory)
     }
-    this.items = {}
+    this.items.clear()
     this.itemCount = 0
+    this.keysByPath.clear()
     await this.flushPersist()
   }
 
@@ -158,23 +170,19 @@ export class ThumbnailCacheStore {
     if (maxBytes <= 0) {
       return
     }
-    const staleKeys: string[] = []
     const indexedAccess: Record<string, number> = {}
-    for (const key of Object.keys(this.items)) {
-      const item = this.items[key]
-      if (item === undefined || !CacheManager.exists(item.path)) {
-        staleKeys.push(key)
-        continue
-      }
+    for (const key of Array.from(this.items.keys())) {
+      const item = this.items.get(key)
+      if (item === undefined) { continue }
       const previous = indexedAccess[item.path]
       indexedAccess[item.path] = previous === undefined
         ? item.lastAccessAt : Math.max(previous, item.lastAccessAt)
     }
-    if (staleKeys.length > 0) {
-      this.removeKeys(staleKeys)
+    const files = await this.listPhysicalFiles()
+    const present = new Set<string>(files.map((file: ThumbnailPhysicalFile): string => file.path))
+    for (const path of Array.from(this.keysByPath.keys())) {
+      if (!present.has(path)) { CacheManager.reportRemoved(path) }
     }
-
-    const files = this.listPhysicalFiles()
     let total = 0
     for (const file of files) {
       total += file.size
@@ -190,7 +198,8 @@ export class ThumbnailCacheStore {
         break
       }
       try {
-        fileIo.unlinkSync(file.path)
+        await fileIo.unlink(file.path)
+        CacheManager.reportRemoved(file.path)
         CacheManager.invalidateThumbnailInventory()
         removedPaths.add(file.path)
         total = Math.max(0, total - file.size)
@@ -207,43 +216,32 @@ export class ThumbnailCacheStore {
         }))
   }
 
-  private listPhysicalFiles(): ThumbnailPhysicalFile[] {
+  private async listPhysicalFiles(): Promise<ThumbnailPhysicalFile[]> {
     const result: ThumbnailPhysicalFile[] = []
     let names: string[] = []
     try {
-      names = fileIo.listFileSync(this.directory)
+      names = await fileIo.listFile(this.directory)
     } catch (_) {
       return result
     }
-    for (const name of names) {
-      const path = this.directory + '/' + name
-      try {
-        const stat = fileIo.statSync(path)
-        if (stat.isFile()) {
-          result.push({
-            path: path,
-            size: stat.size,
-            modifiedTime: stat.mtime * 1000,
-            lastAccessAt: stat.mtime * 1000
-          })
-        }
-      } catch (_) {
-        // The file may disappear between listFileSync and statSync.
-      }
+    for (let offset = 0; offset < names.length; offset += 8) {
+      const batch = await Promise.all(names.slice(offset, offset + 8).map(
+        async (name: string): Promise<ThumbnailPhysicalFile | null> => {
+          const path = this.directory + '/' + name
+          try {
+            const stat = await fileIo.stat(path)
+            return stat.isFile() ? { path: path, size: stat.size,
+              modifiedTime: stat.mtime * 1000, lastAccessAt: stat.mtime * 1000 } : null
+          } catch (_) { return null }
+        }))
+      for (const file of batch) { if (file !== null) { result.push(file) } }
     }
     return result
   }
 
   private removeKeysForPath(path: string): void {
-    const keys: string[] = []
-    for (const key of Object.keys(this.items)) {
-      if (this.items[key].path === path) {
-        keys.push(key)
-      }
-    }
-    if (keys.length > 0) {
-      this.removeKeys(keys)
-    }
+    const keys = this.keysByPath.get(path)
+    if (keys !== undefined) { this.removeKeys(Array.from(keys)) }
   }
 
   private touchIndexedItem(item: ThumbnailCacheItem): void {
@@ -275,83 +273,88 @@ export class ThumbnailCacheStore {
       // report a useful error if the private storage cannot be opened.
     }
     try {
-      const text = fileIo.readTextSync(this.indexPath)
+      const text = await fileIo.readText(this.indexPath)
       const parsed = JSON.parse(text) as JsonObject
       const rawItems = this.asRecord(parsed['items'])
       for (const key of Object.keys(rawItems)) {
         const raw = this.asRecord(rawItems[key])
         const path = this.stringValue(raw['path'])
-        if (!path.startsWith(this.directory + '/') || !CacheManager.exists(path)) {
+        // Validate only on demand; startup must not stat every thumbnail and
+        // every alias on the UI thread. Image failure handles external loss.
+        if (!path.startsWith(this.directory + '/')) {
           continue
         }
-        this.items[key] = {
+        this.items.set(key, {
           path: path,
           lastAccessAt: this.numberValue(raw['lastAccessAt'], Date.now()),
           size: this.numberValue(raw['size'], 0)
-        }
+        })
       }
       const migrated = this.promoteLegacyAliases()
-      this.itemCount = Object.keys(this.items).length
-      this.trimIndex()
+      for (const key of Array.from(this.items.keys())) { this.indexPathKey(this.items.get(key)!.path, key) }
+      this.itemCount = Array.from(this.items.keys()).length
+      await this.trimIndex()
       if (migrated) {
         this.schedulePersist()
       }
     } catch (_) {
-      this.items = {}
+      this.items.clear()
       this.itemCount = 0
     }
   }
 
-  private trimIndex(): void {
+  private async trimIndex(): Promise<void> {
     if (this.itemCount <= ThumbnailCacheStore.MAX_INDEX_ITEMS) {
       return
     }
-    const keys = Object.keys(this.items)
+    const keys = Array.from(this.items.keys())
     keys.sort((left: string, right: string): number => {
-      return this.items[left].lastAccessAt - this.items[right].lastAccessAt
+      return this.items.get(left)!.lastAccessAt - this.items.get(right)!.lastAccessAt
     })
-    const removeCount = Math.max(0, keys.length - ThumbnailCacheStore.MAX_INDEX_ITEMS)
+    // Leave headroom so steady browsing does not sort 40,000 aliases for
+    // every newly generated thumbnail once the index reaches capacity.
+    const removeCount = Math.max(128, keys.length - ThumbnailCacheStore.MAX_INDEX_ITEMS)
     const removedPaths: Record<string, boolean> = {}
     const removedKeys = keys.slice(0, removeCount)
     for (const key of removedKeys) {
-      removedPaths[this.items[key].path] = true
+      removedPaths[this.items.get(key)!.path] = true
     }
     this.removeKeys(removedKeys)
     const retainedPaths: Record<string, boolean> = {}
-    for (const key of Object.keys(this.items)) {
-      retainedPaths[this.items[key].path] = true
+    for (const key of Array.from(this.items.keys())) {
+      retainedPaths[this.items.get(key)!.path] = true
     }
     for (const path of Object.keys(removedPaths)) {
       if (retainedPaths[path] !== true) {
-        try {
-          fileIo.unlinkSync(path)
-          CacheManager.invalidateThumbnailInventory()
-        } catch (_) {}
+        await CacheManager.remove(path)
       }
     }
   }
 
   private removeKeys(keys: string[]): void {
-    const removed: Record<string, boolean> = {}
     for (const key of keys) {
-      removed[key] = true
+      const item = this.items.get(key)
+      if (item === undefined) { continue }
+      const aliases = this.keysByPath.get(item.path)
+      aliases?.delete(key)
+      if (aliases?.size === 0) { this.keysByPath.delete(item.path) }
+      this.items.delete(key)
+      this.itemCount -= 1
     }
-    const next: Record<string, ThumbnailCacheItem> = {}
-    for (const key of Object.keys(this.items)) {
-      if (removed[key] !== true) {
-        next[key] = this.items[key]
-      }
-    }
-    this.items = next
-    this.itemCount = Object.keys(next).length
+  }
+
+  private indexPathKey(path: string, key: string): void {
+    let keys = this.keysByPath.get(path)
+    if (keys === undefined) { keys = new Set(); this.keysByPath.set(path, keys) }
+    keys.add(key)
   }
 
   private promoteLegacyAliases(): boolean {
     let changed = false
-    for (const key of Object.keys(this.items)) {
+    for (const key of Array.from(this.items.keys())) {
       const identityKey = this.identityAliasForLegacyKey(key)
-      if (identityKey.length > 0 && this.items[identityKey] === undefined) {
-        this.items[identityKey] = this.items[key]
+      if (identityKey.length > 0 && this.items.get(identityKey) === undefined) {
+        this.items.set(identityKey, this.items.get(key)!)
         changed = true
       }
     }
@@ -397,9 +400,11 @@ export class ThumbnailCacheStore {
   }
 
   private persist(): Promise<void> {
+    const items: Record<string, ThumbnailCacheItem> = {}
+    this.items.forEach((item: ThumbnailCacheItem, key: string): void => { items[key] = item })
     const document: ThumbnailCacheDocument = {
       version: 1,
-      items: this.items
+      items: items
     }
     const content = JSON.stringify(document)
     const operation = this.writeQueue.then((): void => {

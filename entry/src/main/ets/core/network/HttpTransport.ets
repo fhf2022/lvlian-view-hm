@@ -5,10 +5,13 @@ import { util } from '@kit.ArkTS'
 import { fileIo } from '@kit.CoreFileKit'
 import { UgreenError, UgreenErrorKind } from '../../ugreen/UgreenErrors'
 import { HttpResult, JsonObject } from './HttpTypes'
+import { RemoteFileVersion } from './RemoteFileVersion'
 
 export interface BinaryDownloadProgress {
   receiveSize: number
   totalSize: number
+  etag?: string
+  resumeValidator?: string
 }
 
 export type BinaryProgressListener = (progress: BinaryDownloadProgress) => void
@@ -18,6 +21,8 @@ export interface StreamDownloadResult {
   totalSize: number
   receivedSize: number
   resumed: boolean
+  etag?: string
+  resumeValidator?: string
 }
 
 export interface BinaryRangeResult {
@@ -169,11 +174,17 @@ export class HttpTransport {
     const headersCallback = (raw: Object): void => {
       responseHeaders = this.toHeaders(raw)
       const status = this.headerStatus(responseHeaders)
-      if (status >= 300 && status < 400 && this.headerValue(responseHeaders, 'location').length > 0) { return }
+      if ((status === 0 || (status >= 300 && status < 400)) &&
+        this.headerValue(responseHeaders, 'location').length > 0) { return }
       if (status > 0 && status < 200) { return }
       if (status >= 200) {
         try { this.checkResponse(url, attempt, status) }
         catch (error) { failStream(error as Object); return }
+      }
+      const validator = requestHeaders['If-Range'] || ''
+      if (validator.length > 0 && !RemoteFileVersion.matches(validator, responseHeaders)) {
+        failStream(new UgreenError(UgreenErrorKind.NETWORK, '远端文件已变化，请重新下载', 206))
+        return
       }
       const advertisedLength = this.numberHeader(responseHeaders, 'content-length')
       if (advertisedLength > safeLength) {
@@ -278,7 +289,7 @@ export class HttpTransport {
   async requestBinaryToFile(url: string, targetPath: string,
     headers: Record<string, string> = {}, resumeOffset: number = 0,
     expectedTotal: number = 0, onProgress?: BinaryProgressListener,
-    shouldContinue?: () => boolean): Promise<StreamDownloadResult> {
+    shouldContinue?: () => boolean, expectedValidator: string = ''): Promise<StreamDownloadResult> {
     const attempt = NasConnection.shared().begin(url)
     const request = http.createHttp()
     const requestHeaders: Record<string, string> = {}
@@ -287,6 +298,8 @@ export class HttpTransport {
     }
     if (resumeOffset > 0) {
       requestHeaders['Range'] = 'bytes=' + resumeOffset.toString() + '-'
+      const validator = RemoteFileVersion.strongEtag(expectedValidator)
+      if (validator.length > 0) { requestHeaders['If-Range'] = validator }
     }
 
     StorageBudget.pin(targetPath)
@@ -296,6 +309,7 @@ export class HttpTransport {
     let totalSize = expectedTotal
     let responseCode = 0
     let responseHeaders: Record<string, string> = {}
+    let responseValidator = ''
     let headerResolve: (() => void) | null = null
     let headerReject: ((error: Object) => void) | null = null
     const headerReady = new Promise<void>((resolve, reject) => {
@@ -358,6 +372,14 @@ export class HttpTransport {
           throw new UgreenError(UgreenErrorKind.NETWORK, '服务器返回了无效的断点范围', status)
         }
         const append = resumeOffset > 0 && rangeStart === resumeOffset
+        if (append && !RemoteFileVersion.matches(expectedValidator, responseHeaders)) {
+          throw new UgreenError(UgreenErrorKind.NETWORK, '远端文件已变化，重新下载', 206)
+        }
+        const rangeTotal = this.rangeTotal(this.headerValue(responseHeaders, 'content-range'))
+        if (append && expectedTotal > 0 && rangeTotal !== expectedTotal) {
+          throw new UgreenError(UgreenErrorKind.NETWORK, '远端文件大小已变化，重新下载', 206)
+        }
+        responseValidator = RemoteFileVersion.fromHeaders(responseHeaders)
         // Without a matching range, stream a potential 200 fallback into a
         // separate file. Commit by rename only after its final status is valid;
         // a gateway page cannot truncate the existing resumable prefix.
@@ -401,7 +423,9 @@ export class HttpTransport {
         receivedSize += written
         StorageBudget.sync(activePath)
         if (onProgress !== undefined) {
-          onProgress({ receiveSize: (appendMode ? resumeOffset : 0) + receivedSize, totalSize: totalSize })
+          onProgress({ receiveSize: (appendMode ? resumeOffset : 0) + receivedSize, totalSize: totalSize,
+            etag: replacementUsed ? undefined : this.headerValue(responseHeaders, 'etag'),
+            resumeValidator: replacementUsed ? undefined : responseValidator })
         }
       } catch (error) {
         streamError = error as Object
@@ -469,7 +493,9 @@ export class HttpTransport {
         responseCode: responseCode,
         totalSize: totalSize,
         receivedSize: finalReceived,
-        resumed: append
+        resumed: append,
+        etag: this.headerValue(responseHeaders, 'etag'),
+        resumeValidator: responseValidator
       }
     } catch (error) {
       if (streamError !== null) { throw streamError as Error }

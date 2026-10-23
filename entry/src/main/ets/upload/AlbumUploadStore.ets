@@ -17,6 +17,7 @@ export class AlbumUploadStore {
       id TEXT PRIMARY KEY, batch TEXT NOT NULL, uri TEXT, name TEXT, target TEXT, size INTEGER,
       modified INTEGER, state TEXT, error TEXT, prepared INTEGER, UNIQUE(batch, uri))`)
     await db.executeSql('CREATE INDEX IF NOT EXISTS album_pending ON album_items(batch, state)')
+    await db.executeSql("CREATE INDEX IF NOT EXISTS album_unfinished ON album_items(batch) WHERE state IN ('pending','active')")
     await db.executeSql(`CREATE TABLE IF NOT EXISTS album_remote (
       batch TEXT, name TEXT, size INTEGER, directory INTEGER, PRIMARY KEY(batch, name))`)
     await db.executeSql(`CREATE TABLE IF NOT EXISTS album_ledger (
@@ -79,8 +80,36 @@ export class AlbumUploadStore {
     return items
   }
   async next(batch: string): Promise<AlbumUploadItem | null> {
-    const result = await this.store().querySql("SELECT * FROM album_items WHERE batch=? AND state IN ('pending','active') ORDER BY rowid LIMIT 1", [batch])
+    const result = await this.store().querySql("SELECT * FROM album_items INDEXED BY album_unfinished WHERE batch=? AND state IN ('pending','active') ORDER BY rowid LIMIT 1", [batch])
     try { return result.goToNextRow() ? this.item(result) : null } finally { result.close() }
+  }
+  /** Item state and counters commit together. Recount is reserved for recovery and batch boundaries. */
+  async finishItem(job: AlbumUploadJob, item: AlbumUploadItem): Promise<void> {
+    const db = this.store()
+    const uploaded = job.uploaded, skipped = job.skipped, failed = job.failed, completed = job.completedBytes
+    db.beginTransaction()
+    try {
+      const result = await db.querySql('SELECT state,size FROM album_items WHERE id=? AND batch=?', [item.id, job.id])
+      let previous: AlbumItemState
+      let size: number
+      try {
+        if (!result.goToNextRow()) { throw new Error('上传清单条目不存在') }
+        previous = this.text(result, 'state') as AlbumItemState
+        size = this.number(result, 'size')
+      } finally { result.close() }
+      await this.update(item)
+      job.uploaded += (item.state === 'uploaded' ? 1 : 0) - (previous === 'uploaded' ? 1 : 0)
+      job.skipped += (item.state === 'skipped' ? 1 : 0) - (previous === 'skipped' ? 1 : 0)
+      job.failed += (item.state === 'failed' ? 1 : 0) - (previous === 'failed' ? 1 : 0)
+      job.completedBytes += (item.state === 'uploaded' || item.state === 'skipped' ? item.size : 0) -
+        (previous === 'uploaded' || previous === 'skipped' ? size : 0)
+      await this.save(job)
+      db.commit()
+    } catch (error) {
+      job.uploaded = uploaded; job.skipped = skipped; job.failed = failed; job.completedBytes = completed
+      db.rollBack()
+      throw error as Error
+    }
   }
   async recount(job: AlbumUploadJob): Promise<void> {
     const result = await this.store().querySql('SELECT state,COUNT(*) AS count,SUM(size) AS size FROM album_items WHERE batch=? GROUP BY state', [job.id])

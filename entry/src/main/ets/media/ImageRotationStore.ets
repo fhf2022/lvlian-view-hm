@@ -125,6 +125,18 @@ export class ImageRotationStore {
     await operation
   }
 
+  async rename(scope: string, oldPath: string, entry: FileEntry): Promise<void> {
+    const operation = this.writeQueue.then(async (): Promise<void> => {
+      const store = await this.readyStore()
+      if (store === null || scope.length === 0) { return }
+      await store.executeSql('UPDATE OR REPLACE image_rotation SET remote_path=?,parent_path=? ' +
+        'WHERE scope=? AND remote_path=? AND file_size=? AND modified_time=?',
+        [entry.path, this.parentPath(entry.path), scope, oldPath, entry.size, entry.modifiedTime])
+    })
+    this.writeQueue = operation.catch((): void => {})
+    await operation
+  }
+
   async remove(scope: string, path: string): Promise<void> {
     if (scope.length === 0 || path.length === 0) {
       return

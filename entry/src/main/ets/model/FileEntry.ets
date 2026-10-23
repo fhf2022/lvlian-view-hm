@@ -160,8 +160,10 @@ export class DownloadTaskRecord {
     result.errorMessage = source.errorMessage
     result.manualMobileResume = source.manualMobileResume
     result.sourceKey = source.sourceKey
+    result.sourceScope = source.sourceScope
     result.sourceEtag = source.sourceEtag
     result.sourceChecksum = source.sourceChecksum
+    result.resumeValidator = source.resumeValidator
   }
 
   id: string = ''
@@ -186,6 +188,8 @@ export class DownloadTaskRecord {
   manualMobileResume: boolean = false
   // Stable identity shared by video streaming and the durable download queue.
   sourceKey: string = ''
+  sourceScope: string = ''
   sourceEtag: string = ''
   sourceChecksum: string = ''
+  resumeValidator: string = ''
 }

@@ -43,8 +43,15 @@ export class VideoPlaybackManager {
 
   async open(handle: VideoSourceHandle, positionMs: number,
     callbacks: VideoPlaybackCallbacks, autoPlay: boolean = true): Promise<void> {
-    await this.release()
+    const releasing = this.release()
+    const generation = this.generation
+    await releasing
+    if (generation !== this.generation) { return }
     const player = await media.createAVPlayer()
+    if (generation !== this.generation) {
+      try { await player.release() } catch (_) {}
+      return
+    }
     this.player = player
     this.handle = handle
     this.callbacks = callbacks
@@ -56,7 +63,6 @@ export class VideoPlaybackManager {
     this.currentTimeHintMs = Math.max(0, positionMs)
     this.cachedDurationHintMs = 0
     this.completionReported = false
-    const generation = this.generation
 
     player.on('stateChange', (state: media.AVPlayerState): void => {
       if (generation !== this.generation || this.callbacks === null) {
@@ -345,6 +351,7 @@ export class VideoPlaybackManager {
         // guessing a render/timer frame.
         await this.waitForInitialized(player, generation)
       }
+      if (!this.isCurrentPlayer(player, generation)) { return }
       if (player.state !== 'initialized') {
         throw new Error('视频数据源未进入 initialized 状态: ' + player.state)
       }
@@ -363,6 +370,7 @@ export class VideoPlaybackManager {
         // strategy at the initialized state before prepare().
         await player.setPlaybackStrategy(playbackStrategy)
       }
+      if (!this.isCurrentPlayer(player, generation)) { return }
       await player.prepare()
       if (!this.isCurrentPlayer(player, generation)) {
         return
@@ -403,7 +411,7 @@ export class VideoPlaybackManager {
           // The descriptor may already have been closed by player teardown.
         }
       }
-      this.configuring = false
+      if (generation === this.generation) { this.configuring = false }
     }
   }
 

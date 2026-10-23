@@ -1,11 +1,16 @@
 import { DownloadDestination } from '../download/DownloadDestination'
 import { StorageBudget } from '../download/StorageBudget'
-import { DownloadTaskRecord } from '../model/FileEntry'
+import { DownloadTaskRecord, DownloadTaskStatus } from '../model/FileEntry'
+import { NetworkPolicy } from '../core/network/NetworkPolicy'
+import { RemoteFileVersion } from '../core/network/RemoteFileVersion'
+import { TransferBackgroundManager } from '../transfer/TransferBackgroundManager'
+import { TransferProgress } from '../transfer/TransferProgress'
+import { TransferRunPolicy } from '../transfer/TransferRunPolicy'
 import { Context } from '@kit.AbilityKit'
 import { fileIo } from '@kit.CoreFileKit'
 import { media } from '@kit.MediaKit'
 import { CacheManager } from '../download/CacheManager'
-import { HttpTransport } from '../core/network/HttpTransport'
+import { BinaryRangeResult, HttpTransport } from '../core/network/HttpTransport'
 import { NasConnection } from '../core/network/NasConnection'
 import { UgreenError, UgreenErrorKind } from '../ugreen/UgreenErrors'
 import { FileEntry, DownloadDescriptor } from '../model/FileEntry'
@@ -46,12 +51,13 @@ export class VideoSourceHandle {
   streamType: string = 'file'
 }
 
-export type VideoTransferListener = (states: VideoTransferState[]) => void
+export type VideoTransferListener = (states: VideoTransferState[], tasks: DownloadTaskRecord[]) => void
 
 class VideoTransferSession {
   entry: FileEntry = new FileEntry()
   signature: RemoteFileSignature = new RemoteFileSignature()
   descriptor: DownloadDescriptor = new DownloadDescriptor()
+  resumeValidator: string = ''
   sourceKey: string = ''
   streamTaskId: string = ''
   streamTaskClosed: boolean = false
@@ -62,6 +68,8 @@ class VideoTransferSession {
   inFlight: Map<string, Promise<void>> = new Map<string, Promise<void>>()
   paused: boolean = false
   waitingForNas: boolean = false
+  waitingStatus: DownloadTaskStatus | '' = ''
+  manualMobileResume: boolean = false
   removed: boolean = false
   temporaryOnly: boolean = false
   closed: boolean = false
@@ -94,7 +102,69 @@ export class VideoTransferManager {
   private readerPaths: Map<string, string[]> = new Map<string, string[]>()
   private sessions: Map<string, VideoTransferSession> = new Map<string, VideoTransferSession>()
   private states: Record<string, VideoTransferState> = {}
+  private taskRows: Map<string, DownloadTaskRecord> = new Map()
   private listeners: VideoTransferListener[] = []
+  private networkPolicy: NetworkPolicy | null = null
+  private meteredContinue: boolean = false
+  private ready: boolean = false
+  private downloadLane: Promise<void> = Promise.resolve()
+
+  configureDownloads(network: NetworkPolicy, meteredContinue: boolean): void {
+    this.meteredContinue = meteredContinue
+    if (this.networkPolicy === null) {
+      this.networkPolicy = network
+      network.onChange((): void => {
+        if (network.current() === 'unmetered') {
+          for (const session of this.sessions.values()) { session.manualMobileResume = false }
+        }
+        this.resumePendingDownloads()
+      })
+      TransferBackgroundManager.shared().onChange((): void => this.resumePendingDownloads())
+      TransferBackgroundManager.shared().onCancel((): void => {
+        for (const session of this.sessions.values()) {
+          if (!session.downloadRequested) { continue }
+          session.paused = true
+          session.waitingStatus = ''
+        }
+        this.notify()
+      })
+    }
+    this.resumePendingDownloads()
+  }
+
+  setReady(ready: boolean): void {
+    this.ready = ready
+    if (!ready) {
+      for (const session of this.sessions.values()) {
+        if (session.downloadRequested) { session.paused = true; session.waitingStatus = '' }
+      }
+    }
+    this.notify()
+    if (ready) { this.resumePendingDownloads() }
+  }
+
+  private waitingStatus(session: VideoTransferSession): DownloadTaskStatus | '' {
+    return TransferRunPolicy.waiting(this.ready && !session.paused && !session.removed &&
+      session.signature.scopeKey === this.repository?.cacheScopeHash(),
+      this.networkPolicy?.current() ?? 'unknown', this.meteredContinue || session.manualMobileResume,
+      !(session.totalBytes > 0 && session.ranges.complete(session.totalBytes)))
+  }
+
+  private requireDownloadAllowed(session: VideoTransferSession): void {
+    const waiting = this.waitingStatus(session)
+    if (waiting.length === 0) { return }
+    session.waitingStatus = waiting
+    throw new Error('下载已暂停')
+  }
+
+  private resumePendingDownloads(): void {
+    for (const session of this.sessions.values()) {
+      if (session.waitingStatus.length === 0 || session.downloadPromise !== null || session.paused ||
+        session.removed || this.waitingStatus(session).length > 0) { continue }
+      this.startDownload(session).catch((): void => {})
+    }
+    this.notify()
+  }
 
   async initialize(context: Context, repository: UgreenRemoteRepository,
     cacheDirectory: string, cacheLimitBytes: number): Promise<void> {
@@ -317,7 +387,6 @@ export class VideoTransferManager {
       session.descriptor = await this.repository.mediaPlayerDescriptor(entry)
     }
     session.closed = false
-    session.downloadRequested = false
     console.info('[UgreenVideo] source ready path=' + entry.path +
       ' entrySize=' + entry.size.toString() + ' total=' + session.totalBytes.toString() +
       ' local=' + (session.partPath.length > 0).toString())
@@ -389,10 +458,15 @@ export class VideoTransferManager {
     return descriptor
   }
 
+  /** Resolve after admission, not completion. Save/share callers that need
+   * complete bytes must use requestCachedFile instead of blocking the page. */
   async requestDownload(entry: FileEntry, destinationRoot: string = '',
     relativePath: string = ''): Promise<void> {
     await this.requireInitialized()
     const signature = this.signature(entry)
+    await DownloadDestination.directory()
+    await TransferBackgroundManager.shared().requestResume()
+    if (!this.ready || signature.scopeKey !== this.repository?.cacheScopeHash()) { throw new Error('账号已变化') }
     const sourceKey = signature.key()
     const existing = await this.resolveLocal(entry)
     if (existing.length > 0 && this.isDurablePath(existing, signature)) {
@@ -413,9 +487,10 @@ export class VideoTransferManager {
         activeSession.destinationRoot = destinationRoot
         activeSession.relativePath = relativePath
         activeSession.totalBytes = signature.size > 0 ? signature.size : this.fileSize(existing)
+        activeSession.manualMobileResume = this.networkPolicy?.isMetered() ?? true
         activeSession.ranges.clear()
         activeSession.ranges.add(0, activeSession.totalBytes)
-        await this.startDownload(activeSession)
+        this.startDownload(activeSession).catch((): void => {})
         return
       }
       await this.promoteCachedFile(entry, signature, existing, destinationRoot, relativePath)
@@ -426,16 +501,22 @@ export class VideoTransferManager {
     session.relativePath = relativePath
     session.paused = false
     session.temporaryOnly = false
-    await this.startDownload(session)
+    session.manualMobileResume = this.networkPolicy?.isMetered() ?? true
+    this.startDownload(session).catch((): void => {})
   }
 
   snapshotTasks(): DownloadTaskRecord[] {
     const tasks: DownloadTaskRecord[] = []
     for (const record of this.store.snapshot()) {
-      if (!record.userDownload) { continue }
-      const task = new DownloadTaskRecord()
+      if (!record.userDownload || record.scopeKey.length === 0 || record.scopeKey !== this.repository?.cacheScopeHash()) { continue }
+      let task = this.taskRows.get(record.sourceKey)
+      if (task === undefined) {
+        task = new DownloadTaskRecord()
+        this.taskRows.set(record.sourceKey, task)
+      }
       task.id = 'video:' + record.sourceKey
       task.sourceKey = record.sourceKey
+      task.sourceScope = record.scopeKey
       task.remotePath = record.remotePath
       task.name = record.name
       task.mimeType = 'video/*'
@@ -447,22 +528,32 @@ export class VideoTransferManager {
       task.receivedBytes = record.receivedBytes
       const state = this.states[record.sourceKey]
       const session = this.sessions.get(record.sourceKey)
-      task.status = record.durablePath.length > 0 ? 'completed' :
-        (session !== undefined && session.waitingForNas && !session.paused
-          ? (NasConnection.shared().canRequest() ? 'waiting_wifi' : 'waiting_server') :
-        (state !== undefined && state.status === 'failed' ? 'failed' :
-          (session !== undefined && session.downloadPromise !== null && !session.paused ? 'downloading' : 'paused')))
+      task.status = 'paused'
+      if (record.durablePath.length > 0) { task.status = 'completed' }
+      else if (session?.paused) { task.status = 'paused' }
+      else if (session !== undefined && session.waitingStatus !== '') { task.status = session.waitingStatus }
+      else if (session?.waitingForNas) {
+        task.status = NasConnection.shared().canRequest() ? 'waiting_wifi' : 'waiting_server'
+      } else if (state?.status === 'failed') { task.status = 'failed' }
+      else if (session !== undefined && session.downloadPromise !== null) {
+        task.status = state?.status === 'queued' ? 'queued' : 'downloading'
+      }
       task.errorMessage = state === undefined ? '' : state.errorMessage
       tasks.push(task)
     }
     const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000
     let completed = 0
-    return tasks.sort((a: DownloadTaskRecord, b: DownloadTaskRecord): number => b.updatedAt - a.updatedAt)
+    const visible = tasks.sort((a: DownloadTaskRecord, b: DownloadTaskRecord): number => b.updatedAt - a.updatedAt)
       .filter((task: DownloadTaskRecord): boolean => {
         if (task.status !== 'completed') { return true }
         completed += 1
         return completed <= 200 && task.updatedAt >= cutoff
       })
+    const retained = new Set<string>(visible.map((task: DownloadTaskRecord): string => task.sourceKey))
+    for (const key of Array.from(this.taskRows.keys())) {
+      if (!retained.has(key)) { this.taskRows.delete(key) }
+    }
+    return visible
   }
 
   async toggleTask(id: string): Promise<void> {
@@ -473,7 +564,12 @@ export class VideoTransferManager {
       this.resumeAwaitingNas(true)
       return
     }
-    if (session !== undefined && session.downloadPromise !== null) { session.paused = true; this.notify(); return }
+    if (session !== undefined && session.downloadPromise !== null) {
+      if (!session.paused) {
+        session.paused = true; session.waitingStatus = ''; this.notify(); return
+      }
+      await session.downloadPromise.catch((): void => {})
+    }
     const record = this.store.find(key)
     if (record === null || record.durablePath.length > 0) { return }
     const entry = new FileEntry()
@@ -523,6 +619,7 @@ export class VideoTransferManager {
   }
 
   resumeAwaitingNas(allowed: boolean): void {
+    this.resumePendingDownloads()
     if (!allowed || !NasConnection.shared().canRequest()) { this.notify(); return }
     for (const session of this.sessions.values()) {
       if (!session.waitingForNas || session.paused || session.removed || session.temporaryOnly ||
@@ -544,6 +641,9 @@ export class VideoTransferManager {
     const session = await this.getSession(entry, this.signature(entry))
     if (session.downloadPromise === null) { session.temporaryOnly = true }
     await this.startDownload(session)
+    if (session.totalBytes <= 0 || !session.ranges.complete(session.totalBytes)) {
+      throw new Error('视频尚未完整缓存，请继续下载后重试')
+    }
     return session.partPath
   }
 
@@ -683,6 +783,9 @@ export class VideoTransferManager {
       ? this.stagingPath(session.sourceKey) : session.cachePath + '.part'
     const stored = this.store.find(session.sourceKey)
     if (stored !== null) {
+      if (session.descriptor.etag.length === 0) { session.descriptor.etag = stored.transferEtag || stored.etag }
+      if (session.descriptor.checksum.length === 0) { session.descriptor.checksum = stored.transferChecksum || stored.checksum }
+      session.resumeValidator = stored.transferValidator || RemoteFileVersion.strongEtag(session.descriptor.etag)
       session.ranges.load(stored.ranges)
       session.totalBytes = Math.max(session.totalBytes, stored.totalBytes)
       session.durablePath = stored.durablePath
@@ -759,15 +862,8 @@ export class VideoTransferManager {
     state.totalBytes = totalBytes
     state.localPath = cachedPath
     state.errorMessage = ''
-    this.notify()
-    await this.promoteToDownload(session)
-    state.status = 'completed'
-    state.receivedBytes = totalBytes
-    state.totalBytes = totalBytes
-    state.localPath = session.durablePath
-    state.durablePath = session.durablePath
-    state.updatedAt = Date.now()
-    this.notify()
+    session.manualMobileResume = this.networkPolicy?.isMetered() ?? true
+    this.startDownload(session).catch((): void => {})
   }
 
   private async startDownload(session: VideoTransferSession): Promise<void> {
@@ -778,12 +874,17 @@ export class VideoTransferManager {
     session.closed = false
     session.paused = false
     session.downloadRequested = true
+    session.waitingStatus = 'queued'
+    this.ensureState(session.sourceKey).status = 'queued'
     this.persistSession(session)
     StorageBudget.pin(session.partPath)
     const pinnedPath = session.partPath
-    session.downloadPromise = (async (): Promise<void> => {
+    session.downloadPromise = this.downloadLane.catch((): void => {}).then(async (): Promise<void> => {
+      this.requireDownloadAllowed(session)
+      session.waitingStatus = ''
       await this.store.flush()
       await this.useDownloadDescriptor(session)
+      this.requireDownloadAllowed(session)
       const state = this.ensureState(session.sourceKey)
       state.status = 'queued'
       state.totalBytes = session.totalBytes
@@ -792,15 +893,17 @@ export class VideoTransferManager {
       state.errorMessage = ''
       this.notify()
       await this.downloadWhole(session)
-    })()
+    })
+    this.downloadLane = session.downloadPromise.catch((): void => {})
+    this.notify()
     try {
       await session.downloadPromise
     } catch (error) {
       session.waitingForNas = !session.temporaryOnly && !session.paused && !session.removed &&
         error instanceof UgreenError && error.kind === UgreenErrorKind.NAS_UNAVAILABLE
-      session.errorMessage = session.waitingForNas ? '' : this.errorMessage(error)
+      session.errorMessage = session.waitingForNas || session.waitingStatus.length > 0 ? '' : this.errorMessage(error)
       const state = this.ensureState(session.sourceKey)
-      state.status = session.paused || session.waitingForNas ? 'partial' : 'failed'
+      state.status = session.paused || session.waitingForNas || session.waitingStatus.length > 0 ? 'partial' : 'failed'
       state.errorMessage = session.paused || session.waitingForNas ? '' : session.errorMessage
       this.persistSession(session)
       this.notify()
@@ -815,6 +918,7 @@ export class VideoTransferManager {
         this.states[session.sourceKey] = new VideoTransferState()
       }
       this.notify()
+      this.resumePendingDownloads()
     }
   }
 
@@ -824,12 +928,26 @@ export class VideoTransferManager {
       throw new Error('远端服务尚未初始化')
     }
     const descriptor = await this.repository.downloadDescriptor(session.entry.path)
+    this.requireDownloadAllowed(session)
     if (descriptor.url.length === 0) {
       throw new Error('下载接口没有返回有效地址')
     }
+    const versionChanged = RemoteFileVersion.changed(session.totalBytes, session.descriptor.etag,
+      session.descriptor.checksum, descriptor.size, descriptor.etag, descriptor.checksum)
+    const validator = descriptor.etag.length > 0 ? RemoteFileVersion.strongEtag(descriptor.etag) :
+      (session.resumeValidator || RemoteFileVersion.strongEtag(session.descriptor.etag))
+    if (versionChanged || (session.ranges.coveredBytes() > 0 && validator.length === 0)) {
+      this.removeFile(session.partPath)
+      session.ranges.clear()
+      session.resumeValidator = RemoteFileVersion.strongEtag(descriptor.etag)
+    } else {
+      session.resumeValidator = validator
+      if (descriptor.etag.length === 0) { descriptor.etag = session.descriptor.etag }
+      if (descriptor.checksum.length === 0) { descriptor.checksum = session.descriptor.checksum }
+    }
     session.descriptor = descriptor
     if (descriptor.size > 0) {
-      session.totalBytes = Math.max(session.totalBytes, descriptor.size)
+      session.totalBytes = descriptor.size
     }
   }
 
@@ -853,8 +971,40 @@ export class VideoTransferManager {
 
   private async fetchChunkInternal(session: VideoTransferSession, start: number,
     length: number): Promise<void> {
-    const result = await this.transport.requestBinaryRange(session.descriptor.url, start, length,
-      session.descriptor.headers)
+    this.requireDownloadAllowed(session)
+    const headers: Record<string, string> = {}
+    for (const key of Object.keys(session.descriptor.headers)) { headers[key] = session.descriptor.headers[key] }
+    const validator = session.resumeValidator || RemoteFileVersion.strongEtag(session.descriptor.etag)
+    if (validator.length > 0) { headers['If-Range'] = validator }
+    let result: BinaryRangeResult
+    try {
+      result = await this.transport.requestBinaryRange(session.descriptor.url, start, length, headers)
+    } catch (error) {
+      if (error instanceof UgreenError && error.status === 206) {
+        this.removeFile(session.partPath)
+        session.ranges.clear()
+        session.resumeValidator = ''
+        session.descriptor.etag = ''
+        this.persistSession(session)
+      }
+      throw error as Error
+    }
+    this.requireDownloadAllowed(session)
+    let responseEtag = ''
+    for (const key of Object.keys(result.headers)) {
+      if (key.toLowerCase() === 'etag') { responseEtag = result.headers[key] }
+    }
+    if (RemoteFileVersion.changed(session.totalBytes, session.descriptor.etag, '',
+      result.totalSize, responseEtag, '')) {
+      this.removeFile(session.partPath)
+      session.ranges.clear()
+      session.descriptor.etag = responseEtag
+      session.resumeValidator = ''
+      if (result.totalSize > 0) { session.totalBytes = result.totalSize }
+      throw new Error('远端视频已变化，请重试下载')
+    }
+    if (responseEtag.length > 0) { session.descriptor.etag = responseEtag }
+    session.resumeValidator = RemoteFileVersion.fromHeaders(result.headers)
     console.info('[UgreenVideo] range path=' + session.entry.path +
       ' start=' + start.toString() + ' length=' + length.toString() +
       ' status=' + result.responseCode.toString() + ' bytes=' + result.bytes.byteLength.toString() +
@@ -910,6 +1060,7 @@ export class VideoTransferManager {
       let cursor = 0
       let safety = 0
       while (true) {
+        this.requireDownloadAllowed(session)
         if (session.paused || session.removed) { throw new Error('下载已暂停') }
         safety += 1
         if (safety > 100000) {
@@ -957,7 +1108,7 @@ export class VideoTransferManager {
     } catch (error) {
       session.errorMessage = this.errorMessage(error)
       const state = this.ensureState(session.sourceKey)
-      state.status = session.paused || (!session.temporaryOnly && error instanceof UgreenError &&
+      state.status = session.paused || session.waitingStatus.length > 0 || (!session.temporaryOnly && error instanceof UgreenError &&
         error.kind === UgreenErrorKind.NAS_UNAVAILABLE) ? 'partial' : 'failed'
       state.errorMessage = session.errorMessage
       state.receivedBytes = session.ranges.coveredBytes()
@@ -984,6 +1135,7 @@ export class VideoTransferManager {
   }
 
   private async promoteToDownload(session: VideoTransferSession): Promise<void> {
+    this.requireDownloadAllowed(session)
     if (session.paused || session.removed) { throw new Error('下载已暂停') }
     if (session.temporaryOnly) {
       session.downloadRequested = false
@@ -992,7 +1144,8 @@ export class VideoTransferManager {
     }
     const source = session.partPath
     const finalPath = await DownloadDestination.save(source,
-      session.relativePath.length > 0 ? session.relativePath : session.entry.name)
+      session.relativePath.length > 0 ? session.relativePath : session.entry.name,
+      (): boolean => this.waitingStatus(session).length === 0)
     session.durablePath = finalPath
     session.partPath = finalPath
     const record = this.recordFromStored(this.store.find(session.sourceKey), session.entry,
@@ -1059,6 +1212,9 @@ export class VideoTransferManager {
     record.ranges = session.ranges.serialize()
     record.receivedBytes = session.ranges.coveredBytes()
     record.totalBytes = session.totalBytes
+    record.transferEtag = session.descriptor.etag
+    record.transferChecksum = session.descriptor.checksum
+    record.transferValidator = session.resumeValidator
     record.status = cacheComplete ? 'cached' : 'partial'
     this.store.put(record)
   }
@@ -1118,13 +1274,24 @@ export class VideoTransferManager {
   }
 
   private notify(): void {
+    const tasks = this.snapshotTasks()
+    TransferBackgroundManager.shared().update('video-download', tasks.map(
+      (task: DownloadTaskRecord): TransferProgress => {
+        const value = new TransferProgress()
+        value.id = task.id; value.direction = 'download'; value.bytes = task.size
+        value.doneBytes = task.receivedBytes; value.done = task.status === 'completed' ? 1 : 0
+        value.failed = task.status === 'failed' ? 1 : 0; value.state = this.ready ? task.status : 'cancelled'
+        value.pending = this.ready && (task.status === 'queued' || task.status === 'downloading')
+        value.active = value.pending
+        return value
+      }))
     const result: VideoTransferState[] = []
     for (const key of Object.keys(this.states)) {
       result.push(this.copyState(this.states[key]))
     }
     for (const listener of this.listeners.slice()) {
       try {
-        listener(result)
+        listener(result, tasks)
       } catch (error) {
         console.warn('[UgreenMedia] transfer listener failed: ' + JSON.stringify(error))
       }

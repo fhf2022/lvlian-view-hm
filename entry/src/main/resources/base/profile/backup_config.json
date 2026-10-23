@@ -1,3 +1,17 @@
 {
-  "allowToBackupRestore": true
+  "allowToBackupRestore": true,
+  "excludes": [
+    "data/storage/el2/base/files/ugreen-download-tasks/",
+    "data/storage/el2/base/files/ugreen-video-transfers/",
+    "data/storage/el2/base/files/ugreen-upload-tasks/",
+    "data/storage/el2/base/files/ugreen-album-uploads/",
+    "data/storage/el2/base/files/ugreen-thumbnail-cache/",
+    "data/storage/el2/base/files/ugreen-thumbnail-index.json",
+    "data/storage/el2/base/preferences/ugreen-login-settings*",
+    "data/storage/el2/base/preferences/ugreen-network-settings*",
+    "data/storage/el2/base/preferences/ugreen-upload-tasks*",
+    "data/storage/el2/base/preferences/ugreen-media-local-*",
+    "data/storage/el2/base/preferences/ugreen-save-transactions*",
+    "data/storage/el2/database/album-upload.db*"
+  ]
 }

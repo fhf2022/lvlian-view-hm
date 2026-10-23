@@ -19,7 +19,7 @@ const fileIo={OpenMode:{READ_ONLY:fs.constants.O_RDONLY,CREATE:fs.constants.O_CR
 function rdb(config){
   if(databases.has(config.name))return databases.get(config.name);
   const db=new DatabaseSync(':memory:');
-  const wrapper={executeSql:async(sql,args=[])=>{db.prepare(sql).run(...args)},querySql:async(sql,args=[])=>{
+  const wrapper={beginTransaction(){db.exec('BEGIN IMMEDIATE')},commit(){db.exec('COMMIT')},rollBack(){db.exec('ROLLBACK')},executeSql:async(sql,args=[])=>{db.prepare(sql).run(...args)},querySql:async(sql,args=[])=>{
     const rows=db.prepare(sql).all(...args), cols=rows.length?Object.keys(rows[0]):[], r={i:-1,goToNextRow(){return ++this.i<rows.length},
       getColumnIndex:c=>cols.indexOf(c), getString(i){return String(rows[this.i][cols[i]]??'')},getLong(i){return Number(rows[this.i][cols[i]])},close(){}};return r;
   }};databases.set(config.name,wrapper);return wrapper;
@@ -37,7 +37,7 @@ function load(relative){
  const req=name=>mocks[name]||(name.startsWith('.')?load(path.relative(root,path.resolve(path.dirname(full),name+'.ets'))):{});
  vm.runInThisContext('(function(require,module,exports){'+code+'\n})',{filename:full})(req,module,module.exports);return module.exports;
 }
-const {AlbumUploadPolicy,AlbumUploadItem,LocalImageAlbum}=load('entry/src/main/ets/upload/AlbumUploadModel.ets');
+const {AlbumUploadPolicy,AlbumUploadItem,AlbumUploadJob,LocalImageAlbum}=load('entry/src/main/ets/upload/AlbumUploadModel.ets');
 const {AlbumUploadStore}=load('entry/src/main/ets/upload/AlbumUploadStore.ets');
 const {AlbumUploadManager}=load('entry/src/main/ets/upload/AlbumUploadManager.ets');
 const {UgreenError,UgreenErrorKind}=load('entry/src/main/ets/ugreen/UgreenErrors.ets');
@@ -112,6 +112,25 @@ async function finish(m,job){await waitFor(()=>['completed','failed'].includes(j
  const s=new AlbumUploadStore();await s.initialize(context);const rows=Array.from({length:1201},(_,i)=>image('large-'+i+'.jpg',1,1));
  await s.append('pagination-test',rows);assert.equal((await s.items('pagination-test',1100)).length,100);assert.equal((await s.items('pagination-test',1200)).length,1);
  await s.remove('pagination-test');report('1201 item SQLite manifest and bounded pagination');
+ const incremental=new AlbumUploadJob();incremental.id='incremental';incremental.scope='account-a';
+ const manifest=Array.from({length:10000},(_,i)=>Object.assign(new AlbumUploadItem(),{id:'inc-'+i,uri:'fixture://'+i,name:i+'.jpg',size:3}));
+ await s.save(incremental);await s.append(incremental.id,manifest);
+ const db=databases.get('album-upload.db');let aggregateQueries=0,pointQueries=0;const originalQuery=db.querySql;
+ db.querySql=async(sql,args)=>{if(sql.includes('GROUP BY'))aggregateQueries++;if(sql.includes('WHERE id=?'))pointQueries++;return originalQuery(sql,args)};
+ const started=Date.now();for(const item of manifest){item.state='uploaded';await s.finishItem(incremental,item)}
+ const elapsed=Date.now()-started;assert.equal(incremental.uploaded,10000);assert.equal(incremental.completedBytes,30000);
+ assert.equal(aggregateQueries,0);assert.equal(pointQueries,10000);
+ await s.finishItem(incremental,manifest[0]);assert.equal(incremental.uploaded,10000);
+ const originalSave=s.save;s.save=async()=>{throw Error('injected counter commit failure')};manifest[0].state='failed';
+ await assert.rejects(s.finishItem(incremental,manifest[0]));s.save=originalSave;
+ assert.equal(incremental.uploaded,10000);assert.equal(incremental.failed,0);assert.equal(incremental.completedBytes,30000);
+ assert.equal((await s.items(incremental.id))[0].state,'uploaded');await s.recount(incremental);
+ assert.equal(incremental.uploaded,10000);assert.equal(incremental.completedBytes,30000);
+ const plan=await originalQuery("EXPLAIN QUERY PLAN SELECT * FROM album_items INDEXED BY album_unfinished WHERE batch=? AND state IN ('pending','active') ORDER BY rowid LIMIT 1",[incremental.id]);
+ let planText='';while(plan.goToNextRow())planText+=plan.getString(plan.getColumnIndex('detail'));plan.close();
+ assert.match(planText,/album_unfinished/);assert.doesNotMatch(planText,/TEMP B-TREE/);
+ db.querySql=originalQuery;await s.remove(incremental.id);
+ report('10000 incremental commits, duplicate completion and transaction rollback preserve exact counters; indexed pending seek avoids sort ('+elapsed+' ms host)');
  assert.equal(fs.readdirSync(path.join(testRoot,'ugreen-album-uploads')).length,0);report('staging reclaimed after complete, pause and failure');
  fs.writeFileSync(path.join(root,'temp/album-upload/feature-tests.json'),JSON.stringify({passed:scenarios.length,scenarios},null,2));
  fs.readdirSync(testRoot).filter(n=>fs.statSync(path.join(testRoot,n)).isFile()).forEach(n=>fs.unlinkSync(path.join(testRoot,n)));

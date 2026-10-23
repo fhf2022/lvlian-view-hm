@@ -11,6 +11,8 @@ import { UgreenError, UgreenErrorKind } from '../ugreen/UgreenErrors'
 import { UgreenRemoteRepository } from '../repository/UgreenRemoteRepository'
 import { TransferBackgroundManager } from '../transfer/TransferBackgroundManager'
 import { TransferProgress } from '../transfer/TransferProgress'
+import { RemoteFileVersion } from '../core/network/RemoteFileVersion'
+import { TransferRunPolicy } from '../transfer/TransferRunPolicy'
 
 export type DownloadQueueListener = (tasks: DownloadTaskRecord[], speedBytesPerSecond: number) => void
 type PauseReason = 'none' | 'user' | 'network' | 'server' | 'logout' | 'background'
@@ -45,6 +47,8 @@ export class DownloadQueueManager {
   private removedIds: Set<string> = new Set<string>()
   private activeRecordId: string = ''
   private activePauseReason: PauseReason = 'none'
+  private generation: number = 0
+  private activeGeneration: number = 0
   private activeStartBytes: number = 0
   private activeLastBytes: number = 0
   private activeLastAt: number = 0
@@ -119,7 +123,7 @@ export class DownloadQueueManager {
   }
 
   snapshot(): DownloadTaskRecord[] {
-    return this.tasks.map((task: DownloadTaskRecord): DownloadTaskRecord => this.copyTask(task))
+    return this.tasks.filter((task: DownloadTaskRecord): boolean => this.belongsToCurrentAccount(task))
   }
 
   speed(): number {
@@ -129,6 +133,7 @@ export class DownloadQueueManager {
   async setReady(ready: boolean): Promise<void> {
     this.ready = ready
     if (!ready) {
+      this.generation += 1
       this.activePauseReason = 'logout'
       const active = this.activeRecord()
       if (active !== null && active.status === 'downloading') {
@@ -142,7 +147,8 @@ export class DownloadQueueManager {
       return
     }
     if (this.initialized) {
-      this.activePauseReason = 'none'
+      if (this.activeRecordId.length === 0) { this.activePauseReason = 'none' }
+      this.notify()
       this.schedule()
     }
   }
@@ -176,17 +182,23 @@ export class DownloadQueueManager {
     }
     const normalizedRoot = destinationRoot.replace(/[\\/]$/, '')
     const normalizedRelative = relativePath.length > 0 ? this.safeRelativePath(relativePath) : entry.name
+    const scope = this.repository?.cacheScopeHash() ?? ''
+    if (!this.ready || scope.length === 0 || this.repository === null) {
+      throw new Error('请先登录再下载')
+    }
+    const signature = this.repository.signatureForFile(entry)
     for (const existing of this.tasks) {
-      if (existing.remotePath === entry.path && existing.destinationRoot === normalizedRoot &&
+      if (existing.sourceScope === scope && existing.sourceKey === signature.key() &&
+        existing.destinationRoot === normalizedRoot &&
         existing.relativePath === normalizedRelative && existing.status !== 'failed') {
         return existing.id
       }
     }
     const now = Date.now()
-    const scope = this.repository?.cacheScopeHash() ?? ''
+    const generation = this.generation
     await DownloadDestination.directory()
     await TransferBackgroundManager.shared().requestResume()
-    if (!this.ready || scope !== (this.repository?.cacheScopeHash() ?? '')) {
+    if (!this.ready || generation !== this.generation || scope !== (this.repository?.cacheScopeHash() ?? '')) {
       throw new Error('账号已变化，请重新发起下载')
     }
     const task = new DownloadTaskRecord()
@@ -202,6 +214,7 @@ export class DownloadQueueManager {
     task.destinationRoot = normalizedRoot
     task.relativePath = normalizedRelative
     task.manualMobileResume = this.isMeteredNetwork()
+    task.sourceScope = scope
     // Keep the queue record tied to the same remote version used by the
     // video/cache resolver. Older callers may not supply validators.
     if (this.repository !== null) {
@@ -315,8 +328,14 @@ export class DownloadQueueManager {
         task.errorMessage = typeof source.errorMessage === 'string' ? source.errorMessage : ''
         task.manualMobileResume = source.manualMobileResume === true
         task.sourceKey = typeof source.sourceKey === 'string' ? source.sourceKey : ''
+        // v1 already persisted a scoped signature. Never assign an unowned
+        // legacy record to whichever account happens to log in next.
+        task.sourceScope = typeof source.sourceScope === 'string' ? source.sourceScope :
+          (task.sourceKey.startsWith('video-v1:') ? task.sourceKey.split(':')[1] : '')
         task.sourceEtag = typeof source.sourceEtag === 'string' ? source.sourceEtag : ''
         task.sourceChecksum = typeof source.sourceChecksum === 'string' ? source.sourceChecksum : ''
+        task.resumeValidator = typeof source.resumeValidator === 'string' ? source.resumeValidator :
+          RemoteFileVersion.strongEtag(task.sourceEtag)
         if (task.status === 'downloading') {
           task.status = 'queued'
         }
@@ -409,11 +428,13 @@ export class DownloadQueueManager {
   private handleNasState(state: NasConnectionState): void {
     if (state === 'online') {
       for (const task of this.tasks) {
+        if (!this.belongsToCurrentAccount(task)) { continue }
         if (task.status === 'waiting_server') { task.status = 'queued'; task.errorMessage = '' }
       }
       this.schedule()
     } else if (state === 'unavailable' || state === 'connecting') {
       for (const task of this.tasks) {
+        if (!this.belongsToCurrentAccount(task)) { continue }
         if (task.status === 'queued' || task.status === 'downloading') {
           if (task.id === this.activeRecordId) { this.activePauseReason = 'server' }
           task.status = 'waiting_server'
@@ -484,15 +505,8 @@ export class DownloadQueueManager {
   }
 
   private canStart(task: DownloadTaskRecord): boolean {
-    if (!NasConnection.shared().canRequest()) { return false }
-    const state = this.networkPolicy === null ? 'unknown' : this.networkPolicy.current()
-    if (state === 'offline') {
-      return false
-    }
-    if (state === 'unmetered') {
-      return true
-    }
-    return this.meteredDownloadContinue || task.manualMobileResume
+    return TransferRunPolicy.waiting(this.ready && this.belongsToCurrentAccount(task),
+      this.networkPolicy?.current() ?? 'unknown', this.meteredDownloadContinue || task.manualMobileResume) === ''
   }
 
   private async startDownload(record: DownloadTaskRecord): Promise<void> {
@@ -500,6 +514,7 @@ export class DownloadQueueManager {
       return
     }
     this.activeRecordId = record.id
+    this.activeGeneration = this.generation
     this.activePauseReason = 'none'
     StorageBudget.pin(record.stagingPath)
     try {
@@ -525,18 +540,28 @@ export class DownloadQueueManager {
     } else {
       record.receivedBytes = stageSize
     }
-    if (record.size > 0 && record.receivedBytes === record.size) {
-      await this.finalizeRecord(record)
-      return
-    }
     try {
       const descriptor = await this.repository.downloadDescriptor(record.remotePath)
-      if (this.removedIds.has(record.id) || this.activePauseReason === 'user') { return }
+      if (!this.ownsActive(record) || this.activePauseReason !== 'none') { return }
+      const versionChanged = RemoteFileVersion.changed(record.size, record.sourceEtag, record.sourceChecksum,
+        descriptor.size, descriptor.etag, descriptor.checksum)
+      const validator = record.resumeValidator || RemoteFileVersion.strongEtag(record.sourceEtag)
+      if (versionChanged || (record.receivedBytes > 0 && validator.length === 0)) {
+        // No persisted strong HTTP validator can bind Range to the old bytes.
+        this.removeFile(record.stagingPath)
+        record.receivedBytes = 0
+        record.resumeValidator = ''
+        record.sourceEtag = descriptor.etag
+        record.sourceChecksum = descriptor.checksum
+      } else {
+        record.resumeValidator = validator
+      }
       if (descriptor.size > 0) {
         record.size = descriptor.size
       }
       if (descriptor.etag.length > 0) {
         record.sourceEtag = descriptor.etag
+        record.resumeValidator = RemoteFileVersion.strongEtag(descriptor.etag)
       }
       if (descriptor.checksum.length > 0) {
         record.sourceChecksum = descriptor.checksum
@@ -565,6 +590,10 @@ export class DownloadQueueManager {
         this.notify()
         return
       }
+      if (record.size > 0 && record.receivedBytes === record.size) {
+        await this.finalizeRecord(record)
+        return
+      }
       this.activeRecordId = record.id
       this.activePauseReason = 'none'
       this.activeStartBytes = record.receivedBytes
@@ -578,11 +607,14 @@ export class DownloadQueueManager {
       this.notify()
 
       const result = await this.streamWithResumeFallback(record, descriptor, record.receivedBytes)
+      if (result.etag !== undefined && result.etag.length > 0) { record.sourceEtag = result.etag }
+      if (result.resumeValidator !== undefined) { record.resumeValidator = result.resumeValidator }
       if (result.totalSize > 0) {
-        record.size = Math.max(record.size, result.totalSize)
+        // A full If-Range fallback can be a smaller replacement file.
+        record.size = result.totalSize
       }
       record.receivedBytes = this.fileSize(record.stagingPath)
-      if (this.activePauseReason !== 'none') {
+      if (!this.ownsActive(record) || this.activePauseReason !== 'none') {
         // The stream stopped because the user/network policy asked it to.
         return
       }
@@ -591,6 +623,7 @@ export class DownloadQueueManager {
       }
       await this.finalizeRecord(record)
     } catch (error) {
+      if (!this.ownsActive(record)) { record.status = 'paused' }
       if (error instanceof UgreenError && error.kind === UgreenErrorKind.NAS_UNAVAILABLE &&
         record.status !== 'paused' && this.activePauseReason !== 'user') {
         record.status = 'waiting_server'
@@ -623,7 +656,7 @@ export class DownloadQueueManager {
       return await this.streamDownload(record, descriptor, offset)
     } catch (error) {
       if (offset <= 0 || !this.isResumeRejected(error as Object) ||
-        record.status !== 'downloading') {
+        record.status !== 'downloading' || !this.ownsActive(record)) {
         throw error as Error
       }
       // Some NAS firmware returns 206/416 for a stale range. Retry once from
@@ -634,9 +667,13 @@ export class DownloadQueueManager {
       record.updatedAt = Date.now()
       const fresh = this.repository === null
         ? descriptor : await this.repository.downloadDescriptor(record.remotePath)
+      if (!this.shouldContinueActive(record)) { throw new Error('下载已暂停') }
       if (fresh.size > 0) {
         record.size = fresh.size
       }
+      record.sourceEtag = fresh.etag
+      record.sourceChecksum = fresh.checksum
+      record.resumeValidator = RemoteFileVersion.strongEtag(fresh.etag)
       return await this.streamDownload(record, fresh, 0)
     }
   }
@@ -646,7 +683,7 @@ export class DownloadQueueManager {
     return await this.transport.requestBinaryToFile(descriptor.url, record.stagingPath,
       descriptor.headers, offset, record.size, (progress: BinaryDownloadProgress): void => {
         this.updateProgress(record, progress)
-      }, (): boolean => this.shouldContinueActive(record))
+      }, (): boolean => this.shouldContinueActive(record), record.resumeValidator)
   }
 
   private shouldContinueActive(record: DownloadTaskRecord): boolean {
@@ -654,7 +691,7 @@ export class DownloadQueueManager {
       this.activePauseReason = 'background'; record.status = 'queued'
       this.requestPersist(); this.notify(); return false
     }
-    if (!this.ready) {
+    if (!this.ownsActive(record)) {
       this.activePauseReason = 'logout'
       record.status = 'paused'
       record.updatedAt = Date.now()
@@ -689,9 +726,11 @@ export class DownloadQueueManager {
   }
 
   private updateProgress(record: DownloadTaskRecord, progress: BinaryDownloadProgress): void {
-    if (this.activeRecordId !== record.id) {
+    if (!this.ownsActive(record)) {
       return
     }
+    if (progress.etag !== undefined && progress.etag.length > 0) { record.sourceEtag = progress.etag }
+    if (progress.resumeValidator !== undefined) { record.resumeValidator = progress.resumeValidator }
     const received = Math.max(progress.receiveSize, this.fileSize(record.stagingPath))
     if (progress.totalSize > 0) {
       record.size = Math.max(record.size, progress.totalSize)
@@ -711,6 +750,7 @@ export class DownloadQueueManager {
   }
 
   private async finalizeRecord(record: DownloadTaskRecord): Promise<void> {
+    if (!this.ownsActive(record) || this.activePauseReason !== 'none') { return }
     const actualSize = this.fileSize(record.stagingPath)
     if (record.size > 0 && actualSize !== record.size) {
       record.receivedBytes = actualSize
@@ -723,7 +763,8 @@ export class DownloadQueueManager {
     }
     try {
       const finalPath = await DownloadDestination.save(record.stagingPath,
-        record.relativePath.length > 0 ? record.relativePath : record.name)
+        record.relativePath.length > 0 ? record.relativePath : record.name,
+        (): boolean => this.ownsActive(record) && this.activePauseReason === 'none')
       record.finalPath = finalPath
       record.receivedBytes = record.size > 0 ? record.size : actualSize
       if (record.size <= 0) {
@@ -749,7 +790,7 @@ export class DownloadQueueManager {
 
   private queueHead(): DownloadTaskRecord | null {
     for (const task of this.tasks) {
-      if (task.status !== 'completed') {
+      if (this.belongsToCurrentAccount(task) && task.status !== 'completed') {
         return task
       }
     }
@@ -763,7 +804,7 @@ export class DownloadQueueManager {
 
   private findTask(id: string): DownloadTaskRecord | null {
     for (const task of this.tasks) {
-      if (task.id === id) {
+      if (task.id === id && this.belongsToCurrentAccount(task)) {
         return task
       }
     }
@@ -771,7 +812,16 @@ export class DownloadQueueManager {
   }
 
   private activeRecord(): DownloadTaskRecord | null {
-    return this.activeRecordId.length === 0 ? null : this.findTask(this.activeRecordId)
+    return this.tasks.find((task: DownloadTaskRecord): boolean => task.id === this.activeRecordId) ?? null
+  }
+
+  private belongsToCurrentAccount(task: DownloadTaskRecord): boolean {
+    return task.sourceScope.length > 0 && task.sourceScope === this.repository?.cacheScopeHash()
+  }
+
+  private ownsActive(task: DownloadTaskRecord): boolean {
+    return this.ready && this.belongsToCurrentAccount(task) && this.activeGeneration === this.generation &&
+      this.activeRecordId === task.id && !this.removedIds.has(task.id)
   }
 
   private isMeteredNetwork(): boolean {
@@ -800,7 +850,8 @@ export class DownloadQueueManager {
 
   private notify(): void {
     const head = this.queueHead()
-    TransferBackgroundManager.shared().update('download', this.tasks.map((task: DownloadTaskRecord): TransferProgress => {
+    const snapshot = this.snapshot()
+    TransferBackgroundManager.shared().update('download', snapshot.map((task: DownloadTaskRecord): TransferProgress => {
       const value = new TransferProgress()
       value.id = task.id; value.direction = 'download'; value.bytes = task.size
       value.doneBytes = task.status === 'completed' ? task.size : task.receivedBytes
@@ -811,7 +862,6 @@ export class DownloadQueueManager {
       value.active = this.ready && value.pending && head !== null && head.id === task.id && this.canStart(task)
       return value
     }))
-    const snapshot = this.snapshot()
     for (const listener of this.listeners.slice()) {
       try {
         listener(snapshot, this.speedBytesPerSecond)
@@ -819,12 +869,6 @@ export class DownloadQueueManager {
         console.warn('[UgreenDownload] listener failed: ' + JSON.stringify(error))
       }
     }
-  }
-
-  private copyTask(source: DownloadTaskRecord): DownloadTaskRecord {
-    const result = new DownloadTaskRecord()
-    DownloadTaskRecord.copyInto(source, result)
-    return result
   }
 
   private ensureDirectory(path: string): void {

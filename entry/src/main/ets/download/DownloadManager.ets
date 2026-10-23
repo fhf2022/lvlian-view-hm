@@ -4,6 +4,7 @@ import { DownloadDescriptor } from '../model/FileEntry'
 import { BinaryProgressListener, HttpTransport, StreamDownloadResult } from '../core/network/HttpTransport'
 import { UgreenError } from '../ugreen/UgreenErrors'
 import { CacheManager } from './CacheManager'
+import { RemoteFileVersion } from '../core/network/RemoteFileVersion'
 
 export class DownloadManager {
   private transport: HttpTransport
@@ -17,11 +18,12 @@ export class DownloadManager {
     shouldContinue?: () => boolean): Promise<string> {
     const target = CacheManager.cachePath(directory, descriptor.fileName, cacheKey)
     StorageBudget.pin(target)
-    StorageBudget.pin(target + '.part')
+    const part = this.partPath(target, descriptor.etag)
+    StorageBudget.pin(part)
     try {
       return await this.downloadPinned(descriptor, directory, maxBytes, cacheKey, onProgress, shouldContinue)
     } finally {
-      StorageBudget.unpin(target + '.part')
+      StorageBudget.unpin(part)
       StorageBudget.unpin(target)
     }
   }
@@ -29,13 +31,15 @@ export class DownloadManager {
   private async downloadPinned(descriptor: DownloadDescriptor, directory: string, maxBytes: number,
     cacheKey: string, onProgress?: BinaryProgressListener,
     shouldContinue?: () => boolean): Promise<string> {
+    if (shouldContinue !== undefined && !shouldContinue()) { throw new Error('下载已取消') }
     const targetPath = CacheManager.cachePath(directory, descriptor.fileName, cacheKey)
     if (CacheManager.exists(targetPath)) {
       return targetPath
     }
-    const partPath = targetPath + '.part'
+    const partPath = this.partPath(targetPath, descriptor.etag)
     let resumeOffset = this.fileSize(partPath)
-    if (descriptor.size > 0 && resumeOffset > descriptor.size) {
+    if ((descriptor.size > 0 && resumeOffset > descriptor.size) ||
+      (resumeOffset > 0 && RemoteFileVersion.strongEtag(descriptor.etag).length === 0)) {
       this.removeFile(partPath)
       resumeOffset = 0
     }
@@ -54,6 +58,7 @@ export class DownloadManager {
     try {
       const result = await this.downloadToPart(descriptor, partPath, resumeOffset, onProgress,
         shouldContinue)
+      if (shouldContinue !== undefined && !shouldContinue()) { throw new Error('下载已取消') }
       const finalSize = this.fileSize(partPath)
       const expectedSize = descriptor.size > 0 ? descriptor.size : result.totalSize
       if (expectedSize > 0 && finalSize !== expectedSize) {
@@ -71,6 +76,7 @@ export class DownloadManager {
       if (resumeOffset > 0 && this.shouldRestartWithoutRange(error)) {
         this.removeFile(partPath)
         const retry = await this.downloadToPart(descriptor, partPath, 0, onProgress, shouldContinue)
+        if (shouldContinue !== undefined && !shouldContinue()) { throw new Error('下载已取消') }
         const finalSize = this.fileSize(partPath)
         const expectedSize = descriptor.size > 0 ? descriptor.size : retry.totalSize
         if (expectedSize > 0 && finalSize !== expectedSize) {
@@ -101,7 +107,12 @@ export class DownloadManager {
     resumeOffset: number, onProgress?: BinaryProgressListener,
     shouldContinue?: () => boolean): Promise<StreamDownloadResult> {
     return await this.transport.requestBinaryToFile(descriptor.url, partPath, descriptor.headers,
-      resumeOffset, descriptor.size, onProgress, shouldContinue)
+      resumeOffset, descriptor.size, onProgress, shouldContinue, descriptor.etag)
+  }
+
+  private partPath(target: string, etag: string): string {
+    const validator = RemoteFileVersion.strongEtag(etag)
+    return target + (validator.length > 0 ? '.' + CacheManager.hash(validator) : '') + '.part'
   }
 
   private fileSize(path: string): number {

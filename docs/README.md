@@ -25,6 +25,7 @@
 | [NAS 中断与恢复](NAS_CONNECTION_RECOVERY.md) | 不可达状态、缓存浏览、任务保留、恢复与重试 |
 | [跨设备接续（开发版）](CONTINUATION.md) | 第一版范围、账号检查、目录快照、任务保留和待验证的双机行为 |
 | [查看器返回时的界面保留](PARENT_CHROME_RETENTION.md) | 图片、视频返回时底栏等元素的生命周期 |
+| [玻璃控件统一约束](GLASS_CONTROLS.md) | 底栏、时间轴、悬浮球的尺寸、形变留白、阴影、触摸边界与迁移验收 |
 | [连续多选修复](file-selection-fix.md) | 区间反转、命中和拖选交互的实现记录 |
 | [图片返回覆盖层实验](viewer-return-overlay-poc.md) | 共享元素返回动画的历史验证 |
 

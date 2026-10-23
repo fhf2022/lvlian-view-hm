@@ -69,6 +69,8 @@ export class UgreenRemoteRepository {
   private directoryMetadataStore: DirectoryMetadataStore = new DirectoryMetadataStore()
   private metadataInitPromise: Promise<void> | null = null
   private metadataScope: string = ''
+  private cachedScope: string = ''
+  private cachedScopeHash: string = ''
   private directoryCache: Map<string, DirectoryCacheItem> = new Map<string, DirectoryCacheItem>()
   private directoryPageCache: Map<string, Map<number, UgreenDirectoryPage>> =
     new Map<string, Map<number, UgreenDirectoryPage>>()
@@ -146,12 +148,17 @@ export class UgreenRemoteRepository {
 
   cacheScopeHash(): string {
     const scope = this.client.cacheScope()
-    return scope.length > 0 ? CacheManager.hash('cache-scope-v2:' + scope) : ''
+    if (scope !== this.cachedScope) {
+      this.cachedScope = scope
+      this.cachedScopeHash = scope.length > 0 ? CacheManager.hash('cache-scope-v2:' + scope) : ''
+    }
+    return this.cachedScopeHash
   }
 
   cacheKeyForFile(entry: FileEntry): string {
     return 'original-v3:' + this.cacheScopeHash() + ':' + entry.path + ':' +
-      entry.size.toString() + ':' + entry.modifiedTime.toString()
+      entry.size.toString() + ':' + entry.modifiedTime.toString() +
+      (entry.etag.length > 0 || entry.checksum.length > 0 ? ':' + entry.etag + ':' + entry.checksum : '')
   }
 
   /**
@@ -810,8 +817,11 @@ export class UgreenRemoteRepository {
 
   async download(entry: FileEntry, filesDirectory: string, maxBytes: number,
     onProgress?: BinaryProgressListener, shouldContinue?: () => boolean): Promise<string> {
-    return await this.client.withReconnect(() =>
-      this.downloadOnce(entry, filesDirectory, maxBytes, onProgress, shouldContinue))
+    const scope = this.cacheScopeHash()
+    return await this.client.withReconnect((): Promise<string> => {
+      if (scope !== this.cacheScopeHash()) { throw new Error('账号已变化') }
+      return this.downloadOnce(entry, filesDirectory, maxBytes, onProgress, shouldContinue)
+    })
   }
 
   /**
@@ -843,7 +853,10 @@ export class UgreenRemoteRepository {
 
   private async downloadOnce(entry: FileEntry, filesDirectory: string, maxBytes: number,
     onProgress?: BinaryProgressListener, shouldContinue?: () => boolean): Promise<string> {
+    const scope = this.cacheScopeHash()
+    const cacheKey = this.cacheKeyForFile(entry)
     const descriptor = await this.client.download(entry.path)
+    if (scope !== this.cacheScopeHash()) { throw new Error('账号已变化') }
     if (descriptor.size <= 0 && entry.size > 0) {
       descriptor.size = entry.size
     }
@@ -854,7 +867,8 @@ export class UgreenRemoteRepository {
       descriptor.checksum = entry.checksum
     }
     return await this.downloadManager.download(descriptor, filesDirectory, maxBytes,
-      this.cacheKeyForFile(entry), onProgress, shouldContinue)
+      cacheKey, onProgress, (): boolean => scope === this.cacheScopeHash() &&
+        (shouldContinue === undefined || shouldContinue()))
   }
 
   async prepareThumbnail(entry: FileEntry, cacheDirectory: string, maxBytes: number,
@@ -932,6 +946,7 @@ export class UgreenRemoteRepository {
 
   private async prepareThumbnailOnce(entry: FileEntry, cacheDirectory: string, maxBytes: number,
     profile: ThumbnailProfile = 'list'): Promise<string> {
+    const scope = this.cacheScopeHash()
     const identityKey = this.thumbnailIdentityKey(entry, profile)
     const identityFileName = entry.name + '.thumbnail'
     const directPath = await this.thumbnailCacheStore.find(identityKey, identityFileName)
@@ -939,14 +954,16 @@ export class UgreenRemoteRepository {
       return directPath
     }
 
-    if (!NasConnection.shared().canRequest()) { return '' }
+    if (scope !== this.cacheScopeHash() || !NasConnection.shared().canRequest()) { return '' }
 
     const descriptors = await this.client.thumbnailCandidates(entry)
+    if (scope !== this.cacheScopeHash()) { return '' }
 
     // Resolve every persistent candidate before starting any network request.
     // The thumbnail cache is deliberately isolated from the disposable
     // original-file cache and never reads legacy cacheDir previews.
     for (const descriptor of descriptors) {
+      if (scope !== this.cacheScopeHash()) { return '' }
       if (descriptor.url.length === 0) {
         continue
       }
@@ -968,6 +985,7 @@ export class UgreenRemoteRepository {
     }
 
     for (const descriptor of descriptors) {
+      if (scope !== this.cacheScopeHash()) { return '' }
       if (descriptor.url.length === 0) {
         continue
       }
@@ -1029,9 +1047,18 @@ export class UgreenRemoteRepository {
     return prepared === null ? '' : prepared.path
   }
 
-  async rename(entry: FileEntry, newName: string): Promise<void> {
+  async rename(entry: FileEntry, newName: string): Promise<FileEntry> {
     await this.client.rename(entry.path, newName)
-    await this.clearDirectoryMetadataAfterMutation()
+    // A disposable-index failure cannot undo an already successful NAS rename.
+    try { await this.clearDirectoryMetadataAfterMutation() } catch (_) {
+      console.warn('[UgreenRepository] renamed; metadata invalidation failed')
+    }
+    const renamed = entry.clone()
+    renamed.name = newName
+    renamed.path = entry.path.substring(0, entry.path.lastIndexOf('/') + 1) + newName
+    renamed.thumbnailUrl = ''
+    renamed.coverUrl = ''
+    return renamed
   }
 
   async copy(paths: string[], targetPath: string): Promise<void> {

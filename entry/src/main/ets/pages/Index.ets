@@ -1,4 +1,7 @@
+import { DEBUG } from 'BuildProfile'
+import { rekeyRecord } from '../model/RecordUtils'
 import { StartupAuthorization } from '../core/authorization/StartupAuthorization'
+import { LoginCredentialStore } from '../core/LoginCredentialStore'
 import { IncomingShareManager } from '../share/IncomingShareManager'
 import { ContinuationManager, ContinuationPage, ContinuationAccountRequired } from '../continuation/ContinuationManager'
 import { ContinuationPolicy, ContinuationSnapshot } from '../continuation/ContinuationModel'
@@ -129,10 +132,10 @@ const VIDEO_GEOMETRY_TRANSITION_DURATION: number = 420
 const VIDEO_FALLBACK_TRANSITION_DURATION: number = 160
 const VIDEO_FRAME_CROSSFADE_DURATION: number = 120
 const IMAGE_RETURN_MOUNT_FRAME_LIMIT: number = 8
-const IMAGE_VIEWER_DIAGNOSTICS: boolean = true
+const IMAGE_VIEWER_DIAGNOSTICS: boolean = DEBUG
 // 一次性诊断开关：记录「点击 → 画面出现/消失」各段耗时（见 tapTrace / tapTraceBegin）。
 // ⚠️ 出结论后改回 false，或整段删除。
-const TAP_TRACE: boolean = true
+const TAP_TRACE: boolean = DEBUG
 // ── 实验 G：状态写入 hitrace 打点（与 ftrace 同一条时间轴）──────────────────
 //
 // 目的：把「某个根级 @State 被写入」与「随后的 CustomNodeUpdate name:Index」
@@ -145,7 +148,7 @@ const TAP_TRACE: boolean = true
 // ⚠️ 出结论后把 STATE_TRACE 改回 false（或整段删除）。
 // ⚠️ G4（handleImageDismissUpdate / 下拉手势）刻意不打点：既有 trace 已证明
 //    HandleDragUpdate → CNU(Index) 相关性为 0%，无需重复验证。
-const STATE_TRACE: boolean = true
+const STATE_TRACE: boolean = DEBUG
 const STATE_TRACE_TASK_ID: number = 1001
 // ── 实验 H0：条目级精准失效 vs 全局 epoch 重渲染 ────────────────────────────
 //
@@ -203,7 +206,7 @@ const EXPERIMENT_R2_WATERFALL_CELL: boolean = true
 //   4) viewer target Image onAppear：目标节点出现时刻的 transitionId
 //   附：shouldReplaceViewerTransitionSource（parent build 期）→ source 是保留还是被 Blank 顶掉
 // 只在 startViewerEntryTransition 后 800ms 窗口内输出，避免热路径刷屏。
-const OPEN_ANIM_PROBE: boolean = true
+const OPEN_ANIM_PROBE: boolean = DEBUG
 // ── 缩略图完成路径诊断（用于隔离验证 M1a / M1b）────────────────────────────
 //
 // M1 实际包含两个子问题：
@@ -220,7 +223,7 @@ const OPEN_ANIM_PROBE: boolean = true
 const THUMB_BATCH_EPOCH: boolean = true
 // 诊断开关：汇总统计缩略图完成路径。⚠️ 只在窗口结束时输出一条 hilog，
 // 绝不逐张打印（日志本身会干扰性能测量）。
-const THUMB_DIAG: boolean = true
+const THUMB_DIAG: boolean = DEBUG
 // ── 实验 A：网格项把 Image 换成同尺寸 Blank（**分界实验**）────────────────
 //
 // 目的：判断"Grid measure 被拖慢"到底是【Grid 布局算法本身】还是【Image 子树/图片处理】。
@@ -1541,6 +1544,58 @@ struct Index {
   // 这里缓存"最终结果"，命中即零 NAPI、零嵌套查；signature 变化自动失效。
   private previewUriResultCache: Map<string, string> = new Map<string, string>()
   private previewUriResultKeys: string[] = []
+  private removedPreviewPaths: Set<string> = new Set()
+  private removedPreviewTimer: number = 0
+  private previewRecoveryAttempts: Set<string> = new Set()
+  private previewReloadPaths: Set<string> = new Set()
+  private cacheRemovalListener = (path: string): void => {
+    if (!path.startsWith(this.thumbnailDirectory + '/')) { return }
+    this.removedPreviewPaths.add(fileUri.getUriFromPath(path))
+    if (this.removedPreviewTimer !== 0) { return }
+    this.removedPreviewTimer = setTimeout((): void => {
+      this.removedPreviewTimer = 0
+      const removed = this.removedPreviewPaths
+      this.removedPreviewPaths = new Set()
+      // Scan the bounded URI LRU once per batch, never the thumbnail directory.
+      for (const path of this.previewUriResultKeys) {
+        const value = this.previewUriResultCache.get(path)
+        const uri = value === undefined ? '' : value.substring(value.indexOf('\u0000') + 1)
+        if (removed.has(uri)) { this.invalidateEntryPreview(path) }
+      }
+    }, 0)
+  }
+
+  private invalidateEntryPreview(path: string): void {
+    this.previewUriResultCache.delete(path)
+    this.previewLocalPaths[path] = ''
+    this.previewLocalSignatures[path] = ''
+    this.previewCanonicalPaths[path] = false
+    this.updateImageVisualState(path, (state: ImageVisualState): void => {
+      state.thumbnailUri = ''; state.thumbnailSignature = ''; state.thumbnailDecodedUri = ''
+    }, false)
+    this.notifyEntryChanged(path, this.fileViewMode)
+    const index = this.fileEntryDataSource.indexOfPath(path)
+    if (index >= 0) {
+      if (this.isPreviewRequestActive(path)) { this.previewReloadPaths.add(path) }
+      else { this.loadEntryPreview(this.entries[index]) }
+    }
+  }
+
+  private recoverEntryPreview(entry: FileEntry): void {
+    const identity = this.repository.signatureForFile(entry).key()
+    if (this.previewRecoveryAttempts.has(identity)) { return }
+    const uri = this.previewUri(entry)
+    if (!uri.startsWith('file://')) { return }
+    this.previewRecoveryAttempts.add(identity)
+    if (this.previewRecoveryAttempts.size > 128) {
+      this.previewRecoveryAttempts.delete(Array.from(this.previewRecoveryAttempts)[0])
+    }
+    // Only Image failure does IO. Decode pressure must not cause NAS retries.
+    const path = new fileUri.FileUri(uri).path
+    fileIo.stat(path).then((stat: fileIo.Stat): void => {
+      if (stat.size === 0) { CacheManager.remove(path).catch((): void => {}) }
+    }).catch((): void => { CacheManager.reportRemoved(path) })
+  }
   private currentPageIndex: number = 1
   private currentPageHasMore: boolean = false
   private loadingNextPage: boolean = false
@@ -1728,13 +1783,13 @@ struct Index {
       this.scheduleNasRecovery()
     }
   }
-  private videoTransferStateListener = (states: VideoTransferState[]): void => {
+  private videoTransferStateListener = (states: VideoTransferState[], tasks: DownloadTaskRecord[]): void => {
     const next: Record<string, VideoTransferState> = {}
     for (const state of states) {
       next[state.sourceKey] = state
     }
     this.videoTransferStates = next
-    this.downloadTasks = this.downloadQueue.snapshot().concat(this.videoTransferManager.snapshotTasks())
+    this.downloadTasks = this.downloadQueue.snapshot().concat(tasks)
   }
   private gestureShareRegistered: boolean = false
   private gestureSharePageVisible: boolean = true
@@ -1757,6 +1812,7 @@ struct Index {
     lightEffect: { color: '#66FFFFFF' }
   })
   aboutToAppear(): void {
+    CacheManager.onRemoved(this.cacheRemovalListener)
     ContinuationManager.shared().attach(this.continuationPage)
     this.completeStartupAuthorization(false)
   }
@@ -2044,6 +2100,7 @@ struct Index {
     }
     this.gridThumbBridge.onError = (entry: FileEntry): void => {
       this.imageTelemetry.recordPipelineError(entry.path, 'grid')
+      this.recoverEntryPreview(entry)
     }
     // 🔬 OpenAnimProbe 时间点 3 的落点（只读）
     this.gridThumbBridge.probeAppear = (entry: FileEntry, index: number): void => {
@@ -2089,6 +2146,9 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    CacheManager.offRemoved(this.cacheRemovalListener)
+    if (this.removedPreviewTimer !== 0) { clearTimeout(this.removedPreviewTimer); this.removedPreviewTimer = 0 }
+    this.removedPreviewPaths.clear()
     ContinuationManager.shared().detach(this.continuationPage)
     this.startupAuthorizationToken++
     this.albumUpload.setForeground(false)
@@ -4132,6 +4192,7 @@ struct Index {
             .syncLoad(this.fileImageShouldSyncLoad(entry))
             .onComplete((event?: ViewerImageCompleteEvent): void =>
               this.recordThumbnailComplete(entry, this.previewUri(entry), index, surface, event))
+            .onError((): void => this.recoverEntryPreview(entry))
         if (this.isVideo(entry)) {
           SymbolGlyph($r('sys.symbol.play'))
             .fontSize(13)
@@ -5192,6 +5253,7 @@ struct Index {
                       })
                       .onError((): void => {
                         this.imageTelemetry.recordPipelineError(entry.path, 'grid')
+                        this.recoverEntryPreview(entry)
                       })
                   } else {
                     Image(this.fileImageSource(entry, 'grid'))
@@ -5208,6 +5270,7 @@ struct Index {
                       })
                       .onError((): void => {
                         this.imageTelemetry.recordPipelineError(entry.path, 'grid')
+                        this.recoverEntryPreview(entry)
                       })
                   }
                 } else if (entry.isDirectory) {
@@ -11445,6 +11508,7 @@ struct Index {
     try {
       const context = getContext(this) as Context
       await this.downloadQueue.initialize(context, this.repository, this.networkPolicy)
+      this.videoTransferManager.configureDownloads(this.networkPolicy, this.meteredDownloadContinue)
       await this.uploadQueue.initialize(context, this.repository, this.networkPolicy,
         (tasks: UploadTaskRecord[]): void => {
           this.uploadTasks = tasks.slice()
@@ -11560,6 +11624,7 @@ struct Index {
     await this.persistNetworkPreferences()
     await this.ensureDownloadState()
     await this.downloadQueue.setMeteredDownloadContinue(value)
+    this.videoTransferManager.configureDownloads(this.networkPolicy, value)
     if (value && !this.offlineCacheMode) { this.videoTransferManager.resumeAwaitingNas(true) }
   }
 
@@ -11589,7 +11654,6 @@ struct Index {
       this.loginPreferences = await preferences.getPreferences(context, 'ugreen-login-settings')
       const storedLinkId = await this.loginPreferences.get('cloud_link_id', this.linkId)
       const storedUsername = await this.loginPreferences.get('cloud_username', '')
-      const storedPassword = await this.loginPreferences.get('cloud_password', '')
       const storedRemember = await this.loginPreferences.get('remember_password', false)
       const storedAddress = await this.loginPreferences.get('remember_address', false)
       const storedAuto = await this.loginPreferences.get('auto_login', false)
@@ -11608,9 +11672,8 @@ struct Index {
       if (typeof storedAuto === 'boolean') {
         this.autoLogin = storedAuto
       }
-      if (this.rememberPassword && typeof storedPassword === 'string') {
-        this.password = storedPassword
-      }
+      this.password = await LoginCredentialStore.read(this.loginPreferences,
+        this.linkId, this.username, this.rememberPassword)
       if (this.rememberPassword && this.username.length > 0 && this.password.length > 0) {
         // Rehydrate the in-memory re-login path even when the current token
         // has expired after a long idle period or the UI object was rebuilt.
@@ -11657,7 +11720,13 @@ struct Index {
       }
       await this.loginPreferences.put('cloud_link_id', this.linkId)
       await this.loginPreferences.put('cloud_username', this.username)
-      await this.loginPreferences.put('cloud_password', this.rememberPassword ? this.password : '')
+      if (!this.rememberPassword) {
+        await this.loginPreferences.put('remember_password', false)
+        await this.loginPreferences.put('auto_login', false)
+        await this.loginPreferences.flush()
+      }
+      await LoginCredentialStore.save(this.loginPreferences, this.linkId, this.username,
+        this.rememberPassword ? this.password : '')
       await this.loginPreferences.put('remember_password', this.rememberPassword)
       await this.loginPreferences.put('remember_address', this.rememberAddress)
       await this.loginPreferences.put('auto_login', this.autoLogin)
@@ -11667,7 +11736,8 @@ struct Index {
       }
       await this.loginPreferences.flush()
     } catch (_) {
-      // The login flow must not fail only because preferences cannot be written.
+      console.warn('[UgreenLogin] saving login settings failed')
+      this.showImmersiveToast('登录设置保存失败，请重试')
     }
   }
 
@@ -11710,6 +11780,8 @@ struct Index {
     this.repository.restoreOfflineIdentity(profile.baseUrl, profile.uid)
     this.offlineCacheMode = true
     await this.ensureCacheState()
+    await this.ensureDownloadState()
+    this.videoTransferManager.setReady(true)
     this.rootKind = profile.rootKind
     this.selectedBottomTab = profile.rootKind === 'personal' ? 'home' : 'shared'
     this.personalRootEntriesType = profile.personalRootType
@@ -11830,6 +11902,7 @@ struct Index {
       await this.refreshVideoManager()
       await this.ensureDownloadState()
       if (profile !== this.offlineProfile || String(this.screen) === 'login') { return }
+      this.videoTransferManager.setReady(true)
       await this.downloadQueue.setReady(true)
       if (profile !== this.offlineProfile || String(this.screen) === 'login') { return }
       await this.uploadQueue.setReady(true)
@@ -13130,6 +13203,7 @@ struct Index {
   }
 
   private failWaterfallDecode(entry: FileEntry): void {
+    this.recoverEntryPreview(entry)
     if (this.waterfallActiveDecodePaths[entry.path] === true) {
       this.waterfallActiveDecodePaths[entry.path] = false
       this.waterfallActiveDecodes = Math.max(0, this.waterfallActiveDecodes - 1)
@@ -14684,6 +14758,7 @@ struct Index {
       await this.saveOfflineProfile()
       await this.refreshVideoManager()
       await this.ensureDownloadState()
+      this.videoTransferManager.setReady(true)
       await this.downloadQueue.setReady(true)
       await this.uploadQueue.setReady(true)
       await this.albumUpload.setReady(true)
@@ -14729,6 +14804,7 @@ struct Index {
       await this.saveOfflineProfile()
       await this.refreshVideoManager()
       await this.ensureDownloadState()
+      this.videoTransferManager.setReady(true)
       await this.downloadQueue.setReady(true)
       await this.uploadQueue.setReady(true)
       await this.albumUpload.setReady(true)
@@ -20991,10 +21067,11 @@ struct Index {
     this.errorText = ''
     this.statusText = '正在下载视频…'
     try {
+      await this.ensureDownloadState()
       await this.refreshVideoManager()
       await this.videoTransferManager.requestDownload(entry)
-      this.statusText = '视频已保存到系统下载目录'
-      this.showImmersiveToast('视频已保存到系统下载目录：' + entry.name)
+      this.statusText = '已加入下载队列'
+      this.showImmersiveToast('已加入下载：' + entry.name)
     } catch (error) {
       this.reportError(error as Object, '视频下载失败')
       this.statusText = '视频下载失败'
@@ -21842,19 +21919,7 @@ struct Index {
       if (!await this.confirmMeteredDownload(entry)) {
         return
       }
-      this.isBusy = true
-      this.statusText = '正在下载视频…'
-      try {
-        await this.refreshVideoManager()
-        await this.videoTransferManager.requestDownload(entry)
-        this.statusText = '视频已保存到系统下载目录'
-        this.showImmersiveToast('视频已保存到系统下载目录：' + entry.name)
-      } catch (error) {
-        this.reportError(error as Object, '视频下载失败')
-        this.statusText = '视频下载失败'
-      } finally {
-        this.isBusy = false
-      }
+      await this.downloadVideoFromPlayer(entry)
       return
     }
     try {
@@ -22920,8 +22985,8 @@ struct Index {
     this.errorText = ''
   }
 
-  private closeRename(): void {
-    if (this.isBusy) {
+  private closeRename(completed: boolean = false): void {
+    if (this.isBusy && !completed) {
       return
     }
     this.showRenameDialog = false
@@ -22934,43 +22999,65 @@ struct Index {
       return
     }
     const newName = this.renameText.trim()
-    if (newName.length === 0 || newName.indexOf('/') >= 0 || newName.indexOf('\\') >= 0) {
+    if (newName.length === 0 || newName === '.' || newName === '..' ||
+      newName.indexOf('/') >= 0 || newName.indexOf('\\') >= 0) {
       this.presentErrorMessage('名称不能为空，且不能包含路径分隔符', '重命名失败')
       return
     }
     const entry = this.renameEntry
+    if (newName === entry.name) { this.closeRename(); return }
+    const scope = this.repository.cacheScopeHash()
     this.isBusy = true
     this.errorText = ''
     this.statusText = '正在重命名…'
     try {
-      await this.repository.rename(entry, newName)
-      await this.refreshCurrentDirectory()
-      if (this.showImageViewer) {
-        for (const updatedEntry of this.entries) {
-          if (updatedEntry.path === entry.path) {
-            const nextImages: FileEntry[] = []
-            for (const imageEntry of this.viewerImages) {
-              nextImages.push(imageEntry.path === entry.path ? updatedEntry : imageEntry)
-            }
-            this.replaceViewerImages(nextImages)
-            this.viewerImageEntry = updatedEntry
-            if (this.viewerImageIndex >= 0 && this.viewerImageIndex < nextImages.length &&
-              nextImages[this.viewerImageIndex].path === updatedEntry.path) {
-              this.viewerHeaderTitle = updatedEntry.name
-            }
-            break
-          }
+      const renamed = await this.repository.rename(entry, newName)
+      if (scope !== this.repository.cacheScopeHash()) { return }
+      if (this.isImage(renamed)) {
+        try { await this.imageRotationStore.rename(scope, entry.path, renamed) } catch (_) {
+          console.warn('[UgreenImage] rename rotation metadata failed')
         }
+        if (scope !== this.repository.cacheScopeHash()) { return }
       }
-      this.closeRename()
+      this.applyRenamedEntry(entry.path, renamed)
+      this.closeRename(true)
       this.statusText = '重命名成功'
       this.showImmersiveToast('已重命名为：' + newName)
+      try { await this.refreshCurrentDirectory() } catch (error) {
+        this.reportError(error as Object, '已重命名，刷新目录失败')
+      }
     } catch (error) {
       this.reportError(error as Object, '重命名失败')
       this.statusText = '重命名失败'
     } finally {
       this.isBusy = false
     }
+  }
+
+  private applyRenamedEntry(oldPath: string, renamed: FileEntry): void {
+    const path = renamed.path
+    this.invalidatePath(oldPath)
+    this.previewUriResultCache.delete(oldPath)
+    this.replaceEntries(this.entries.map((item: FileEntry): FileEntry => item.path === oldPath ? renamed : item))
+    this.fileSelection.replace(this.selectedPaths.map((value: string): string => value === oldPath ? path : value))
+    this.publishFileSelection()
+    const state = this.imageVisualStates[oldPath]
+    if (state !== undefined) { this.imageVisualStates = rekeyRecord(this.imageVisualStates, oldPath, path) }
+    const preview = this.viewerPreviewBitmaps[oldPath]
+    if (preview !== undefined) { this.viewerPreviewBitmaps = rekeyRecord(this.viewerPreviewBitmaps, oldPath, path) }
+    const original = this.viewerOriginalBitmaps[oldPath]
+    if (original !== undefined) { this.viewerOriginalBitmaps = rekeyRecord(this.viewerOriginalBitmaps, oldPath, path) }
+    this.viewerOriginalLocalPaths[path] = this.viewerOriginalLocalPaths[oldPath] || ''
+    this.viewerOriginalLocalPaths[oldPath] = ''
+    this.viewerPreviewBitmapAliases[path] = this.viewerPreviewBitmapAliases[oldPath] === true
+    this.viewerPreviewBitmapAliases[oldPath] = false
+    this.viewerLoadRequests[oldPath] = false
+    this.replaceViewerImages(this.viewerImages.map((item: FileEntry): FileEntry => item.path === oldPath ? renamed : item))
+    if (this.viewerImageEntry?.path === oldPath) { this.viewerImageEntry = renamed; this.viewerHeaderTitle = renamed.name }
+    if (this.viewerOverlayEntry?.path === oldPath) { this.viewerOverlayEntry = renamed }
+    if (this.viewerCurrentFramePath === oldPath) { this.viewerCurrentFramePath = path }
+    if (this.viewerReturnScrollPath === oldPath) { this.viewerReturnScrollPath = path }
+    this.notifyEntryChanged(path, this.fileViewMode)
   }
 
   private async deleteEntry(entry: FileEntry): Promise<void> {
@@ -23475,7 +23562,8 @@ struct Index {
   }
 
   private previewSignature(entry: FileEntry): string {
-    return entry.modifiedTime.toString() + ':' + entry.size.toString()
+    return this.repository.cacheScopeHash() + ':' + entry.modifiedTime.toString() + ':' +
+      entry.size.toString() + ':' + entry.etag + ':' + entry.checksum
   }
 
   private waterfallEntrySignature(entry: FileEntry, rotationOverride?: number): string {
@@ -23505,7 +23593,7 @@ struct Index {
     if (path.length === 0 || uri.length === 0) {
       return
     }
-    if (!this.previewUriResultCache.has(path)) {
+    if (!this.previewUriResultCache.has(path) && this.previewUriResultKeys.indexOf(path) < 0) {
       this.previewUriResultKeys.push(path)
     }
     this.previewUriResultCache.set(path, signature + '\u0000' + uri)
@@ -24021,6 +24109,8 @@ struct Index {
   }
 
   private resetPreviewState(resetScroll: boolean = true): void {
+    this.previewRecoveryAttempts.clear()
+    this.previewReloadPaths.clear()
     this.previewGeneration += 1
     this.loadingNextPage = false
     // Keep the bounded URI LRU across directory snapshots. The signature
@@ -24118,9 +24208,12 @@ struct Index {
     if (!this.isImage(entry) || displayPath.length === 0) {
       return
     }
+    const generation = this.previewGeneration
+    const identity = this.repository.signatureForFile(entry).key()
     try {
       const previewPath = await this.mediaPreviewManager.fromLocal(entry, displayPath,
-        this.thumbnailDirectory, this.thumbnailCacheLimitBytes)
+        this.thumbnailDirectory, this.thumbnailCacheLimitBytes, identity)
+      if (generation !== this.previewGeneration || identity !== this.repository.signatureForFile(entry).key()) { return }
       if (previewPath.length > 0) {
         // This local thumbnail was encoded from the canonical display copy;
         // unlike the NAS thumbnail, its pixel data is already upright. The
@@ -24213,7 +24306,7 @@ struct Index {
       // thumbnail, whose service response may have stripped EXIF metadata.
       if (this.isImage(entry)) {
         const canonicalPath = this.mediaPreviewManager.cachedImagePreview(entry,
-          this.thumbnailDirectory)
+          this.thumbnailDirectory, this.repository.signatureForFile(entry).key())
         if (canonicalPath.length > 0) {
           if (!this.isPathGenerationValid(entry.path, pathToken)) {
             this.imageTelemetry.recordStaleCompletion(entry.path, 'pathTokenSuperseded')
@@ -24277,6 +24370,11 @@ struct Index {
       // 而按所有者清除也不会让老请求误清新请求的状态。
       if (this.previewRequests[entry.path] === requestToken) {
         this.previewRequests[entry.path] = 0
+        if (this.previewReloadPaths.delete(entry.path)) {
+          setTimeout((): void => {
+            if (generation === this.previewGeneration) { this.loadEntryPreview(entry) }
+          }, 0)
+        }
       }
     }
   }
@@ -24569,6 +24667,7 @@ struct Index {
     this.closeImageViewer()
     this.closeAudioPlayer(true)
     this.closeVideoPlayer()
+    this.videoTransferManager.setReady(false)
     await this.videoTransferManager.flush()
     await this.ensureDownloadState()
     await this.downloadQueue.setReady(false)

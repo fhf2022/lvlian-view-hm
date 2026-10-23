@@ -278,6 +278,7 @@ export class AlbumUploadManager {
   private async run(job: AlbumUploadJob): Promise<void> {
     try {
       if (!this.runnable(job)) { return }
+      await this.store.recount(job)
       job.state = 'checking'; await this.store.save(job); this.publish()
       if (!await this.indexRemote(job)) { return }
       while (this.runnable(job)) {
@@ -308,14 +309,13 @@ export class AlbumUploadManager {
           item.state = 'failed'; item.error = (error as Error).message || '图片上传失败'
         } finally {
           if (item.state === 'active') { item.state = 'pending' }
-          await this.store.update(item)
           if (String(item.state) === 'uploaded' || item.state === 'skipped') {
             await this.store.rememberRemote(job.id, item.targetName, item.size, false)
             await this.store.remember(job, item)
           }
           // Clear the current contribution before completed bytes enter the aggregate.
           job.currentBytes = 0; job.currentSize = 0
-          await this.store.recount(job); this.publish(false)
+          await this.store.finishItem(job, item); this.publish(false)
         }
       }
     } catch (error) {
@@ -325,7 +325,7 @@ export class AlbumUploadManager {
       } else { job.state = 'paused' }
     } finally {
       job.currentName = ''; job.currentBytes = 0; job.currentSize = 0
-      await this.store.save(job)
+      await this.store.recount(job)
     }
   }
   private publish(force: boolean = true): void {

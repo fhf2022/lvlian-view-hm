@@ -76,23 +76,24 @@ export class DownloadDestination {
     return new fileUri.FileUri(result[0]).path.replace(/\/+$/, '')
   }
 
-  static async save(source: string, relativePath: string): Promise<string> {
+  static async save(source: string, relativePath: string, shouldContinue?: () => boolean): Promise<string> {
     StorageBudget.pin(source)
     let finalPath = ''
     const operation = DownloadDestination.queue.then(async (): Promise<void> => {
-      finalPath = await DownloadDestination.publish(source, relativePath)
+      finalPath = await DownloadDestination.publish(source, relativePath, shouldContinue)
     })
     DownloadDestination.queue = operation.catch((): void => {})
     try { await operation; return finalPath } finally { StorageBudget.unpin(source) }
   }
 
-  private static async publish(source: string, relativePath: string): Promise<string> {
+  private static async publish(source: string, relativePath: string, shouldContinue?: () => boolean): Promise<string> {
     if (DownloadDestination.context === null) { throw new Error('下载目录尚未初始化') }
     StorageBudget.pin(source)
     try {
       const root = await DownloadDestination.directory()
       const store = await preferences.getPreferences(DownloadDestination.context, 'ugreen-save-transactions')
       const saved = await store.get(source, '')
+      if (shouldContinue !== undefined && !shouldContinue()) { throw new Error('保存已取消') }
       let intent: SaveIntent | null = null
       if (typeof saved === 'string' && saved.length > 0) {
         intent = JSON.parse(saved) as SaveIntent
@@ -118,8 +119,10 @@ export class DownloadDestination {
         await store.flush()
       }
       try {
+        if (shouldContinue !== undefined && !shouldContinue()) { throw new Error('保存已取消') }
         // Copy preserves readers and the only resumable source if finalization fails.
         await fileIo.copyFile(source, intent.target)
+        if (shouldContinue !== undefined && !shouldContinue()) { throw new Error('保存已取消') }
         if (fileIo.statSync(intent.target).size !== size) { throw new Error('保存文件校验失败') }
         intent.committed = true
         await store.put(source, JSON.stringify(intent))
