@@ -1,3 +1,22 @@
+import { DownloadTaskRecord } from '../model/FileEntry'
+
+// ForEach keeps each row by task ID. Subscribe to the task itself here rather
+// than freezing primitive values in a by-value @Builder call in the parent.
+@Component
+export struct TransferQueueTaskRow {
+  @ObjectLink task: DownloadTaskRecord
+  infoForTask: (task: DownloadTaskRecord) => string = (): string => ''
+  progressForTask: (task: DownloadTaskRecord) => number = (): number => 0
+  @BuilderParam leading: () => void
+
+  build() {
+    TransferTaskListRow({ title: this.task.name, info: this.infoForTask(this.task),
+      progress: this.progressForTask(this.task), loading: this.task.status === 'downloading' && this.task.size <= 0 }) {
+      this.leading()
+    }
+  }
+}
+
 @Component
 export struct TransferTaskListRow {
   @Prop title: string = ''

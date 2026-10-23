@@ -823,25 +823,7 @@ export class DownloadQueueManager {
 
   private copyTask(source: DownloadTaskRecord): DownloadTaskRecord {
     const result = new DownloadTaskRecord()
-    result.id = source.id
-    result.remotePath = source.remotePath
-    result.name = source.name
-    result.mimeType = source.mimeType
-    result.size = source.size
-    result.receivedBytes = source.receivedBytes
-    result.status = source.status
-    result.createdAt = source.createdAt
-    result.updatedAt = source.updatedAt
-    result.stagingPath = source.stagingPath
-    result.finalPath = source.finalPath
-    result.destinationRoot = source.destinationRoot
-    result.relativePath = source.relativePath
-    result.systemTaskId = source.systemTaskId
-    result.errorMessage = source.errorMessage
-    result.manualMobileResume = source.manualMobileResume
-    result.sourceKey = source.sourceKey
-    result.sourceEtag = source.sourceEtag
-    result.sourceChecksum = source.sourceChecksum
+    DownloadTaskRecord.copyInto(source, result)
     return result
   }
 

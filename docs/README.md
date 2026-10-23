@@ -20,6 +20,7 @@
 | 文档 | 内容 |
 | --- | --- |
 | [图库文件夹上传](ALBUM_UPLOAD.md) | 系统相册选择、固定清单、冲突策略、续传、版本演进 |
+| [系统分享上传](INCOMING_SHARE.md) | 跨应用接收文件、复用目标选择、临时授权、登录与账号隔离 |
 | [后台传输与总进度](BACKGROUND_TRANSFER_PLAN.md) | dataTransfer 保护、通知授权、进度聚合、故障降级和验证范围 |
 | [NAS 中断与恢复](NAS_CONNECTION_RECOVERY.md) | 不可达状态、缓存浏览、任务保留、恢复与重试 |
 | [跨设备接续（开发版）](CONTINUATION.md) | 第一版范围、账号检查、目录快照、任务保留和待验证的双机行为 |

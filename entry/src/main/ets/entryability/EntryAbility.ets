@@ -4,6 +4,7 @@ import { window } from '@kit.ArkUI';
 import { TransferBackgroundManager } from '../transfer/TransferBackgroundManager';
 import { StartupAuthorization } from '../core/authorization/StartupAuthorization';
 import { ContinuationManager } from '../continuation/ContinuationManager';
+import { IncomingShareManager } from '../share/IncomingShareManager';
 
 const DOMAIN = 0x0000;
 
@@ -58,6 +59,7 @@ export default class EntryAbility extends UIAbility {
     }
     AppStorage.setOrCreate('transferNavigationRequest', want.parameters?.transferEntry === true ? 1 : 0);
     AppStorage.setOrCreate('abilityInBackground', false);
+    IncomingShareManager.shared().receive(want);
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
     } catch (err) {
@@ -67,6 +69,7 @@ export default class EntryAbility extends UIAbility {
   }
 
   onDestroy(): void {
+    IncomingShareManager.shared().destroy();
     ContinuationManager.shared().destroy();
     TransferBackgroundManager.shared().destroy().catch(() => {});
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onDestroy');
@@ -146,6 +149,7 @@ export default class EntryAbility extends UIAbility {
       this.context.restoreWindowStage(new LocalStorage());
       return;
     }
+    IncomingShareManager.shared().receive(want);
     if (want.parameters?.transferEntry === true) {
       const previous = AppStorage.get<number>('transferNavigationRequest') ?? 0;
       AppStorage.setOrCreate('transferNavigationRequest', previous + 1);

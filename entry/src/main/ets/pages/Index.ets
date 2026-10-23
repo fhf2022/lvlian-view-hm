@@ -1,4 +1,5 @@
 import { StartupAuthorization } from '../core/authorization/StartupAuthorization'
+import { IncomingShareManager } from '../share/IncomingShareManager'
 import { ContinuationManager, ContinuationPage, ContinuationAccountRequired } from '../continuation/ContinuationManager'
 import { ContinuationPolicy, ContinuationSnapshot } from '../continuation/ContinuationModel'
 import { StorageBudget } from '../download/StorageBudget'
@@ -14,7 +15,7 @@ import { FloatingImportControl } from '../components/FloatingImportControl'
 import { AlbumUploadPicker } from '../components/AlbumUploadPicker'
 import { AlbumUploadSheet } from '../components/AlbumUploadSheet'
 import { AlbumUploadDetails } from '../components/AlbumUploadDetails'
-import { TransferTaskListRow } from '../components/TransferTaskListRow'
+import { TransferTaskListRow, TransferQueueTaskRow } from '../components/TransferTaskListRow'
 import { HeaderStyle } from '../ui/HeaderStyle'
 import { FileRowStyle } from '../ui/FileRowStyle'
 import { TaskPanel, TaskPanelFooter, TaskPanelSection } from '../components/TaskPanel'
@@ -99,7 +100,7 @@ type FileSortKey = 'name' | 'type' | 'time' | 'size'
 type SearchReturnMode = 'none' | 'directory' | 'image' | 'audio' | 'video' | 'download'
 type FileAction = 'share' | 'openWith' | 'quickView' | 'multiSelect' | 'download' |
   'saveGallery' | 'releaseCache' | 'rename' | 'details' | 'delete' | 'copy' | 'move'
-type DestinationOperation = 'copy' | 'move'
+type DestinationOperation = 'copy' | 'move' | 'upload'
 type DeleteResolution = 'deleted' | 'failed' | 'unknown'
 
 // Shared-element transitions are deliberately separate from the 180 ms
@@ -1300,6 +1301,11 @@ struct Index {
   @StorageProp('transferNavigationRequest') @Watch('onTransferNavigationRequested')
   transferNavigationRequest: number = 0
   @StorageProp('transferProtectionActive') transferProtectionActive: boolean = false
+  @StorageProp('incomingShareRequest') @Watch('onIncomingShareRequested') incomingShareRequest: number = 0
+  @State incomingShareUris: string[] = []
+  private incomingShareId: number = 0
+  private incomingShareScope: string = ''
+  private incomingShareScheduled: boolean = false
   @StorageProp('transferProtectionError') transferProtectionError: string = ''
   @StorageProp('transferNotificationBlocked') transferNotificationBlocked: boolean = false
   @StorageProp('transferProgressText') transferProgressText: string = ''
@@ -1767,6 +1773,51 @@ struct Index {
   private onContinuationSceneChanged(): void {
     ContinuationManager.shared().refresh()
     this.onContinuationMessage()
+    this.onIncomingShareRequested()
+  }
+
+  private onIncomingShareRequested(): void {
+    if (this.incomingShareScheduled || IncomingShareManager.shared().peek() === undefined) { return }
+    this.incomingShareScheduled = true
+    setTimeout((): void => {
+      this.incomingShareScheduled = false
+      this.presentIncomingShare()
+    }, 0)
+  }
+
+  private presentIncomingShare(): void {
+    if (!this.startupAuthorized || this.startupRestoring || !this.gestureSharePageVisible ||
+      this.abilityInBackground || this.screen === 'login' || this.screen === 'otp' ||
+      this.isBusy || this.isNavigating || this.showPageTransition || this.continuationDialogCount > 0 ||
+      this.continuationPending || this.continuationSending || this.showDestinationPicker ||
+      this.showAlbumPicker || this.showAlbumUpload || this.showAlbumDetails || this.importSelecting ||
+      this.showRenameDialog || this.showCreateFolderDialog || this.destinationFolderDialog) { return }
+    const request = IncomingShareManager.shared().peek()
+    if (request === undefined) { return }
+    if (this.showImageViewer || this.showAudioPlayer || this.showVideoPlayer ||
+      this.viewerClosing || this.viewerReturnOverlayVisible || this.audioClosing || this.videoOverlayClosing) {
+      if (this.showImageViewer) { this.closeImageViewer() }
+      if (this.showAudioPlayer && !this.audioClosing) { this.closeAudioPlayer() }
+      if (this.showVideoPlayer && !this.videoOverlayClosing) { this.closeVideoPlayer() }
+      // Media returns retain their existing animation and input-layer cleanup.
+      this.incomingShareScheduled = true
+      setTimeout((): void => {
+        this.incomingShareScheduled = false
+        this.onIncomingShareRequested()
+      }, 280)
+      return
+    }
+    if (request.error !== '') {
+      IncomingShareManager.shared().dismiss(request.id)
+      this.showTrackedDialog({ title: '无法接收文件', message: request.error,
+        buttons: [{ text: '确定', color: '#2E6BFF' }] }).catch(() => {})
+      return
+    }
+    this.incomingShareId = request.id
+    this.incomingShareUris = request.uris.slice()
+    this.incomingShareScope = this.repository.cacheScopeHash()
+    this.importExpanded = false
+    this.beginDestinationPickerForEntries('upload', [])
   }
 
   private onContinuationMessage(): void {
@@ -2207,6 +2258,7 @@ struct Index {
     if (!this.startupAuthorized) { return }
     this.albumUpload.setForeground(!this.abilityInBackground)
     this.gestureSharePageVisible = true
+    this.onIncomingShareRequested()
     NasConnection.shared().setForeground(!this.abilityInBackground)
     this.scheduleNasRecovery()
     this.syncGestureShareRegistration()
@@ -2227,6 +2279,7 @@ struct Index {
     this.syncGestureShareRegistration()
     this.handlePlaybackBackgroundState(this.abilityInBackground)
     if (!this.abilityInBackground) {
+      this.onIncomingShareRequested()
       this.scheduleVideoPipRestore()
     }
   }
@@ -4614,7 +4667,11 @@ struct Index {
         } else {
           ForEach(this.visibleTransferTasks(), (task: DownloadTaskRecord) => {
             ListItem() {
-              this.DownloadTaskRow(task)
+              TransferQueueTaskRow({ task: task,
+                infoForTask: (value: DownloadTaskRecord): string => this.downloadTaskInfo(value),
+                progressForTask: (value: DownloadTaskRecord): number => this.downloadTaskProgress(value) }) {
+                this.FileLeadingVisual(this.downloadTaskEntry(task))
+              }
             }
             .width('100%')
             .onClick(() => this.toggleDownloadTask(task))
@@ -4928,12 +4985,6 @@ struct Index {
       this.showImmersiveToast('已加入上传：' + uris.length.toString() + ' 个文件')
     } catch (error) { this.reportError(error as Object, '文件导入失败') }
     finally { this.importSelecting = false }
-  }
-
-  @Builder
-  DownloadTaskRow(task: DownloadTaskRecord): void {
-    this.TransferTaskRow(this.downloadTaskEntry(task), task.name, this.downloadTaskInfo(task),
-      this.downloadTaskProgress(task), task.status === 'downloading' && task.size <= 0)
   }
 
   @Builder
@@ -7849,7 +7900,8 @@ struct Index {
         .padding(0).borderRadius(0).backgroundColor(Color.Transparent).stateEffect(false)
         .hitTestBehavior(HitTestMode.Block).onClick(() => this.closeDestinationPicker())
       if (!this.destinationPickerClosing) {
-        TaskPanel({ title: '选择目标文件夹', idPrefix: 'destination-picker', safeTop: this.topSafeInset(),
+        TaskPanel({ title: this.destinationOperation === 'upload' ? '选择上传位置' : '选择目标文件夹',
+          idPrefix: 'destination-picker', safeTop: this.topSafeInset(),
           hasFooter: true, showAuxiliary: true, auxiliaryLabel: '新建文件夹',
           auxiliaryEnabled: !this.destinationLoading, closeEnabled: !this.destinationOperationRunning,
           onClose: (): void => { this.closeDestinationPicker() },
@@ -7893,11 +7945,11 @@ struct Index {
   @Builder
   DestinationPickerFooter(): void {
     TaskPanelFooter({ label: this.destinationOperationRunning ? '处理中…' :
-      (this.destinationOperation === 'copy' ? '复制 ' : '移动 ') +
-        this.destinationSelectedEntries.length.toString() + ' 项到此处',
+      (this.destinationOperation === 'upload' ? '上传 ' : this.destinationOperation === 'copy' ? '复制 ' : '移动 ') +
+        this.destinationItemCount().toString() + ' 项到此处',
       actionId: 'destination-picker-confirm', busy: this.destinationOperationRunning,
       actionEnabled: !this.destinationLoading && !this.destinationPickerClosing &&
-        this.destinationSelectedEntries.length > 0 && this.destinationPath.length > 0,
+        this.destinationItemCount() > 0 && this.destinationPath.length > 0,
       summaryTitle: this.destinationDisplayName(), summaryValue: this.destinationPath,
       safeBottom: this.bottomSafeInset(), onAction: (): void => { this.confirmDestinationOperation() } })
   }
@@ -16350,6 +16402,12 @@ struct Index {
       this.destinationRootExpanded = true
       this.destinationSelectedEntries = []
       this.destinationFolderText = ''
+      if (this.destinationOperation === 'upload') {
+        IncomingShareManager.shared().dismiss(this.incomingShareId)
+        this.incomingShareId = 0
+        this.incomingShareUris = []
+        this.incomingShareScope = ''
+      }
       // Release the input layer after the 180 ms card exit completes.
     }, 200)
   }
@@ -16801,6 +16859,11 @@ struct Index {
   }
 
   private async confirmDestinationOperation(): Promise<void> {
+    if (this.destinationOperationRunning || this.destinationPickerClosing) { return }
+    if (this.destinationOperation === 'upload') {
+      await this.confirmIncomingShareUpload()
+      return
+    }
     if (this.destinationLoading || this.destinationSelectedEntries.length === 0) {
       return
     }
@@ -16838,6 +16901,49 @@ struct Index {
     } finally {
       this.destinationOperationRunning = false
       this.destinationLoading = false
+    }
+  }
+
+  private destinationItemCount(): number {
+    return this.destinationOperation === 'upload' ? this.incomingShareUris.length : this.destinationSelectedEntries.length
+  }
+
+  private async confirmIncomingShareUpload(): Promise<void> {
+    if (this.destinationLoading || this.incomingShareUris.length === 0 || this.destinationPath === '') { return }
+    const uris = this.incomingShareUris.slice()
+    const target = this.destinationPath
+    const scope = this.incomingShareScope
+    if (scope === '' || scope !== this.repository.cacheScopeHash()) {
+      this.showImmersiveToast('登录状态已改变，请重新分享并选择上传位置')
+      this.closeDestinationPicker()
+      return
+    }
+    this.destinationOperationRunning = true
+    this.destinationLoading = true
+    let added = 0
+    let failed = 0
+    try {
+      await this.ensureDownloadState()
+      this.transferDirection = 'upload'
+      for (const uri of uris) {
+        if (scope !== this.repository.cacheScopeHash()) {
+          failed += uris.length - added - failed
+          break
+        }
+        try {
+          const task = await this.uploadQueue.enqueue(uri, target, scope)
+          if (task.status === 'failed') { failed++ } else { added++ }
+        } catch (_) { failed++ }
+      }
+      this.showImmersiveToast(failed > 0 ? '已添加 ' + added + ' 项，' + failed + ' 项失败' :
+        '已加入上传：' + added + ' 个文件')
+    } catch (error) {
+      this.reportError(error as Object, '添加上传失败')
+    } finally {
+      this.destinationLoading = false
+      this.destinationOperationRunning = false
+      this.closeDestinationPicker()
+      this.openDownloads()
     }
   }
 

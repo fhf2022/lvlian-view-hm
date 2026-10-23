@@ -140,7 +140,30 @@ export type DownloadTaskStatus = 'queued' | 'downloading' | 'paused' | 'waiting_
  * A user-visible download is deliberately not a CacheManager entry.  The
  * staging file lives in filesDir and survives cache cleanup/system reclaim.
  */
+@Observed
 export class DownloadTaskRecord {
+  static copyInto(source: DownloadTaskRecord, result: DownloadTaskRecord): void {
+    result.id = source.id
+    result.remotePath = source.remotePath
+    result.name = source.name
+    result.mimeType = source.mimeType
+    result.size = source.size
+    result.receivedBytes = source.receivedBytes
+    result.status = source.status
+    result.createdAt = source.createdAt
+    result.updatedAt = source.updatedAt
+    result.stagingPath = source.stagingPath
+    result.finalPath = source.finalPath
+    result.destinationRoot = source.destinationRoot
+    result.relativePath = source.relativePath
+    result.systemTaskId = source.systemTaskId
+    result.errorMessage = source.errorMessage
+    result.manualMobileResume = source.manualMobileResume
+    result.sourceKey = source.sourceKey
+    result.sourceEtag = source.sourceEtag
+    result.sourceChecksum = source.sourceChecksum
+  }
+
   id: string = ''
   remotePath: string = ''
   name: string = ''

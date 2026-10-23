@@ -11,6 +11,7 @@ import { UgreenError, UgreenErrorKind } from '../ugreen/UgreenErrors'
 import { TransferBackgroundManager } from '../transfer/TransferBackgroundManager'
 import { TransferProgress } from '../transfer/TransferProgress'
 
+@Observed
 export class UploadTaskRecord extends DownloadTaskRecord {
   uuid: string = ''
   scope: string = ''
@@ -41,7 +42,14 @@ export class UploadQueueManager {
     this.root = context.filesDir + '/ugreen-upload-tasks'
     if (!fileIo.accessSync(this.root)) { fileIo.mkdirSync(this.root) }
     this.prefs = await preferences.getPreferences(context, 'ugreen-upload-tasks')
-    this.tasks = JSON.parse(String(await this.prefs.get('tasks', '[]'))) as UploadTaskRecord[]
+    const restored = JSON.parse(String(await this.prefs.get('tasks', '[]'))) as UploadTaskRecord[]
+    this.tasks = restored.map((task: UploadTaskRecord): UploadTaskRecord => {
+      const result = new UploadTaskRecord()
+      DownloadTaskRecord.copyInto(task, result)
+      result.uuid = task.uuid; result.scope = task.scope; result.prepared = task.prepared
+      result.importing = task.importing; result.skipped = task.skipped
+      return result
+    })
     this.tasks = this.tasks.filter((task: UploadTaskRecord): boolean =>
       task.id.startsWith('upload:') && /^[a-zA-Z0-9-]+$/.test(task.uuid) &&
       task.stagingPath === this.root + '/' + task.uuid + '.part')
@@ -120,7 +128,7 @@ export class UploadQueueManager {
     this.pump()
   }
 
-  async enqueue(uri: string, dir: string, scope: string): Promise<void> {
+  async enqueue(uri: string, dir: string, scope: string): Promise<UploadTaskRecord> {
     await TransferBackgroundManager.shared().requestResume()
     if (this.repository === null || !this.ready || scope !== this.repository.cacheScopeHash()) {
       throw new Error('登录状态已改变，请重新选择上传文件')
@@ -143,7 +151,9 @@ export class UploadQueueManager {
     this.tasks.unshift(task)
     StorageBudget.pin(task.stagingPath)
     try {
-      task.size = (await fileIo.stat(source.fd)).size
+      const sourceStat = await fileIo.stat(source.fd)
+      if (!sourceStat.isFile()) { throw new Error('请选择文件，暂不支持分享文件夹') }
+      task.size = sourceStat.size
       await this.persist()
       this.publish()
       // Admission before creating a large staging copy; every actual write is also admitted.
@@ -161,6 +171,7 @@ export class UploadQueueManager {
         if (written !== read) { throw new Error('暂存写入不完整') }
         copied += read
       }
+      if (!this.ready || scope !== this.repository.cacheScopeHash()) { throw new Error('导入已中止') }
       task.importing = false
       task.status = 'queued'
     } catch (error) {
@@ -176,6 +187,7 @@ export class UploadQueueManager {
       this.publish()
       this.pump()
     }
+    return task
   }
 
   async toggle(id: string): Promise<void> {
@@ -322,6 +334,8 @@ export class UploadQueueManager {
         (this.network.isUnmetered() || task.manualMobileResume)
       return value
     }))
+    // Rows bind these observed records via @ObjectLink. Keep identity stable
+    // across progress updates and rehydrate persisted tasks as observed classes.
     this.listener(tasks.slice())
   }
   private persist(): Promise<void> {

@@ -69,6 +69,16 @@
             "actions": [
               "ohos.want.action.home"
             ]
+          },
+          {
+            "actions": ["ohos.want.action.sendData"],
+            // File UTDs and logical content UTDs (media, PDF, archives, etc.)
+            // have separate roots. Only records carrying a readable file URI
+            // are imported; text/link payloads are never fetched as files.
+            "uris": [
+              { "scheme": "file", "utd": "general.file", "maxFileSupported": 500 },
+              { "scheme": "file", "utd": "general.object", "maxFileSupported": 500 }
+            ]
           }
         ]
       }

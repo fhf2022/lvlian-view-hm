@@ -79,6 +79,8 @@ export struct AudioPlayerPage {
   private lyricScroller: Scroller = new Scroller()
   private lyricSource: AudioLyricSource = new AudioLyricSource()
   private lastLyricIndex: number = -1
+  private seekCancelled: boolean = false
+  private seekClickCommitted: boolean = false
 
   aboutToAppear(): void { this.refreshLyrics() }
 
@@ -228,12 +230,26 @@ export struct AudioPlayerPage {
         value: this.seeking ? this.seekValue : Math.min(this.positionMs, this.durationMs) })
         .blockColor(this.foreground()).selectedColor(this.foreground()).trackColor(this.dark ? '#33FFFFFF' : '#33172033')
         .blockSize({ width: 1, height: 1 }).height(16).margin({ left: -4, right: -4 })
+        .sliderInteractionMode(SliderInteraction.SLIDE_AND_CLICK_UP)
         .enabled(!this.busy && this.durationMs > 0).hitTestBehavior(HitTestMode.Block)
+        .onTouch((event: TouchEvent) => {
+          if (event.type === TouchType.Down) {
+            this.seekCancelled = false; this.seekClickCommitted = false
+          } else if (event.type === TouchType.Cancel) {
+            this.seekCancelled = true; this.seeking = false
+          }
+        })
         .onChange((value: number, mode: SliderChangeMode) => {
+          if (this.seekCancelled) { return }
           this.seekValue = value
-          if (mode === SliderChangeMode.Begin || mode === SliderChangeMode.Moving) { this.seeking = true }
-          if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
-            this.seeking = false; this.onSeek(value)
+          if (mode === SliderChangeMode.Begin || mode === SliderChangeMode.Moving) {
+            this.seeking = true; this.seekClickCommitted = false
+          } else if (mode === SliderChangeMode.Click) {
+            this.seeking = false; this.seekClickCommitted = true; this.onSeek(value)
+          } else if (mode === SliderChangeMode.End) {
+            this.seeking = false
+            if (!this.seekClickCommitted) { this.onSeek(value) }
+            this.seekClickCommitted = false
           }
         }).id('audio-progress-slider')
       Row() {
