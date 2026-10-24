@@ -877,11 +877,13 @@ class RowHitArea {
 @Entry
 @Component
 struct Index {
-  @StorageProp('continuationPending') continuationPending: boolean = false
-  @StorageProp('continuationWaitingForAccount') continuationWaitingForAccount: boolean = false
+  @StorageProp('continuationPending') @Watch('onContinuationNoticeChanged') continuationPending: boolean = false
+  @StorageProp('continuationWaitingForAccount') @Watch('onContinuationNoticeChanged')
+  continuationWaitingForAccount: boolean = false
   @StorageProp('continuationMessage') @Watch('onContinuationMessage') continuationMessage: string = ''
   @State @Watch('onContinuationSceneChanged') continuationSending: boolean = false
   @State @Watch('onContinuationSceneChanged') continuationDialogCount: number = 0
+  private continuationNoticeStage: string = ''
   private continuationAncestorAnchors: Map<string, string> = new Map()
   private continuationPendingDeletes: Set<string> = new Set()
   private continuationPage: ContinuationPage = {
@@ -915,7 +917,6 @@ struct Index {
   @State otpCode: string = ''
   @State baseUrl: string = ''
   @State statusText: string = ''
-  @State errorText: string = ''
   @State @Watch('onContinuationSceneChanged') isBusy: boolean = false
   @State trustDevice: boolean = false
   @State autoLogin: boolean = false
@@ -1742,7 +1743,8 @@ struct Index {
   private videoStatePromise: Promise<void> | null = null
   private searchTimer: number = 0
   private searchGeneration: number = 0
-  private errorDialogShowing: boolean = false
+  private noticeMessage: string = ''
+  private noticeShownAt: number = 0
   private networkStateListener = (state: NetworkClass): void => {
     this.networkClass = state
     NasConnection.shared().setPhoneOffline(state === 'offline')
@@ -1816,6 +1818,7 @@ struct Index {
 
   private onContinuationSceneChanged(): void {
     ContinuationManager.shared().refresh()
+    this.onContinuationNoticeChanged()
     this.onContinuationMessage()
     this.onIncomingShareRequested()
   }
@@ -1853,8 +1856,7 @@ struct Index {
     }
     if (request.error !== '') {
       IncomingShareManager.shared().dismiss(request.id)
-      this.showTrackedDialog({ title: '无法接收文件', message: request.error,
-        buttons: [{ text: '确定', color: '#2E6BFF' }] }).catch(() => {})
+      this.presentErrorMessage(request.error, '无法接收文件')
       return
     }
     this.incomingShareId = request.id
@@ -1865,10 +1867,25 @@ struct Index {
   }
 
   private onContinuationMessage(): void {
-    if (this.startupAuthorized && !this.startupRestoring && this.continuationMessage !== '') {
+    if (this.startupAuthorized && !this.startupRestoring && !this.abilityInBackground &&
+      this.gestureSharePageVisible && this.continuationMessage !== '') {
       const message = this.continuationMessage
       AppStorage.setOrCreate('continuationMessage', '')
       this.showImmersiveToast(message)
+    }
+  }
+
+  private onContinuationNoticeChanged(): void {
+    if (!this.continuationSending && !this.continuationPending) { this.continuationNoticeStage = ''; return }
+    if (!this.startupAuthorized || this.startupRestoring ||
+      this.abilityInBackground || !this.gestureSharePageVisible) { return }
+    // The original device retains its current page and only shows feedback.
+    // The receiver uses the app splash until restoration/account validation ends.
+    const stage = this.continuationSending ? 'sending' : (this.continuationWaitingForAccount ? 'account' : '')
+    if (stage === '') { return }
+    if (stage === this.continuationNoticeStage) { return }
+    if (this.showImmersiveToast(stage === 'sending' ? '正在流转到另一设备' : '请登录相同的 NAS 和账号以接续')) {
+      this.continuationNoticeStage = stage
     }
   }
 
@@ -1993,8 +2010,8 @@ struct Index {
     const ordered = DirectoryTimelinePolicy.query(entries, query)
     const timeline = DirectoryTimelinePolicy.build(entries, true)
     if (!unchanged()) { throw new Error('接续已取消') }
-    // All fallible network/identity work has finished. Commit one complete page
-    // under the opaque cover; never expose a partially restored home header.
+    // Finish all fallible network/identity work before committing the complete
+    // directory and header together. The receiver keeps its existing page visible.
     this.navigationRequestId++
     this.directoryIndexRequestToken++
     this.pendingDirectoryIndexSnapshot = null
@@ -2355,6 +2372,8 @@ struct Index {
     if (!this.startupAuthorized) { return }
     this.albumUpload.setForeground(!this.abilityInBackground)
     this.gestureSharePageVisible = true
+    this.onContinuationNoticeChanged()
+    this.onContinuationMessage()
     this.onIncomingShareRequested()
     NasConnection.shared().setForeground(!this.abilityInBackground)
     this.scheduleNasRecovery()
@@ -2376,6 +2395,8 @@ struct Index {
     this.syncGestureShareRegistration()
     this.handlePlaybackBackgroundState(this.abilityInBackground)
     if (!this.abilityInBackground) {
+      this.onContinuationNoticeChanged()
+      this.onContinuationMessage()
       this.onIncomingShareRequested()
       this.scheduleVideoPipRestore()
     }
@@ -2701,7 +2722,6 @@ struct Index {
     let targetRejected = false
     let stage = 'prepare'
     try {
-      this.errorText = ''
       this.statusText = '正在准备隔空传送…'
       const preparation = this.prepareGestureShare(candidates.map(
         (entry: FileEntry): FileEntry => entry.clone()), pinnedPaths)
@@ -2896,10 +2916,11 @@ struct Index {
     return this.getUIContext().px2vp(this.navigationBarHeightPx)
   }
 
-  // 底栏底边到屏幕底边的距离。对齐系统「智慧生活」的悬浮底栏：直接贴导航条
-  // 安全区，不再额外留浮动间距（本机实测两者都是 28vp，底栏高同为 56vp）。
+  // Navigation avoid areas can be zero in a floating window or the upper split.
+  // Keep the same edge clearance as the sides without adding to full-screen
+  // navigation spacing. Content, timeline and media return share this margin.
   private floatingBarBottomMargin(): number {
-    return this.bottomSafeInset()
+    return Math.max(Glass.windowInset, this.bottomSafeInset())
   }
 
   private floatingBarContentInset(extra: number = FLOATING_BAR_CONTENT_EXTRA_VP): number {
@@ -3037,7 +3058,8 @@ struct Index {
   // Parent chrome is retained beneath overlays. Only input ownership changes;
   // do not use these flags to unmount material hosts or change the bar's mode.
   private parentOverlayOwnsInteraction(): boolean {
-    return !this.startupAuthorized || this.startupRestoring || this.viewerOwnsParentInteraction() || this.showAudioPlayer ||
+    return !this.startupAuthorized || this.startupRestoring || this.continuationSending ||
+      this.viewerOwnsParentInteraction() || this.showAudioPlayer ||
       this.videoPlaybackUiVisible() || this.videoEntryTransitionActive ||
       this.contextMenuEntry !== null || this.showRenameDialog ||
       this.showDestinationPicker || this.showCreateFolderDialog ||
@@ -3811,39 +3833,24 @@ struct Index {
       this.CreateFolderOverlay()
       this.DestinationFolderOverlay()
       this.AlbumUploadOverlay()
-      if (this.startupAuthorized && !this.startupRestoring && this.continuationPending &&
-        this.continuationWaitingForAccount) {
-        Row({ space: 12 }) {
-          Text('接续需要登录相同的 NAS 和账号').fontSize(14).layoutWeight(1)
-            .fontColor($r('sys.color.font_primary'))
-          Button('取消').fontSize(14).height(36)
-            .onClick(() => ContinuationManager.shared().cancel())
-        }
-        .padding(16).width('100%').backgroundColor($r('app.color.page_background'))
-        .position({ x: 0, y: this.topSafeInset() + HeaderStyle.overlayHeight }).zIndex(190)
+      if (this.continuationSending) {
+        // Retain the source's exact page and media surface. Only hold input
+        // while capturing/exporting, as the former opaque cover did.
+        Row().width('100%').height('100%').backgroundColor(Color.Transparent)
+          .hitTestBehavior(HitTestMode.Block).zIndex(190).id('continuation-source-input-guard')
       }
-      if (this.startupAuthorized && !this.startupRestoring &&
-        ((this.continuationPending && !this.continuationWaitingForAccount) || this.continuationSending)) {
-        Column({ space: 16 }) {
-          Image($r('app.media.icon')).width(76).height(76).objectFit(ImageFit.Contain).borderRadius(18)
-          LoadingProgress().width(24).height(24).color('#2E6BFF')
-          Text(this.continuationSending ? '正在准备接续…' : '正在接续…')
-            .fontSize(14).fontColor($r('sys.color.font_secondary'))
-          Button('取消').height(40).fontSize(14).backgroundColor(Color.Transparent)
-            .fontColor($r('sys.color.font_secondary')).onClick(() => ContinuationManager.shared().cancel())
-        }
-        .width('100%').height('100%').justifyContent(FlexAlign.Center).alignItems(HorizontalAlign.Center)
-        .backgroundColor($r('app.color.page_background'))
-        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-        .hitTestBehavior(HitTestMode.Block).zIndex(190).id('continuation-restoration-cover')
-      }
-      if (!this.startupAuthorized || this.startupRestoring) {
+      if (!this.startupAuthorized || this.startupRestoring ||
+        (this.continuationPending && !this.continuationWaitingForAccount)) {
         Column({ space: 16 }) {
           Image($r('app.media.icon')).width(76).height(76)
             .objectFit(ImageFit.Contain).borderRadius(18).clip(true)
             .accessibilityText('联文件应用图标').id('startup-app-logo')
+          // Cold and hot receivers share the logo placeholder. A source never
+          // opens this cover; privacy actions remain available when required.
           if (this.startupAuthorizing || this.startupAuthorized) {
-            LoadingProgress().width(24).height(24).color('#2E6BFF')
+            if (!this.continuationPending) {
+              LoadingProgress().width(24).height(24).color('#2E6BFF')
+            }
           } else {
             Text(this.startupAuthorizationMessage).fontSize(14).fontColor($r('sys.color.font_secondary'))
               .textAlign(TextAlign.Center).id('startup-authorization-message')
@@ -11065,15 +11072,31 @@ struct Index {
     return new uiMaterial.ImmersiveMaterial(options)
   }
 
-  private showImmersiveToast(message: string): void {
+  private showImmersiveToast(message: string): boolean {
+    const text = message.trim()
+    if (text === '' || this.abilityInBackground || !this.gestureSharePageVisible) { return false }
+    const now = this.getMonotonicNow()
+    if (text === this.noticeMessage && now - this.noticeShownAt < 2000) { return false }
     // The page's own UIContext, not the module-level promptAction: the global
     // one resolves against whichever context is current, which is wrong (and
     // fails outright) when the call comes from a dismissing subwindow such as
     // the long-press menu.
-    this.getUIContext().getPromptAction().showToast({
-      message: message,
-      systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THIN)
-    })
+    try {
+      this.getUIContext().getPromptAction().showToast({
+        message: text, duration: 2000,
+        // Native Toast measures from the navigation avoid area's top. Subtract
+        // that inset once so the message stays 12vp above our shared toolbar,
+        // including floating windows and the upper split with no navigation bar.
+        bottom: Math.max(0, this.floatingBarContentInset(12) - this.bottomSafeInset()),
+        systemMaterial: this.floatingPanelMaterial
+      })
+      this.noticeMessage = text
+      this.noticeShownAt = now
+      return true
+    } catch (_) {
+      console.warn('[Notice] Unable to show page feedback')
+      return false
+    }
   }
 
   private reportError(error: Object, title: string = '操作失败'): void {
@@ -11089,33 +11112,9 @@ struct Index {
 
   private presentErrorMessage(message: string, title: string = '操作失败'): void {
     const normalized = message.trim().length > 0 ? message.trim() : '操作失败，请稍后重试'
-    this.errorText = normalized
-    if (this.errorDialogShowing) {
-      return
-    }
-    // Every failure in the app funnels through here, so this is the whole
-    // failure cue: one place, and only for a dialog that is actually going to
-    // be shown (the guard above already folded away repeats).
-    HapticFeedback.failure()
-    this.errorDialogShowing = true
-    this.showErrorDialog(normalized, title)
-  }
-
-  private async showErrorDialog(message: string, title: string): Promise<void> {
-    try {
-      await this.showTrackedDialog({
-        title: title,
-        message: message,
-        buttons: [
-          { text: '知道了', color: this.isDarkTheme ? '#FFFFFFFF' : '#536174' }
-        ],
-        systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THICK, false)
-      })
-    } catch (_) {
-      this.showImmersiveToast(message)
-    } finally {
-      this.errorDialogShowing = false
-    }
+    const text = title.trim() !== '' && !normalized.startsWith(title.trim())
+      ? title.trim() + '：' + normalized : normalized
+    if (this.showImmersiveToast(text)) { HapticFeedback.failure() }
   }
 
   private ensureCacheState(): Promise<void> {
@@ -11781,7 +11780,6 @@ struct Index {
     this.refreshFileListImageRotations(this.searchResults)
     this.searchLoading = false
     this.searchScrollOffset = Math.max(0, cached.scrollOffset)
-    this.errorText = ''
     const offset = this.searchScrollOffset
     setTimeout((): void => {
       if (this.showSearch && this.searchQuery.trim().length > 0 &&
@@ -11898,7 +11896,6 @@ struct Index {
     this.showAudioPlayer = false
     this.isBusy = false
     this.isNavigating = false
-    this.errorText = ''
     this.statusText = ''
     this.showSearch = true
     this.updateTopTitle(this.fileTitle(this.currentPath))
@@ -11954,7 +11951,6 @@ struct Index {
     this.resetSearchResultScroll()
     this.searchLoading = false
     this.searchHistoryExpanded = false
-    this.errorText = ''
     this.updateBottomBarVisibility(true)
   }
 
@@ -13076,7 +13072,6 @@ struct Index {
     this.searchResults = []
     this.resetSearchResultScroll()
     this.cacheSearchResults(normalized, searchScope, [], true, 0)
-    this.errorText = ''
     try {
       const results = await this.repository.search(searchPath, searchRootType, normalized, searchScope,
         (batch: FileEntry[]): void => {
@@ -13793,7 +13788,6 @@ struct Index {
     this.showNetworkSettings = false
     this.showPlaybackSettings = false
     this.leaveRecycleBinIfOpen()
-    this.errorText = ''
     // statusText 是全局的操作状态文案：文件页浏览时会写入“个人目录”“正在读取目录…”
     // 等消息，而设置页的二级页面底部也渲染它。进入设置页时先清空，避免这些
     // 文件页文案串到设置页里。
@@ -13813,7 +13807,6 @@ struct Index {
     this.showNetworkSettings = false
     this.showPlaybackSettings = false
     this.ensureCacheState()
-    this.errorText = ''
     this.updateTopTitle('缓存与存储')
     this.updateBottomBarVisibility(true)
   }
@@ -13828,7 +13821,6 @@ struct Index {
     this.showRecycleBinSettings = false
     this.showViewSettings = true
     this.ensureViewState()
-    this.errorText = ''
     this.updateTopTitle('默认视图')
     this.updateBottomBarVisibility(true)
   }
@@ -13838,7 +13830,6 @@ struct Index {
       return
     }
     this.showViewSettings = false
-    this.errorText = ''
     this.updateTopTitle('设置')
     this.updateBottomBarVisibility(true)
   }
@@ -13852,7 +13843,6 @@ struct Index {
     this.showNetworkSettings = false
     this.showViewSettings = false
     this.ensurePlaybackState()
-    this.errorText = ''
     this.updateTopTitle('播放与控制')
     this.updateBottomBarVisibility(true)
   }
@@ -13864,7 +13854,6 @@ struct Index {
     this.showStorageSettings = false
     this.showNetworkSettings = false
     this.showPlaybackSettings = false
-    this.errorText = ''
     this.updateTopTitle('设置')
     this.updateBottomBarVisibility(true)
   }
@@ -13876,7 +13865,6 @@ struct Index {
     this.showPlaybackSettings = false
     this.showStorageSettings = false
     this.showNetworkSettings = false
-    this.errorText = ''
     this.updateTopTitle('设置')
     this.updateBottomBarVisibility(true)
   }
@@ -13890,7 +13878,6 @@ struct Index {
     this.showNetworkSettings = true
     this.showPlaybackSettings = false
     this.ensureNetworkState()
-    this.errorText = ''
     this.updateTopTitle('网络与流量')
     this.updateBottomBarVisibility(true)
   }
@@ -13902,7 +13889,6 @@ struct Index {
     this.showNetworkSettings = false
     this.showStorageSettings = false
     this.showPlaybackSettings = false
-    this.errorText = ''
     this.updateTopTitle('设置')
     this.updateBottomBarVisibility(true)
   }
@@ -13918,7 +13904,6 @@ struct Index {
     this.showPlaybackSettings = false
     this.showNetworkSettings = false
     this.showRecycleBinSettings = true
-    this.errorText = ''
     this.statusText = ''
     this.recycleScope = 'personal'
     this.recycleEntries = []
@@ -13944,7 +13929,6 @@ struct Index {
     this.recycleLoading = false
     this.recycleStack = []
     this.recycleBlockedShares = []
-    this.errorText = ''
     this.statusText = ''
     this.updateTopTitle('设置')
     this.updateBottomBarVisibility(true)
@@ -14020,7 +14004,6 @@ struct Index {
     this.recycleLoading = true
     this.recycleEntries = []
     this.recycleBlockedShares = []
-    this.errorText = ''
     this.statusText = ''
     if (shares.length === 0) {
       this.recycleLoading = false
@@ -14204,7 +14187,6 @@ struct Index {
       return
     }
     this.isBusy = true
-    this.errorText = ''
     const origin = this.recycleOriginDirectory(entry)
     this.statusText = '正在还原…'
     try {
@@ -14279,7 +14261,6 @@ struct Index {
       return
     }
     this.isBusy = true
-    this.errorText = ''
     this.statusText = '正在删除…'
     try {
       await this.repository.purgeRecycle(paths)
@@ -14378,7 +14359,6 @@ struct Index {
       return
     }
     this.isBusy = true
-    this.errorText = ''
     this.statusText = '正在调整缓存…'
     try {
       await this.ensureCacheState()
@@ -14408,7 +14388,6 @@ struct Index {
       return
     }
     this.isBusy = true
-    this.errorText = ''
     this.statusText = '正在清理缓存…'
     try {
       await this.ensureCacheState()
@@ -14428,7 +14407,6 @@ struct Index {
     if (this.isBusy) {
       return
     }
-    this.errorText = ''
     this.isBusy = true
     this.statusText = '正在解析云盘地址…'
     try {
@@ -14466,7 +14444,6 @@ struct Index {
     if (this.isBusy) {
       return
     }
-    this.errorText = ''
     this.isBusy = true
     if (!silent) {
       this.statusText = '正在解析云盘地址…'
@@ -14527,7 +14504,6 @@ struct Index {
     if (this.isBusy) {
       return
     }
-    this.errorText = ''
     this.isBusy = true
     this.statusText = '正在验证验证码…'
     try {
@@ -15503,7 +15479,6 @@ struct Index {
     this.fileVisibleEndIndex = 0
     const requestId = this.navigationRequestId + 1
     this.navigationRequestId = requestId
-    this.errorText = ''
     this.statusText = '正在读取目录…'
     const nextPath = this.resolveEntryPath(entry)
     const nextRootType = nextPath.length > 0 ? 3 :
@@ -15767,7 +15742,6 @@ struct Index {
     if (entry.isDirectory) {
       return
     }
-    this.errorText = ''
     try {
       await this.ensureDownloadState()
       await this.downloadQueue.enqueue(entry)
@@ -16031,7 +16005,6 @@ struct Index {
     }
     this.closeActionMenu()
     this.isBusy = true
-    this.errorText = ''
     this.statusText = '正在准备文件夹下载…'
     try {
       await this.ensureDownloadState()
@@ -16714,7 +16687,6 @@ struct Index {
     }
     this.destinationOperationRunning = true
     this.destinationLoading = true
-    this.errorText = ''
     try {
       const paths = entries.map((entry: FileEntry): string => entry.path)
       if (this.destinationOperation === 'copy') {
@@ -16834,7 +16806,6 @@ struct Index {
     this.viewerClosing = false
     this.viewerInteractionUnlocked = false
     this.isBusy = true
-    this.errorText = ''
     this.statusText = '正在准备图片预览…'
     try {
       const imageEntries = customImageEntries !== undefined && customImageEntries.length > 0
@@ -19203,7 +19174,6 @@ struct Index {
       return
     }
     this.isBusy = true
-    this.errorText = ''
     this.statusText = '正在准备分享…'
     try {
       const localPath = await this.ensureCachedFile(entry)
@@ -19258,7 +19228,6 @@ struct Index {
     const originalViewerImages = this.viewerImages.slice()
     const originalViewerIndex = deletedIndex
     this.isBusy = true
-    this.errorText = ''
     this.statusText = '正在移入云盘回收站…'
     let resolution: DeleteResolution = 'failed'
     try {
@@ -19318,7 +19287,6 @@ struct Index {
     const animateEntry = opening && continuationPosition < 0
     this.isBusy = true
     this.audioOwnsBusy = true
-    this.errorText = ''
     this.statusText = '正在准备音频…'
     if (!keepQueue || !this.showAudioPlayer) {
       const candidates = this.showSearch ? this.searchResults : this.entries
@@ -19535,7 +19503,6 @@ struct Index {
     const token = this.videoOpenToken + 1
     this.videoOpenToken = token
     this.isBusy = true
-    this.errorText = ''
     this.statusText = '正在准备视频…'
     try {
       await this.refreshVideoManager()
@@ -20914,7 +20881,6 @@ struct Index {
       return
     }
     this.isBusy = true
-    this.errorText = ''
     this.statusText = '正在下载视频…'
     try {
       await this.ensureDownloadState()
@@ -21140,7 +21106,6 @@ struct Index {
     this.restoreDirectoryViewState(origin.viewState)
     this.updateTopTitle(origin.topTitle)
     this.topTitleOpacity = origin.topTitleOpacity
-    this.errorText = ''
   }
 
   private async createVideoPipController(): Promise<PiPWindow.PiPController> {
@@ -21653,7 +21618,6 @@ struct Index {
       return
     }
     this.isBusy = true
-    this.errorText = ''
     this.statusText = forcePicker ? '正在准备其他应用打开…' : '正在准备快速查看…'
     try {
       const localPath = await this.ensureCachedFile(entry)
@@ -21770,7 +21734,6 @@ struct Index {
       return
     }
     this.closeActionMenu()
-    this.errorText = ''
     if (this.isVideo(entry)) {
       if (!await this.confirmMeteredDownload(entry)) {
         return
@@ -21798,7 +21761,6 @@ struct Index {
       return
     }
     this.isBusy = true
-    this.errorText = ''
     this.statusText = '正在缓存并保存到图库…'
     try {
       const localPath = await this.ensureCachedFile(entry)
@@ -22536,7 +22498,6 @@ struct Index {
       return
     }
     this.isBusy = true
-    this.errorText = ''
     this.statusText = '正在准备分享…'
     try {
       const localPaths: string[] = []
@@ -22595,7 +22556,6 @@ struct Index {
       return
     }
     this.isBusy = true
-    this.errorText = ''
     this.statusText = '正在移入云盘回收站…'
     let resolutions: DeleteResolution[] = []
     try {
@@ -22657,7 +22617,6 @@ struct Index {
     }
     this.closeSelectionMoreMenu()
     this.isBusy = true
-    this.errorText = ''
     this.statusText = '正在加入下载队列…'
     try {
       await this.ensureDownloadState()
@@ -22802,7 +22761,6 @@ struct Index {
     }
     this.closeFileSortMenu()
     this.newFolderText = ''
-    this.errorText = ''
     this.getUIContext().animateTo({
       duration: 280,
       curve: curves.interpolatingSpring(0, 1, 320, 30)
@@ -22833,7 +22791,6 @@ struct Index {
     const parent = this.currentPath.replace(/\/+$/, '')
     const path = parent + '/' + name
     this.isBusy = true
-    this.errorText = ''
     try {
       await this.repository.createFolder(path)
       await this.refreshCurrentDirectory()
@@ -22854,7 +22811,6 @@ struct Index {
     this.renameEntry = entry
     this.renameText = entry.name
     this.showRenameDialog = true
-    this.errorText = ''
   }
 
   private closeRename(completed: boolean = false): void {
@@ -22880,7 +22836,6 @@ struct Index {
     if (newName === entry.name) { this.closeRename(); return }
     const scope = this.repository.cacheScopeHash()
     this.isBusy = true
-    this.errorText = ''
     this.statusText = '正在重命名…'
     try {
       const renamed = await this.repository.rename(entry, newName)
@@ -22956,7 +22911,6 @@ struct Index {
       return
     }
     this.isBusy = true
-    this.errorText = ''
     this.statusText = '正在移入云盘回收站…'
     let resolution: DeleteResolution = 'failed'
     try {
@@ -24579,7 +24533,6 @@ struct Index {
     this.bottomBarOffsetY = 0
     this.bottomBarOpacity = 1
     this.resetPreviewState()
-    this.errorText = ''
     this.statusText = ''
     await this.persistLoginPreferences()
     this.showImmersiveToast('已退出账号')

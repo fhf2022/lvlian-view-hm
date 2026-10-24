@@ -50,11 +50,9 @@
         "description": "$string:EntryAbility_desc",
         "icon": "$media:layered_image",
         "label": "$string:EntryAbility_label",
-        // Invisible on purpose - see the comment in start_window_icon.svg.
-        // The launch page exists only to cover the gap before the app's own
-        // first frame, and a background that already matches it makes the cold
-        // start continuous.
-        "startWindowIcon": "$media:start_window_icon",
+        // Keep visible app branding before the first ArkUI frame, including
+        // cold continuation launches. The in-app receiver uses this same icon.
+        "startWindowIcon": "$media:icon",
         "startWindowBackground": "$color:start_window_background",
         "exported": true,
         "backgroundModes": [

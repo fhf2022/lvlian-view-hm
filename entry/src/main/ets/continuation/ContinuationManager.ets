@@ -144,8 +144,16 @@ export class ContinuationManager {
       const session = distributedDataObject.genSessionId()
       await this.bounded(object.setSessionId(session))
       if (!valid()) { throw new Error('接续已取消') }
-      await this.bounded(object.save(wantParam.targetDevice as string))
-      if (!valid()) { throw new Error('接续已取消') }
+      // The source explicitly stays alive below. Start persistence, then let
+      // the system launch the receiver; its existing 'restored' observer waits
+      // for the asset. Awaiting remote persistence here delays even the splash.
+      void object.save(wantParam.targetDevice as string).catch((error: Object): void => {
+        if (!valid() || this.outgoing !== object) { return }
+        this.reportFailure('save', error)
+        // After AGREE there is no remote completion acknowledgement. Do not
+        // resume a possibly different source track or revoke a live receiver.
+        this.message('接续数据同步失败，请在接收设备重试')
+      })
       wantParam.linkfilesContinuationProtocol = snapshot.state.protocol
       wantParam.linkfilesContinuationRequest = snapshot.state.requestId
       wantParam.linkfilesContinuationSession = session
