@@ -1,0 +1,15 @@
+const fs=require('node:fs'),assert=require('node:assert/strict'),vm=require('node:vm'),ts=require(process.argv[2]);
+const src=fs.readFileSync('entry/src/main/ets/pages/Index.ets','utf8');
+function method(name){const a=src.search(new RegExp('^  (?:private )?(?:async )?'+name+'\\(','m'));assert.ok(a>=0,name);const rest=src.slice(a+1),b=rest.search(/^  (?:private |@Builder|aboutTo|onBackPress\(|build\()/m);return src.slice(a,a+b+1)}
+const ex={};vm.runInNewContext(ts.transpileModule('export class Pipeline {\n'+['decodeWaterfallBitmap','completeWaterfallDecode','failWaterfallDecode'].map(method).join('\n')+'\n}',{compilerOptions:{target:ts.ScriptTarget.ES2021,module:ts.ModuleKind.CommonJS}}).outputText,{exports:ex,console,fileUri:{getUriFromPath:p=>'file://'+p}});
+const deferred=()=>{let resolve;const promise=new Promise(r=>resolve=r);return{promise,resolve}};
+const entry={path:'/photo/a.jpg'};
+function fixture(){const p=new ex.Pipeline(),gate=deferred(),record={displayWidth:1200,displayHeight:1600};Object.assign(p,{waterfallGeneration:7,fileViewMode:'waterfall',waterfallVisiblePaths:{[entry.path]:true},waterfallActiveDecodes:1,waterfallActiveDecodePaths:{[entry.path]:8},waterfallDecodedPaths:{},waterfallBitmaps:{},fileContentScrolling:false,timelineScrubActive:false,showImageViewer:false,installed:0,released:0,drained:0,warmed:0,
+imageVisualState:()=>({userRotation:0}),waterfallAspectRatioReady:()=>true,waterfallSourceSize:()=>({width:600,height:800}),viewerBitmapStore:{decode:()=>gate.promise,async release(){p.released++}},installViewerBitmap(){p.installed++},applyDecodedBitmapGeometry(){},setWaterfallAspectRatio(){},setWaterfallOriginalUri(){},drainWaterfallDecodes(){p.drained++},warmTimelineVisibleEntries(){p.warmed++},recoverEntryPreview(){},async releaseViewerBitmap(){}});return{p,gate,record};}
+(async()=>{
+for(const change of [p=>p.fileContentScrolling=true,p=>p.timelineScrubActive=true,p=>p.showImageViewer=true,p=>p.waterfallGeneration++]){
+ const {p,gate,record}=fixture();const running=p.decodeWaterfallBitmap(entry,'/cache/a',7);assert.equal(p.waterfallActiveDecodes,1);change(p);p.failWaterfallDecode(entry);assert.equal(p.waterfallActiveDecodes,1,'fallback Image error must not release active native decoder');gate.resolve(record);await running;assert.equal(p.installed,0,'busy or obsolete decode must not publish');assert.equal(p.released,1);assert.equal(p.waterfallActiveDecodes,0);assert.equal(p.drained,1);assert.equal(p.warmed,p.waterfallGeneration===7?0:1);
+}
+const {p,gate,record}=fixture();const running=p.decodeWaterfallBitmap(entry,'/cache/a',7);gate.resolve(record);await running;assert.equal(p.installed,1);assert.equal(p.released,0);assert.equal(p.waterfallActiveDecodes,0);
+console.log('PASS actual waterfall decoder: native slot ownership, timeline/viewer/scroll cancellation, stale generation release and normal commit');
+})().catch(e=>{console.error(e);process.exitCode=1});

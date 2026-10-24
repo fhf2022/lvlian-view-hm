@@ -2198,9 +2198,9 @@ struct Index {
         if (!valid()) { return }
         this.waterfallLocalPaths[entry.path] = path
         this.waterfallLocalSignatures[entry.path] = this.waterfallEntrySignature(entry)
-        if (this.fileContentScrolling || this.showImageViewer) { return }
+        if (this.fileContentScrolling || this.timelineScrubActive || this.showImageViewer) { return }
         const geometry = await this.readViewerImageGeometry(path, entry.path)
-        if (!valid() || this.fileContentScrolling || this.showImageViewer) { return }
+        if (!valid() || this.fileContentScrolling || this.timelineScrubActive || this.showImageViewer) { return }
         if (geometry !== null) {
           this.setWaterfallAspectRatio(entry, geometry.displayWidth, geometry.displayHeight)
         }
@@ -12998,7 +12998,8 @@ struct Index {
       if (!this.waterfallAspectRatioReady(entry)) {
         const geometry = await this.readViewerImageGeometry(localPath, entry.path)
         if (generation !== this.waterfallGeneration || this.fileViewMode !== 'waterfall' ||
-          this.fileContentScrolling || this.waterfallVisiblePaths[entry.path] !== true ||
+          this.fileContentScrolling || this.timelineScrubActive || this.showImageViewer ||
+          this.waterfallVisiblePaths[entry.path] !== true ||
           this.imageVisualState(entry.path).userRotation !== rotation) { return }
         if (geometry !== null) { this.setWaterfallAspectRatio(entry, geometry.displayWidth, geometry.displayHeight) }
       }
@@ -13006,7 +13007,8 @@ struct Index {
         this.waterfallSourceSize(entry))
       if (record === null || generation !== this.waterfallGeneration ||
         this.fileViewMode !== 'waterfall' || this.waterfallVisiblePaths[entry.path] !== true ||
-        this.imageVisualState(entry.path).userRotation !== rotation || this.fileContentScrolling) {
+        this.imageVisualState(entry.path).userRotation !== rotation || this.fileContentScrolling ||
+        this.timelineScrubActive || this.showImageViewer) {
         if (record !== null) {
           await this.viewerBitmapStore.release(record)
         }
