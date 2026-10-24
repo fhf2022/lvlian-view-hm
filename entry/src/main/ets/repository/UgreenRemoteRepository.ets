@@ -2,6 +2,7 @@ import { Context } from '@kit.AbilityKit'
 import { DownloadManager } from '../download/DownloadManager'
 import { CacheManager } from '../download/CacheManager'
 import { BinaryProgressListener, HttpTransport } from '../core/network/HttpTransport'
+import { DownloadCancellation } from '../core/network/DownloadCancellation'
 import { UgreenDirectoryPage, UgreenRemoteClient } from '../ugreen/UgreenRemoteClient'
 import { DownloadDescriptor, FileEntry, RootDirectory, LoginResult } from '../model/FileEntry'
 import { RemoteFileSignature } from '../media/MediaLocalStore'
@@ -816,11 +817,12 @@ export class UgreenRemoteRepository {
   }
 
   async download(entry: FileEntry, filesDirectory: string, maxBytes: number,
-    onProgress?: BinaryProgressListener, shouldContinue?: () => boolean): Promise<string> {
+    onProgress?: BinaryProgressListener, shouldContinue?: () => boolean,
+    cancellation?: DownloadCancellation): Promise<string> {
     const scope = this.cacheScopeHash()
     return await this.client.withReconnect((): Promise<string> => {
       if (scope !== this.cacheScopeHash()) { throw new Error('账号已变化') }
-      return this.downloadOnce(entry, filesDirectory, maxBytes, onProgress, shouldContinue)
+      return this.downloadOnce(entry, filesDirectory, maxBytes, onProgress, shouldContinue, cancellation)
     })
   }
 
@@ -852,7 +854,8 @@ export class UgreenRemoteRepository {
   }
 
   private async downloadOnce(entry: FileEntry, filesDirectory: string, maxBytes: number,
-    onProgress?: BinaryProgressListener, shouldContinue?: () => boolean): Promise<string> {
+    onProgress?: BinaryProgressListener, shouldContinue?: () => boolean,
+    cancellation?: DownloadCancellation): Promise<string> {
     const scope = this.cacheScopeHash()
     const cacheKey = this.cacheKeyForFile(entry)
     const descriptor = await this.client.download(entry.path)
@@ -868,7 +871,7 @@ export class UgreenRemoteRepository {
     }
     return await this.downloadManager.download(descriptor, filesDirectory, maxBytes,
       cacheKey, onProgress, (): boolean => scope === this.cacheScopeHash() &&
-        (shouldContinue === undefined || shouldContinue()))
+        (shouldContinue === undefined || shouldContinue()), cancellation)
   }
 
   async prepareThumbnail(entry: FileEntry, cacheDirectory: string, maxBytes: number,

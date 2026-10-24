@@ -6,6 +6,7 @@ import { fileIo } from '@kit.CoreFileKit'
 import { UgreenError, UgreenErrorKind } from '../../ugreen/UgreenErrors'
 import { HttpResult, JsonObject } from './HttpTypes'
 import { RemoteFileVersion } from './RemoteFileVersion'
+import { DownloadCancellation } from './DownloadCancellation'
 
 export interface BinaryDownloadProgress {
   receiveSize: number
@@ -289,7 +290,8 @@ export class HttpTransport {
   async requestBinaryToFile(url: string, targetPath: string,
     headers: Record<string, string> = {}, resumeOffset: number = 0,
     expectedTotal: number = 0, onProgress?: BinaryProgressListener,
-    shouldContinue?: () => boolean, expectedValidator: string = ''): Promise<StreamDownloadResult> {
+    shouldContinue?: () => boolean, expectedValidator: string = '',
+    cancellation?: DownloadCancellation): Promise<StreamDownloadResult> {
     const attempt = NasConnection.shared().begin(url)
     const request = http.createHttp()
     const requestHeaders: Record<string, string> = {}
@@ -445,7 +447,17 @@ export class HttpTransport {
     request.on('headersReceive', headersCallback)
     request.on('dataReceive', dataCallback)
     request.on('dataEnd', endCallback)
+    const unsubscribe = cancellation?.subscribe((): void => {
+      streamError = new UgreenError(UgreenErrorKind.NETWORK, '下载已取消', 499)
+      paused = true
+      headerReject?.(streamError)
+      dataReject?.(streamError)
+      try { request.destroy() } catch (_) {}
+    })
     try {
+      if (cancellation?.isCancelled()) {
+        throw new UgreenError(UgreenErrorKind.NETWORK, '下载已取消', 499)
+      }
       // Open only after accepted response headers; a failed request must leave
       // the existing .part untouched. Data is still written directly to disk.
       requestStarted = true
@@ -508,6 +520,7 @@ export class HttpTransport {
       if (!requestStarted) { throw error as Error }
       throw this.requestFailure(error as Object, url, attempt)
     } finally {
+      unsubscribe?.()
       if (fileFd >= 0) {
         try {
           fileIo.closeSync(fileFd)

@@ -2,9 +2,10 @@ import { StorageBudget } from './StorageBudget'
 import { fileIo } from '@kit.CoreFileKit'
 import { DownloadDescriptor } from '../model/FileEntry'
 import { BinaryProgressListener, HttpTransport, StreamDownloadResult } from '../core/network/HttpTransport'
-import { UgreenError } from '../ugreen/UgreenErrors'
+import { UgreenError, UgreenErrorKind } from '../ugreen/UgreenErrors'
 import { CacheManager } from './CacheManager'
 import { RemoteFileVersion } from '../core/network/RemoteFileVersion'
+import { DownloadCancellation } from '../core/network/DownloadCancellation'
 
 export class DownloadManager {
   private transport: HttpTransport
@@ -15,13 +16,13 @@ export class DownloadManager {
 
   async download(descriptor: DownloadDescriptor, directory: string, maxBytes: number,
     cacheKey: string = '', onProgress?: BinaryProgressListener,
-    shouldContinue?: () => boolean): Promise<string> {
+    shouldContinue?: () => boolean, cancellation?: DownloadCancellation): Promise<string> {
     const target = CacheManager.cachePath(directory, descriptor.fileName, cacheKey)
     StorageBudget.pin(target)
     const part = this.partPath(target, descriptor.etag)
     StorageBudget.pin(part)
     try {
-      return await this.downloadPinned(descriptor, directory, maxBytes, cacheKey, onProgress, shouldContinue)
+      return await this.downloadPinned(descriptor, directory, maxBytes, cacheKey, onProgress, shouldContinue, cancellation)
     } finally {
       StorageBudget.unpin(part)
       StorageBudget.unpin(target)
@@ -30,8 +31,10 @@ export class DownloadManager {
 
   private async downloadPinned(descriptor: DownloadDescriptor, directory: string, maxBytes: number,
     cacheKey: string, onProgress?: BinaryProgressListener,
-    shouldContinue?: () => boolean): Promise<string> {
-    if (shouldContinue !== undefined && !shouldContinue()) { throw new Error('下载已取消') }
+    shouldContinue?: () => boolean, cancellation?: DownloadCancellation): Promise<string> {
+    if (shouldContinue !== undefined && !shouldContinue()) {
+      throw new UgreenError(UgreenErrorKind.NETWORK, '下载已取消', 499)
+    }
     const targetPath = CacheManager.cachePath(directory, descriptor.fileName, cacheKey)
     if (CacheManager.exists(targetPath)) {
       return targetPath
@@ -57,8 +60,10 @@ export class DownloadManager {
     await CacheManager.prepareForIncoming(directory, maxBytes, incomingBytes, targetPath, [partPath])
     try {
       const result = await this.downloadToPart(descriptor, partPath, resumeOffset, onProgress,
-        shouldContinue)
-      if (shouldContinue !== undefined && !shouldContinue()) { throw new Error('下载已取消') }
+        shouldContinue, cancellation)
+      if (shouldContinue !== undefined && !shouldContinue()) {
+        throw new UgreenError(UgreenErrorKind.NETWORK, '下载已取消', 499)
+      }
       const finalSize = this.fileSize(partPath)
       const expectedSize = descriptor.size > 0 ? descriptor.size : result.totalSize
       if (expectedSize > 0 && finalSize !== expectedSize) {
@@ -75,8 +80,10 @@ export class DownloadManager {
       // stale .part file cannot be appended to a full response.
       if (resumeOffset > 0 && this.shouldRestartWithoutRange(error)) {
         this.removeFile(partPath)
-        const retry = await this.downloadToPart(descriptor, partPath, 0, onProgress, shouldContinue)
-        if (shouldContinue !== undefined && !shouldContinue()) { throw new Error('下载已取消') }
+        const retry = await this.downloadToPart(descriptor, partPath, 0, onProgress, shouldContinue, cancellation)
+        if (shouldContinue !== undefined && !shouldContinue()) {
+          throw new UgreenError(UgreenErrorKind.NETWORK, '下载已取消', 499)
+        }
         const finalSize = this.fileSize(partPath)
         const expectedSize = descriptor.size > 0 ? descriptor.size : retry.totalSize
         if (expectedSize > 0 && finalSize !== expectedSize) {
@@ -105,9 +112,9 @@ export class DownloadManager {
 
   private async downloadToPart(descriptor: DownloadDescriptor, partPath: string,
     resumeOffset: number, onProgress?: BinaryProgressListener,
-    shouldContinue?: () => boolean): Promise<StreamDownloadResult> {
+    shouldContinue?: () => boolean, cancellation?: DownloadCancellation): Promise<StreamDownloadResult> {
     return await this.transport.requestBinaryToFile(descriptor.url, partPath, descriptor.headers,
-      resumeOffset, descriptor.size, onProgress, shouldContinue, descriptor.etag)
+      resumeOffset, descriptor.size, onProgress, shouldContinue, descriptor.etag, cancellation)
   }
 
   private partPath(target: string, etag: string): string {

@@ -80,7 +80,8 @@ import { ReturnPerfSession } from '../media/ReturnPerfSession'
 import { ThumbnailPolicy, ThumbnailSize } from '../media/ThumbnailPolicy'
 import { ThumbnailCacheStore } from '../media/ThumbnailCacheStore'
 import { ViewerBitmapRecord, ViewerBitmapStore } from '../media/ViewerBitmapStore'
-import { ViewerPrefetchCoordinator, ViewerEntryState } from '../media/ViewerPrefetchCoordinator'
+import { ViewerPrefetchCoordinator } from '../media/ViewerPrefetchCoordinator'
+import { DownloadCancellation } from '../core/network/DownloadCancellation'
 import { NetworkClass, NetworkPolicy } from '../core/network/NetworkPolicy'
 import { NasConnection, NasConnectionState } from '../core/network/NasConnection'
 import { OfflineAccountProfile } from '../core/session/OfflineAccountProfile'
@@ -2161,12 +2162,15 @@ struct Index {
       isViewerActive: (): boolean => this.showImageViewer && !this.viewerClosePending,
       isInteractionBusy: (): boolean => this.viewerVisualCommitBlocked('') || this.imageScale > 1.001 || this.imageTouchActive,
       shouldAutoPrefetch: (): boolean => this.shouldAutoLoadViewerOriginal(),
+      maxConcurrentDownloads: (): number => this.networkPolicy.isMetered() ? 1 : 2,
+      fileKey: (entry: FileEntry): string => this.originalCacheKey(entry),
       isFileCached: (entry: FileEntry): boolean => {
         const cacheKey = this.originalCacheKey(entry)
         return CacheManager.findExisting(this.cacheDirectory, entry.name, cacheKey).length > 0
       },
-      downloadOriginalFile: async (entry: FileEntry, shouldContinue: () => boolean): Promise<string> => {
-        return await this.ensureCachedFile(entry, undefined, shouldContinue)
+      downloadOriginalFile: async (entry: FileEntry, onProgress: BinaryProgressListener,
+        shouldContinue: () => boolean, cancellation: DownloadCancellation): Promise<string> => {
+        return await this.ensureCachedFile(entry, onProgress, shouldContinue, cancellation)
       },
       onOriginalFileReady: async (entry: FileEntry, _localPath: string): Promise<void> => {
         await this.primeViewerOriginalFrame(entry)
@@ -18467,8 +18471,9 @@ struct Index {
   private async loadViewerOriginal(entry: FileEntry, generation: number): Promise<void> {
     let completed = false
     let failed = false
+    let cancelled = false
+    const manual = this.viewerManualLoadPaths[entry.path] === true
     try {
-      const manual = this.viewerManualLoadPaths[entry.path] === true
       await this.ensureCacheState()
       const existingPath = CacheManager.findExisting(this.cacheDirectory, entry.name,
         this.originalCacheKey(entry))
@@ -18480,18 +18485,13 @@ struct Index {
           this.updateViewerDownloadProgress(entry.path, progress)
         }
       }
-      // Wi-Fi is an unrestricted transport for this viewer. Keep its
-      // download on the same uninterrupted path as an explicit ring tap.
-      // The continuation guard is only needed for automatic loading on a
-      // metered network, where the user may turn the mobile-data switch off
-      // while a request is already receiving bytes.
-      const continueDownload = manual || !this.networkPolicy.isMetered()
-        ? undefined
-        : (): boolean => this.showImageViewer && this.shouldAutoLoadViewerOriginal()
+      const coordinator = this.viewerPrefetchCoordinator
+      if (coordinator === null) { return }
       const localPath = existingPath.length > 0
-        ? existingPath : await this.ensureCachedFile(entry, progressListener, continueDownload)
+        ? existingPath : await coordinator.downloadCurrentOriginal(entry, progressListener, manual)
       if (!this.showImageViewer || generation !== this.viewerGeneration ||
-        !this.viewerContainsPath(entry.path)) {
+        !this.viewerContainsPath(entry.path) ||
+        (EXPERIMENT_A3_SINGLE_ORIGINAL_VIEWER && entry.path !== this.viewerPrimaryPath)) {
         return
       }
       if (existingPath.length > 0) {
@@ -18499,7 +18499,8 @@ struct Index {
       }
       const record = await this.decodeViewerOriginalBitmap(entry, localPath)
       if (record === null || !this.showImageViewer || generation !== this.viewerGeneration ||
-        !this.viewerContainsPath(entry.path)) {
+        !this.viewerContainsPath(entry.path) ||
+        (EXPERIMENT_A3_SINGLE_ORIGINAL_VIEWER && entry.path !== this.viewerPrimaryPath)) {
         return
       }
       this.applyDecodedBitmapGeometry(entry.path, record, true)
@@ -18507,6 +18508,7 @@ struct Index {
       completed = true
     } catch (error) {
       if (error instanceof UgreenError && error.status === 499) {
+        cancelled = true
         return
       }
       failed = true
@@ -18536,6 +18538,15 @@ struct Index {
         this.viewerLoadRequests[entry.path] = false
         this.viewerActiveLoadPaths[entry.path] = false
         this.viewerManualLoadPaths[entry.path] = false
+        if (EXPERIMENT_A3_SINGLE_ORIGINAL_VIEWER && entry.path !== this.viewerPrimaryPath) {
+          this.trimViewerOriginalState()
+        }
+        // A quick away/back can select this file while its old cancellation
+        // is still settling. Requeue only that still-visible cancelled load.
+        if (cancelled && this.showImageViewer && !this.viewerClosePending &&
+          entry.path === this.viewerPrimaryPath && (manual || this.shouldAutoLoadViewerOriginal())) {
+          this.enqueueViewerOriginal(entry, true, manual)
+        }
         this.drainViewerLoadQueue()
       }
     }
@@ -21602,7 +21613,8 @@ struct Index {
   }
 
   private async ensureCachedFile(entry: FileEntry,
-    onProgress?: BinaryProgressListener, shouldContinue?: () => boolean): Promise<string> {
+    onProgress?: BinaryProgressListener, shouldContinue?: () => boolean,
+    cancellation?: DownloadCancellation): Promise<string> {
     if (this.isVideo(entry)) {
       await this.refreshVideoManager()
       const videoLocal = await this.videoTransferManager.resolveLocal(entry)
@@ -21636,7 +21648,7 @@ struct Index {
     const context = getContext(this) as Context
     const directory = this.cacheDirectory.length > 0 ? this.cacheDirectory : context.cacheDir
     const localPath = await this.repository.download(entry, directory, this.cacheLimitBytes,
-      onProgress, shouldContinue)
+      onProgress, shouldContinue, cancellation)
     await this.refreshCacheUsage()
     return localPath
   }
