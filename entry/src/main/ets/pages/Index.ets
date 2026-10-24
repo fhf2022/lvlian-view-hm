@@ -38,7 +38,8 @@ import { LocalAlbumSource } from '../upload/LocalAlbumSource'
 import { FisheyeTimeline } from '../components/FisheyeTimeline'
 import { ProximityLightReceiver } from '../components/ProximityLightReceiver'
 import { UploadQueueManager, UploadTaskRecord } from '../upload/UploadQueueManager'
-import { preferences, uniformTypeDescriptor as utd } from '@kit.ArkData'
+import { FileImport } from '../upload/FileImport'
+import { preferences, unifiedDataChannel, uniformTypeDescriptor as utd } from '@kit.ArkData'
 import { image } from '@kit.ImageKit'
 import { media } from '@kit.MediaKit'
 import { audio, AVVolumePanel } from '@kit.AudioKit'
@@ -1253,6 +1254,10 @@ struct Index {
   private albumUpload: AlbumUploadManager = new AlbumUploadManager()
   @State @Watch('onContinuationSceneChanged') importExpanded: boolean = false
   @State @Watch('onContinuationSceneChanged') importSelecting: boolean = false
+  @State private dropImportHover: boolean = false
+  private dropImportActive: boolean = false
+  private dropImportKey: string = ''
+  private dropImportGeneration: number = 0
   private uploadQueue: UploadQueueManager = new UploadQueueManager()
   @State @Watch('onContinuationSceneChanged') showPageTransition: boolean = false
   @State fileTransitionHeader: DirectoryHeaderState | null = null
@@ -1817,6 +1822,7 @@ struct Index {
   }
 
   private onContinuationSceneChanged(): void {
+    if (this.dropImportHover && !this.canAcceptFileDrop()) { this.dropImportHover = false }
     ContinuationManager.shared().refresh()
     this.onContinuationNoticeChanged()
     this.onContinuationMessage()
@@ -2200,6 +2206,7 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    this.cancelDropImport()
     CacheManager.offRemoved(this.cacheRemovalListener)
     if (this.removedPreviewTimer !== 0) { clearTimeout(this.removedPreviewTimer); this.removedPreviewTimer = 0 }
     this.removedPreviewPaths.clear()
@@ -3457,6 +3464,7 @@ struct Index {
   }
 
   onBackPress(): boolean {
+    if (this.dropImportKey !== '') { this.cancelDropImport(); return true }
     if (this.continuationPending || this.continuationSending) {
       ContinuationManager.shared().cancel(); return true
     }
@@ -3629,6 +3637,11 @@ struct Index {
       .translate({ x: this.pageOffsetX, y: 0, z: 0 })
       // Viewer Input Ownership: main-file-content 恒定为 Default，不再依赖动态 BLOCK_DESCENDANTS。
       .hitTestBehavior(HitTestMode.Default)
+      .allowDrop(this.canAcceptFileDrop() ? FileImport.dropTypes : null)
+      .onDragEnter((event: DragEvent) => this.updateFileDropHover(event))
+      .onDragMove((event: DragEvent) => this.updateFileDropHover(event))
+      .onDragLeave(() => { this.dropImportHover = false })
+      .onDrop((event: DragEvent) => this.receiveFileDrop(event), { disableDataPrefetch: true })
       .onAreaChange((_, area) => {
         if (this.contextMenuEntry !== null &&
           ((typeof area.width === 'number' && area.width > 0 && area.width !== this.pageWidthVp) ||
@@ -3641,6 +3654,19 @@ struct Index {
         }
         this.recordFilePageSize(area)
       })
+
+      if (this.dropImportHover && this.canAcceptFileDrop()) {
+        Column() {
+          Column() {
+            Text('松开上传到此文件夹').fontSize(14).fontColor($r('sys.color.font_emphasize'))
+              .padding({ left: 16, right: 16, top: 8, bottom: 8 }).borderRadius(18)
+              .backgroundColor($r('app.color.surface_card')).margin({ top: 8 })
+          }.width('100%').height('100%').borderRadius(16)
+            .border({ width: 2, color: $r('sys.color.comp_background_emphasize') })
+        }.width('100%').height('100%')
+          .padding({ left: 8, right: 8, top: this.fileContentTopInset(), bottom: this.floatingBarContentInset(8) })
+          .hitTestBehavior(HitTestMode.None).zIndex(18).id('file-drop-target-hint')
+      }
 
       // Keep material hosts and the current bar mode across every overlay,
       // matching the image viewer's return path.
@@ -5027,6 +5053,105 @@ struct Index {
       applyShadow: false, colorInvert: true, interactive: true, lightEffect: { color: '#66FFFFFF' } })
   }
 
+  private canAcceptFileDrop(): boolean {
+    return this.screen === 'files' && this.currentPath !== '' && !this.offlineCacheMode &&
+      !this.parentOverlayOwnsInteraction() && !this.isBusy && !this.isNavigating &&
+      !this.showPageTransition && !this.showSearch && !this.selectionMode && !this.importSelecting &&
+      !this.continuationPending && !this.continuationSending && this.continuationDialogCount === 0
+  }
+
+  private externalFileDrag(event: DragEvent): boolean {
+    return event.getDragSource() !== (getContext(this) as common.UIAbilityContext).applicationInfo.name
+  }
+
+  private updateFileDropHover(event: DragEvent): void {
+    const accepted = this.canAcceptFileDrop() && this.externalFileDrag(event)
+    if (this.dropImportHover !== accepted) { this.dropImportHover = accepted }
+    event.dragBehavior = DragBehavior.COPY
+    event.setResult(accepted ? DragResult.DROP_ENABLED : DragResult.DROP_DISABLED)
+  }
+
+  private receiveFileDrop(event: DragEvent): void {
+    this.dropImportHover = false
+    if (!this.canAcceptFileDrop() || !this.externalFileDrag(event)) {
+      event.setResult(DragResult.DRAG_FAILED); return
+    }
+    // Capture the directory/account at release, before asking UDMF for data.
+    const target = this.currentPath
+    const scope = this.repository.cacheScopeHash()
+    const token = ++this.dropImportGeneration
+    this.dropImportActive = true
+    this.importSelecting = true
+    let received = false
+    try {
+      const key = event.startDataLoading({
+        progressIndicator: unifiedDataChannel.ProgressIndicator.DEFAULT,
+        // One extra record lets us detect an oversized selection, rather than
+        // silently importing only its first 500 files. No extra sandbox copy.
+        acceptableInfo: { recordCount: FileImport.maxFiles + 1 },
+        dataProgressListener: (progress: unifiedDataChannel.ProgressInfo,
+          data: unifiedDataChannel.UnifiedData | null): void => {
+          if (received || token !== this.dropImportGeneration || !this.dropImportActive ||
+            progress.status === unifiedDataChannel.ListenerStatus.PROCESSING) { return }
+          received = true
+          this.dropImportKey = ''
+          if (progress.status === unifiedDataChannel.ListenerStatus.FINISHED && data !== null) {
+            void this.importDroppedFiles(data, target, scope, token)
+          } else {
+            this.finishDropImport(token)
+            if (progress.status !== unifiedDataChannel.ListenerStatus.CANCELED) {
+              this.showImmersiveToast('读取拖入文件失败，请在来源应用确认文件已下载后重试')
+            }
+          }
+        }
+      })
+      if (!received) { this.dropImportKey = key }
+      event.dragBehavior = DragBehavior.COPY
+      event.setResult(DragResult.DRAG_SUCCESSFUL)
+    } catch (error) {
+      this.finishDropImport(token)
+      event.setResult(DragResult.DRAG_FAILED)
+      this.reportError(error as Object, '读取拖入文件失败')
+    }
+  }
+
+  private async importDroppedFiles(data: unifiedDataChannel.UnifiedData, target: string,
+    scope: string, token: number): Promise<void> {
+    try {
+      const files = FileImport.fromDrop(data)
+      await this.ensureDownloadState()
+      const valid = (): boolean => token === this.dropImportGeneration && this.dropImportActive &&
+        scope === this.repository.cacheScopeHash()
+      if (!valid()) { throw new Error('导入已取消或登录状态已改变') }
+      this.transferDirection = 'upload'
+      const result = await FileImport.enqueue(this.uploadQueue, files.uris, target, scope, valid)
+      result.failed += files.unsupported
+      if (token === this.dropImportGeneration && this.dropImportActive) { this.showImmersiveToast(result.message()) }
+    } catch (error) {
+      if (token === this.dropImportGeneration && this.dropImportActive) {
+        this.reportError(error as Object, '拖入文件失败')
+      }
+    } finally { this.finishDropImport(token) }
+  }
+
+  private finishDropImport(token: number): void {
+    if (token !== this.dropImportGeneration || !this.dropImportActive) { return }
+    this.dropImportKey = ''
+    this.dropImportActive = false
+    this.importSelecting = false
+  }
+
+  private cancelDropImport(): void {
+    if (!this.dropImportActive) { return }
+    const key = this.dropImportKey
+    this.dropImportGeneration++
+    this.finishDropImport(this.dropImportGeneration)
+    this.dropImportHover = false
+    if (key !== '') {
+      try { this.getUIContext().getDragController().cancelDataLoading(key) } catch (_) {}
+    }
+  }
+
   private async selectImportSource(source: string): Promise<void> {
     if (source === 'folder') { this.openCreateFolder(); return }
     if (this.currentPath.length === 0 || this.importSelecting || this.isBusy || this.showAlbumPicker || this.showAlbumUpload) { return }
@@ -5076,10 +5201,11 @@ struct Index {
       // dragging the user off to the transfer page for something that runs in
       // the background loses their place for no reason.
       this.transferDirection = 'upload'
-      for (const uri of uris) { await this.uploadQueue.enqueue(uri, target, scope) }
+      const result = await FileImport.enqueue(this.uploadQueue, uris, target, scope,
+        (): boolean => scope === this.repository.cacheScopeHash())
       // The file page does not render statusText, so without this the upload
       // would start with nothing on screen to say so.
-      this.showImmersiveToast('已加入上传：' + uris.length.toString() + ' 个文件')
+      this.showImmersiveToast(result.message())
     } catch (error) { this.reportError(error as Object, '文件导入失败') }
     finally { this.importSelecting = false }
   }
@@ -16725,23 +16851,12 @@ struct Index {
     }
     this.destinationOperationRunning = true
     this.destinationLoading = true
-    let added = 0
-    let failed = 0
     try {
       await this.ensureDownloadState()
       this.transferDirection = 'upload'
-      for (const uri of uris) {
-        if (scope !== this.repository.cacheScopeHash()) {
-          failed += uris.length - added - failed
-          break
-        }
-        try {
-          const task = await this.uploadQueue.enqueue(uri, target, scope)
-          if (task.status === 'failed') { failed++ } else { added++ }
-        } catch (_) { failed++ }
-      }
-      this.showImmersiveToast(failed > 0 ? '已添加 ' + added + ' 项，' + failed + ' 项失败' :
-        '已加入上传：' + added + ' 个文件')
+      const result = await FileImport.enqueue(this.uploadQueue, uris, target, scope,
+        (): boolean => scope === this.repository.cacheScopeHash())
+      this.showImmersiveToast(result.message())
     } catch (error) {
       this.reportError(error as Object, '添加上传失败')
     } finally {
