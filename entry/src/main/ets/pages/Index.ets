@@ -1475,6 +1475,8 @@ struct Index {
   // temporarily removed by the viewer. Keep the first visible image as a
   // stable return anchor in addition to the raw offset.
   private viewerReturnScrollAnchor: FileViewAnchor | null = null
+  private fileViewportVersion: number = 0
+  private viewerReturnViewportVersion: number = 0
   private searchResultScroller: Scroller = new Scroller()
   private searchSession: SearchSession | null = null
   private searchScrollOffset: number = 0
@@ -2809,7 +2811,7 @@ struct Index {
     })
   }
 
-  private restoreImageViewerOrientation(): void {
+  private async restoreImageViewerOrientation(): Promise<void> {
     const token = this.imageViewerRotationToken + 1
     this.imageViewerRotationToken = token
     const win = this.imageViewerWindow
@@ -2822,7 +2824,7 @@ struct Index {
     try {
       win.off('windowSizeChange', this.imageViewerWindowSizeChange)
       if (previous !== null) {
-        win.setPreferredOrientation(previous).catch((error: Error) => {
+        await win.setPreferredOrientation(previous).catch((error: Error) => {
           console.warn('[UgreenImage] restore orientation failed: ' + JSON.stringify(error))
         })
       }
@@ -3614,12 +3616,7 @@ struct Index {
           this.mainContentOriginX = area.globalPosition.x
           this.mainContentOriginY = area.globalPosition.y
         }
-        if (typeof area.width === 'number' && area.width > 0) {
-          this.pageWidthVp = area.width
-        }
-        if (typeof area.height === 'number' && area.height > 0) {
-          this.pageHeightVp = area.height
-        }
+        this.recordFilePageSize(area)
       })
 
       // Keep material hosts and the current bar mode across every overlay,
@@ -17031,6 +17028,7 @@ struct Index {
   }
 
   private captureViewerReturnScrollPosition(): void {
+    this.viewerReturnViewportVersion = this.fileViewportVersion
     this.viewerReturnScrollOffset = null
     this.viewerReturnScrollPath = ''
     this.viewerReturnScrollAnchor = null
@@ -17117,6 +17115,51 @@ struct Index {
       state.decodeState === 'displayed' ? 'original' : 'thumbnail'
   }
 
+  private recordFilePageSize(area: Area): void {
+    const width = typeof area.width === 'number' && area.width > 0 ? area.width : this.pageWidthVp
+    const height = typeof area.height === 'number' && area.height > 0 ? area.height : this.pageHeightVp
+    if (Math.abs(width - this.pageWidthVp) > 0.5 || Math.abs(height - this.pageHeightVp) > 0.5) {
+      this.fileViewportVersion++
+    }
+    this.pageWidthVp = width
+    this.pageHeightVp = height
+  }
+
+  private mediaReturnBandTop(): number {
+    return Math.max(this.fileScrollViewport.y, this.fileContentTopInset())
+  }
+
+  private mediaReturnBandBottom(): number {
+    const viewport = this.fileScrollViewport
+    const height = viewport.height > 0 ? viewport.height : this.pageHeightVp
+    return Math.max(this.mediaReturnBandTop(),
+      Math.min(this.pageHeightVp, viewport.y + height) - this.floatingBarContentInset(0))
+  }
+
+  private gridViewerReturnTargetVisible(entry: FileEntry): boolean {
+    if (!this.refreshGridThumbnailArea(entry)) { return false }
+    const state = this.imageVisualState(entry.path)
+    const viewport = this.fileScrollViewport
+    return state.thumbnailSurface === 'grid' && state.thumbnailWidth > 0 && state.thumbnailHeight > 0 &&
+      state.thumbnailX >= viewport.x - 0.5 &&
+      state.thumbnailX + state.thumbnailWidth <= viewport.x + viewport.width + 0.5 &&
+      state.thumbnailY >= this.mediaReturnBandTop() - 0.5 &&
+      state.thumbnailY + state.thumbnailHeight <= this.mediaReturnBandBottom() + 0.5
+  }
+
+  private async waitForFileViewport(isCurrent: () => boolean): Promise<boolean> {
+    let version = this.fileViewportVersion
+    let stableFrames = 0
+    for (let frame = 0; frame < IMAGE_RETURN_MOUNT_FRAME_LIMIT; frame++) {
+      await this.nextRenderFrame()
+      if (!isCurrent()) { return false }
+      stableFrames = version === this.fileViewportVersion ? stableFrames + 1 : 0
+      version = this.fileViewportVersion
+      if (stableFrames >= 2) { return true }
+    }
+    return false
+  }
+
   private scrollMediaReturnSourceIntoView(entry: FileEntry): boolean {
     try {
       if (this.showSearch) {
@@ -17142,7 +17185,8 @@ struct Index {
       const childIndex = this.fileViewMode === 'list' ? index + 1 : index
       const scroller = this.fileViewMode === 'waterfall'
         ? this.waterfallScroller : this.fileListScroller
-      this.scrollItemIntoContentBand(scroller, childIndex, 0, false)
+      this.scrollItemIntoContentBand(scroller, childIndex, 0, false,
+        this.fileViewMode === 'grid' ? entry : undefined)
       return true
     } catch (error) {
       console.warn('[UgreenMedia] position return source failed: ' + JSON.stringify(error))
@@ -17159,16 +17203,27 @@ struct Index {
    * 返回动画会飞到一个被遮挡的矩形。
    */
   private scrollItemIntoContentBand(scroller: Scroller, childIndex: number,
-    attempt: number = 0, retryOnMissing: boolean = true): void {
+    attempt: number = 0, retryOnMissing: boolean = true, gridEntry?: FileEntry): void {
     let itemY = 0
     let itemHeight = 0
     let hasRect = false
     try {
-      const rect = scroller.getItemRect(childIndex)
-      if (rect !== undefined && typeof rect.y === 'number' && rect.height > 0) {
-        itemY = rect.y
-        itemHeight = rect.height
-        hasRect = true
+      if (gridEntry !== undefined) {
+        // GridItem includes the first-row inset and directory labels. Only
+        // the actual thumbnail is the target of the return flight.
+        if (this.refreshGridThumbnailArea(gridEntry, childIndex)) {
+          const state = this.imageVisualState(gridEntry.path)
+          itemY = state.thumbnailY - this.fileScrollViewport.y
+          itemHeight = state.thumbnailHeight
+          hasRect = itemHeight > 0
+        }
+      } else {
+        const rect = scroller.getItemRect(childIndex)
+        if (rect !== undefined && typeof rect.y === 'number' && rect.height > 0) {
+          itemY = rect.y
+          itemHeight = rect.height
+          hasRect = true
+        }
       }
     } catch (_) {
       hasRect = false
@@ -17197,11 +17252,8 @@ struct Index {
     // expansion can put its origin at 0 instead of below the status bar; use
     // the measured viewport shared with drag selection, not a fixed 94 vp.
     const viewportY = this.fileScrollViewport.y
-    const viewportHeight = this.fileScrollViewport.height > 0
-      ? this.fileScrollViewport.height : this.pageHeightVp
-    const bandTop = Math.max(0, this.fileContentTopInset() - viewportY)
-    const bandBottom = Math.max(bandTop, Math.min(this.pageHeightVp, viewportY + viewportHeight) -
-      this.floatingBarContentInset(0) - viewportY)
+    const bandTop = this.mediaReturnBandTop() - viewportY
+    const bandBottom = this.mediaReturnBandBottom() - viewportY
     let delta = 0
     if (itemY < bandTop) {
       delta = itemY - bandTop
@@ -17220,12 +17272,14 @@ struct Index {
 
   /** Shared image/audio return preparation. Never use the explicit file locator here. */
   private async prepareMediaReturnSource(entry: FileEntry, isCurrent: () => boolean,
-    sourceReady: () => boolean, prepareSource?: () => Promise<void>): Promise<boolean> {
+    sourceReady: () => boolean, prepareSource?: () => Promise<void>,
+    positionGridSource: boolean = false): Promise<boolean> {
     if (!isCurrent()) { return false }
-    // Match the Grid image return overlay: use mounted geometry only. A
-    // missing target fades out without moving or rebuilding the file grid.
+    // Ordinary Grid returns keep the mounted target/fade fast path. Only
+    // explicit resize recovery may position a missing Grid thumbnail.
     if (this.screen === 'files' && !this.showSearch && this.fileViewMode === 'grid') {
-      return sourceReady()
+      const ready = sourceReady()
+      if (!positionGridSource || ready) { return ready }
     }
     if (!this.scrollMediaReturnSourceIntoView(entry)) { return false }
     if (prepareSource !== undefined) { await prepareSource() }
@@ -17425,8 +17479,8 @@ struct Index {
     this.isBusy = true
     this.setImageChromeVisible(false, false)
 
-    // PoC scope: ordinary Grid. The close path reads cached geometry only;
-    // it never scrolls, measures other items or prepares/decodes an Original.
+    // Ordinary Grid keeps its stationary overlay return. A changed viewport
+    // may position only the target thumbnail; it never decodes an Original.
     if (!skipReturnGeometry && this.screen === 'files' && !this.showSearch &&
       this.fileViewMode === 'grid') {
       await this.closeGridViewerWithReturnOverlay(returningEntry, shouldRestoreSearch)
@@ -17535,6 +17589,23 @@ struct Index {
     shouldRestoreSearch: boolean): Promise<void> {
     const token = ++this.viewerReturnOverlayToken
     this.viewerReturnOverlayStartedAt = this.getMonotonicNow()
+    const openingGeneration = this.viewerGeneration
+    const isCurrent = (): boolean => token === this.viewerReturnOverlayToken &&
+      openingGeneration === this.viewerGeneration && this.showImageViewer &&
+      this.viewerImageEntry?.path === entry.path
+    const layoutChanged = this.viewerReturnViewportVersion !== this.fileViewportVersion
+    let positioned = true
+    if (layoutChanged) {
+      // Restore the window policy before choosing a target; restoring it
+      // after the flight could trigger another layout and invalidate it.
+      await this.restoreImageViewerOrientation()
+      positioned = await this.waitForFileViewport(isCurrent)
+      if (positioned) {
+        positioned = await this.prepareMediaReturnSource(entry, isCurrent,
+          (): boolean => this.gridViewerReturnTargetVisible(entry), undefined, true)
+      }
+      if (!isCurrent()) { return }
+    }
     const snapshot = new ViewerReturnSnapshot()
     snapshot.path = entry.path
     snapshot.source = this.viewerImageSource(entry)
@@ -17565,7 +17636,8 @@ struct Index {
     const hasGridArea = this.refreshGridThumbnailArea(entry)
     const state = this.imageVisualState(entry.path)
     snapshot.hasTarget = hasGridArea && state.thumbnailSurface === 'grid' &&
-      state.thumbnailVisibleRatio >= 0.999 && state.thumbnailWidth > 0 && state.thumbnailHeight > 0 &&
+      (layoutChanged ? positioned && this.gridViewerReturnTargetVisible(entry)
+        : state.thumbnailVisibleRatio >= 0.999) && state.thumbnailWidth > 0 && state.thumbnailHeight > 0 &&
       state.thumbnailY >= this.fileContentTopInset() &&
       state.thumbnailY + state.thumbnailHeight <= this.pageHeightVp - this.bottomSafeInset() - 8
     snapshot.target.x = state.thumbnailX - this.viewerLayerOriginX
@@ -17573,6 +17645,7 @@ struct Index {
     snapshot.target.width = state.thumbnailWidth
     snapshot.target.height = state.thumbnailHeight
     this.viewerReturnSnapshot = snapshot
+    const targetViewportVersion = this.fileViewportVersion
     this.viewerReturnReadyPath = snapshot.hasTarget ? entry.path : ''
     this.logViewerReturnOverlay('request')
     this.clearViewerEntryTransition()
@@ -17598,6 +17671,12 @@ struct Index {
     })
     if (token !== this.viewerReturnOverlayToken || closeGeneration !== this.viewerGeneration) {
       return
+    }
+    // A second resize during the handoff must not fly to a stale rectangle.
+    // No corrective scrolling is allowed after the return animation starts.
+    if (targetViewportVersion !== this.fileViewportVersion) {
+      snapshot.hasTarget = false
+      this.viewerReturnReadyPath = ''
     }
     this.logViewerReturnOverlay('animation-start')
     await new Promise<void>((resolve: () => void): void => {
