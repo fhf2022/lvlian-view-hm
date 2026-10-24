@@ -6,6 +6,7 @@ import { AudioTrackInfo } from './AudioPlayerPolicy'
 export class AudioMetadataReader {
   static async read(path: string): Promise<AudioTrackInfo> {
     const result = new AudioTrackInfo()
+    if (path.length === 0) { return result }
     let extractor: media.AVMetadataExtractor | null = null
     let file: fileIo.File | null = null
     try {

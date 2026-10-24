@@ -1,5 +1,6 @@
 import { fileIo } from '@kit.CoreFileKit'
 import { media } from '@kit.MediaKit'
+import { DownloadDescriptor } from '../model/FileEntry'
 
 export type AudioTimeListener = (timeMs: number) => void
 export type AudioDurationListener = (durationMs: number) => void
@@ -7,42 +8,47 @@ export type AudioStateListener = (state: media.AVPlayerState) => void
 export type AudioErrorListener = (error: Object) => void
 
 /**
- * Keeps the AVPlayer and its file descriptor together. The descriptor must stay
- * open for the whole playback session, and is closed only after AVPlayer.release().
+ * Owns one AVPlayer and either its local FD or a transient authenticated URL.
+ * Network playback uses MediaKit buffering, never a whole-file staging download.
  */
 export class AudioPlaybackManager {
   private player: media.AVPlayer | null = null
   private sourceFd: number = -1
+  private source: string | DownloadDescriptor = ''
   private timeListener: AudioTimeListener | null = null
   private durationListener: AudioDurationListener | null = null
   private stateListener: AudioStateListener | null = null
   private errorListener: AudioErrorListener | null = null
   private operation: number = 0
-  private cancelInitialization: (() => void) | null = null
+  private cancelInitialization: ((error?: Object) => void) | null = null
   private pendingSeek: number = -1
   private seekTimer: number = -1
   private seekResolve: ((completed: boolean) => void) | null = null
 
-  async open(path: string, onTime: AudioTimeListener, onDuration: AudioDurationListener,
+  async open(source: string | DownloadDescriptor, onTime: AudioTimeListener, onDuration: AudioDurationListener,
     onState: AudioStateListener, onError: AudioErrorListener, positionMs: number = 0): Promise<void> {
     const token = this.operation + 1
     await this.release()
     if (token !== this.operation) { return }
     const player = await media.createAVPlayer()
-    let sourceFile: fileIo.File
-    try {
-      sourceFile = await fileIo.open(path, fileIo.OpenMode.READ_ONLY)
-    } catch (error) {
-      await player.release().catch(() => {})
-      throw error as Error
+    if (token !== this.operation) { await player.release().catch(() => {}); return }
+    let sourceFd = -1
+    if (typeof source === 'string') {
+      try {
+        sourceFd = (await fileIo.open(source, fileIo.OpenMode.READ_ONLY)).fd
+      } catch (error) {
+        await player.release().catch(() => {})
+        throw error as Error
+      }
     }
     if (token !== this.operation) {
       await player.release().catch(() => {})
-      fileIo.closeSync(sourceFile.fd)
+      if (sourceFd >= 0) { fileIo.closeSync(sourceFd) }
       return
     }
     this.player = player
-    this.sourceFd = sourceFile.fd
+    this.sourceFd = sourceFd
+    this.source = source
     this.timeListener = onTime
     this.durationListener = onDuration
     this.stateListener = onState
@@ -78,10 +84,8 @@ export class AudioPlaybackManager {
     })
     player.on('error', (error) => {
       if (this.player !== player || token !== this.operation) { return }
-      this.cancelInitialization?.()
-      if (this.errorListener !== null) {
-        this.errorListener(error as Object)
-      }
+      if (this.cancelInitialization !== null) { this.cancelInitialization(error as Object) }
+      else { this.errorListener?.(error as Object) }
     })
 
     try {
@@ -94,13 +98,15 @@ export class AudioPlaybackManager {
           if (finished) { return }
           finished = true; clearTimeout(timer); this.cancelInitialization = null; resolve()
         }
-        this.cancelInitialization = (): void => {
+        this.cancelInitialization = (error?: Object): void => {
           if (finished) { return }
           finished = true; clearTimeout(timer); this.cancelInitialization = null
-          reject(new Error('音频准备已取消或超时'))
+          reject(error !== undefined ? error as Error : new Error('音频准备已取消或超时'))
         }
         try {
-          player.url = 'fd://' + this.sourceFd.toString()
+          this.assignSource(player).catch((error: Object): void => {
+            if (this.player === player && token === this.operation) { this.cancelInitialization?.(error) }
+          })
           if (player.state === 'initialized') { initialized() }
         } catch (error) {
           this.cancelInitialization()
@@ -147,7 +153,7 @@ export class AudioPlaybackManager {
     }
     if (player.state === 'stopped' || player.state === 'error' || player.state === 'prepared') {
       await player.reset()
-      player.url = 'fd://' + this.sourceFd.toString()
+      await this.assignSource(player)
       await player.prepare()
       if (player.duration > 0 && this.durationListener !== null) {
         this.durationListener(player.duration)
@@ -195,6 +201,7 @@ export class AudioPlaybackManager {
     const sourceFd = this.sourceFd
     this.player = null
     this.sourceFd = -1
+    this.source = ''
     this.timeListener = null
     this.durationListener = null
     this.stateListener = null
@@ -216,6 +223,16 @@ export class AudioPlaybackManager {
         // The player may already have closed the descriptor.
       }
     }
+  }
+
+  private async assignSource(player: media.AVPlayer): Promise<void> {
+    if (typeof this.source === 'string') {
+      player.url = 'fd://' + this.sourceFd.toString()
+      return
+    }
+    const source = media.createMediaSourceWithUrl(this.source.url, this.source.headers)
+    source.enableOfflineCache(false)
+    await player.setMediaSource(source, { preferredBufferDuration: 8 })
   }
 
   private clearSeek(completed: boolean = false): void {

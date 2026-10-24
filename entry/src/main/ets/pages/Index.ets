@@ -47,7 +47,7 @@ import { AVCastPicker, AVCastPickerState, avSession } from '@kit.AVSessionKit'
 import { visionImageAnalyzer } from '@kit.VisionKit'
 import { hilog, hiTraceMeter } from '@kit.PerformanceAnalysisKit'
 import { systemDateTime } from '@kit.BasicServicesKit'
-import { DownloadTaskRecord, FileEntry } from '../model/FileEntry'
+import { DownloadDescriptor, DownloadTaskRecord, FileEntry } from '../model/FileEntry'
 import { FileSelectionModel, FileSelectionState } from '../model/FileSelectionModel'
 import { DragSelectionScrollPolicy } from '../model/DragSelectionScrollPolicy'
 import { ContextMenuPreviewLayout, ContextPreviewRect } from '../model/ContextMenuPreviewLayout'
@@ -19359,10 +19359,14 @@ struct Index {
     try {
       await this.audioManager.release()
       await this.audioSession.close()
-      const localPath = await this.ensureCachedFile(entry)
+      await this.ensureCacheState()
+      const localPath = CacheManager.findExisting(this.cacheDirectory, entry.name, this.originalCacheKey(entry))
+      const source: string | DownloadDescriptor = localPath.length > 0 ? localPath :
+        await this.repository.downloadDescriptor(entry.path)
       if (!openingValid()) { return }
       this.audioLocalPath = localPath
-      await this.audioManager.open(localPath,
+      console.info('[LinkFilesAudio] source=' + (localPath.length > 0 ? 'local' : 'network'))
+      await this.audioManager.open(source,
         (timeMs: number): void => {
           if (!valid()) { return }
           this.audioCurrentMs = Math.max(0, timeMs)
