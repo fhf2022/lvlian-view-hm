@@ -27,6 +27,7 @@ import { GlassMenuSurface } from '../components/GlassMenuSurface'
 import { GlassMenuRow } from '../components/GlassMenuRow'
 import { EntryDetailsContent } from '../components/EntryDetailsContent'
 import { FileRowStyle } from '../ui/FileRowStyle'
+import { FileGridCell, FileGridCellEvents } from '../components/FileGridCell'
 import { TaskPanel, TaskPanelFooter, TaskPanelSection } from '../components/TaskPanel'
 import { TaskPanelStyle } from '../ui/TaskPanelStyle'
 import { DirectoryHeaderState } from '../ui/DirectoryHeaderState'
@@ -562,18 +563,21 @@ struct GridThumbCell {
   build() {
     if (this.thumbState().available) {
       if (this.thumbState().sourceWidth > 0) {
+        // Image(source) resolves the complete state at the start of this
+        // native Image update. The following attributes use that same
+        // result instead of repeating source/URI/transition resolution.
         Image(this.thumbState().source)
           .width('100%')
           .height('100%')
           .sourceSize({
-            width: this.thumbState().sourceWidth,
-            height: this.thumbState().sourceHeight
+            width: this.state.sourceWidth,
+            height: this.state.sourceHeight
           })
-          .orientation(this.thumbState().orientation)
+          .orientation(this.state.orientation)
           .objectFit(ImageFit.Cover)
-          .geometryTransition(this.thumbState().transitionId)
-          .syncLoad(this.thumbState().syncLoad)
-          .visibility(this.thumbState().hidden ? Visibility.Hidden : Visibility.Visible)
+          .geometryTransition(this.state.transitionId)
+          .syncLoad(this.state.syncLoad)
+          .visibility(this.state.hidden ? Visibility.Hidden : Visibility.Visible)
           .onAppear((): void => {
             this.bridge.probeAppear(this.entry, this.index)
           })
@@ -587,11 +591,11 @@ struct GridThumbCell {
         Image(this.thumbState().source)
           .width('100%')
           .height('100%')
-          .orientation(this.thumbState().orientation)
+          .orientation(this.state.orientation)
           .objectFit(ImageFit.Cover)
-          .geometryTransition(this.thumbState().transitionId)
-          .syncLoad(this.thumbState().syncLoad)
-          .visibility(this.thumbState().hidden ? Visibility.Hidden : Visibility.Visible)
+          .geometryTransition(this.state.transitionId)
+          .syncLoad(this.state.syncLoad)
+          .visibility(this.state.hidden ? Visibility.Hidden : Visibility.Visible)
           .onAppear((): void => {
             this.bridge.probeAppear(this.entry, this.index)
           })
@@ -1457,6 +1461,7 @@ struct Index {
   private fileGridOptions: GridLayoutOptions = { regularSize: [1, 1] }
   // R2 原型：网格 cell 子组件与 Index 之间的桥（在 aboutToAppear 里接线）
   private gridThumbBridge: GridThumbBridge = new GridThumbBridge()
+  private fileGridCellEvents: FileGridCellEvents = new FileGridCellEvents()
   // R2 推广：瀑布流 cell 的桥
   private waterfallThumbBridge: WaterfallThumbBridge = new WaterfallThumbBridge()
   private waterfallScroller: Scroller = new Scroller()
@@ -2109,6 +2114,30 @@ struct Index {
         ' index=' + index.toString() +
         ' tidNow=' + this.fileImageTransitionId(entry, 'grid'))
     }
+    this.fileGridCellEvents.click = (entry: FileEntry): void => this.handleFileEntryClick(entry)
+    this.fileGridCellEvents.visible = (entry: FileEntry, ratio: number): void => {
+      const index = this.fileEntryDataSource.indexOfPath(entry.path)
+      if (index < 0) { return }
+      this.recordThumbnailVisibility(entry, index, 'grid', ratio)
+      this.noteVisibleEntryForLoad(entry, ratio)
+      if (!entry.isDirectory && this.isImage(entry) && ratio > 0.05) {
+        this.imageTelemetry.recordVisibleEnter(entry.path, this.fileImageSourceAvailable(entry, 'grid'))
+      }
+    }
+    this.fileGridCellEvents.longPress = (entry: FileEntry, event: GestureEvent): void => {
+      if (this.selectionMode) {
+        this.beginDragSelection(entry, this.fileEntryDataSource.indexOfPath(entry.path))
+      } else {
+        this.showActionMenu(entry, event)
+      }
+    }
+    this.fileGridCellEvents.drag = (event: GestureEvent): void => this.extendDragSelection(event)
+    this.fileGridCellEvents.dragEnd = (event: GestureEvent): void => {
+      this.extendDragSelection(event)
+      this.endDragSelection()
+    }
+    this.fileGridCellEvents.dragCancel = (): void => this.cancelDragSelectionGesture()
+    this.fileGridCellEvents.isVideo = (entry: FileEntry): boolean => this.isVideo(entry)
     // ── R2 推广：瀑布流接线 ────────────────────────────────────────────────
     // 就地自增同样必须开，否则 waterfallDataSource.notifyItemChanged 仍走 clone
     // 路径 → 换实例 → @ObjectLink 断链。
@@ -5128,72 +5157,81 @@ struct Index {
     return template
   }
 
+  // Stable FileEntry/index inputs retain the original Image branches. No
+  // temporary GridImageState object is passed through this Builder.
   @Builder
-  GridItemThumbnail(entry: FileEntry, index: number, state: GridImageState): void {
-    Stack({ alignContent: Alignment.Center }) {
-      if (this.shouldReplaceViewerTransitionSource(entry)) {
-        Blank()
+  private FileGridThumbnail(entry: FileEntry, index: number): void {
+    if (this.shouldReplaceViewerTransitionSource(entry)) {
+      Blank()
+        .width('100%')
+        .height('100%')
+    } else if (EXPERIMENT_GRID_FIXED_SOURCE && !entry.isDirectory) {
+      // 实验 D：Image 组件与节点结构完全不变，只把 source 换成
+      // 「同一个、已缓存的本地小图」。这样只消除真实 URI / previewUri /
+      // getUriFromPath / 每文件不同 source / thumbnail 解码，
+      // 用来区分「Image 节点本身贵」还是「处理真实 source 贵」。
+      Image($r('app.media.startIcon'))
+        .width('100%')
+        .height('100%')
+        .orientation(ImageRotateOrientation.UP)
+        .objectFit(ImageFit.Cover)
+        .geometryTransition(this.fileImageTransitionId(entry, 'grid'))
+    } else if (EXPERIMENT_R2_THUMB_CELL && !entry.isDirectory) {
+      // R2 原型：文件类缩略图交给独立子组件。
+      // 依赖 entry.previewRevision（@ObjectLink）驱动局部重算，
+      // 不再需要"整树重跑"来顺带刷新这一格。
+      GridThumbCell({ entry: entry, bridge: this.gridThumbBridge, index: index })
+    } else if (this.fileImageSourceAvailable(entry, 'grid')) {
+      if (this.gridSourceWidth(entry) > 0) {
+        // 实验 B′/F：指定解码尺寸。
+        // ⚠️ 宽高严格按源图比例（gridSourceSizeFor 负责），
+        //    绝不传正方形（会改比例），也绝不超过源尺寸（会解码失败）。
+        Image(this.fileImageSource(entry, 'grid'))
           .width('100%')
           .height('100%')
-      } else if (state.available) {
-        if (EXPERIMENT_GRID_BLANK) {
-          // 实验 A：同尺寸占位，去掉 Image 子树与图片解码。
-          // ⚠️ 必须 hitTestBehavior(None)：Blank 默认会吃掉触摸。
-          Blank()
-            .width('100%')
-            .height('100%')
-            .backgroundColor('#EFEFF3')
-            .hitTestBehavior(HitTestMode.None)
-        } else if (state.sourceWidth > 0) {
-          // 实验 B′：指定解码尺寸。宽高严格按源图比例（gridSourceSizeFor 负责），
-          // 绝不传正方形（会改比例），也绝不超过源尺寸（会解码失败）。
-          Image(state.source)
-            .width('100%')
-            .height('100%')
-            .sourceSize({ width: state.sourceWidth, height: state.sourceHeight })
-            .orientation(state.orientation)
-            .objectFit(ImageFit.Cover)
-            .geometryTransition(state.transitionId)
-            .syncLoad(state.syncLoad)
-            .onComplete((event?: ViewerImageCompleteEvent): void =>
-              this.recordThumbnailComplete(entry, this.previewUri(entry), index, 'grid', event))
-        } else {
-          Image(state.source)
-            .width('100%')
-            .height('100%')
-            .orientation(state.orientation)
-            .objectFit(ImageFit.Cover)
-            .geometryTransition(state.transitionId)
-            .syncLoad(state.syncLoad)
-            .onComplete((event?: ViewerImageCompleteEvent): void =>
-              this.recordThumbnailComplete(entry, this.previewUri(entry), index, 'grid', event))
-        }
-      } else if (entry.isDirectory) {
-        this.FolderIcon(44)
+          .sourceSize({
+            width: this.gridSourceWidth(entry),
+            height: this.gridSourceHeight(entry)
+          })
+          .orientation(this.fileImageSourceOrientation(entry, 'grid'))
+          .objectFit(ImageFit.Cover)
+          .geometryTransition(this.fileImageTransitionId(entry, 'grid'))
+          .syncLoad(this.fileImageShouldSyncLoad(entry))
+          .onComplete((event?: ViewerImageCompleteEvent): void => {
+            this.imageTelemetry.recordPipelineComplete(entry.path, 'grid')
+            this.recordThumbnailComplete(entry, this.previewUri(entry), index,
+              'grid', event)
+          })
+          .onError((): void => {
+            this.imageTelemetry.recordPipelineError(entry.path, 'grid')
+            this.recoverEntryPreview(entry)
+          })
       } else {
-        Image(this.fileIcon(entry))
-          .width(48)
-          .height(48)
-          .objectFit(ImageFit.Contain)
+        Image(this.fileImageSource(entry, 'grid'))
+          .width('100%')
+          .height('100%')
+          .orientation(this.fileImageSourceOrientation(entry, 'grid'))
+          .objectFit(ImageFit.Cover)
+          .geometryTransition(this.fileImageTransitionId(entry, 'grid'))
+          .syncLoad(this.fileImageShouldSyncLoad(entry))
+          .onComplete((event?: ViewerImageCompleteEvent): void => {
+            this.imageTelemetry.recordPipelineComplete(entry.path, 'grid')
+            this.recordThumbnailComplete(entry, this.previewUri(entry), index,
+              'grid', event)
+          })
+          .onError((): void => {
+            this.imageTelemetry.recordPipelineError(entry.path, 'grid')
+            this.recoverEntryPreview(entry)
+          })
       }
+    } else if (entry.isDirectory) {
+      this.FolderIcon(44)
+    } else {
+      Image(this.fileIcon(entry))
+        .width(48)
+        .height(48)
+        .objectFit(ImageFit.Contain)
     }
-    .width('100%')
-    // 固定 1:1，和系统相册一致：不论屏幕多宽，格子永远是正方形。
-    .aspectRatio(1)
-    .borderRadius(0)
-    // ⚠️ 这里绝不能加 .clip(true)：
-    // ImageFit.Cover 的官方语义是「两边都大于或等于显示边界，超出部分被截断」；
-    // 本 Stack 的其它子节点是固定 44vp 的文件夹图标和 Blank，都不会溢出。
-    // 外层再加 clip 只会给每个格子生成一个离屏图层。
-    .onAreaChange((_, area) => {
-      this.recordThumbnailArea(entry, index, 'grid', area)
-      this.recordRowHitArea(entry, index, 'grid', area)
-    })
-    .onVisibleAreaChange([0.0, 0.999],
-      (_isExpanding: boolean, ratio: number): void => {
-        this.recordThumbnailVisibility(entry, index, 'grid', ratio)
-        this.noteVisibleEntryForLoad(entry, ratio)
-      })
   }
 
   @Builder
@@ -5201,160 +5239,16 @@ struct Index {
     Grid(this.fileListScroller, this.fileGridOptions) {
       LazyForEach(this.fileEntryDataSource, (entry: FileEntry, index: number) => {
         GridItem() {
-          // 勾选角标放右下角（多选态）。
-          Stack({ alignContent: Alignment.BottomEnd }) {
-            Column({ space: 0 }) {
-              // ⚠️ 这里必须【内联】而不是提取成带参数的 @Builder：
-              // @Builder 传入新建对象会让这一层每帧重建，打断 geometryTransition
-              // 的共享元素转场（实测"过场动画消失"）。回到内联后动画恢复。
-              Stack({ alignContent: Alignment.Center }) {
-                if (this.shouldReplaceViewerTransitionSource(entry)) {
-                  Blank()
-                    .width('100%')
-                    .height('100%')
-                } else if (EXPERIMENT_GRID_FIXED_SOURCE && !entry.isDirectory) {
-                  // 实验 D：Image 组件与节点结构完全不变，只把 source 换成
-                  // 「同一个、已缓存的本地小图」。这样只消除真实 URI / previewUri /
-                  // getUriFromPath / 每文件不同 source / thumbnail 解码，
-                  // 用来区分「Image 节点本身贵」还是「处理真实 source 贵」。
-                  Image($r('app.media.startIcon'))
-                    .width('100%')
-                    .height('100%')
-                    .orientation(ImageRotateOrientation.UP)
-                    .objectFit(ImageFit.Cover)
-                    .geometryTransition(this.fileImageTransitionId(entry, 'grid'))
-                } else if (EXPERIMENT_R2_THUMB_CELL && !entry.isDirectory) {
-                  // R2 原型：文件类缩略图交给独立子组件。
-                  // 依赖 entry.previewRevision（@ObjectLink）驱动局部重算，
-                  // 不再需要"整树重跑"来顺带刷新这一格。
-                  GridThumbCell({ entry: entry, bridge: this.gridThumbBridge, index: index })
-                } else if (this.fileImageSourceAvailable(entry, 'grid')) {
-                  if (this.gridSourceWidth(entry) > 0) {
-                    // 实验 B′/F：指定解码尺寸。
-                    // ⚠️ 宽高严格按源图比例（gridSourceSizeFor 负责），
-                    //    绝不传正方形（会改比例），也绝不超过源尺寸（会解码失败）。
-                    Image(this.fileImageSource(entry, 'grid'))
-                      .width('100%')
-                      .height('100%')
-                      .sourceSize({
-                        width: this.gridSourceWidth(entry),
-                        height: this.gridSourceHeight(entry)
-                      })
-                      .orientation(this.fileImageSourceOrientation(entry, 'grid'))
-                      .objectFit(ImageFit.Cover)
-                      .geometryTransition(this.fileImageTransitionId(entry, 'grid'))
-                      .syncLoad(this.fileImageShouldSyncLoad(entry))
-                      .onComplete((event?: ViewerImageCompleteEvent): void => {
-                        this.imageTelemetry.recordPipelineComplete(entry.path, 'grid')
-                        this.recordThumbnailComplete(entry, this.previewUri(entry), index,
-                          'grid', event)
-                      })
-                      .onError((): void => {
-                        this.imageTelemetry.recordPipelineError(entry.path, 'grid')
-                        this.recoverEntryPreview(entry)
-                      })
-                  } else {
-                    Image(this.fileImageSource(entry, 'grid'))
-                      .width('100%')
-                      .height('100%')
-                      .orientation(this.fileImageSourceOrientation(entry, 'grid'))
-                      .objectFit(ImageFit.Cover)
-                      .geometryTransition(this.fileImageTransitionId(entry, 'grid'))
-                      .syncLoad(this.fileImageShouldSyncLoad(entry))
-                      .onComplete((event?: ViewerImageCompleteEvent): void => {
-                        this.imageTelemetry.recordPipelineComplete(entry.path, 'grid')
-                        this.recordThumbnailComplete(entry, this.previewUri(entry), index,
-                          'grid', event)
-                      })
-                      .onError((): void => {
-                        this.imageTelemetry.recordPipelineError(entry.path, 'grid')
-                        this.recoverEntryPreview(entry)
-                      })
-                  }
-                } else if (entry.isDirectory) {
-                  this.FolderIcon(44)
-                } else {
-                  Image(this.fileIcon(entry))
-                    .width(48)
-                    .height(48)
-                    .objectFit(ImageFit.Contain)
-                }
-              }
-              .width('100%')
-              // 固定 1:1，和系统相册一致：不论屏幕多宽，格子永远是正方形。
-              .aspectRatio(1)
-              .borderRadius(0)
-              .onAreaChange((_, area) => {
-                this.recordThumbnailArea(entry, index, 'grid', area)
-                this.recordRowHitArea(entry, index, 'grid', area)
-              })
-              .onVisibleAreaChange([0.0, 0.999],
-                (_isExpanding: boolean, ratio: number): void => {
-                  this.recordThumbnailVisibility(entry, index, 'grid', ratio)
-                  this.noteVisibleEntryForLoad(entry, ratio)
-                  if (!entry.isDirectory && this.isImage(entry) && ratio > 0.05) {
-                    const isReady = this.fileImageSourceAvailable(entry, 'grid')
-                    this.imageTelemetry.recordVisibleEnter(entry.path, isReady)
-                  }
-                })
-
-              // 图片/视频不再占文字位（紧凑方块才好看）；文件夹仍保留名字，
-              // 否则网格里分不出哪个是文件夹。
-              if (entry.isDirectory) {
-                Text(entry.name)
-                  .fontSize(11)
-                  .fontColor($r('app.color.text_primary'))
-                  .maxLines(1)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  .width('100%')
-                  .textAlign(TextAlign.Center)
-                  .margin({ top: 2 })
-              }
-            }
-            .width('100%')
-            .padding(1)
-            this.VideoTransferIndicator(entry)
-            if (this.selectionMode) {
-              Row() {
-                this.SelectionCheckbox(entry)
-              }
-                .margin({ bottom: 6, right: 6 })
-            }
-          }
-          // 顶部留白，照抄瀑布流的做法：加在【条目】的 margin 上，不是容器的 padding。
-          // 容器的 padding 会变成一条裁切线（图滚到那儿就整块消失 ✗）；
-          // margin 属于内容本身，会跟着一起滚走 ✓ —— 刚打开时首行落在标题下方能点到，
-          // 往上滑时又仍能钻进页头底下继续露一截。
-          .margin({ top: index < this.fileGridColumnCount() ? this.fileContentTopInset() : 0 })
-          .onClick(() => this.handleFileEntryClick(entry))
-          // 与文件列表同一套：序列组要求先长按成功，后面的 Pan 才参与，
-          // 普通滑动仍然是网格滚动；长按后拖动才是连续多选。
-          .priorityGesture(
-            GestureGroup(GestureMode.Sequence,
-              LongPressGesture({ repeat: false, duration: 380 })
-                .onAction((event: GestureEvent): void => {
-                  if (this.selectionMode) {
-                    this.beginDragSelection(entry, index)
-                  } else {
-                    this.showActionMenu(entry, event)
-                  }
-                }),
-              PanGesture({ direction: PanDirection.All, distance: 8 })
-                .onActionStart((event: GestureEvent): void => {
-                  this.extendDragSelection(event)
-                })
-                .onActionUpdate((event: GestureEvent): void => {
-                  this.extendDragSelection(event)
-                })
-                .onActionEnd((event: GestureEvent): void => {
-                  this.extendDragSelection(event)
-                  this.endDragSelection()
-                })
-                .onActionCancel((): void => {
-                  this.cancelDragSelectionGesture()
-                })
-            ).onCancel((): void => this.cancelDragSelectionGesture())
-          )
+          FileGridCell({
+            entry: entry,
+            selectionMode: this.selectionMode,
+            topInset: index < this.fileGridColumnCount() ? this.fileContentTopInset() : 0,
+            thumbnailId: this.gridThumbnailComponentId(entry),
+            events: this.fileGridCellEvents,
+            videoIndicator: () => { this.VideoTransferIndicator(entry) },
+            selectionIndicator: () => { this.SelectionCheckbox(entry) },
+            content: this.FileGridThumbnail.bind(this, entry, index)
+          })
         }
         .onAppear(() => {
           this.resolveFileListImageRotation(entry)
@@ -9714,6 +9608,45 @@ struct Index {
     }
   }
 
+  private gridThumbnailComponentId(entry: FileEntry): string {
+    return 'file-grid-thumbnail:' + entry.path
+  }
+
+  // Grid cells do not need to report a new window position on every scroll
+  // frame. Read the exact mounted thumbnail only when an interaction needs
+  // it; this also handles mixed rows, first-row margins and width changes.
+  private refreshGridThumbnailArea(entry: FileEntry, index: number = -1): boolean {
+    if (this.screen !== 'files' || this.showSearch || this.fileViewMode !== 'grid') {
+      return true
+    }
+    try {
+      const ui = this.getUIContext()
+      const rect = ui.getComponentUtils().getRectangleById(this.gridThumbnailComponentId(entry))
+      if (!Number.isFinite(rect.size.width) || !Number.isFinite(rect.size.height) ||
+        !Number.isFinite(rect.windowOffset.x) || !Number.isFinite(rect.windowOffset.y) ||
+        rect.size.width <= 0 || rect.size.height <= 0) {
+        return false
+      }
+      const currentIndex = index >= 0 ? index :
+        this.entries.findIndex((item: FileEntry): boolean => item.path === entry.path)
+      if (currentIndex < 0 || this.entries[currentIndex]?.path !== entry.path) {
+        return false
+      }
+      const area: Area = {
+        width: ui.px2vp(rect.size.width),
+        height: ui.px2vp(rect.size.height),
+        position: { x: 0, y: 0 },
+        globalPosition: { x: ui.px2vp(rect.windowOffset.x), y: ui.px2vp(rect.windowOffset.y) }
+      }
+      this.recordThumbnailArea(entry, currentIndex, 'grid', area)
+      this.recordRowHitArea(entry, currentIndex, 'grid', area)
+      return true
+    } catch (_) {
+      // An offscreen or not-yet-mounted cell must not use its old rectangle.
+      return false
+    }
+  }
+
   private recordThumbnailVisibility(entry: FileEntry, index: number,
     surface: ThumbnailSurfaceKind, ratio: number): void {
     if (this.isAudio(entry)) {
@@ -10037,6 +9970,9 @@ struct Index {
   private hasViewerTransitionSource(entry: FileEntry | null,
     requireFullyVisible: boolean): boolean {
     if (entry === null || !this.isImage(entry)) {
+      return false
+    }
+    if (!this.refreshGridThumbnailArea(entry)) {
       return false
     }
     const state = this.imageVisualState(entry.path)
@@ -12635,14 +12571,18 @@ struct Index {
         (this.getMonotonicNow() - this.viewerReturnOverlayStartedAt).toString() +
         ' path=' + entry.path + ' tid=' + state.transitionId)
     }
-    // 🔬 时间点 2：这一格真正 build 时算出来的 transitionId（只读）
-    this.openAnimProbe('cellBuild',
-      'path=' + entry.path + ' rev=' + entry.previewRevision.toString() +
-      ' tid=' + state.transitionId +
-      ' hide=' + this.inViewerExitFlight(entry).toString() +
-      ' showViewer=' + this.showImageViewer.toString() +
-      ' entryActive=' + this.viewerEntryTransitionActive.toString() +
-      ' geometryBound=' + this.viewerGeometryBound.toString())
+    // Per-cell probes are opt-in. Guard argument construction too: even a
+    // silent logger would otherwise format strings and read global UI state
+    // for every Image attribute evaluated during a fling.
+    if (THUMB_PROBE && this.openAnimProbeActive()) {
+      this.openAnimProbe('cellBuild',
+        'path=' + entry.path + ' rev=' + entry.previewRevision.toString() +
+        ' tid=' + state.transitionId +
+        ' hide=' + this.inViewerExitFlight(entry).toString() +
+        ' showViewer=' + this.showImageViewer.toString() +
+        ' entryActive=' + this.viewerEntryTransitionActive.toString() +
+        ' geometryBound=' + this.viewerGeometryBound.toString())
+    }
     return state
   }
 
@@ -15892,6 +15832,7 @@ struct Index {
     this.contextMenuScrollMoved = false
     this.slidePressKey = ''
     this.contextMenuPreviewSurface = inRecycle ? 'list' : this.activeListSurface()
+    const hasCurrentArea = this.refreshGridThumbnailArea(entry)
     const tile = this.contextMenuPreviewSurface !== 'list'
     const width = this.contextMenuPreviewSurface === 'waterfall'
       ? Math.max(1, (this.effectivePageWidth() - 20 - (this.waterfallColumnCount() - 1) * 8) /
@@ -15910,7 +15851,7 @@ struct Index {
     }
     const directoryKey = this.currentRootType.toString() + ':' + this.currentPath + ':' +
       this.contextMenuPreviewSurface
-    const area = tile && this.rowHitDirectoryKey === directoryKey
+    const area = tile && hasCurrentArea && this.rowHitDirectoryKey === directoryKey
       ? this.rowHitAreas.get(this.contextMenuPreviewSurface + ':' + entry.path) : undefined
     const rect: ContextPreviewRect | null = area === undefined ? null : {
       x: area.x - this.mainContentOriginX,
@@ -17617,8 +17558,9 @@ struct Index {
     this.viewerReturnOverlayScale = scale
     this.viewerReturnOverlayOpacity = this.viewerSurfaceOpacity
     this.viewerReturnOverlayBackdropOpacity = this.imageDismissBackdropOpacity
+    const hasGridArea = this.refreshGridThumbnailArea(entry)
     const state = this.imageVisualState(entry.path)
-    snapshot.hasTarget = state.thumbnailSurface === 'grid' &&
+    snapshot.hasTarget = hasGridArea && state.thumbnailSurface === 'grid' &&
       state.thumbnailVisibleRatio >= 0.999 && state.thumbnailWidth > 0 && state.thumbnailHeight > 0 &&
       state.thumbnailY >= this.fileContentTopInset() &&
       state.thumbnailY + state.thumbnailHeight <= this.pageHeightVp - this.bottomSafeInset() - 8
@@ -21376,7 +21318,7 @@ struct Index {
   private async animateOpenAudioPlayer(entry: FileEntry, token: number, scope: string): Promise<void> {
     const valid = (): boolean => token === this.audioOpenToken && !this.audioClosing && this.showAudioPlayer &&
       scope === this.repository.sessionIdentity() && this.audioEntry?.path === entry.path
-    const source = this.audioThumbnailFrames.get(entry.path)
+    const source = this.refreshGridThumbnailArea(entry) ? this.audioThumbnailFrames.get(entry.path) : undefined
     const sourceTop = this.showSearch ? this.topSafeInset() + 124 : this.fileContentTopInset()
     const hasSource = source !== undefined && AudioPlayerPolicy.returnTarget(source,
       this.audioThumbnailVisibility.get(entry.path) ?? 0, sourceTop,
@@ -21515,6 +21457,7 @@ struct Index {
     const targetTop = this.showSearch ? this.topSafeInset() + 124 : this.fileContentTopInset()
     const targetBottom = this.pageHeightVp - this.bottomSafeInset() - 8
     const sourceReady = (): boolean => {
+      if (!this.refreshGridThumbnailArea(entry)) { return false }
       target = this.audioThumbnailFrames.get(entry.path)
       return target !== undefined && AudioPlayerPolicy.returnTarget(target,
         this.audioThumbnailVisibility.get(entry.path) ?? 0, targetTop, targetBottom, this.pageWidthVp)
@@ -21939,7 +21882,7 @@ struct Index {
       : this.dragSelectionX
     const y = bottom > top
       ? Math.max(top + 1, Math.min(bottom - 1, this.dragSelectionY)) : this.dragSelectionY
-    if (this.dragSelectionScrollRunning) {
+    if (this.dragSelectionScrollRunning || this.dragSurface === 'grid') {
       try {
         const childIndex = this.dragSelectionScroller().getItemIndex(x - viewport.x, y - viewport.y)
         const index = childIndex - (this.dragSurface === 'list' ? 1 : 0)
@@ -21951,6 +21894,9 @@ struct Index {
         // A fresh item may still be mounting. Cached row geometry is the fallback.
       }
     }
+    // Grid hit testing follows the current native layout, including during
+    // edge auto-scroll. Its ordinary cells no longer maintain rowHitAreas.
+    if (this.dragSurface === 'grid') { return }
     const source = this.dragSelectionEntries()
     let hit: RowHitArea | null = null
     let bestDistance = 5

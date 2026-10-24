@@ -9,6 +9,7 @@ import {
 import { ProximityLightReceiver } from './ProximityLightReceiver'
 import { HapticFeedback } from '../core/haptic/HapticFeedback'
 
+@Observed
 class TimelineMarker {
   id: string = ''
   time: number = 0
@@ -19,15 +20,57 @@ class TimelineMarker {
   length: number = 8
   hasImages: boolean = false
   isFocus: boolean = false
+
+  updateFrom(next: TimelineMarker): void {
+    this.time = next.time
+    this.y = next.y
+    this.label = next.label
+    this.kind = next.kind
+    this.opacity = next.opacity
+    this.length = next.length
+    this.hasImages = next.hasImages
+    this.isFocus = next.isFocus
+  }
+}
+
+@Component
+struct TimelineMarkerView {
+  @ObjectLink marker: TimelineMarker
+  @Prop railWidthVp: number = Glass.timelineRailWidth
+
+  build() {
+    if (!this.marker.isFocus) {
+      Row({ space: 3 }) {
+        Row()
+          .width(this.marker.length)
+          .height(this.marker.hasImages ? 3 : 1)
+          .borderRadius(2)
+          .backgroundColor(this.marker.hasImages ? '#D92E6BFF' :
+            $r('sys.color.icon_secondary'))
+        Text(this.marker.label)
+          .fontSize(this.marker.kind === 'day' ? 10 : 9)
+          .fontWeight(FontWeight.Regular)
+          .fontColor($r('sys.color.font_primary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+      }
+      .width(Math.max(30, this.railWidthVp - 8))
+      .height(18)
+      .alignItems(VerticalAlign.Center)
+      .opacity(this.marker.opacity)
+      .position({ x: 4, y: this.marker.y - 9 })
+    }
+  }
 }
 
 @Component
 export struct FisheyeTimeline {
-  @Prop timeline: DirectoryTimeline = new DirectoryTimeline()
-  @Link focusTime: number
+  @Prop @Watch('updateMarkerNodes') timeline: DirectoryTimeline = new DirectoryTimeline()
+  @Link @Watch('updateMarkerNodes') focusTime: number
   @Prop widthVp: number = Glass.timelineWidth
   @Prop railWidthVp: number = Glass.timelineRailWidth
-  @Prop heightVp: number = Glass.timelineMaxHeight
+  @Prop @Watch('updateMarkerNodes') heightVp: number = Glass.timelineMaxHeight
   /** Space owned by the TabBar renderer for native press deformation and shadow. */
   @Prop verticalEffectInsetVp: number = Glass.timelineEffectInset
   @Prop material: uiMaterial.ImmersiveMaterial = GlassMaterial.timeline()
@@ -44,6 +87,24 @@ export struct FisheyeTimeline {
   private readonly moveThresholdVp: number = 5
   private readonly focusBubbleWidthVp: number = Glass.timelineBubbleWidth
   private readonly focusBubbleHeightVp: number = Glass.timelineBubbleHeight
+  @State private markerNodes: TimelineMarker[] = []
+
+  aboutToAppear(): void {
+    this.updateMarkerNodes()
+  }
+
+  private updateMarkerNodes(): void {
+    const next = this.markers()
+    if (this.markerNodes.length === 0) {
+      this.markerNodes = next
+      return
+    }
+    // These fixed slots keep their observed object identity. Updating their
+    // fields refreshes the existing children without replacing their nodes.
+    for (let index = 0; index < next.length; index++) {
+      this.markerNodes[index].updateFrom(next[index])
+    }
+  }
 
   private clampFocus(value: number): number {
     const earliest = DirectoryTimelinePolicy.localDayStart(this.timeline.earliestTime)
@@ -122,7 +183,6 @@ export struct FisheyeTimeline {
     // those dates into focus, so the content follows the finger and time moves
     // toward the past regardless of the file list's sort direction.
     const direction = -1
-    const frameKey = Math.floor(this.focusTime / (15 * 60 * 1000)).toString()
     const dayPitch = Math.max(24, Math.min(34, this.heightVp / 16))
     for (let offset = -3; offset <= 3; offset++) {
       const time = this.addDays(focusDay, offset)
@@ -130,7 +190,7 @@ export struct FisheyeTimeline {
       const label = offset === 0 ? (date.getMonth() + 1).toString() + '/' +
         date.getDate().toString() : (Math.abs(offset) === 1 ? date.getDate().toString() : '')
       const temporalOffset = offset - fraction
-      result.push(this.marker('d' + offset.toString() + ':' + frameKey, time,
+      result.push(this.marker('d' + offset.toString(), time,
         center + temporalOffset * dayPitch * direction, label, 'day',
         offset === 0 ? 1 : 0.82 - Math.abs(offset) * 0.08, offset === 0 ? 17 : 11,
         offset === 0))
@@ -143,11 +203,11 @@ export struct FisheyeTimeline {
       const before = this.addMonths(focusDay, -offset)
       const after = this.addMonths(focusDay, offset)
       const distance = monthBase + (offset - 1) * monthStep
-      result.push(this.marker('mb' + offset.toString() + ':' + frameKey, before,
+      result.push(this.marker('mb' + offset.toString(), before,
         center - distance * direction, offset <= 2
           ? (new Date(before).getMonth() + 1).toString() + '月' : '',
         'month', 0.62 - offset * 0.07, 9))
-      result.push(this.marker('ma' + offset.toString() + ':' + frameKey, after,
+      result.push(this.marker('ma' + offset.toString(), after,
         center + distance * direction, offset <= 2
           ? (new Date(after).getMonth() + 1).toString() + '月' : '',
         'month', 0.62 - offset * 0.07, 9))
@@ -159,10 +219,10 @@ export struct FisheyeTimeline {
       const before = this.addYears(focusDay, -offset)
       const after = this.addYears(focusDay, offset)
       const distance = Math.min(this.heightVp / 2 - 12, yearBase + (offset - 1) * yearStep)
-      result.push(this.marker('yb' + offset.toString() + ':' + frameKey, before,
+      result.push(this.marker('yb' + offset.toString(), before,
         center - distance * direction, offset === 1
           ? new Date(before).getFullYear().toString() : '', 'year', 0.36, 6))
-      result.push(this.marker('ya' + offset.toString() + ':' + frameKey, after,
+      result.push(this.marker('ya' + offset.toString(), after,
         center + distance * direction, offset === 1
           ? new Date(after).getFullYear().toString() : '', 'year', 0.36, 6))
     }
@@ -273,29 +333,8 @@ export struct FisheyeTimeline {
             .backgroundColor('#24FFFFFF')
             .position({ x: 8, y: 14 })
 
-          ForEach(this.markers(), (marker: TimelineMarker) => {
-            if (!marker.isFocus) {
-              Row({ space: 3 }) {
-                Row()
-                  .width(marker.length)
-                  .height(marker.hasImages ? 3 : 1)
-                  .borderRadius(2)
-                  .backgroundColor(marker.hasImages ? '#D92E6BFF' :
-                    $r('sys.color.icon_secondary'))
-                Text(marker.label)
-                  .fontSize(marker.kind === 'day' ? 10 : 9)
-                  .fontWeight(FontWeight.Regular)
-                  .fontColor($r('sys.color.font_primary'))
-                  .maxLines(1)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  .layoutWeight(1)
-              }
-              .width(Math.max(30, this.railWidthVp - 8))
-              .height(18)
-              .alignItems(VerticalAlign.Center)
-              .opacity(marker.opacity)
-              .position({ x: 4, y: marker.y - 9 })
-            }
+          ForEach(this.markerNodes, (marker: TimelineMarker) => {
+            TimelineMarkerView({ marker: marker, railWidthVp: this.railWidthVp })
           }, (marker: TimelineMarker): string => marker.id)
 
           ProximityLightReceiver()
