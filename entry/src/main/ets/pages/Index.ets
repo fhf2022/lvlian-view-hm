@@ -8963,6 +8963,9 @@ struct Index {
       return
     }
     this.setPreviewUri(entry, fileUri.getUriFromPath(localPath), localPath, canonical)
+    if (this.showVideoPlayer && this.videoEntry?.path === entry.path) {
+      this.videoMediaSession.setArtwork(entry, fileUri.getUriFromPath(localPath))
+    }
   }
 
   private releaseFileThumbnailBitmap(path: string): void {
@@ -19898,7 +19901,7 @@ struct Index {
         onCastPlayback: (snapshot: VideoCastPlaybackSnapshot): void => {
           this.handleVideoCastPlayback(snapshot)
         }
-      }).catch((error: Error): void => {
+      }, this.videoPosterUri.length > 0 ? this.videoPosterUri : this.previewUri(entry)).catch((error: Error): void => {
         // The in-app player remains usable when the device does not expose an
         // AVSession service (for example, on an older preview image).
         console.warn('[UgreenAVSession] start bridge failed: ' + JSON.stringify(error))

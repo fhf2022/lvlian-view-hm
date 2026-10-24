@@ -1,6 +1,8 @@
 import { Context, common, wantAgent } from '@kit.AbilityKit'
 import { avSession } from '@kit.AVSessionKit'
 import { FileEntry } from '../model/FileEntry'
+import { image } from '@kit.ImageKit'
+import { SessionArtwork } from './SessionArtwork'
 
 /** Commands delivered by the HarmonyOS system media center. */
 export interface VideoMediaSessionCallbacks {
@@ -52,6 +54,11 @@ export class VideoMediaSessionManager {
   private active: boolean = false
   private updateChain: Promise<void> = Promise.resolve()
   private currentEntry: FileEntry | null = null
+  private metadata: avSession.AVMetadata | null = null
+  private artworkUri: string = ''
+  private artworkBitmap: image.PixelMap | null = null
+  private artworkSequence: number = 0
+  private metadataUpdates: Promise<void> = Promise.resolve()
   private castController: avSession.AVCastController | null = null
   private castRemoteActive: boolean = false
 
@@ -135,12 +142,14 @@ export class VideoMediaSessionManager {
    * publish the selected video and its immediate next item.
    */
   async open(context: Context, entry: FileEntry, nextEntry: FileEntry | null,
-    snapshot: VideoMediaPlaybackSnapshot, callbacks: VideoMediaSessionCallbacks): Promise<void> {
+    snapshot: VideoMediaPlaybackSnapshot, callbacks: VideoMediaSessionCallbacks, artworkUri: string = ''): Promise<void> {
     const token = this.operationToken + 1
     this.operationToken = token
     this.wantsActive = true
     this.callbacks = callbacks
     this.currentEntry = entry
+    this.metadata = null
+    this.artworkSequence++
 
     const session = await this.ensureSession(context)
     if (session === null || token !== this.operationToken || !this.wantsActive) {
@@ -188,7 +197,10 @@ export class VideoMediaSessionManager {
       if (nextEntry !== null) {
         metadata.nextAssetId = nextEntry.path
       }
-      await session.setAVMetadata(metadata)
+      if (token !== this.operationToken || session !== this.session || !this.wantsActive) { return }
+      this.metadata = metadata
+      await this.publishMetadata(artworkUri)
+      if (token !== this.operationToken || session !== this.session || !this.wantsActive) { return }
       console.info('[UgreenAVSession] metadata published asset=' + entry.path)
 
       // A compact queue is enough for the media center to expose the next
@@ -218,6 +230,52 @@ export class VideoMediaSessionManager {
     }
   }
 
+  /** Late file-list thumbnails update the system card without rebuilding the poster. */
+  setArtwork(entry: FileEntry, uri: string): void {
+    if (this.currentEntry?.path !== entry.path || this.metadata === null || !this.wantsActive ||
+      uri.length === 0 || (uri === this.artworkUri && this.artworkBitmap !== null)) { return }
+    this.publishMetadata(uri)
+  }
+
+  private publishMetadata(uri: string): Promise<void> {
+    const token = this.operationToken
+    const sequence = ++this.artworkSequence
+    const session = this.session
+    const base = this.metadata
+    if (session === null || base === null) { return Promise.resolve() }
+    this.metadataUpdates = this.metadataUpdates.then(async (): Promise<void> => {
+      const valid = (): boolean => token === this.operationToken && sequence === this.artworkSequence &&
+        session === this.session && this.wantsActive
+      if (!valid()) { return }
+      const replacing = uri !== this.artworkUri || this.artworkBitmap === null
+      const bitmap = replacing ? await SessionArtwork.decode(uri, false) : this.artworkBitmap
+      if (!valid()) {
+        if (replacing && bitmap !== null) { await bitmap.release().catch(() => {}) }
+        return
+      }
+      try {
+        const metadata: avSession.AVMetadata = {
+          assetId: base.assetId, title: base.title ?? '', subtitle: base.subtitle ?? '',
+          filter: avSession.ProtocolType.TYPE_CAST_PLUS_STREAM | avSession.ProtocolType.TYPE_DLNA
+        }
+        if (base.duration !== undefined) { metadata.duration = base.duration }
+        if (base.nextAssetId !== undefined) { metadata.nextAssetId = base.nextAssetId }
+        if (bitmap !== null) { metadata.mediaImage = bitmap }
+        await session.setAVMetadata(metadata)
+        if (replacing) {
+          if (!valid()) { if (bitmap !== null) { await bitmap.release().catch(() => {}) }; return }
+          const old = this.artworkBitmap
+          this.artworkBitmap = bitmap; this.artworkUri = bitmap !== null ? uri : ''
+          if (old !== null) { await old.release().catch(() => {}) }
+        }
+        console.info('[UgreenAVSession] system artwork published available=' + (bitmap !== null))
+      } catch (_) {
+        if (replacing && bitmap !== null) { await bitmap.release().catch(() => {}) }
+      }
+    }).catch(() => {})
+    return this.metadataUpdates
+  }
+
   /** Update metadata/playback position without blocking the video UI. */
   update(snapshot: VideoMediaPlaybackSnapshot): void {
     const session = this.session
@@ -243,6 +301,10 @@ export class VideoMediaSessionManager {
   /** Deactivate and destroy the session so the system card cannot linger. */
   async close(): Promise<void> {
     this.operationToken += 1
+    this.artworkSequence++
+    this.metadata = null
+    const artwork = this.artworkBitmap
+    this.artworkBitmap = null; this.artworkUri = ''
     this.wantsActive = false
     this.callbacks = null
     this.active = false
@@ -260,6 +322,7 @@ export class VideoMediaSessionManager {
     const session = this.session
     this.session = null
     if (session === null) {
+      if (artwork !== null) { await artwork.release().catch(() => {}) }
       return
     }
     try {
@@ -272,6 +335,7 @@ export class VideoMediaSessionManager {
     } catch (error) {
       console.warn('[UgreenAVSession] destroy failed: ' + JSON.stringify(error))
     }
+    if (artwork !== null) { await artwork.release().catch(() => {}) }
   }
 
   /**
