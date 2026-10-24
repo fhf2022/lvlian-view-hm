@@ -20,6 +20,12 @@ import { AlbumUploadSheet } from '../components/AlbumUploadSheet'
 import { AlbumUploadDetails } from '../components/AlbumUploadDetails'
 import { TransferTaskListRow, TransferQueueTaskRow } from '../components/TransferTaskListRow'
 import { HeaderStyle } from '../ui/HeaderStyle'
+import { GlassControlGeometry as Glass } from '../ui/GlassControlGeometry'
+import { GlassMaterial } from '../ui/GlassMaterial'
+import { GlassBarHost } from '../components/GlassBarHost'
+import { GlassMenuSurface } from '../components/GlassMenuSurface'
+import { GlassMenuRow } from '../components/GlassMenuRow'
+import { EntryDetailsContent } from '../components/EntryDetailsContent'
 import { FileRowStyle } from '../ui/FileRowStyle'
 import { TaskPanel, TaskPanelFooter, TaskPanelSection } from '../components/TaskPanel'
 import { TaskPanelStyle } from '../ui/TaskPanelStyle'
@@ -298,23 +304,8 @@ const IMAGE_DISMISS_TRIGGER_RATIO: number = 0.20
 const IMAGE_DISMISS_FAST_TRIGGER_VELOCITY: number = 900
 const IMAGE_DISMISS_FAST_TRIGGER_DISTANCE: number = 42
 const IMAGE_DISMISS_MAX_SCALE_REDUCTION: number = 0.28
-// HarmonyOS bottom-tab examples use a 56vp bar on phone-sized breakpoints.
-// Keep the custom glass capsules on the same 8vp grid and only adapt their
-// distance from the navigation-indicator avoid area across window heights.
-const FLOATING_BAR_HEIGHT_VP: number = 56
-/** Room above the visible bar for native material shadow and deformation. */
-const FLOATING_BAR_EFFECT_TOP_INSET_VP: number = 20
-const FLOATING_BAR_MIN_GAP_VP: number = 8
-const FLOATING_BAR_MAX_GAP_VP: number = 16
+// Readable file content clearance above the shared glass bar geometry.
 const FLOATING_BAR_CONTENT_EXTRA_VP: number = 32
-const FLOATING_TIMELINE_WIDTH_VP: number = 68
-const FLOATING_TIMELINE_RAIL_WIDTH_VP: number = 42
-const FLOATING_TIMELINE_GAP_VP: number = 8
-// 收起态：整条向右平移，只在屏幕右缘留出一小截（日期标签的左半截，允许被裁切，
-// 正是这一小截提示用户「这里可以点」）。轴条本体因此完全移出屏外，不再挡住最右列。
-const FLOATING_TIMELINE_PEEK_VP: number = 28
-const FLOATING_TIMELINE_EFFECT_INSET_VP: number = 16
-const FLOATING_TIMELINE_UPWARD_SHIFT_VP: number = 8
 // 目录索引的新鲜度阈值。原先 30 秒 —— 进过的目录隔半分钟就会被强制全量重拉一次
 // （forceNetwork=true 会跳过内存与持久化缓存）。实测 /Photos/Camera 有 5342 项，
 // 一次重拉要 6.4 秒；这期间不仅"文件夹较大需等待"的提示一直挂着，连图片的
@@ -325,17 +316,10 @@ const DIRECTORY_INDEX_STALE_MS: number = 5 * 60 * 1000
 const DIRECTORY_AUTO_REFRESH_MAX_ITEMS: number = 2000
 // 进目录的等待提示只在【预计项数 >= 这个值】时才显示（小目录不打扰）。
 const DIRECTORY_OPENING_HINT_MIN_ITEMS: number = 500
-const FILE_TOOL_HEIGHT_VP: number = 40
 // Keep a small number of recently decoded WaterFlow rasters alive. The
 // durable thumbnail files are much cheaper and can cover the rest of the
 // directory; this budget only protects the hot back-scroll path.
 const WATERFALL_BITMAP_MEMORY_LIMIT_BYTES: number = 48 * 1024 * 1024
-// 底栏胶囊宽度随按钮数量自适应：每个页签 82vp，4 项 = 328vp（对齐示例里
-// "按钮少就收窄"的做法）。文件详情页中间的排序胶囊沿用原来的 140vp。
-const BOTTOM_BAR_ITEM_WIDTH_VP: number = 82
-const BOTTOM_BAR_MAX_ITEMS: number = 4
-const FILE_TOOL_SORT_WIDTH_VP: number = 140
-
 interface ViewerReturnScrollOffset {
   xOffset: number
   yOffset: number
@@ -900,8 +884,14 @@ struct Index {
     canReceive: (): boolean => this.continuationCanReceive(),
     capture: (): ContinuationSnapshot => this.captureContinuation(),
     sending: (active: boolean): void => { this.continuationSending = active },
-    pauseSourceVideo: async (): Promise<void> => { await this.videoPlaybackManager.pause() },
-    resumeSourceVideo: async (): Promise<void> => { await this.videoPlaybackManager.play() },
+    pauseSourcePlayback: async (): Promise<void> => {
+      if (this.showAudioPlayer) { await this.audioManager.pause() }
+      else if (this.showVideoPlayer) { await this.videoPlaybackManager.pause() }
+    },
+    resumeSourcePlayback: async (): Promise<void> => {
+      if (this.showAudioPlayer) { await this.audioManager.play() }
+      else if (this.showVideoPlayer) { await this.videoPlaybackManager.play() }
+    },
     restore: async (snapshot: ContinuationSnapshot, valid: () => boolean): Promise<void> => {
       await this.restoreContinuation(snapshot, valid)
     }
@@ -1028,9 +1018,7 @@ struct Index {
   // More/details keep their own snapshot of the committed image. Closing the
   // popup must not clear the sheet content before its dismissal completes.
   @State viewerOverlayEntry: FileEntry | null = null
-  @State imageDetailsEntry: FileEntry | null = null
   @State @Watch('onContinuationSceneChanged') showImageMoreMenu: boolean = false
-  @State @Watch('onContinuationSceneChanged') showImageDetails: boolean = false
   @State viewerLastNavigationDirection: number = 1
   // Pixel/geometry metadata is kept in a private identity map. The previous
   // @State record was copied in full for every visible-row callback, so the
@@ -1095,7 +1083,6 @@ struct Index {
   @State @Watch('onContinuationSceneChanged') viewerFallbackEntryActive: boolean = false
   // Keep the viewer capsule size stable across device rotation. Only its
   // bottom-safe-area position should be recalculated by the new layout.
-  @State viewerBottomBarWidthVp: number = 0
   @State @Watch('onContinuationSceneChanged') viewerTransitionActive: boolean = false
   @State @Watch('onContinuationSceneChanged') showAudioPlayer: boolean = false
   @State audioEntry: FileEntry | null = null
@@ -1108,10 +1095,10 @@ struct Index {
   @State audioCover: string = ''
   @State audioMode: AudioPlayMode = 'order'
   @State audioLyrics: AudioLyricLine[] = []
-  @State audioControlPending: boolean = false
-  @State showAudioQueue: boolean = false
-  @State audioOpening: boolean = false
-  @State audioClosing: boolean = false
+  @State @Watch('onContinuationSceneChanged') audioControlPending: boolean = false
+  @State @Watch('onContinuationSceneChanged') showAudioQueue: boolean = false
+  @State @Watch('onContinuationSceneChanged') audioOpening: boolean = false
+  @State @Watch('onContinuationSceneChanged') audioClosing: boolean = false
   @State audioPageOpacity: number = 1
   @State audioCoverHidden: boolean = false
   @State audioTransitionCoverScale: number = 0
@@ -1267,6 +1254,7 @@ struct Index {
   @State searchQuery: string = ''
   private searchDraft: string = ''
   private searchController: SearchController = new SearchController()
+  private searchFocusPending: boolean = false
   @State searchScope: RemoteSearchScope = 'current'
   @State searchResults: FileEntry[] = []
   @State searchLoading: boolean = false
@@ -1797,30 +1785,21 @@ struct Index {
   private gestureShareCallback = (target: harmonyShare.SharableTarget): void => {
     this.handleGestureShare(target)
   }
-  private bottomCapsuleMaterial: uiMaterial.ImmersiveMaterial = new uiMaterial.ImmersiveMaterial({
-    style: uiMaterial.ImmersiveStyle.THIN,
-    colorInvert: true,
-    applyShadow: true,
-    interactive: true,
-    lightEffect: { color: '#66FFFFFF' }
-  })
-  private timelineRailMaterial: uiMaterial.ImmersiveMaterial = new uiMaterial.ImmersiveMaterial({
-    style: uiMaterial.ImmersiveStyle.THIN,
-    colorInvert: true,
-    applyShadow: false,
-    interactive: true,
-    lightEffect: { color: '#66FFFFFF' }
-  })
+  private bottomCapsuleMaterial: uiMaterial.ImmersiveMaterial = GlassMaterial.bar()
+  private timelineRailMaterial: uiMaterial.ImmersiveMaterial = GlassMaterial.timeline()
+  private floatingPanelMaterial: uiMaterial.ImmersiveMaterial = GlassMaterial.overlay()
   aboutToAppear(): void {
     CacheManager.onRemoved(this.cacheRemovalListener)
     ContinuationManager.shared().attach(this.continuationPage)
     this.completeStartupAuthorization(false)
   }
 
-  private async showTrackedDialog(options: promptAction.ShowDialogOptions): Promise<promptAction.ShowDialogSuccessResponse> {
+  private async showTrackedDialog(request: promptAction.ShowDialogOptions |
+    (() => Promise<promptAction.ShowDialogSuccessResponse>)): Promise<promptAction.ShowDialogSuccessResponse> {
     this.continuationDialogCount++
     try {
-      return await this.getUIContext().getPromptAction().showDialog(options)
+      return await (typeof request === 'function' ? request() :
+        this.getUIContext().getPromptAction().showDialog(request))
     } finally {
       this.continuationDialogCount = Math.max(0, this.continuationDialogCount - 1)
     }
@@ -1892,10 +1871,11 @@ struct Index {
       !this.showDestinationPicker && !this.destinationOperationRunning && !this.destinationFolderDialog &&
       !this.showRenameDialog && !this.showCreateFolderDialog && !this.showAlbumPicker &&
       !this.showAlbumUpload && !this.showAlbumDetails && !this.importSelecting && !this.importExpanded &&
-      !this.showFileSortMenu && !this.showSelectionMoreMenu && !this.showAudioPlayer &&
+      !this.showFileSortMenu && !this.showSelectionMoreMenu &&
+      !this.audioOpening && !this.audioClosing && !this.audioControlPending && !this.showAudioQueue &&
       !this.viewerClosePending && !this.viewerClosing && !this.viewerReturnOverlayVisible &&
       !this.viewerEntryTransitionActive && !this.viewerTransitionActive && !this.viewerFallbackEntryActive &&
-      !this.imageDismissDragging && !this.showImageDetails && !this.showImageMoreMenu &&
+      !this.imageDismissDragging && !this.showImageMoreMenu &&
       !this.videoOverlayClosing && !this.videoEntryTransitionActive && !this.videoCasting &&
       !this.videoPipActive && !this.videoPipBackgrounded && !this.videoPipCreating && !this.videoCastPreparing &&
       !this.videoSeekDragging && !this.videoGestureActive && !this.videoControlPending && !this.videoOrientationChanging &&
@@ -1907,13 +1887,24 @@ struct Index {
     if (!this.continuationOperationIdle() || this.continuationSending || this.continuationPending ||
       this.screen !== 'files' || this.offlineCacheMode || this.repository.sessionIdentity() === '' ||
       this.entries.length > ContinuationPolicy.MAX_ENTRIES || this.fileContentTouchActive ||
-      this.fileContentScrolling || this.loadingNextPage || this.timelineIndexing ||
+      this.fileContentScrolling || this.loadingNextPage ||
       (this.currentPath !== '' && (this.currentPageHasMore || !this.directoryTimeline.complete ||
         this.indexedDirectoryKey !== this.currentRootType.toString() + ':' + this.currentPath))) { return false }
+    // A background index refresh may be pending while the mounted directory
+    // is already complete. Only its committed completeness/key above determine
+    // whether the snapshot is safe; waiting for freshness blocks media forever
+    // when the NAS is slow, even though no directory data is missing.
     if (this.showImageViewer) {
       const entry = this.committedViewerEntry()
-      return this.viewerInteractionUnlocked && entry !== null &&
+      // viewerInteractionUnlocked releases the *parent list* after closing;
+      // it deliberately remains false throughout a stable image session.
+      return entry !== null &&
         ContinuationPolicy.directChild(this.currentPath, entry.path) && this.imageScale === 1
+    }
+    if (this.showAudioPlayer) {
+      return this.audioDurationMs > 0 && this.audioManager.isReady() &&
+        !this.audioManager.isSeeking() && this.audioEntry !== null &&
+        ContinuationPolicy.directChild(this.currentPath, this.audioEntry.path)
     }
     if (this.showVideoPlayer) {
       return this.videoPrepared && !this.videoSeekPending && this.videoEntry !== null &&
@@ -1925,7 +1916,7 @@ struct Index {
   private continuationCanReceive(): boolean {
     return this.continuationOperationIdle() && !this.continuationSending &&
       !this.fileContentTouchActive && !this.fileContentScrolling &&
-      !this.showImageViewer && !this.showVideoPlayer &&
+      !this.showImageViewer && !this.showAudioPlayer && !this.showVideoPlayer &&
       (this.screen === 'files' || this.screen === 'login' || this.screen === 'otp')
   }
 
@@ -1949,6 +1940,13 @@ struct Index {
       state.scene = 'video'; state.target = this.videoEntry?.path ?? ''
       state.anchor = state.target; state.positionMs = Math.max(0, Math.floor(this.videoCurrentMs))
       state.playing = this.videoPlaying
+    } else if (this.showAudioPlayer) {
+      // Older 1.0.10 receivers understand protocol 1 but have no audio scene.
+      // Keep existing scenes compatible and let those peers reject audio early.
+      state.protocol = 2
+      state.scene = 'audio'; state.target = this.audioEntry?.path ?? ''
+      state.anchor = state.target; state.positionMs = Math.max(0, Math.floor(this.audioCurrentMs))
+      state.playing = this.audioPlaying
     }
     snapshot.entries = this.entries.slice()
     return snapshot
@@ -1979,7 +1977,8 @@ struct Index {
     const entries = state.path === '' ? visibleRoots.slice() : snapshot.entries
     const target = entries.find((entry: FileEntry): boolean => entry.path === state.target)
     if (state.scene !== 'directory' && (target === undefined || target.isDirectory ||
-      (state.scene === 'image' ? !this.isImage(target) : !this.isVideo(target)))) {
+      (state.scene === 'image' ? !this.isImage(target) :
+        (state.scene === 'audio' ? !this.isAudio(target) : !this.isVideo(target))))) {
       throw new Error('接续文件类型无效')
     }
     const ordered = DirectoryTimelinePolicy.query(entries, query)
@@ -2033,6 +2032,8 @@ struct Index {
       await this.openImageViewer(target, undefined, true, valid)
     } else if (state.scene === 'video' && target !== undefined) {
       await this.openVideoPlayer(target, state.positionMs, state.playing, valid)
+    } else if (state.scene === 'audio' && target !== undefined) {
+      await this.openAudioPlayer(target, false, state.positionMs, state.playing, valid)
     }
     await this.nextRenderFrame()
   }
@@ -2866,7 +2867,7 @@ struct Index {
   }
 
   private floatingBarContentInset(extra: number = FLOATING_BAR_CONTENT_EXTRA_VP): number {
-    return this.floatingBarBottomMargin() + FLOATING_BAR_HEIGHT_VP + extra
+    return this.floatingBarBottomMargin() + Glass.barHeight + extra
   }
 
   private shouldShowTimeline(): boolean {
@@ -2911,19 +2912,19 @@ struct Index {
     return count
   }
 
-  private floatingTimelineHeight(): number {
-    const fileRegionHeight = this.pageHeightVp - this.fileContentTopInset() -
-      this.floatingBarBottomMargin() - FLOATING_BAR_HEIGHT_VP
-    // 预留与底栏及顶部内容的安全留白（与底栏顶部保留 FLOATING_TIMELINE_GAP_VP 间距，决不重叠）
-    const safeMaxHeight = fileRegionHeight - FLOATING_TIMELINE_GAP_VP * 2 - FLOATING_TIMELINE_EFFECT_INSET_VP * 2
-    if (safeMaxHeight < 120) {
-      return 0
-    }
-    return Math.min(520, safeMaxHeight)
+  private floatingTimelineBottom(): number {
+    return this.pageHeightVp - this.floatingBarBottomMargin() - Glass.barHeight
   }
 
-  private fileToolsBarHeight(): number {
-    return FLOATING_BAR_HEIGHT_VP
+  private floatingTimelineHeight(): number {
+    const fileRegionHeight = this.floatingTimelineBottom() - this.fileContentTopInset()
+    // 预留与底栏及顶部内容的安全留白（与底栏顶部保留 Glass.timelineGap 间距，决不重叠）
+    const safeMaxHeight = fileRegionHeight - Glass.timelineGap * 2 - Glass.timelineEffectInset * 2
+    return Glass.timelineHeight(safeMaxHeight)
+  }
+
+  private floatingTimelineTop(): number {
+    return Glass.timelineTop(this.fileContentTopInset(), this.floatingTimelineBottom())
   }
 
   private isUserRootPath(path: string): boolean {
@@ -3014,16 +3015,7 @@ struct Index {
 
   // 胶囊宽度按按钮数量算：4 项 = 328vp；详情页的排序胶囊固定 140vp。
   private wideBottomBarCapsuleWidth(): number {
-    return Math.min(BOTTOM_BAR_ITEM_WIDTH_VP * BOTTOM_BAR_MAX_ITEMS,
-      this.effectivePageWidth() - 32)
-  }
-
-  private bottomBarCapsuleWidth(): number {
-    const available = this.effectivePageWidth() - 32
-    if (this.bottomBarMode() === 'tools') {
-      return Math.min(FILE_TOOL_SORT_WIDTH_VP, available)
-    }
-    return this.wideBottomBarCapsuleWidth()
+    return Glass.width(this.effectivePageWidth())
   }
 
   private shouldShowFileToolsBar(): boolean {
@@ -3434,10 +3426,6 @@ struct Index {
       return true
     }
     if (this.showImageViewer) {
-      if (this.showImageDetails) {
-        this.closeImageDetails()
-        return true
-      }
       if (this.showImageMoreMenu) {
         this.closeImageMoreMenu()
         return true
@@ -3556,11 +3544,24 @@ struct Index {
           // a fresh layout pass, a downward jump, and a reload-like effect.
           // The viewer is rendered later in this Stack and covers this
           // surface without changing its scroll/layout state.
-          if (this.showSearch) {
-            this.SearchContent()
-          } else {
-            this.FileContent()
+          Stack({ alignContent: Alignment.TopStart }) {
+            Column() {
+              this.FileContent()
+            }
+            .id('directory-content-host')
+            .width('100%')
+            .height('100%')
+            // Retain the directory's scroll, cells and decoded sources while
+            // searching. Hidden also excludes the covered native surfaces
+            // from painting; input belongs exclusively to the search layer.
+            .visibility(this.showSearch ? Visibility.Hidden : Visibility.Visible)
+            .hitTestBehavior(this.showSearch ? HitTestMode.BLOCK_DESCENDANTS : HitTestMode.Default)
+            if (this.showSearch) {
+              this.SearchContent()
+            }
           }
+          .width('100%')
+          .height('100%')
         }
       }
       .id('main-file-content')
@@ -3620,20 +3621,18 @@ struct Index {
           this.DirectoryTimelineBar()
         }
         .id('timeline-bar-host')
-        .width(FLOATING_TIMELINE_WIDTH_VP)
-        .height(this.floatingTimelineHeight() + FLOATING_TIMELINE_EFFECT_INSET_VP * 2)
+        .width(Glass.timelineWidth)
+        .height(this.floatingTimelineHeight() + Glass.timelineEffectInset * 2)
         .position({
-          x: Math.max(0, this.effectivePageWidth() - FLOATING_TIMELINE_WIDTH_VP - 8),
-          // Move the visible rail upward while placing real renderer space
-          // above and below it. The TabBar may clip its own child, but that
-          // clip now lands in the reserved area instead of on the material.
-          y: this.fileContentTopInset() + FLOATING_TIMELINE_GAP_VP -
-            FLOATING_TIMELINE_EFFECT_INSET_VP - FLOATING_TIMELINE_UPWARD_SHIFT_VP
+          x: Math.max(0, this.effectivePageWidth() - Glass.timelineWidth - 8),
+          // Centre within the file region; keep real renderer space above
+          // and below the rail so native deformation remains unclipped.
+          y: this.floatingTimelineTop()
         })
-        // 收起时整体右移，只留 FLOATING_TIMELINE_PEEK_VP 在屏内。
+        // 收起时整体右移，只留 Glass.timelinePeek 在屏内。
         .translate({
           x: this.timelineCollapsed
-            ? FLOATING_TIMELINE_WIDTH_VP - FLOATING_TIMELINE_PEEK_VP : 0,
+            ? Glass.timelineWidth - Glass.timelinePeek : 0,
           y: this.bottomBarOffsetY, z: 0
         })
         .opacity(this.shouldShowTimeline() ? this.bottomBarOpacity : 0)
@@ -3780,7 +3779,6 @@ struct Index {
       this.RenameOverlay()
       this.CreateFolderOverlay()
       this.DestinationFolderOverlay()
-      this.ImageViewerDetailsOverlay()
       this.AlbumUploadOverlay()
       if (this.startupAuthorized && !this.startupRestoring && this.continuationPending &&
         this.continuationWaitingForAccount) {
@@ -4525,7 +4523,7 @@ struct Index {
     }
     .width('100%')
     .height('100%')
-    .backgroundColor(Color.Transparent)
+    .backgroundColor($r('app.color.page_background'))
   }
 
   @Builder
@@ -5081,7 +5079,7 @@ struct Index {
       .monopolizeEvents(true)
       .onClick(() => this.openDownloads())
       .margin({ right: 18,
-        bottom: this.floatingBarBottomMargin() + FLOATING_BAR_HEIGHT_VP + 16 })
+        bottom: this.floatingBarBottomMargin() + Glass.barHeight + 16 })
     }
     .width('100%')
     .height('100%')
@@ -5820,6 +5818,7 @@ struct Index {
             this.closeSearch()
           })
           Search({ value: this.searchQuery, placeholder: '搜索文件', controller: this.searchController })
+            .id('file-search-input')
             .layoutWeight(1)
             .height(HeaderStyle.controlHeight)
             .fontColor($r('sys.color.font_primary'))
@@ -5829,6 +5828,9 @@ struct Index {
             .cancelButton({ style: CancelButtonStyle.INPUT })
             .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN, true))
             .monopolizeEvents(true)
+            .onVisibleAreaChange([0.0, 1.0], (visible: boolean): void => {
+              if (visible) { this.focusSearchInputWhenVisible() }
+            })
             .onChange((value: string) => this.onSearchQueryChanged(value))
             .onSubmit((value: string) => {
               if (value.trim().length > 0) {
@@ -6831,11 +6833,11 @@ struct Index {
     .vertical(false)
     .scrollable(false)
     .barOverlap(true)
-    .barHeight(this.floatingTimelineHeight() + FLOATING_TIMELINE_EFFECT_INSET_VP * 2)
+    .barHeight(this.floatingTimelineHeight() + Glass.timelineEffectInset * 2)
     .barBackgroundColor(Color.Transparent)
     .barBackgroundBlurStyle(BlurStyle.NONE)
-    .width(FLOATING_TIMELINE_WIDTH_VP)
-    .height(this.floatingTimelineHeight() + FLOATING_TIMELINE_EFFECT_INSET_VP * 2)
+    .width(Glass.timelineWidth)
+    .height(this.floatingTimelineHeight() + Glass.timelineEffectInset * 2)
     .clip(false)
     .hitTestBehavior(HitTestMode.Default)
   }
@@ -6845,10 +6847,10 @@ struct Index {
     FisheyeTimeline({
       timeline: this.directoryTimeline,
       focusTime: $timelineFocusTime,
-      widthVp: FLOATING_TIMELINE_WIDTH_VP,
-      railWidthVp: FLOATING_TIMELINE_RAIL_WIDTH_VP,
+      widthVp: Glass.timelineWidth,
+      railWidthVp: Glass.timelineRailWidth,
       heightVp: this.floatingTimelineHeight(),
-      verticalEffectInsetVp: FLOATING_TIMELINE_EFFECT_INSET_VP,
+      verticalEffectInsetVp: Glass.timelineEffectInset,
       material: this.timelineRailMaterial,
       onScrubStart: (): void => { this.beginTimelineScrub() },
       onScrub: (time: number): void => { this.previewTimelineTime(time) },
@@ -6871,31 +6873,9 @@ struct Index {
 
   @Builder
   BottomBar(): void {
-    // 三态共用一个常驻外壳。外壳是 Tabs 的底部页签区，沉浸式材质才在生效
-    // 范围内；内部三层内容全部常驻，只改 opacity/translate，节点不重建。
-    Tabs({ barPosition: BarPosition.End }) {
-      TabContent() {}.tabBar(this.BottomBarContent)
-    }
-    .vertical(false)
-    .scrollable(false)
-    .barOverlap(true)
-    // 原来的悬浮底栏靠 barFloatingStyle 的 barBottomMargin=40 把胶囊抬高 40vp；
-    // 这里改成普通内容后，用 barHeight 预留出同样的 40vp，位置完全还原。
-    .barHeight(this.fileToolsBarHeight() + FLOATING_BAR_EFFECT_TOP_INSET_VP + 40)
-    // This Tabs instance only supplies the supported bottom-TabBar material
-    // scope. Its own rectangular bar must stay visually transparent.
-    .barBackgroundColor(Color.Transparent)
-    .barBackgroundBlurStyle(BlurStyle.NONE)
-    .width('100%')
-    .height(this.fileToolsBarHeight() + FLOATING_BAR_EFFECT_TOP_INSET_VP + 80)
-    .margin({ bottom: this.floatingBarBottomMargin() - 40 })
-    .clip(false)
-    // Cut 4E-1: 将底栏全宽 Tabs 宿主的 hitTestBehavior 从 Default 改为 None。
-    // 该透明宿主自身不参与命中测试，不阻塞下层 Grid；其内部胶囊子节点继续按各自命中行为参与交互。
-    .hitTestBehavior(HitTestMode.None)
-    .onAreaChange((_, area: Area) => {
-      this.updateBottomBarVisualHostRect(area)
-    })
+    GlassBarHost({ bottomInset: this.floatingBarBottomMargin(),
+      content: (): void => { this.BottomBarContent() },
+      onHostAreaChange: (area: Area): void => this.updateBottomBarVisualHostRect(area) })
   }
 
   @Builder
@@ -6906,7 +6886,7 @@ struct Index {
         this.HomeBarContent()
       }
       .width('100%')
-      .height(FLOATING_BAR_HEIGHT_VP)
+      .height(Glass.barHeight)
       .opacity(this.bottomBarMode() === 'home' ? 1 : 0)
       .translate({ x: 0, y: this.bottomBarMode() === 'home' ? 0 : 12, z: 0 })
       // ⚠️ 隐藏态必须用 BLOCK_DESCENDANTS ✗ 不能用 None：
@@ -6921,7 +6901,7 @@ struct Index {
         this.SelectionBarContent()
       }
       .width('100%')
-      .height(FLOATING_BAR_HEIGHT_VP)
+      .height(Glass.barHeight)
       .opacity(this.bottomBarMode() === 'selection' ? 1 : 0)
       .translate({ x: 0, y: this.bottomBarMode() === 'selection' ? 0 : 12, z: 0 })
       // ⚠️ 与另两个底栏保持一致：隐藏态必须 BLOCK_DESCENDANTS。
@@ -6936,7 +6916,7 @@ struct Index {
         this.FileToolsBarContent()
       }
       .width('100%')
-      .height(this.fileToolsBarHeight())
+      .height(Glass.barHeight)
       .opacity(this.bottomBarMode() === 'tools' ? 1 : 0)
       .translate({ x: 0, y: this.bottomBarMode() === 'tools' ? 0 : 12, z: 0 })
       .hitTestBehavior(this.bottomBarMode() === 'tools'
@@ -6944,13 +6924,8 @@ struct Index {
       .animation({ duration: 200, curve: Curve.FastOutSlowIn })
     }
     .width('100%')
-    .height(this.fileToolsBarHeight() + FLOATING_BAR_EFFECT_TOP_INSET_VP)
-    // The visible 56vp controls stay bottom-aligned at their previous screen
-    // position. The extra top area only carries native shadow/deformation.
-    .margin({ bottom: 40 })
-    // Cut 4E-2: 将 BottomBarContent 全宽外壳从 Default 改为 None。
-    // 该容器仅用于排版与阴影承载，自身不拦截触摸，将空白区域透传给底层 Grid；
-    // 内部各胶囊子组件继续按自身的 hitTestBehavior 处理点击交互。
+    .height(Glass.barHeight)
+    .clip(false)
     .hitTestBehavior(HitTestMode.None)
   }
 
@@ -6966,16 +6941,17 @@ struct Index {
       }
       .width('100%')
       .height('100%')
-      .padding({ left: 8, right: 8, top: 0, bottom: 0 })
+      .padding({ left: Glass.contentPadding, right: Glass.contentPadding })
 
       ProximityLightReceiver()
         .width('100%')
         .height('100%')
         .hitTestBehavior(HitTestMode.None)
     }
-    .width(this.bottomBarCapsuleWidth())
-    .height(FLOATING_BAR_HEIGHT_VP)
-    .borderRadius(FLOATING_BAR_HEIGHT_VP / 2)
+    .id('home-glass-bar')
+    .width(this.wideBottomBarCapsuleWidth())
+    .height(Glass.barHeight)
+    .borderRadius(Glass.barHeight / 2)
     .systemMaterial(this.bottomCapsuleMaterial)
     // The capsule is above the scrolling page. Keep a drag that starts here
     // inside the capsule instead of letting the underlying List receive it.
@@ -7009,9 +6985,10 @@ struct Index {
           .justifyContent(FlexAlign.Center)
         }
         .type(ButtonType.Normal)
-        .width(FILE_TOOL_SORT_WIDTH_VP)
-        .height(FLOATING_BAR_HEIGHT_VP)
-        .borderRadius(FLOATING_BAR_HEIGHT_VP / 2)
+        .id('file-tools-sort')
+        .width(Glass.sortWidth)
+        .height(Glass.barHeight)
+        .borderRadius(Glass.barHeight / 2)
         .backgroundColor(Color.Transparent)
         .systemMaterial(this.bottomCapsuleMaterial)
         .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
@@ -7023,23 +7000,8 @@ struct Index {
           HapticFeedback.confirm()
           this.toggleFileSortMenu()
         })
-        .bindPopup(this.showFileSortMenu, {
-          builder: this.FileSortPopup,
-          placement: Placement.Top,
-          maskColor: Color.Transparent,
-          enableArrow: false,
-          autoCancel: true,
-          // CustomPopupOptions exposes the official transition hook. The SDK does
-          // not provide a HarmonyOS 7-only sort-popup animation name; keep the
-          // popup on ArkUI's supported transition path instead of faking one.
-          transition: this.fileSortPopupTransition(),
-          systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
-          onStateChange: (state: PopupStateChange): void => {
-            if (!state.isVisible) {
-              this.showFileSortMenu = false
-            }
-          }
-        })
+        .bindPopup(this.showFileSortMenu, this.floatingMenuOptions(() => { this.FileSortPopup() },
+          this.fileSortPopupTransition(), () => this.closeFileSortMenu()))
 
         // The glyph is the mode this tap will switch TO, so the icon and the
         // next tap always correspond one-to-one. It only repaints because the
@@ -7053,8 +7015,8 @@ struct Index {
         })
       }
       .width('100%')
-      .height(FLOATING_BAR_HEIGHT_VP)
-      .padding({ left: 16, right: 16 })
+      .height(Glass.barHeight)
+      .padding({ left: Glass.toolsInset, right: Glass.toolsInset })
       .justifyContent(FlexAlign.SpaceBetween)
       // 原来的 40vp 圆钮/排序胶囊在 120vp 栏里居中，底边距栏底 40vp；
       // 这里靠底对齐还原同一个位置。
@@ -7064,11 +7026,11 @@ struct Index {
       // moving light continuous without introducing a full-width outline.
       ProximityLightReceiver({ mode: 'fileTools' })
         .width('100%')
-        .height(FLOATING_BAR_HEIGHT_VP)
+        .height(Glass.barHeight)
         .hitTestBehavior(HitTestMode.None)
     }
     .width('100%')
-    .height(this.fileToolsBarHeight())
+    .height(Glass.barHeight)
     .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
   }
 
@@ -7084,10 +7046,10 @@ struct Index {
       this.SelectionMoreButton()
     }
     .id('selection_bottom_bar')
-    .width(this.bottomBarCapsuleWidth())
-    .height(FLOATING_BAR_HEIGHT_VP)
-    .padding({ left: 8, right: 8, top: 0, bottom: 0 })
-    .borderRadius(FLOATING_BAR_HEIGHT_VP / 2)
+    .width(this.wideBottomBarCapsuleWidth())
+    .height(Glass.barHeight)
+    .padding({ left: Glass.contentPadding, right: Glass.contentPadding })
+    .borderRadius(Glass.barHeight / 2)
     .systemMaterial(this.bottomCapsuleMaterial)
     .hitTestBehavior(this.bottomBarMode() === 'selection' ? HitTestMode.Default : HitTestMode.None)
     .onAreaChange((_, area: Area) => {
@@ -7098,13 +7060,13 @@ struct Index {
   @Builder
   SelectionActionButton(icon: Resource, title: string, action: () => void): void {
     Button() {
-      Column({ space: 2 }) {
+      Column({ space: Glass.itemGap }) {
         SymbolGlyph(icon)
-          .fontSize(24)
+          .fontSize(Glass.iconSize)
           .fontColor([this.selectionActionEnabled(title)
             ? $r('sys.color.icon_primary') : $r('sys.color.icon_tertiary')])
         Text(title)
-          .fontSize(12)
+          .fontSize(Glass.labelSize)
           .fontColor(this.selectionActionEnabled(title)
             ? $r('sys.color.font_primary') : $r('sys.color.font_tertiary'))
       }
@@ -7112,7 +7074,7 @@ struct Index {
     }
     .type(ButtonType.Normal)
     .layoutWeight(1)
-    .height(FLOATING_BAR_HEIGHT_VP)
+    .height(Glass.barHeight)
     .padding(0)
     .backgroundColor(Color.Transparent)
     .stateEffect(false)
@@ -7130,13 +7092,13 @@ struct Index {
   @Builder
   SelectionMoreButton(): void {
     Button() {
-      Column({ space: 2 }) {
+      Column({ space: Glass.itemGap }) {
         SymbolGlyph($r('sys.symbol.more'))
-          .fontSize(24)
+          .fontSize(Glass.iconSize)
           .fontColor([this.selectedEntryCount > 0
             ? $r('sys.color.icon_primary') : $r('sys.color.icon_tertiary')])
         Text('更多')
-          .fontSize(12)
+          .fontSize(Glass.labelSize)
           .fontColor(this.selectedEntryCount > 0
             ? $r('sys.color.font_primary') : $r('sys.color.font_tertiary'))
       }
@@ -7144,7 +7106,7 @@ struct Index {
     }
     .type(ButtonType.Normal)
     .layoutWeight(1)
-    .height(FLOATING_BAR_HEIGHT_VP)
+    .height(Glass.barHeight)
     .padding(0)
     .backgroundColor(Color.Transparent)
     .stateEffect(false)
@@ -7158,104 +7120,72 @@ struct Index {
       HapticFeedback.confirm()
       this.toggleSelectionMoreMenu()
     })
-    .bindPopup(this.showSelectionMoreMenu, {
-      builder: this.SelectionMorePopup,
-      placement: Placement.Top,
-      maskColor: Color.Transparent,
-      enableArrow: false,
-      autoCancel: true,
-      transition: this.fileSortPopupTransition(),
-      systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
-      onStateChange: (state: PopupStateChange): void => {
-        if (!state.isVisible) {
-          this.showSelectionMoreMenu = false
-        }
-      }
-    })
+    .bindPopup(this.showSelectionMoreMenu, this.floatingMenuOptions(() => { this.SelectionMorePopup() },
+      this.fileSortPopupTransition(), () => this.closeSelectionMoreMenu()))
   }
+
 
   @Builder
   SelectionMorePopup(): void {
-    Column() {
-      this.SelectionMoreRow($r('sys.symbol.move'), '移动',
-        () => this.beginSelectionDestinationPicker('move'))
-      this.SelectionMoreRow($r('sys.symbol.download'), '下载',
-        () => this.downloadSelectedEntries())
+    GlassMenuSurface({ widthVp: Math.min(Glass.menuWidth, this.effectivePageWidth() - 40),
+      content: () => {
+        this.SelectionMoreRow($r('sys.symbol.move'), '移动',
+          () => this.beginSelectionDestinationPicker('move'))
+        this.SelectionMoreRow($r('sys.symbol.download'), '下载',
+          () => this.downloadSelectedEntries())
 
-      if (this.selectedPaths.length === 1) {
-        if (this.selectedSingleEntry() !== null &&
-          this.actionSupportsOpenWith(this.selectedSingleEntry() as FileEntry)) {
-          this.SelectionMoreRow($r('sys.symbol.rectangle_and_arrowshape_turn_up_right'), '其他应用打开',
-            () => this.openWithSelectedEntry(this.selectedSingleEntry() as FileEntry))
-        }
-        if (this.selectedSingleEntry() !== null &&
-          this.actionSupportsQuickView(this.selectedSingleEntry() as FileEntry)) {
-          this.SelectionMoreRow($r('sys.symbol.play'), '快速查看',
-            () => this.quickViewSelectedEntry(this.selectedSingleEntry() as FileEntry))
-        }
-        if (this.selectedSingleEntry() !== null &&
-          !(this.selectedSingleEntry() as FileEntry).isDirectory &&
-          this.isMedia(this.selectedSingleEntry() as FileEntry)) {
-          this.SelectionMoreRow($r('sys.symbol.picture_badge_arrow_down'), '保存图库',
-            () => this.saveSelectedGallery(this.selectedSingleEntry() as FileEntry))
-        }
-        if (this.selectedSingleEntry() !== null &&
-          this.actionHasLocalCache(this.selectedSingleEntry() as FileEntry)) {
+        if (this.selectedPaths.length === 1) {
+          if (this.selectedSingleEntry() !== null &&
+            this.actionSupportsOpenWith(this.selectedSingleEntry() as FileEntry)) {
+            this.SelectionMoreRow($r('sys.symbol.rectangle_and_arrowshape_turn_up_right'), '其他应用打开',
+              () => this.openWithSelectedEntry(this.selectedSingleEntry() as FileEntry))
+          }
+          if (this.selectedSingleEntry() !== null &&
+            this.actionSupportsQuickView(this.selectedSingleEntry() as FileEntry)) {
+            this.SelectionMoreRow($r('sys.symbol.play'), '快速查看',
+              () => this.quickViewSelectedEntry(this.selectedSingleEntry() as FileEntry))
+          }
+          if (this.selectedSingleEntry() !== null &&
+            !(this.selectedSingleEntry() as FileEntry).isDirectory &&
+            this.isMedia(this.selectedSingleEntry() as FileEntry)) {
+            this.SelectionMoreRow($r('sys.symbol.picture_badge_arrow_down'), '保存图库',
+              () => this.saveSelectedGallery(this.selectedSingleEntry() as FileEntry))
+          }
+          if (this.selectedSingleEntry() !== null &&
+            this.actionHasLocalCache(this.selectedSingleEntry() as FileEntry)) {
+            this.SelectionMoreRow($r('sys.symbol.arrow_down'), '释放缓存',
+              () => this.releaseSelectedCaches())
+          }
+          if (this.selectedSingleEntry() !== null) {
+            this.SelectionMoreRow($r('sys.symbol.rename'), '重命名',
+              () => this.renameSelectedEntry(this.selectedSingleEntry() as FileEntry))
+            this.SelectionMoreRow($r('sys.symbol.info_circle'), '详情',
+              () => this.showEntryDetailsSelected(this.selectedSingleEntry() as FileEntry), false)
+          }
+        } else if (this.selectedCachedEntries().length > 0) {
           this.SelectionMoreRow($r('sys.symbol.arrow_down'), '释放缓存',
-            () => this.releaseSelectedCaches())
+            () => this.releaseSelectedCaches(), false)
         }
-        if (this.selectedSingleEntry() !== null) {
-          this.SelectionMoreRow($r('sys.symbol.rename'), '重命名',
-            () => this.renameSelectedEntry(this.selectedSingleEntry() as FileEntry))
-          this.SelectionMoreRow($r('sys.symbol.info_circle'), '详情',
-            () => this.showEntryDetailsSelected(this.selectedSingleEntry() as FileEntry), false)
-        }
-      } else if (this.selectedCachedEntries().length > 0) {
-        this.SelectionMoreRow($r('sys.symbol.arrow_down'), '释放缓存',
-          () => this.releaseSelectedCaches(), false)
-      }
-    }
-    .width(228)
-    .padding({ left: 10, right: 10, top: 8, bottom: 8 })
-    .borderRadius(22)
-    .hitTestBehavior(HitTestMode.Default)
+    } })
   }
 
+  // Selection owns dismissal; the shared row owns only display and input.
   @Builder
   SelectionMoreRow(icon: Resource, title: string, action: () => void,
     showDivider: boolean = true): void {
-    Row() {
-      Text(title)
-        .fontSize(16)
-        .fontColor($r('sys.color.font_primary'))
-        .layoutWeight(1)
-      SymbolGlyph(icon)
-        .fontSize(21)
-        .fontColor([$r('sys.color.icon_primary')])
-        .width(30)
-    }
-    .width('100%')
-    .height(48)
-    .padding({ left: 10, right: 8 })
-    .borderRadius(14)
-    .backgroundColor(Color.Transparent)
-    // 和其它菜单一致：按下 A、滑到 B 松手 → 执行 B（并同样收起菜单）。
-    .onAreaChange((_, area) => this.registerSlideItem('selmore', title, area, () => {
-      this.showSelectionMoreMenu = false
+    this.FloatingMenuActionRow('selmore', icon, title, () => {
+      this.closeSelectionMoreMenu()
       action()
-    }))
-    .onTouch((event: TouchEvent) => this.slideItemTouch('selmore', title, event))
-    .onClick(() => {
-      this.showSelectionMoreMenu = false
-      action()
-    })
+    }, showDivider)
+  }
 
-    if (showDivider) {
-      Divider()
-        .strokeWidth(0.5)
-        .color($r('sys.color.comp_divider'))
-        .margin({ left: 10, right: 10 })
-    }
+  @Builder
+  FloatingMenuActionRow(group: string, icon: Resource, title: string, action: () => void,
+    showDivider: boolean = true): void {
+    GlassMenuRow({ icon: icon, title: title, showDivider: showDivider,
+      rowId: 'floating-menu-' + group + '-' + title, onActivate: action,
+      onRowArea: (area: Area) => this.registerSlideItem(group, title, area, action),
+      onRowTouch: (event: TouchEvent) => this.slideItemTouch(group, title, event) })
   }
 
   @Builder
@@ -7269,13 +7199,15 @@ struct Index {
   FileToolCircleButton(options: FileToolCircleButtonOptions): void {
     Button() {
       SymbolGlyph(options.icon)
-        .fontSize(24)
+        .fontSize(Glass.iconSize)
         .fontColor([$r('sys.color.icon_primary')])
     }
     .type(ButtonType.Normal)
-    .width(FLOATING_BAR_HEIGHT_VP)
-    .height(FLOATING_BAR_HEIGHT_VP)
-    .borderRadius(FLOATING_BAR_HEIGHT_VP / 2)
+    .id('file-tool-' + options.slideKey)
+    .accessibilityText(options.slideKey)
+    .width(Glass.barHeight)
+    .height(Glass.barHeight)
+    .borderRadius(Glass.barHeight / 2)
     .backgroundColor(Color.Transparent)
     .systemMaterial(this.bottomCapsuleMaterial)
     .hitTestBehavior(this.bottomBarMode() === 'tools' ? HitTestMode.Default : HitTestMode.None)
@@ -7291,16 +7223,23 @@ struct Index {
 
   @Builder
   FileSortPopup(): void {
-    Column() {
-      this.FileSortOption('名称', 'name')
-      this.FileSortOption('类型', 'type')
-      this.FileSortOption('时间', 'time')
-      this.FileSortOption('大小', 'size')
-    }
-    .width(226)
-    .padding({ left: 12, right: 12, top: 8, bottom: 8 })
-    .borderRadius(24)
-    .hitTestBehavior(HitTestMode.Default)
+    GlassMenuSurface({ widthVp: Math.min(Glass.menuWidth, this.effectivePageWidth() - 40),
+      content: () => {
+        this.FileSortOption('名称', 'name')
+        this.FileSortOption('类型', 'type')
+        this.FileSortOption('时间', 'time')
+        this.FileSortOption('大小', 'size')
+    } })
+  }
+
+  private floatingMenuOptions(builder: CustomBuilder, transition: TransitionEffect,
+    onClosed: () => void): CustomPopupOptions {
+    return { builder: builder, placement: Placement.Top, targetSpace: 6,
+      maskColor: Color.Transparent, enableArrow: false, autoCancel: true,
+      radius: Glass.menuRadius, transition: transition, systemMaterial: this.floatingPanelMaterial,
+      onStateChange: (state: PopupStateChange): void => {
+        if (!state.isVisible) { onClosed() }
+      } }
   }
 
   private fileSortPopupTransition(): TransitionEffect {
@@ -7387,7 +7326,7 @@ struct Index {
     Row() {
       Text(title)
         .fontSize(16)
-        .fontColor($r('app.color.text_primary'))
+        .fontColor($r('sys.color.font_primary'))
         .layoutWeight(1)
       if (this.fileSortKey === key) {
         SymbolGlyph(this.fileSortAscending
@@ -7407,24 +7346,24 @@ struct Index {
       Divider()
         .width('100%')
         .strokeWidth(0.5)
-        .color($r('app.color.divider'))
+        .color($r('sys.color.comp_divider'))
     }
   }
 
   @Builder
   BottomNavItem(icon: Resource, title: string, tab: BottomTab, action: () => void): void {
-    Column({ space: 2 }) {
+    Column({ space: Glass.itemGap }) {
       Stack() {
         SymbolGlyph(icon)
-          .fontSize(24)
+          .fontSize(Glass.iconSize)
           .fontColor([this.selectedBottomTab === tab
             ? $r('sys.color.icon_emphasize') : $r('sys.color.icon_primary')])
       }
       .width('100%')
-      .height(24)
+      .height(Glass.iconSize)
 
       Text(title)
-        .fontSize(12)
+        .fontSize(Glass.labelSize)
         .fontWeight(this.selectedBottomTab === tab ? FontWeight.Medium : FontWeight.Normal)
         .fontColor(this.selectedBottomTab === tab
           ? $r('sys.color.font_emphasize') : $r('sys.color.font_primary'))
@@ -10251,7 +10190,7 @@ struct Index {
       .disableSwipe(this.imageScale > 1.001 || this.viewerTransitionActive ||
         this.viewerEntryTransitionActive || this.imageDismissDragging ||
         this.isBusy || this.showImageMoreMenu ||
-        this.showImageDetails || this.showRenameDialog)
+        this.continuationDialogCount > 0 || this.showRenameDialog)
       .width('100%')
       .height('100%')
       .onAreaChange((_, area) => {
@@ -10648,34 +10587,23 @@ struct Index {
 
   @Builder
   ImageViewerBottomBar(): void {
-    Tabs({ barPosition: BarPosition.End }) {
-      TabContent() {}.tabBar(this.ImageViewerBarContent)
+    GlassBarHost({ bottomInset: this.floatingBarBottomMargin(),
+      content: (): void => { this.ImageViewerBarSurface() } })
+  }
+
+  @Builder
+  ImageViewerBarSurface(): void {
+    Stack() {
+      this.ImageViewerBarContent()
+      ProximityLightReceiver().width('100%').height('100%').hitTestBehavior(HitTestMode.None)
     }
-    .vertical(false)
-    .scrollable(false)
-    .barOverlap(true)
-    .barHeight(FLOATING_BAR_HEIGHT_VP)
-    // 和首页/多选底栏统一宽度：5 项时每项约 61vp，与系统「智慧生活」底栏一致。
-    // Do not derive this from the parent file bar mode: that bar remains
-    // mounted behind the viewer and is normally in the 140vp tools mode.
-    .barWidth(this.wideBottomBarCapsuleWidth())
-    .barFloatingStyle({ barBottomMargin: 40, maskColor: Color.Transparent,
-      systemMaterial: this.bottomCapsuleMaterial })
-    .width('100%')
-    .height(FLOATING_BAR_HEIGHT_VP + 80)
-    .margin({ bottom: this.floatingBarBottomMargin() - 40 })
-    .clip(false)
-    // barFloatingStyle places the 56vp capsule 40vp from the bottom of this
-    // 136vp Tabs host. Restrict the host to that exact visual rectangle, then
-    // let the material-owning Tabs block image gestures without cutting off
-    // its own press light and deformation handling.
-    .responseRegion({
-      x: Math.max(0, (this.effectivePageWidth() - this.wideBottomBarCapsuleWidth()) / 2),
-      y: 40,
-      width: this.wideBottomBarCapsuleWidth(),
-      height: FLOATING_BAR_HEIGHT_VP
-    })
-    .hitTestBehavior(HitTestMode.BLOCK_HIERARCHY)
+    .width(this.wideBottomBarCapsuleWidth())
+    .height(Glass.barHeight)
+    .borderRadius(Glass.barHeight / 2)
+    .systemMaterial(this.bottomCapsuleMaterial)
+    .hitTestBehavior(HitTestMode.Default)
+    .monopolizeEvents(true)
+    .id('image-viewer-glass-bar')
   }
 
   @Builder
@@ -10717,33 +10645,25 @@ struct Index {
       this.ImageViewerMoreButton()
     }
     .width('100%')
-    // TabBar 上下各保留 4vp，可见内容高度是 48vp；这里必须按 48 排版，
-    // 否则内容按 56vp 居中、视觉上会整体下沉约 14px（和系统底栏对不齐）。
-    .height(FLOATING_BAR_HEIGHT_VP - 8)
-    .padding({ left: 8, right: 8, top: 0, bottom: 0 })
-    .borderRadius(FLOATING_BAR_HEIGHT_VP / 2)
-    .onAreaChange((_, area) => {
-      if (this.viewerBottomBarWidthVp <= 0 &&
-        typeof area.width === 'number' && area.width > 0) {
-        this.viewerBottomBarWidthVp = area.width
-      }
-    })
+    .height(Glass.barHeight)
+    .padding({ left: Glass.contentPadding, right: Glass.contentPadding })
+    .borderRadius(Glass.barHeight / 2)
     .hitTestBehavior(HitTestMode.Default)
   }
 
   @Builder
   ImageViewerActionItem(icon: Resource, title: string, action: () => void): void {
-    Column({ space: 2 }) {
+    Column({ space: Glass.itemGap }) {
       Stack() {
         SymbolGlyph(icon)
-          .fontSize(24)
+          .fontSize(Glass.iconSize)
           .fontColor([$r('sys.color.icon_primary')])
       }
       .width('100%')
-      .height(24)
+      .height(Glass.iconSize)
 
       Text(title)
-        .fontSize(12)
+        .fontSize(Glass.labelSize)
         .fontColor($r('sys.color.font_primary'))
     }
     .layoutWeight(1)
@@ -10765,60 +10685,30 @@ struct Index {
     }
     .layoutWeight(1)
     .height('100%')
-    .bindPopup(this.showImageMoreMenu, {
-      builder: this.ImageViewerMoreContent,
-      placement: Placement.Top,
-      targetSpace: 6,
-      maskColor: Color.Transparent,
-      enableArrow: false,
-      autoCancel: true,
-      radius: 24,
-      transition: this.imageMoreMenuTransition(),
-      systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
-      onStateChange: (state: PopupStateChange) => {
-        if (!state.isVisible && this.showImageMoreMenu) {
-          this.closeImageMoreMenu()
-        }
-      }
-    })
+    .bindPopup(this.showImageMoreMenu, this.floatingMenuOptions(() => { this.ImageViewerMoreContent() },
+      this.imageMoreMenuTransition(), () => {
+        if (this.showImageMoreMenu) { this.closeImageMoreMenu() }
+      }))
   }
+
 
   @Builder
   ImageViewerMoreContent(): void {
-    Column() {
-      if (this.isSearchViewer()) {
-        this.ImageViewerMoreRow($r('sys.symbol.folder'), '定位到所在目录',
-          () => this.triggerLocateFromViewer(), true)
-      }
-      this.ImageViewerMoreRow($r('sys.symbol.rotate_left'), '旋转',
-        () => this.rotateViewerOverlayImage(), true)
-      this.ImageViewerMoreRow($r('sys.symbol.rectangle_and_arrowshape_turn_up_right'), '其他应用打开',
-        () => this.openViewerOverlayWithOtherApp(), true)
-      this.ImageViewerMoreRow($r('sys.symbol.rename'), '重命名',
-        () => this.openRenameFromViewerOverlay(), true)
-      this.ImageViewerMoreRow($r('sys.symbol.info_circle'), '详情',
-        () => this.openImageDetails(), false)
-    }
-    .width(Math.min(228, this.effectivePageWidth() - 40))
-    .padding({ left: 10, right: 10, top: 8, bottom: 8 })
-    .borderRadius(24)
-    .hitTestBehavior(HitTestMode.Default)
-  }
-
-  /**
-   * Fade only the scrim. The underlying image and the bottom capsule remain
-   * fixed while the menu itself performs the anchored expansion.
-   */
-  private imageMoreOverlayTransition(): TransitionEffect {
-    const appear = TransitionEffect.opacity(0).animation({
-      duration: 170,
-      curve: Curve.EaseOut
-    })
-    const disappear = TransitionEffect.opacity(0).animation({
-      duration: 140,
-      curve: Curve.EaseIn
-    })
-    return TransitionEffect.asymmetric(appear, disappear)
+    GlassMenuSurface({ widthVp: Math.min(Glass.menuWidth, this.effectivePageWidth() - 40),
+      content: () => {
+        if (this.isSearchViewer()) {
+          this.FloatingMenuActionRow('viewermenu', $r('sys.symbol.folder'), '定位到所在目录',
+            () => this.triggerLocateFromViewer(), true)
+        }
+        this.FloatingMenuActionRow('viewermenu', $r('sys.symbol.rotate_left'), '旋转',
+          () => this.rotateViewerOverlayImage(), true)
+        this.FloatingMenuActionRow('viewermenu', $r('sys.symbol.rectangle_and_arrowshape_turn_up_right'), '其他应用打开',
+          () => this.openViewerOverlayWithOtherApp(), true)
+        this.FloatingMenuActionRow('viewermenu', $r('sys.symbol.rename'), '重命名',
+          () => this.openRenameFromViewerOverlay(), true)
+        this.FloatingMenuActionRow('viewermenu', $r('sys.symbol.info_circle'), '详情',
+          () => this.openImageDetails(), false)
+    } })
   }
 
   /**
@@ -10859,118 +10749,6 @@ struct Index {
         curve: Curve.EaseIn
       })
     return TransitionEffect.asymmetric(appear, disappear)
-  }
-
-  @Builder
-  ImageViewerMoreRow(icon: Resource, title: string, action: () => void, showDivider: boolean): void {
-    Column() {
-      Button() {
-        Row() {
-          Text(title)
-            .fontSize(16)
-            .fontColor($r('sys.color.font_primary'))
-            .layoutWeight(1)
-          SymbolGlyph(icon)
-            .fontSize(22)
-            .fontColor([$r('sys.color.icon_primary')])
-            .width(32)
-        }
-        .width('100%')
-        .height('100%')
-        .padding({ left: 10, right: 8 })
-      }
-      .type(ButtonType.Normal)
-      .width('100%')
-      .height(48)
-      .padding(0)
-      .borderRadius(14)
-      .backgroundColor(Color.Transparent)
-      .stateEffect(true)
-      // 和其它菜单一样：按下 A、滑到 B 松手 → 执行 B。
-      .onAreaChange((_, area) =>
-        this.registerSlideItem('viewermenu', title, area, action))
-      .onTouch((event: TouchEvent) => this.slideItemTouch('viewermenu', title, event))
-      .onClick(action)
-
-      if (showDivider) {
-        Divider()
-          .strokeWidth(0.5)
-          .color($r('sys.color.comp_divider'))
-          .margin({ left: 10, right: 10 })
-      }
-    }
-    .width('100%')
-  }
-
-  @Builder
-  ImageViewerDetailsOverlay(): void {
-    Column() {}
-      .width(0)
-      .height(0)
-      .bindSheet($$this.showImageDetails, this.ImageViewerDetailsContent, {
-        height: SheetSize.FIT_CONTENT,
-        dragBar: false,
-        showClose: false,
-        systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
-        // Native dismissal also updates the two-way bound visibility. Keep
-        // FIT_CONTENT stable until the sheet and its modal mask have gone.
-        onDisappear: (): void => {
-          this.showImageDetails = false
-          this.imageDetailsEntry = null
-        }
-      })
-  }
-
-  @Builder
-  ImageViewerDetailsContent(): void {
-    if (this.imageDetailsEntry !== null) {
-    Column({ space: 12 }) {
-      Row() {
-        Text('详情')
-          .fontSize(20)
-          .fontWeight(FontWeight.Bold)
-          .fontColor($r('app.color.text_primary'))
-          .layoutWeight(1)
-        Text('×')
-          .id('image-details-close')
-          .fontSize(28)
-          .fontColor($r('app.color.text_tertiary'))
-          .onClick(() => this.closeImageDetails())
-      }
-      .width('100%')
-
-      this.ImageDetailsLine('文件名', (this.imageDetailsEntry as FileEntry).name)
-      this.ImageDetailsLine('路径', this.entryDisplayPath(this.imageDetailsEntry as FileEntry))
-      this.ImageDetailsLine('大小', this.formatSize((this.imageDetailsEntry as FileEntry).size))
-      this.ImageDetailsLine('修改时间',
-        this.formatTime((this.imageDetailsEntry as FileEntry).modifiedTime))
-      this.ImageDetailsLine('文件类型',
-        this.fileType(this.imageDetailsEntry as FileEntry).length > 0
-          ? this.fileType(this.imageDetailsEntry as FileEntry) : '图片')
-    }
-    .width('100%')
-    .padding({ left: 20, right: 20, top: 18, bottom: 20 })
-    .borderRadius(22)
-    .onClick(() => {})
-    }
-  }
-
-  @Builder
-  ImageDetailsLine(label: string, value: string): void {
-    Row({ space: 12 }) {
-      Text(label)
-        .fontSize(13)
-        .fontColor($r('app.color.text_tertiary'))
-        .width(68)
-      Text(value)
-        .fontSize(14)
-        .fontColor($r('app.color.text_primary'))
-        .layoutWeight(1)
-        .maxLines(2)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-    }
-    .width('100%')
-    .alignItems(VerticalAlign.Top)
   }
 
   @Builder
@@ -11341,8 +11119,8 @@ struct Index {
 
   /**
    * Material for small floating controls whose glyphs sit over changing page
-   * content. Keep automatic inversion on this narrow subtree only; menus and
-   * dialogs continue to use immersiveMaterial without broad color processing.
+   * content. Light menus/details use floatingPanelMaterial; heavier confirmation
+   * dialogs keep their own non-inverting material.
    */
   private adaptiveControlMaterial(style: uiMaterial.ImmersiveStyle = uiMaterial.ImmersiveStyle.THIN,
     interactive: boolean = true, materialColor: string = ''): uiMaterial.Material {
@@ -12158,6 +11936,8 @@ struct Index {
     if (session === null) {
       return
     }
+    const directoryUnchanged = this.currentPath === session.originPath &&
+      this.currentRootType === session.originRootType && this.fileViewMode === session.originViewState.mode
     this.navigationStack = session.originNavigationStack.slice()
     this.navigationEntryStack = this.cloneNavigationEntryStack(session.originNavigationEntryStack)
     this.navigationRootTypeStack = session.originNavigationRootTypeStack.slice()
@@ -12167,12 +11947,14 @@ struct Index {
     this.navigationPageHasMoreStack = session.originPageHasMoreStack.slice()
     this.currentPath = session.originPath
     this.currentRootType = session.originRootType
-    this.currentPageIndex = session.originPageIndex
-    this.currentPageHasMore = session.originPageHasMore
     this.fileViewMode = session.originViewState.mode
-    this.replaceEntries(session.originEntries.slice())
-    this.resetPreviewState(false)
-    this.restoreDirectoryViewState(session.originViewState)
+    if (!directoryUnchanged) {
+      this.currentPageIndex = session.originPageIndex
+      this.currentPageHasMore = session.originPageHasMore
+      this.replaceEntries(session.originEntries.slice())
+      this.resetPreviewState(false)
+      this.restoreDirectoryViewState(session.originViewState)
+    }
     this.searchDraft = session.query
     this.searchQuery = session.query
     this.searchScope = session.scope
@@ -12201,7 +11983,19 @@ struct Index {
     }, 0)
   }
 
+  private focusSearchInputWhenVisible(): void {
+    if (!this.searchFocusPending || !this.showSearch || this.screen !== 'files' ||
+      this.showImageViewer || this.showAudioPlayer || this.showVideoPlayer) { return }
+    // Only a fresh search requests the keyboard. Rebuilds, scope changes and
+    // returning from a result must not reclaim focus after the user dismisses it.
+    this.searchFocusPending = false
+    try {
+      this.getUIContext().getFocusController().requestFocus('file-search-input')
+    } catch (_) {}
+  }
+
   private dismissKeyboard(): void {
+    this.searchFocusPending = false
     try {
       this.searchController.stopEditing()
     } catch (_) {}
@@ -12223,6 +12017,7 @@ struct Index {
     this.searchSession = this.createSearchSession()
     this.searchResultCache = {}
     this.searchScrollOffset = 0
+    this.searchFocusPending = true
     this.showSearch = true
     this.searchDraft = ''
     this.searchQuery = ''
@@ -12245,7 +12040,13 @@ struct Index {
 
   private exitSearchToOrigin(): void {
     const session = this.searchSession
+    const directoryRetained = session !== null && session.returnMode === 'none' &&
+      this.currentPath === session.originPath && this.currentRootType === session.originRootType &&
+      this.fileViewMode === session.originViewState.mode
     this.discardSearchSession()
+    // A plain search open/close never left this directory. Replacing its data
+    // and clearing previews here would undo the retained surface's state.
+    if (directoryRetained) { return }
     if (session !== null) {
       this.navigationStack = session.originNavigationStack.slice()
       this.navigationEntryStack = this.cloneNavigationEntryStack(session.originNavigationEntryStack)
@@ -16207,11 +16008,7 @@ struct Index {
     this.contextMenuEntry = null
     this.pendingContextAction = null
     this.contextMenuScrollMoved = false
-    this.slideItems.forEach((_, key: string): void => {
-      if (key.startsWith('ctxmenu:')) {
-        this.slideItems.delete(key)
-      }
-    })
+    this.clearSlideItems('ctxmenu')
     if (bitmap !== null) {
       this.viewerBitmapStore.releasePreview(bitmap).catch((): void => {})
     }
@@ -16405,6 +16202,7 @@ struct Index {
   }
 
   private async showEntryDetails(entry: FileEntry): Promise<void> {
+    if (this.continuationDialogCount > 0) { return }
     this.closeActionMenu()
     const type = entry.isDirectory ? '文件夹' : (this.fileType(entry).length > 0 ? this.fileType(entry) : '文件')
     const lines: string[] = [
@@ -16416,11 +16214,37 @@ struct Index {
     if (entry.isDirectory && entry.childCount >= 0) {
       lines.splice(1, 0, '项目：' + entry.childCount.toString() + ' 项')
     }
-    await this.showTrackedDialog({
-      title: entry.name,
-      message: lines.join('\n'),
-      buttons: [{ text: '确定', color: '#2E6BFF' }],
-      systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THICK, false)
+    await this.showTrackedDialog(() => this.presentEntryDetails(entry.name, lines.join('\n')))
+  }
+
+  @Builder
+  EntryDetailsDialogContent(title: string, message: string, onConfirm: () => void): void {
+    EntryDetailsContent({ title: title, message: message,
+      maxContentHeight: Math.max(80, this.pageHeightVp - this.topSafeInset() - this.bottomSafeInset() - 160),
+      onConfirm: onConfirm })
+  }
+
+  private presentEntryDetails(title: string, message: string): Promise<promptAction.ShowDialogSuccessResponse> {
+    const prompt = this.getUIContext().getPromptAction()
+    return new Promise<promptAction.ShowDialogSuccessResponse>((resolve, reject) => {
+      let dialogId = -1
+      let confirmPending = false
+      const onConfirm = (): void => {
+        if (confirmPending) { return }
+        confirmPending = true
+        if (dialogId >= 0) { prompt.closeCustomDialog(dialogId) }
+      }
+      // Keep the platform's centred dialog and input mask. Custom content is
+      // needed because showDialog's generated text does not invert on thin glass.
+      prompt.openCustomDialog({ builder: () => { this.EntryDetailsDialogContent(title, message, onConfirm) },
+        alignment: DialogAlignment.Center, autoCancel: true,
+        width: Math.min(400, this.effectivePageWidth() - Glass.windowInset * 2),
+        systemMaterial: this.floatingPanelMaterial,
+        onDidDisappear: (): void => resolve({ index: confirmPending ? 0 : -1 })
+      }).then((id: number): void => {
+        dialogId = id
+        if (confirmPending) { prompt.closeCustomDialog(id) }
+      }).catch(reject)
     })
   }
 
@@ -17127,9 +16951,7 @@ struct Index {
       this.viewerPendingRotationPath = ''
       this.viewerCloseRequested = false
       this.viewerReturnReadyPath = entry.path
-      this.viewerBottomBarWidthVp = 0
       this.showImageMoreMenu = false
-      this.showImageDetails = false
       this.viewerOverlayEntry = null
       this.viewerLastNavigationDirection = 1
       this.resetImageTransform()
@@ -17565,14 +17387,12 @@ struct Index {
     this.replaceViewerImages([])
     this.viewerImageIndex = 0
     this.showImageMoreMenu = false
-    this.showImageDetails = false
     this.viewerOverlayEntry = null
     this.viewerLastNavigationDirection = 1
     this.viewerProgressLastUpdateAt = {}
     this.viewerRevealTokens = {}
     this.viewerPendingBitmapReveals = {}
     this.viewerPendingRotationPath = ''
-    this.viewerBottomBarWidthVp = 0
     this.viewerTransitionActive = false
     this.imageChromeVisible = true
     this.imageChromeOpacity = 1
@@ -18019,7 +17839,7 @@ struct Index {
     return this.showImageViewer && !this.viewerClosePending &&
       index === this.viewerImageIndex && this.imageScale <= 1.001 &&
       !this.viewerTransitionActive && !this.viewerEntryTransitionActive &&
-      !this.showImageMoreMenu && !this.showImageDetails && !this.showRenameDialog &&
+      !this.showImageMoreMenu && this.continuationDialogCount === 0 && !this.showRenameDialog &&
       !this.imageAnalyzerActive
   }
 
@@ -19148,26 +18968,26 @@ struct Index {
 
   private async saveViewerImage(entry: FileEntry): Promise<void> {
     this.closeImageMoreMenu()
-    this.closeImageDetails()
     await this.saveToGallery(entry)
   }
 
   private openImageMoreMenu(): void {
-    if (!this.showImageViewer || this.isBusy) {
+    if (!this.showImageViewer || this.isBusy || this.showImageMoreMenu || this.continuationDialogCount > 0) {
       return
     }
     const entry = this.committedViewerActionEntry('more')
     if (entry === null) {
       return
     }
+    this.clearSlideItems('viewermenu')
     this.viewerOverlayEntry = entry
-    this.showImageDetails = false
     this.showImageMoreMenu = true
   }
 
   private closeImageMoreMenu(): void {
     this.showImageMoreMenu = false
     this.viewerOverlayEntry = null
+    this.clearSlideItems('viewermenu')
   }
 
   private rotateViewerOverlayImage(): void {
@@ -19192,7 +19012,6 @@ struct Index {
       return
     }
     this.showImageMoreMenu = false
-    this.showImageDetails = false
     this.viewerOverlayEntry = null
     this.openRename(entry)
   }
@@ -19342,16 +19161,14 @@ struct Index {
   }
 
   private openImageDetails(): void {
-    if (!this.showImageViewer || this.isBusy || this.viewerOverlayEntry === null) {
+    const entry = this.viewerOverlayEntry
+    if (!this.showImageViewer || this.isBusy || entry === null || this.continuationDialogCount > 0) {
       return
     }
-    this.imageDetailsEntry = this.viewerOverlayEntry
+    // Capture the menu's committed entry before closing it. Use the same native
+    // dialog as files/audio in this tick, while the popup context is still valid.
     this.closeImageMoreMenu()
-    this.showImageDetails = true
-  }
-
-  private closeImageDetails(): void {
-    this.showImageDetails = false
+    this.showEntryDetails(entry)
   }
 
   private async shareViewerImage(entry: FileEntry): Promise<void> {
@@ -19359,7 +19176,6 @@ struct Index {
       return
     }
     this.closeImageMoreMenu()
-    this.closeImageDetails()
     if (!await this.confirmMeteredDownload(entry)) {
       return
     }
@@ -19397,7 +19213,6 @@ struct Index {
     }
     const preferredDirection = this.viewerLastNavigationDirection >= 0 ? 1 : -1
     this.closeImageMoreMenu()
-    this.closeImageDetails()
     HapticFeedback.warn()
     const response = await this.showTrackedDialog({
       title: '删除图片？',
@@ -19460,17 +19275,24 @@ struct Index {
     }
   }
 
-  private async openAudioPlayer(entry: FileEntry, keepQueue: boolean = false): Promise<void> {
+  private async openAudioPlayer(entry: FileEntry, keepQueue: boolean = false,
+    continuationPosition: number = -1, continuationPlaying: boolean = true,
+    continuationValid: (() => boolean) | null = null): Promise<void> {
     if (this.isBusy || this.audioOpening || this.audioClosing || entry.isDirectory) { return }
     this.closeActionMenu()
     if (!await this.confirmMeteredDownload(entry)) { return }
     await this.ensurePlaybackState()
+    if (continuationValid !== null && !continuationValid()) { return }
     if (this.isBusy || this.audioOpening || this.audioClosing) { return }
     const token = ++this.audioOpenToken
     const scope = this.repository.sessionIdentity()
     const valid = (): boolean => token === this.audioOpenToken && !this.audioEntryCloseRequested &&
       scope === this.repository.sessionIdentity()
+    // The transport guard expires after successful restoration. Playback
+    // callbacks must retain their normal media-session lifetime afterwards.
+    const openingValid = (): boolean => valid() && (continuationValid === null || continuationValid())
     const opening = !this.showAudioPlayer
+    const animateEntry = opening && continuationPosition < 0
     this.isBusy = true
     this.audioOwnsBusy = true
     this.errorText = ''
@@ -19496,19 +19318,19 @@ struct Index {
       this.audioCoverVisibleRatio = 0
     }
     this.audioEntryCloseRequested = false
-    this.audioOpening = opening
-    this.audioTransitionCoverScale = opening ? 0.95 : 0
-    this.audioPageOpacity = opening ? 0 : 1; this.audioCoverHidden = opening
+    this.audioOpening = animateEntry
+    this.audioTransitionCoverScale = animateEntry ? 0.95 : 0
+    this.audioPageOpacity = animateEntry ? 0 : 1; this.audioCoverHidden = animateEntry
     this.audioCurrentMs = 0; this.audioDurationMs = 0; this.audioPlaying = false
     this.showAudioPlayer = true
     // Downloading/preparing the audio proceeds in parallel with the visual
     // transition. Only the optional artwork hand-off waits for the flight.
-    const entryTransition = opening ? this.animateOpenAudioPlayer(entry, token, scope) : Promise.resolve()
+    const entryTransition = animateEntry ? this.animateOpenAudioPlayer(entry, token, scope) : Promise.resolve()
     try {
       await this.audioManager.release()
       await this.audioSession.close()
       const localPath = await this.ensureCachedFile(entry)
-      if (!valid()) { return }
+      if (!openingValid()) { return }
       this.audioLocalPath = localPath
       await this.audioManager.open(localPath,
         (timeMs: number): void => {
@@ -19527,13 +19349,14 @@ struct Index {
             setTimeout((): void => { if (valid() && !this.audioClosing) { this.skipAudio(1, true) } }, 0)
           }
           this.updateAudioSession(true)
+          ContinuationManager.shared().refresh()
         },
         (error: Object): void => {
           if (!valid()) { return }
           this.audioPlaying = false; this.updateAudioSession(true)
           this.reportError(error, '音频播放错误')
-        })
-      if (!valid()) { return }
+        }, Math.max(0, continuationPosition))
+      if (!openingValid()) { return }
       await this.audioSession.open(getContext(this) as common.UIAbilityContext, entry.path,
         this.audioTitle, this.audioArtist, this.audioCover, {
           play: () => this.setAudioPlaying(true), pause: () => this.setAudioPlaying(false),
@@ -19541,23 +19364,27 @@ struct Index {
           previous: () => this.skipAudio(-1), seek: (position: number) => this.seekAudio(position),
           loopMode: (mode: AudioPlayMode): void => { this.audioMode = mode; this.updateAudioSession(true) }
         })
-      if (!valid()) { return }
+      if (!openingValid()) { return }
       this.updateAudioSession(true)
-      if (this.autoPlayOnOpen && (!this.playbackBackgroundActive || this.backgroundAudioPlayback)) {
+      const play = continuationPosition >= 0 ? continuationPlaying : this.autoPlayOnOpen
+      if (play && (!this.playbackBackgroundActive || this.backgroundAudioPlayback)) {
         await this.audioManager.play()
       }
-      if (!valid()) { return }
+      if (!openingValid()) { return }
       this.statusText = ''
       // Artwork/tags are optional and settle after playback is usable. No
       // thumbnail or metadata decoder failure is allowed to stop an audio file.
       this.prepareAudioPresentation(entry, localPath, token, scope, entryTransition)
     } catch (error) {
-      if (valid()) {
+      if (openingValid()) {
         await this.audioManager.release()
         this.finishCloseAudioPlayer(false)
         this.reportError(error as Object, '音频播放失败')
       }
     } finally {
+      if (token === this.audioOpenToken && continuationValid !== null && !continuationValid()) {
+        this.finishCloseAudioPlayer(false)
+      }
       if (token === this.audioOpenToken && this.audioOwnsBusy) {
         this.audioOwnsBusy = false
         this.isBusy = false
@@ -19665,7 +19492,6 @@ struct Index {
     }
     this.closeActionMenu()
     this.closeImageMoreMenu()
-    this.closeImageDetails()
     if (!await this.confirmMeteredDownload(entry)) {
       return
     }
@@ -19980,6 +19806,7 @@ struct Index {
       if (token === this.videoOpenToken) {
         this.isBusy = false
         this.scheduleVideoChromeHide()
+        ContinuationManager.shared().refresh()
       }
     }
   }
@@ -21763,7 +21590,12 @@ struct Index {
     if (!Number.isFinite(value) || this.audioDurationMs <= 0 || this.audioOpening || this.audioClosing || this.isBusy) { return }
     const timeMs = Math.min(this.audioDurationMs, Math.max(0, Math.floor(value)))
     this.audioCurrentMs = timeMs
-    this.audioManager.seek(timeMs)
+    const token = this.audioOpenToken
+    const seek = this.audioManager.seek(timeMs)
+    ContinuationManager.shared().refresh()
+    seek.then((): void => {
+      if (token === this.audioOpenToken) { ContinuationManager.shared().refresh() }
+    })
     this.updateAudioSession(true)
   }
 
@@ -21793,7 +21625,6 @@ struct Index {
     }
     this.closeActionMenu()
     this.closeImageMoreMenu()
-    this.closeImageDetails()
     if (!await this.confirmMeteredDownload(entry)) {
       return
     }
@@ -22385,6 +22216,13 @@ struct Index {
   private slideItems: Map<string, SlideActionItem> = new Map<string, SlideActionItem>()
   private slidePressKey: string = ''
 
+  private clearSlideItems(barId: string): void {
+    const prefix = barId + ':'
+    this.slideItems.forEach((_, key: string): void => {
+      if (key.startsWith(prefix)) { this.slideItems.delete(key) }
+    })
+  }
+
   private registerSlideItem(barId: string, key: string, area: Area, action: () => void): void {
     const position = area.globalPosition
     if (typeof position.x !== 'number' || typeof position.y !== 'number') {
@@ -22584,11 +22422,17 @@ struct Index {
     if (this.selectedPaths.length === 0) {
       return
     }
-    this.showSelectionMoreMenu = !this.showSelectionMoreMenu
+    if (this.showSelectionMoreMenu) {
+      this.closeSelectionMoreMenu()
+    } else {
+      this.clearSlideItems('selmore')
+      this.showSelectionMoreMenu = true
+    }
   }
 
   private closeSelectionMoreMenu(): void {
     this.showSelectionMoreMenu = false
+    this.clearSlideItems('selmore')
   }
 
   private exitSelectionMode(): void {

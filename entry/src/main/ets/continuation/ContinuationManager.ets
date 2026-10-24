@@ -14,8 +14,8 @@ export interface ContinuationPage {
   canReceive: () => boolean
   capture: () => ContinuationSnapshot
   sending: (active: boolean) => void
-  pauseSourceVideo: () => Promise<void>
-  resumeSourceVideo: () => Promise<void>
+  pauseSourcePlayback: () => Promise<void>
+  resumeSourcePlayback: () => Promise<void>
   restore: (snapshot: ContinuationSnapshot, valid: () => boolean) => Promise<void>
 }
 
@@ -90,9 +90,10 @@ export class ContinuationManager {
     Promise.resolve().then(() => context.setMissionContinueState(enabled ? AbilityConstant.ContinueState.ACTIVE :
       AbilityConstant.ContinueState.INACTIVE)).then((): void => {
       this.active = enabled
+      hilog.info(0, 'Continuation', 'Mission availability=%{public}s', enabled ? 'active' : 'inactive')
     }).catch((): void => {
       // Unsupported device/system settings must not interfere with normal browsing.
-      this.active = enabled
+      this.active = null
       hilog.warn(0, 'Continuation', 'Unable to update continuation availability')
     }).finally((): void => {
       this.stateUpdating = false
@@ -104,10 +105,12 @@ export class ContinuationManager {
   }
 
   async export(wantParam: Record<string, Object>): Promise<AbilityConstant.OnContinueResult> {
+    hilog.info(0, 'Continuation', 'Export requested')
     const context = this.context
     const page = this.page
     if (context === null || page === null || !page.available() || this.exporting ||
       this.incomingId !== '' || typeof wantParam.targetDevice !== 'string' || wantParam.targetDevice === '') {
+      hilog.warn(0, 'Continuation', 'Export rejected before capture')
       return AbilityConstant.OnContinueResult.REJECT
     }
     if (typeof wantParam.version !== 'number' || wantParam.version < ContinuationManager.MIN_PEER_VERSION) {
@@ -118,7 +121,7 @@ export class ContinuationManager {
     const valid = (): boolean => this.generation === token && this.page === page && this.context === context
     this.exporting = true
     page.sending(true)
-    let resumeVideo = false
+    let resumePlayback = false
     try {
       await this.clearOutgoing()
       await ContinuationSnapshotStore.prune(context)
@@ -127,9 +130,9 @@ export class ContinuationManager {
       snapshot.state.requestId = util.generateRandomUUID()
       snapshot.state.createdAt = Date.now()
       snapshot.state.count = snapshot.entries.length
-      if (snapshot.state.scene === 'video') {
-        resumeVideo = snapshot.state.playing
-        await this.bounded(page.pauseSourceVideo())
+      if (snapshot.state.scene === 'video' || snapshot.state.scene === 'audio') {
+        resumePlayback = snapshot.state.playing
+        await this.bounded(page.pauseSourcePlayback())
       }
       this.outgoingPath = context.distributedFilesDir + '/' + ContinuationSnapshotStore.fileName(snapshot.state.requestId)
       const asset = await this.bounded(ContinuationSnapshotStore.write(context, snapshot, valid))
@@ -143,16 +146,17 @@ export class ContinuationManager {
       if (!valid()) { throw new Error('接续已取消') }
       await this.bounded(object.save(wantParam.targetDevice as string))
       if (!valid()) { throw new Error('接续已取消') }
-      wantParam.linkfilesContinuationProtocol = 1
+      wantParam.linkfilesContinuationProtocol = snapshot.state.protocol
       wantParam.linkfilesContinuationRequest = snapshot.state.requestId
       wantParam.linkfilesContinuationSession = session
       wantParam[wantConstant.Params.SUPPORT_CONTINUE_SOURCE_EXIT_KEY] = false
       wantParam[wantConstant.Params.SUPPORT_CONTINUE_PAGE_STACK_KEY] = false
       this.outgoingTimer = setTimeout((): void => { void this.clearOutgoing() }, ContinuationPolicy.MAX_AGE_MS)
+      hilog.info(0, 'Continuation', 'Export prepared')
       return AbilityConstant.OnContinueResult.AGREE
     } catch (error) {
       this.reportFailure('export', error as Object)
-      if (resumeVideo && this.page === page) { page.resumeSourceVideo().catch(() => {}) }
+      if (resumePlayback && this.page === page) { page.resumeSourcePlayback().catch(() => {}) }
       await this.clearOutgoing()
       this.message('接续准备失败，请稍后重试')
       return AbilityConstant.OnContinueResult.REJECT
@@ -164,8 +168,9 @@ export class ContinuationManager {
   }
 
   receive(want: Want): void {
+    hilog.info(0, 'Continuation', 'Receive requested')
     const params = want.parameters
-    if (params?.linkfilesContinuationProtocol !== 1 ||
+    if ((params?.linkfilesContinuationProtocol !== 1 && params?.linkfilesContinuationProtocol !== 2) ||
       typeof params.linkfilesContinuationRequest !== 'string' ||
       !/^[0-9a-f-]{36}$/.test(params.linkfilesContinuationRequest) ||
       typeof params.linkfilesContinuationSession !== 'string' ||
@@ -259,7 +264,10 @@ export class ContinuationManager {
       this.incomingSnapshot === snapshot
     try {
       await page.restore(snapshot, valid)
-      if (valid()) { this.cancel() }
+      if (valid()) {
+        hilog.info(0, 'Continuation', 'Restore completed')
+        this.cancel()
+      }
     } catch (error) {
       if (valid()) {
         if (error instanceof ContinuationAccountRequired) {

@@ -1,3 +1,5 @@
+import { GlassControlGeometry as Glass } from '../ui/GlassControlGeometry'
+import { GlassMaterial } from '../ui/GlassMaterial'
 import { uiMaterial, LengthMetrics } from '@kit.ArkUI'
 import { preferences } from '@kit.ArkData'
 import { ImportLightState } from './ProximityLighting'
@@ -60,28 +62,9 @@ export struct FloatingImportControl {
 
   aboutToDisappear(): void { this.publishLight(false) }
 
-  /**
-   * Create the material for the ball on every render.
-   *
-   * A fresh instance keeps the native material state (light origin, touch
-   * coordinates) on the frame that is currently drawn.
-   *
-   * lightEffect is left off on purpose. It is the material's own "press point
-   * light" (see the immersive light sense best practice): a halo that spreads
-   * from the point that was pressed. That halo is anchored where the press
-   * started and does not travel with the node, so the moment the ball follows
-   * the finger the halo is left behind and slips off the ball - the ball has to
-   * print its own highlight for the drag instead (see TouchLight()).
-   */
-  private surfaceMaterial(): uiMaterial.ImmersiveMaterial {
-    return new uiMaterial.ImmersiveMaterial({
-      style: uiMaterial.ImmersiveStyle.THIN,
-      applyShadow: true,
-      colorInvert: true,
-      interactive: false,
-      lightEffect: null
-    })
-  }
+  // Native light is disabled for the moving ball. TouchLight paints the
+  // frozen press point in local coordinates without recreating the material.
+  private material: uiMaterial.ImmersiveMaterial = GlassMaterial.importSurface()
 
   /** True from touch down until the gesture is released. */
   private lit(): boolean {
@@ -100,8 +83,8 @@ export struct FloatingImportControl {
       this.fraction = edge === 'top' ? 0 : edge === 'bottom' ? 1 : normalized
     } catch (_) {}
   }
-  private maxX(): number { return Math.max(8, this.viewportWidth - 64) }
-  private maxY(): number { return Math.max(this.safeTop, this.viewportHeight - this.safeBottom - 56) }
+  private maxX(): number { return Math.max(8, this.viewportWidth - Glass.barHeight - Glass.importPadding) }
+  private maxY(): number { return Math.max(this.safeTop, this.viewportHeight - this.safeBottom - Glass.barHeight) }
   private circleX(): number {
     if (this.dragging) { return this.dragX }
     return this.edge === 'left' ? 8 : this.maxX()
@@ -110,9 +93,9 @@ export struct FloatingImportControl {
     if (this.dragging) { return this.dragY }
     return this.safeTop + this.fraction * (this.maxY() - this.safeTop)
   }
-  private expandedSurfaceWidth(): number { return Math.min(180, this.viewportWidth - 16) }
-  private surfaceWidth(): number { return this.expanded ? this.expandedSurfaceWidth() : 56 }
-  private surfaceHeight(): number { return this.expanded ? 208 : 56 }
+  private expandedSurfaceWidth(): number { return Math.min(Glass.importWidth, this.viewportWidth - Glass.importPadding * 2) }
+  private surfaceWidth(): number { return this.expanded ? this.expandedSurfaceWidth() : Glass.barHeight }
+  private surfaceHeight(): number { return this.expanded ? Glass.importHeight : Glass.barHeight }
   private x(): number { return Math.max(8, Math.min(this.circleX(), this.viewportWidth - this.surfaceWidth() - 8)) }
   private y(): number {
     return Math.max(this.safeTop, Math.min(this.circleY(), this.viewportHeight - this.safeBottom - this.surfaceHeight()))
@@ -147,7 +130,7 @@ export struct FloatingImportControl {
 
   /** 展开菜单里 y 落在第几项（四项等高 48vp，容器上下各 8vp 内边距）。 */
   private sourceAt(y: number): string {
-    const index = Math.floor((y - 8) / 48)
+    const index = Math.floor((y - Glass.importPadding) / Glass.importRowHeight)
     if (index < 0 || index > 3) {
       return ''
     }
@@ -188,11 +171,11 @@ export struct FloatingImportControl {
     Stack({ alignContent: Alignment.TopStart }) {
       Row() {
         SymbolGlyph($r('sys.symbol.plus'))
-          .fontSize(24)
+          .fontSize(Glass.iconSize)
           .fontColor([$r('sys.color.icon_primary')])
       }
-      .width(56)
-      .height(56)
+      .width(Glass.barHeight)
+      .height(Glass.barHeight)
       .justifyContent(FlexAlign.Center)
       .opacity(this.expanded ? 0 : 1)
 
@@ -205,16 +188,16 @@ export struct FloatingImportControl {
         this.ChoiceVisual($r('sys.symbol.folder_badge_plus'), '新建文件夹')
       }
       .width(this.expandedSurfaceWidth())
-      .height(208)
-      .padding({ top: 8, bottom: 8 })
+      .height(Glass.importHeight)
+      .padding({ top: Glass.importPadding, bottom: Glass.importPadding })
       .position({ x: 0, y: 0 })
       .opacity(this.expanded ? 1 : 0)
       .animation({ duration: this.expanded ? 120 : 70, curve: Curve.EaseOut })
     }
       .width(this.surfaceWidth()).height(this.surfaceHeight())
-      .borderRadius(this.expanded ? 24 : 28)
+      .borderRadius(this.expanded ? 24 : Glass.barHeight / 2)
       .backgroundColor(Color.Transparent)
-      .systemMaterial(this.surfaceMaterial())
+      .systemMaterial(this.material)
       .position({ x: this.x(), y: this.y() })
       .hitTestBehavior(HitTestMode.None)
   }
@@ -223,21 +206,21 @@ export struct FloatingImportControl {
   ChoiceVisual(symbol: Resource, label: string) {
     Row({ space: 12 }) {
       SymbolGlyph(symbol)
-        .fontSize(24)
+        .fontSize(Glass.iconSize)
         .fontColor([$r('sys.color.icon_primary')])
       Text(label)
         .fontSize(16)
         .fontColor($r('sys.color.font_primary'))
         .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
     }
-    .width('100%').height(48).padding({ left: 16, right: 12 })
+    .width('100%').height(Glass.importRowHeight).padding({ left: 16, right: 12 })
     .hitTestBehavior(HitTestMode.None)
   }
 
   @Builder
   ChoiceHitTarget(label: string, source: string) {
     Row()
-    .width('100%').height(48).padding({ left: 16, right: 12 })
+    .width('100%').height(Glass.importRowHeight).padding({ left: 16, right: 12 })
     .onClick(() => this.choose(source))
     .accessibilityText(label)
     .id('import-choice:' + source)
@@ -279,7 +262,7 @@ export struct FloatingImportControl {
         .position({ x: this.lightX - HALF_HALO, y: this.lightY - HALF_HALO })
     }
     .width('100%').height('100%')
-    .borderRadius(this.expanded ? 24 : 28)
+    .borderRadius(this.expanded ? 24 : Glass.barHeight / 2)
     .clip(true)
     .opacity(this.lit() ? 1 : 0)
     .animation({ duration: 140, curve: Curve.EaseOut })
@@ -289,7 +272,7 @@ export struct FloatingImportControl {
   @Builder
   CollapsedBall() {
     Row()
-    .width(56).height(56).justifyContent(FlexAlign.Center)
+    .width(Glass.barHeight).height(Glass.barHeight).justifyContent(FlexAlign.Center)
     // The drag recognizer lives on the exact 56vp ball only. Removing the
     // recognizer from the panel ancestor avoids competing with Choice clicks.
     .hitTestBehavior(this.expanded ? HitTestMode.BLOCK_DESCENDANTS : HitTestMode.Default)
@@ -364,8 +347,8 @@ export struct FloatingImportControl {
         this.ChoiceHitTarget('新建文件夹', 'folder')
       }
       .width(this.expandedSurfaceWidth())
-      .height(208)
-      .padding({ top: 8, bottom: 8 })
+      .height(Glass.importHeight)
+      .padding({ top: Glass.importPadding, bottom: Glass.importPadding })
       .position({ x: 0, y: 0 })
       .opacity(this.expanded ? 1 : 0)
       .animation({ duration: this.expanded ? 120 : 70, curve: Curve.EaseOut })
@@ -409,7 +392,7 @@ export struct FloatingImportControl {
     }
     .backgroundColor(Color.Transparent)
     .width(this.surfaceWidth()).height(this.surfaceHeight())
-    .borderRadius(this.expanded ? 24 : 28)
+    .borderRadius(this.expanded ? 24 : Glass.barHeight / 2)
     .hitTestBehavior(HitTestMode.Default)
     .position({ x: this.x(), y: this.y() })
     .onAreaChange((_, area: Area) => {

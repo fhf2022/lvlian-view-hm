@@ -1,3 +1,5 @@
+import { GlassControlGeometry as Glass } from '../ui/GlassControlGeometry'
+import { GlassMaterial } from '../ui/GlassMaterial'
 import { uiMaterial } from '@kit.ArkUI'
 import {
   DirectoryTimeline,
@@ -23,17 +25,12 @@ class TimelineMarker {
 export struct FisheyeTimeline {
   @Prop timeline: DirectoryTimeline = new DirectoryTimeline()
   @Link focusTime: number
-  @Prop widthVp: number = 68
-  @Prop railWidthVp: number = 42
-  @Prop heightVp: number = 520
+  @Prop widthVp: number = Glass.timelineWidth
+  @Prop railWidthVp: number = Glass.timelineRailWidth
+  @Prop heightVp: number = Glass.timelineMaxHeight
   /** Space owned by the TabBar renderer for native press deformation and shadow. */
-  @Prop verticalEffectInsetVp: number = 16
-  @Prop material: uiMaterial.ImmersiveMaterial = new uiMaterial.ImmersiveMaterial({
-    style: uiMaterial.ImmersiveStyle.THIN,
-    colorInvert: true,
-    applyShadow: false,
-    interactive: true
-  })
+  @Prop verticalEffectInsetVp: number = Glass.timelineEffectInset
+  @Prop material: uiMaterial.ImmersiveMaterial = GlassMaterial.timeline()
   onScrubStart: () => void = () => {}
   onScrub: (time: number) => void = () => {}
   onScrubEnd: (time: number) => void = () => {}
@@ -45,8 +42,8 @@ export struct FisheyeTimeline {
   private touchStartY: number = 0
   private touchStartFocus: number = 0
   private readonly moveThresholdVp: number = 5
-  private readonly focusBubbleWidthVp: number = 58
-  private readonly focusBubbleHeightVp: number = 30
+  private readonly focusBubbleWidthVp: number = Glass.timelineBubbleWidth
+  private readonly focusBubbleHeightVp: number = Glass.timelineBubbleHeight
 
   private clampFocus(value: number): number {
     const earliest = DirectoryTimelinePolicy.localDayStart(this.timeline.earliestTime)

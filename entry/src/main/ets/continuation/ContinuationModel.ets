@@ -1,7 +1,7 @@
 import { FileEntry } from '../model/FileEntry'
 import { DirectorySortKey } from '../model/DirectoryTimeline'
 
-export type ContinuationScene = 'directory' | 'image' | 'video'
+export type ContinuationScene = 'directory' | 'image' | 'audio' | 'video'
 export type ContinuationView = 'list' | 'grid' | 'waterfall'
 
 /** Versioned business state. Never contains credentials, media URLs or local cache paths. */
@@ -76,12 +76,13 @@ export class ContinuationPolicy {
   }
 
   static validate(state: ContinuationState): void {
-    if (state === null || typeof state !== 'object' || state.protocol !== 1 ||
+    if (state === null || typeof state !== 'object' || ![1, 2].includes(state.protocol) ||
       typeof state.requestId !== 'string' || !/^[0-9a-f-]{36}$/.test(state.requestId) ||
       !ContinuationPolicy.integer(state.createdAt) || Math.abs(Date.now() - state.createdAt) > ContinuationPolicy.MAX_AGE_MS ||
       !ContinuationPolicy.text(state.nasId, 512) || state.nasId.length === 0 ||
       !ContinuationPolicy.text(state.userId, 512) || state.userId.length === 0 ||
-      !['directory', 'image', 'video'].includes(state.scene) ||
+      !['directory', 'image', 'audio', 'video'].includes(state.scene) ||
+      (state.scene === 'audio' && state.protocol < 2) ||
       !['personal', 'shared'].includes(state.rootKind) || !ContinuationPolicy.path(state.path, true) ||
       ![2, 3, 4].includes(state.rootType) || !['list', 'grid', 'waterfall'].includes(state.view) ||
       !['name', 'type', 'time', 'size'].includes(state.sort) || typeof state.ascending !== 'boolean' ||

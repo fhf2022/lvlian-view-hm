@@ -1,3 +1,4 @@
+import { GlassControlGeometry as Glass } from '../ui/GlassControlGeometry'
 import { ImportLightState, ProximityLighting } from './ProximityLighting'
 
 /** Decorative overlay; each receiver draws only its own light-facing outline. */
@@ -30,9 +31,9 @@ export struct ProximityLightReceiver {
     light.addColorStop(1, 'rgba(235,250,255,0)')
     this.context.beginPath()
     if (this.mode === 'fileTools') {
-      const sidePadding = 16
+      const sidePadding = Glass.toolsInset
       const circleSize = this.heightVp
-      const sortWidth = 140
+      const sortWidth = Glass.sortWidth
       const gap = Math.max(0,
         (this.widthVp - sidePadding * 2 - circleSize * 2 - sortWidth) / 2)
       const sortX = sidePadding + circleSize + gap

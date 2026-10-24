@@ -21,9 +21,10 @@ export class AudioPlaybackManager {
   private cancelInitialization: (() => void) | null = null
   private pendingSeek: number = -1
   private seekTimer: number = -1
+  private seekResolve: ((completed: boolean) => void) | null = null
 
   async open(path: string, onTime: AudioTimeListener, onDuration: AudioDurationListener,
-    onState: AudioStateListener, onError: AudioErrorListener): Promise<void> {
+    onState: AudioStateListener, onError: AudioErrorListener, positionMs: number = 0): Promise<void> {
     const token = this.operation + 1
     await this.release()
     if (token !== this.operation) { return }
@@ -66,7 +67,7 @@ export class AudioPlaybackManager {
       if (this.player !== player || token !== this.operation || this.pendingSeek < 0) { return }
       // A rapid second seek may precede the first seekDone event.
       if (Math.abs(timeMs - this.pendingSeek) > 1500) { return }
-      this.clearSeek()
+      this.clearSeek(true)
       this.timeListener?.(timeMs)
     })
     player.on('durationUpdate', (durationMs: number) => {
@@ -107,6 +108,12 @@ export class AudioPlaybackManager {
       })
       if (this.player !== player || token !== this.operation) { return }
       await player.prepare()
+      if (this.player !== player || token !== this.operation) { return }
+      if (positionMs > 0 && positionMs < player.duration) {
+        const completed = await this.seek(positionMs)
+        if (this.player !== player || token !== this.operation) { return }
+        if (!completed) { throw new Error('无法恢复音频播放进度') }
+      }
     } catch (error) {
       if (this.player === player) { await this.release() }
       throw error as Error
@@ -148,24 +155,36 @@ export class AudioPlaybackManager {
     }
   }
 
-  seek(timeMs: number): void {
+  isSeeking(): boolean { return this.pendingSeek >= 0 }
+
+  isReady(): boolean {
+    const player = this.player
+    return player !== null && (player.state === 'prepared' || player.state === 'playing' ||
+      player.state === 'paused' || player.state === 'completed')
+  }
+
+  async seek(timeMs: number): Promise<boolean> {
     if (this.player === null) {
-      return
+      return false
     }
     if (this.player.state === 'prepared' || this.player.state === 'playing' ||
       this.player.state === 'paused' || this.player.state === 'completed') {
-      if (!Number.isFinite(timeMs)) { return }
+      if (!Number.isFinite(timeMs)) { return false }
       const target = Math.min(this.player.duration, Math.max(0, Math.floor(timeMs)))
       this.clearSeek()
-      this.pendingSeek = target
       const player = this.player
-      this.seekTimer = setTimeout((): void => {
-        if (this.player !== player) { return }
-        this.clearSeek()
-        this.timeListener?.(Math.max(0, player.currentTime))
-      }, 2000)
-      try { player.seek(target) } catch (_) { this.clearSeek() }
+      return new Promise<boolean>((resolve: (completed: boolean) => void): void => {
+        this.pendingSeek = target
+        this.seekResolve = resolve
+        this.seekTimer = setTimeout((): void => {
+          if (this.player !== player) { return }
+          this.clearSeek()
+          this.timeListener?.(Math.max(0, player.currentTime))
+        }, 2000)
+        try { player.seek(target) } catch (_) { this.clearSeek() }
+      })
     }
+    return false
   }
 
   async release(): Promise<void> {
@@ -199,8 +218,11 @@ export class AudioPlaybackManager {
     }
   }
 
-  private clearSeek(): void {
+  private clearSeek(completed: boolean = false): void {
     if (this.seekTimer >= 0) { clearTimeout(this.seekTimer); this.seekTimer = -1 }
     this.pendingSeek = -1
+    const resolve = this.seekResolve
+    this.seekResolve = null
+    resolve?.(completed)
   }
 }
