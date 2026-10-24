@@ -1,4 +1,5 @@
 import { FileEntry } from '../model/FileEntry'
+import { FileGridLayout } from '../ui/FileGridLayout'
 
 export class FileGridCellEvents {
   click: (entry: FileEntry) => void = (_entry: FileEntry): void => {}
@@ -52,7 +53,7 @@ export struct FileGridCell {
         }
       }
       .width('100%')
-      .padding(1)
+      .padding(FileGridLayout.cellPadding)
       if (this.events.isVideo(this.entry)) {
         this.videoIndicator()
       }

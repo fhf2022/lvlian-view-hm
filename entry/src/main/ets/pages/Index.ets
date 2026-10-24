@@ -27,6 +27,7 @@ import { GlassMenuSurface } from '../components/GlassMenuSurface'
 import { GlassMenuRow } from '../components/GlassMenuRow'
 import { EntryDetailsContent } from '../components/EntryDetailsContent'
 import { FileRowStyle } from '../ui/FileRowStyle'
+import { FileGridLayout } from '../ui/FileGridLayout'
 import { FileGridCell, FileGridCellEvents } from '../components/FileGridCell'
 import { TaskPanel, TaskPanelFooter, TaskPanelSection } from '../components/TaskPanel'
 import { TaskPanelStyle } from '../ui/TaskPanelStyle'
@@ -5117,18 +5118,8 @@ struct Index {
     .hitTestBehavior(HitTestMode.None)
   }
 
-  /**
-   * 网格列数按可用宽度算：目标格子约 94vp（和系统相册一个量级）。
-   * 手机 376vp -> 4 列；平板会自动变多，窄屏也不会挤出半格。
-   */
   private fileGridColumnCount(): number {
-    const width = this.pageWidthVp
-    if (!(width > 0)) {
-      return 2
-    }
-    // 目标格子宽 80–140vp（文件的网格：要放下文件名与勾选角标；图片网格同一档，
-    // 保持两者列数一致）。手机 376vp -> 4 列（与以前一致），平板竖屏 -> 上限 10 列。
-    return Math.max(2, Math.min(10, Math.floor(width / 80)))
+    return FileGridLayout.columns(this.pageWidthVp, this.pageHeightVp)
   }
 
   /** 瀑布流列数：目标列宽 240vp（区间 240–360vp）。列宽直接决定图片高度，所以比网格大一档。 */
@@ -5269,8 +5260,8 @@ struct Index {
     }
     .id('main-grid')
     .columnsTemplate(this.fileGridColumns())
-    .columnsGap(1)
-    .rowsGap(1)
+    .columnsGap(FileGridLayout.gap)
+    .rowsGap(FileGridLayout.gap)
     // 每侧缓存的条目数 = cachedCount × 列数。官方 grid.d.ts 原文：
     // "The number of the grid items to be cached before and after the currently displayed
     //  one equals the value of cachedCount multiplied by the number of columns."
@@ -5572,7 +5563,7 @@ struct Index {
                 }
               }
               .width('100%')
-              .padding(1)
+              .padding(FileGridLayout.cellPadding)
             }
             // 与真实网格（GridFileList）保持完全一样的顶部留白。缺了它，转场快照会
             // 整体偏高约一个内容顶距，动画看起来就是"内容先往上跳一下再打开"。
@@ -5582,8 +5573,8 @@ struct Index {
         // 与真实网格（GridFileList 的 .columnsGap(1)/.rowsGap(1)）保持一致。
         // 之前这里是 2，每个格子差 1vp、四列累积后整体几何不同，转场会挪一下 ✗
         .columnsTemplate(this.fileGridColumns())
-        .columnsGap(1)
-        .rowsGap(1)
+        .columnsGap(FileGridLayout.gap)
+        .rowsGap(FileGridLayout.gap)
         .width('100%')
         .layoutWeight(1)
         .contentEndOffset(this.floatingBarContentInset())
