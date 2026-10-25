@@ -93,26 +93,7 @@ export class ViewerBitmapStore {
       const physicalWidth = Math.max(1, Math.floor(info.size.width))
       const physicalHeight = Math.max(1, Math.floor(info.size.height))
       const exifValue = await this.readExif(source)
-      const transform = this.transformFor(exifValue)
-      const swapsAxes = transform.rotation === 90 || transform.rotation === 270
-      const normalizedUserRotation = ImageTransformPolicy.normalizedRotation(userRotation)
-      const exifDisplayWidth = swapsAxes ? physicalHeight : physicalWidth
-      const exifDisplayHeight = swapsAxes ? physicalWidth : physicalHeight
-      const userSwapsAxes = ImageTransformPolicy.swapsAxes(normalizedUserRotation)
-      return {
-        physicalWidth: physicalWidth,
-        physicalHeight: physicalHeight,
-        exifDisplayWidth: exifDisplayWidth,
-        exifDisplayHeight: exifDisplayHeight,
-        displayWidth: userSwapsAxes ? exifDisplayHeight : exifDisplayWidth,
-        displayHeight: userSwapsAxes ? exifDisplayWidth : exifDisplayHeight,
-        exifValue: exifValue,
-        exifRotation: transform.rotation,
-        mirrorHorizontal: transform.mirrorHorizontal,
-        mirrorVertical: transform.mirrorVertical,
-        userRotation: normalizedUserRotation,
-        transformKey: this.transformKey(path, exifValue, normalizedUserRotation)
-      }
+      return this.metadataForInfo(path, physicalWidth, physicalHeight, exifValue, userRotation)
     } catch (error) {
       console.warn('[UgreenBitmap] metadata failed: ' + path + ': ' + JSON.stringify(error))
       return null
@@ -129,6 +110,30 @@ export class ViewerBitmapStore {
         } catch (_) {
         }
       }
+    }
+  }
+
+  metadataForInfo(path: string, physicalWidth: number, physicalHeight: number,
+    exifValue: string, userRotation: number = 0): ViewerBitmapMetadata {
+    const transform = this.transformFor(exifValue)
+    const swapsAxes = transform.rotation === 90 || transform.rotation === 270
+    const normalizedUserRotation = ImageTransformPolicy.normalizedRotation(userRotation)
+    const exifDisplayWidth = swapsAxes ? physicalHeight : physicalWidth
+    const exifDisplayHeight = swapsAxes ? physicalWidth : physicalHeight
+    const userSwapsAxes = ImageTransformPolicy.swapsAxes(normalizedUserRotation)
+    return {
+      physicalWidth: physicalWidth,
+      physicalHeight: physicalHeight,
+      exifDisplayWidth: exifDisplayWidth,
+      exifDisplayHeight: exifDisplayHeight,
+      displayWidth: userSwapsAxes ? exifDisplayHeight : exifDisplayWidth,
+      displayHeight: userSwapsAxes ? exifDisplayWidth : exifDisplayHeight,
+      exifValue: exifValue,
+      exifRotation: transform.rotation,
+      mirrorHorizontal: transform.mirrorHorizontal,
+      mirrorVertical: transform.mirrorVertical,
+      userRotation: normalizedUserRotation,
+      transformKey: this.transformKey(path, exifValue, normalizedUserRotation)
     }
   }
 

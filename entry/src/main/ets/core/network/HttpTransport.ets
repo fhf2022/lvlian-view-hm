@@ -337,6 +337,9 @@ export class HttpTransport {
     let replacementUsed = false
     let replacementCommitted = false
     let targetOpened = false
+    let headerAccepted = false
+    let earlyBody = false
+    let stagedAppend = false
 
     const openStreamFile = (append: boolean, replacement: boolean = false): void => {
       if (fileFd >= 0) {
@@ -357,12 +360,12 @@ export class HttpTransport {
     const headersCallback = (raw: Object): void => {
       try {
         responseHeaders = this.toHeaders(raw)
-        const status = this.headerStatus(responseHeaders)
+        const status = responseCode > 0 ? responseCode : this.headerStatus(responseHeaders)
         if (status > 0 && status < 200) { return }
         if ((status === 0 || (status >= 300 && status < 400)) &&
           this.headerValue(responseHeaders, 'location').length > 0) { return }
-        // headersReceive precedes dataReceive. Reject a gateway error before
-        // opening/TRUNCating an existing partial file or writing its HTML body.
+        // Validate before touching an existing partial file. Some NEXT builds
+        // deliver data before final headers (especially across redirects).
         // Some NEXT runtimes omit status-line from this event although the
         // completed response still supplies its code. Do not require it.
         if (status > 0) { this.checkResponse(url, attempt, status) }
@@ -386,6 +389,8 @@ export class HttpTransport {
         // separate file. Commit by rename only after its final status is valid;
         // a gateway page cannot truncate the existing resumable prefix.
         openStreamFile(append, resumeOffset > 0 && !append)
+        if (earlyBody) { appendMode = append; stagedAppend = append }
+        headerAccepted = true
         if (headerResolve !== null) {
           headerResolve()
         }
@@ -413,9 +418,12 @@ export class HttpTransport {
           return
         }
         if (fileFd < 0) {
-          throw new UgreenError(UgreenErrorKind.NETWORK, '下载响应尚未准备好', 0)
+          // Stream early bytes to disk, never an unbounded JS buffer and never
+          // the old prefix. Commit only after final status/range validation.
+          earlyBody = true
+          openStreamFile(false, true)
         }
-        StorageBudget.admit(activePath, (appendMode ? resumeOffset : 0) + receivedSize + chunk.byteLength)
+        StorageBudget.admit(activePath, (appendMode && !earlyBody ? resumeOffset : 0) + receivedSize + chunk.byteLength)
         let written = 0
         while (written < chunk.byteLength) {
           const count = fileIo.writeSync(fileFd, chunk.slice(written))
@@ -469,6 +477,7 @@ export class HttpTransport {
         usingCache: false
       })
       this.checkResponse(url, attempt, responseCode)
+      if (!headerAccepted && !paused) { headersCallback(responseHeaders) }
       await headerReady
 
       const append = this.shouldAppendResponse(responseCode, resumeOffset, responseHeaders)
@@ -494,7 +503,46 @@ export class HttpTransport {
       if (replacementUsed) {
         fileIo.closeSync(fileFd)
         fileFd = -1
-        fileIo.renameSync(replacementPath, targetPath)
+        if (stagedAppend) {
+          if (totalSize > 0 && finalReceived !== totalSize) {
+            throw new UgreenError(UgreenErrorKind.NETWORK, '文件下载不完整', 0)
+          }
+          // Rare reordered-header resume: append the validated suffix with a
+          // fixed-size async copy. Normal streams keep the direct-write path.
+          let sourceFd = -1
+          let targetFd = -1
+          try {
+            if (fileIo.statSync(targetPath).size !== resumeOffset) {
+              throw new UgreenError(UgreenErrorKind.NETWORK, '续传文件已变化', 206)
+            }
+            sourceFd = fileIo.openSync(replacementPath, fileIo.OpenMode.READ_ONLY).fd
+            targetFd = fileIo.openSync(targetPath, fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.APPEND).fd
+            const buffer = new ArrayBuffer(64 * 1024)
+            let copied = 0
+            while (copied < receivedSize) {
+              if (cancellation?.isCancelled() || (shouldContinue !== undefined && !shouldContinue())) {
+                throw new UgreenError(UgreenErrorKind.NETWORK, '下载已取消', 499)
+              }
+              const count = await fileIo.read(sourceFd, buffer)
+              if (count <= 0) { throw new Error('读取临时文件失败') }
+              StorageBudget.admit(targetPath, resumeOffset + copied + count)
+              let written = 0
+              while (written < count) {
+                const bytes = await fileIo.write(targetFd, buffer.slice(written, count))
+                if (bytes <= 0) { throw new Error('写入文件失败') }
+                written += bytes
+              }
+              copied += count
+            }
+          } catch (error) {
+            streamError = error as Object
+            throw error as Error
+          } finally {
+            if (sourceFd >= 0) { fileIo.closeSync(sourceFd) }
+            if (targetFd >= 0) { fileIo.closeSync(targetFd) }
+          }
+          fileIo.unlinkSync(replacementPath)
+        } else { fileIo.renameSync(replacementPath, targetPath) }
         replacementCommitted = true
         StorageBudget.sync(targetPath)
       }

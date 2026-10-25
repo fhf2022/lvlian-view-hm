@@ -77,11 +77,13 @@ import { UgreenError, UgreenErrorKind, readableUgreenError } from '../ugreen/Ugr
 import { FileEntryDataSource, THUMB_PROBE } from '../model/FileEntryDataSource'
 import { PreviewLoadQueue } from '../media/PreviewLoadQueue'
 import { WaterfallOriginalLoader } from '../media/WaterfallOriginalLoader'
+import { WaterfallBatchChange, WaterfallBatchCoordinator } from '../media/WaterfallBatchCoordinator'
+import { WaterfallEdgePull } from '../media/WaterfallEdgePull'
 import { ImagePipelineTelemetry } from '../media/ImagePipelineTelemetry'
 import { ReturnPerfSession } from '../media/ReturnPerfSession'
 import { ThumbnailPolicy, ThumbnailSize } from '../media/ThumbnailPolicy'
 import { ThumbnailCacheStore } from '../media/ThumbnailCacheStore'
-import { ViewerBitmapRecord, ViewerBitmapStore } from '../media/ViewerBitmapStore'
+import { ViewerBitmapMetadata, ViewerBitmapRecord, ViewerBitmapStore } from '../media/ViewerBitmapStore'
 import { ViewerPrefetchCoordinator } from '../media/ViewerPrefetchCoordinator'
 import { DownloadCancellation } from '../core/network/DownloadCancellation'
 import { NetworkClass, NetworkPolicy } from '../core/network/NetworkPolicy'
@@ -439,12 +441,11 @@ class WaterfallThumbBridge {
 class WaterfallImageState {
   available: boolean = false
   aspectReady: boolean = false
+  failed: boolean = false
   source: image.PixelMap | string = ''
   orientation: ImageRotateOrientation = ImageRotateOrientation.UP
   transitionId: string = ''
   syncLoad: boolean = false
-  sourceWidth: number = 0
-  sourceHeight: number = 0
 }
 
 /**
@@ -471,7 +472,6 @@ struct WaterfallThumbCell {
           Image(this.st().source)
             .width('100%')
             .height('100%')
-            .sourceSize({ width: this.st().sourceWidth, height: this.st().sourceHeight })
             .orientation(this.st().orientation)
             .objectFit(ImageFit.Contain)
             .geometryTransition(this.st().transitionId)
@@ -502,7 +502,9 @@ struct WaterfallThumbCell {
             })
         }
       }
-      if (!this.st().available || !this.st().aspectReady) {
+      if (this.st().failed) {
+        Text('!').fontSize(22).fontColor('#888888')
+      } else if (!this.st().available || !this.st().aspectReady) {
         LoadingProgress()
           .width(24)
           .height(24)
@@ -1222,6 +1224,9 @@ struct Index {
   private thumbDiagWindowStartAt: number = 0
   @State waterfallAspectEpoch: number = 0
   @State waterfallColumnWidthVp: number = 0
+  @State waterfallBatchEpoch: number = 0
+  @State waterfallBlockedEdge: number = 0
+  @State waterfallPullOffset: number = 0
   @State directoryCounts: Record<string, number> = {}
   // 进目录的等待提示是否该显示（按目录项数判断，见 armDirectoryOpeningHint）
   @State directoryOpeningHintVisible: boolean = false
@@ -1428,6 +1433,7 @@ struct Index {
   private imageRotationStore: ImageRotationStore = new ImageRotationStore()
   private fileListPersistedDisplayState: ImageDisplayState = new ImageDisplayState()
   private fileListRotationReady: boolean = false
+  private fileListRotationPreparation: Promise<void> | null = null
   private imageAnalyzerController: visionImageAnalyzer.VisionImageAnalyzerController =
     new visionImageAnalyzer.VisionImageAnalyzerController()
   // Keep the already rendered parent pages so system/back navigation does not
@@ -1642,8 +1648,20 @@ struct Index {
   private waterfallGeneration: number = 0
   private waterfallEntries: FileEntry[] = []
   private waterfallOriginalLoader: WaterfallOriginalLoader | null = null
+  private waterfallBatches: WaterfallBatchCoordinator | null = null
+  private waterfallEdgePull: WaterfallEdgePull = new WaterfallEdgePull()
+  private waterfallLayoutCount: number = 0
+  private waterfallColumnTails: Map<number, number[]> = new Map<number, number[]>()
+  private waterfallLayoutDirty: boolean = false
+  private waterfallLayoutWidth: number = 0
+  private waterfallPublishedFirst: number = 0
+  private waterfallLayoutHeight: number = 0
+  private waterfallJumpToken: number = 0
+  private waterfallGroupTops: Map<number, number> = new Map<number, number>()
+  private waterfallGroupBottoms: Map<number, number> = new Map<number, number>()
+  private waterfallRasterFailed: Record<string, boolean> = {}
+  private imageOriginalRequests: Map<string, Promise<string>> = new Map<string, Promise<string>>()
   private waterfallDecodeQueue: FileEntry[] = []
-  private waterfallGeometryQueue: PreviewLoadQueue = new PreviewLoadQueue(2, 32)
   private waterfallLocalPaths: Record<string, string> = {}
   private waterfallLocalSignatures: Record<string, string> = {}
   private waterfallActiveDecodePaths: Record<string, number> = {}
@@ -2189,22 +2207,53 @@ struct Index {
         if (!valid()) { return '' }
         const cached = CacheManager.findExisting(this.cacheDirectory, entry.name, this.originalCacheKey(entry))
         if (cached.length > 0) { return cached }
-        if (!this.shouldAutoLoadViewerOriginal()) { return '' }
-        return await this.ensureCachedFile(entry, undefined,
-          (): boolean => valid() && this.shouldAutoLoadViewerOriginal(), cancellation)
+        if (!this.shouldAutoLoadViewerOriginal()) { throw new Error('Original network restricted') }
+        return await this.waterfallNetworkRequest(valid, (): Promise<string> =>
+          this.loadSharedImageOriginal(entry, undefined,
+            (): boolean => valid() && this.shouldAutoLoadViewerOriginal(), cancellation))
       },
       ready: async (entry: FileEntry, path: string, valid: () => boolean): Promise<void> => {
         if (!valid()) { return }
         this.waterfallLocalPaths[entry.path] = path
         this.waterfallLocalSignatures[entry.path] = this.waterfallEntrySignature(entry)
-        if (this.fileContentScrolling || this.timelineScrubActive || this.showImageViewer) { return }
-        const geometry = await this.readViewerImageGeometry(path, entry.path)
-        if (!valid() || this.fileContentScrolling || this.timelineScrubActive || this.showImageViewer) { return }
-        if (geometry !== null) {
-          this.setWaterfallAspectRatio(entry, geometry.displayWidth, geometry.displayHeight)
-        }
         this.enqueueWaterfallDecode(entry)
+      },
+      finished: (entry: FileEntry, success: boolean, error?: Object): void => {
+        if (!success && error instanceof Error) {
+          console.warn('[WaterfallBatch] original failed message=' + error.message.replace(/https?:\/\/\S+/g, '[url]') +
+            (error instanceof UgreenError ? ' kind=' + error.kind + ' status=' + error.status + ' api=' + error.apiCode : ''))
+        }
+        this.waterfallBatches?.originalFinished(entry, success)
       }
+    })
+    this.waterfallBatches = new WaterfallBatchCoordinator({
+      geometry: (entry: FileEntry, valid: () => boolean): Promise<ViewerBitmapMetadata | null> =>
+        this.waterfallNetworkRequest(valid, (): Promise<ViewerBitmapMetadata | null> =>
+          this.prepareWaterfallGeometry(entry, valid)).catch((error: Error): never => {
+          console.warn('[WaterfallBatch] geometry failed name=' + error.name + ' message=' +
+            error.message.replace(/https?:\/\/\S+/g, '[url]') + ' network=' + this.networkClass +
+            ' metered=' + this.networkPolicy.isMetered() + ' auto=' + this.meteredAutoOriginal +
+            ' offline=' + this.offlineCacheMode)
+          throw error
+        }),
+      layout: (entry: FileEntry, info: ViewerBitmapMetadata | null): void => this.applyWaterfallLayout(entry, info),
+      thumbnail: async (entry: FileEntry, valid: () => boolean): Promise<void> => {
+        await this.ensureCacheState()
+        if (!valid()) { return }
+        const generation = this.previewGeneration
+        const path = await this.repository.prepareThumbnail(entry, this.thumbnailDirectory,
+          this.thumbnailCacheLimitBytes, 'list')
+        if (valid() && generation === this.previewGeneration && path.length > 0) {
+          await this.publishThumbnailPreview(entry, path, false, generation)
+        }
+      },
+      publish: (change: WaterfallBatchChange): void => this.publishWaterfallBatch(change),
+      originals: (entries: FileEntry[], retry: boolean): void => {
+        if (retry) { this.waterfallOriginalLoader?.retryFailed() }
+        this.waterfallOriginalLoader?.update(entries, this.networkPolicy.isMetered() ? 1 : 2)
+      },
+      evict: (entries: FileEntry[]): void => this.evictWaterfallResources(entries),
+      changed: (): void => { this.waterfallBatchEpoch++ }
     })
     this.viewerPrefetchCoordinator = new ViewerPrefetchCoordinator({
       isViewerActive: (): boolean => this.showImageViewer && !this.viewerClosePending,
@@ -2218,9 +2267,13 @@ struct Index {
       },
       downloadOriginalFile: async (entry: FileEntry, onProgress: BinaryProgressListener,
         shouldContinue: () => boolean, cancellation: DownloadCancellation): Promise<string> => {
-        await this.waterfallOriginalLoader?.settle(entry)
-        if (!shouldContinue()) { return '' }
-        return await this.ensureCachedFile(entry, onProgress, shouldContinue, cancellation)
+        const groupPath = this.waterfallLocalPaths[entry.path]
+        if (typeof groupPath === 'string' && groupPath.length > 0 && !CacheManager.exists(groupPath)) {
+          this.waterfallOriginalLoader?.invalidate(entry)
+        }
+        const member = this.waterfallOriginalLoader?.requestMember(entry)
+        if (member !== null && member !== undefined) { return await member }
+        return await this.loadSharedImageOriginal(entry, onProgress, shouldContinue, cancellation)
       },
       onOriginalFileReady: async (entry: FileEntry, _localPath: string): Promise<void> => {
         await this.primeViewerOriginalFrame(entry)
@@ -3395,7 +3448,7 @@ struct Index {
         if (index < 0) {
           return true
         }
-        const rect = this.waterfallScroller.getItemRect(index)
+        const rect = this.waterfallScroller.getItemRect(this.waterfallLocalIndex(index))
         return rect !== undefined && typeof rect.y === 'number' &&
           Math.abs(rect.y - state.anchor.y) <= 1
       }
@@ -5496,7 +5549,6 @@ struct Index {
       Image(this.fileImageSource(entry, 'waterfall'))
         .width('100%')
         .height('100%')
-        .sourceSize(this.waterfallSourceSize(entry))
         .orientation(this.fileImageSourceOrientation(entry, 'waterfall'))
         .objectFit(ImageFit.Contain)
         .geometryTransition(this.fileImageTransitionId(entry, 'waterfall'))
@@ -5538,17 +5590,16 @@ struct Index {
 
   @Builder
   WaterfallFileList(): void {
+    Stack({ alignContent: this.waterfallBlockedEdge < 0 ? Alignment.Top : Alignment.Bottom }) {
     WaterFlow({
       scroller: this.waterfallScroller,
-      // WaterFlow has no contentEndOffset; its scrollable footer uses the
-      // same inset as List/Grid without changing the FlowItem indexes.
-      footer: () => { this.FileContentEndSpace() },
+      footer: () => { this.WaterfallEndSpace() },
       layoutMode: WaterFlowLayoutMode.SLIDING_WINDOW
     }) {
       LazyForEach(this.waterfallDataSource, (entry: FileEntry, index: number) => {
         FlowItem() {
           Stack({ alignContent: Alignment.TopEnd }) {
-            if (this.shouldReplaceViewerTransitionSource(entry)) {
+            if (this.shouldReplaceViewerTransitionSource(entry) || !this.waterfallResourceResident(entry)) {
               Blank()
                 .width('100%')
                 .height('100%')
@@ -5557,11 +5608,11 @@ struct Index {
                 if (EXPERIMENT_R2_WATERFALL_CELL) {
                   // R2 推广：图片 + LoadingProgress 整块交给独立子组件，
                   // 依赖 entry.previewRevision（@ObjectLink）做单条精准刷新。
-                  WaterfallThumbCell({ entry: entry, bridge: this.waterfallThumbBridge, index: index })
+                  WaterfallThumbCell({ entry: entry, bridge: this.waterfallThumbBridge, index: this.waterfallEntryIndex(entry) })
                 } else {
                   Stack({ alignContent: Alignment.Center }) {
                     if (this.fileImageSourceAvailable(entry, 'waterfall')) {
-                      this.WaterfallPreviewImage(entry, index)
+                      this.WaterfallPreviewImage(entry, this.waterfallEntryIndex(entry))
                     }
                     if (!this.fileImageSourceAvailable(entry, 'waterfall') ||
                       !this.waterfallAspectRatioReady(entry)) {
@@ -5590,19 +5641,19 @@ struct Index {
           .backgroundColor('#12000000')
           .borderRadius(10)
           .onAreaChange((_, area) => {
-            this.recordThumbnailArea(entry, index, 'waterfall', area)
-            this.recordRowHitArea(entry, index, 'waterfall', area)
+            this.recordThumbnailArea(entry, this.waterfallEntryIndex(entry), 'waterfall', area)
+            this.recordRowHitArea(entry, this.waterfallEntryIndex(entry), 'waterfall', area)
           })
           .onVisibleAreaChange([0.0, 0.999],
             (_isExpanding: boolean, ratio: number): void =>
-              this.recordThumbnailVisibility(entry, index, 'waterfall', ratio))
+              this.recordThumbnailVisibility(entry, this.waterfallEntryIndex(entry), 'waterfall', ratio))
           .onClick(() => this.handleFileEntryClick(entry))
           .priorityGesture(
             GestureGroup(GestureMode.Sequence,
               LongPressGesture({ repeat: false, duration: 380 })
                 .onAction((event: GestureEvent): void => {
                   if (this.selectionMode) {
-                    this.beginDragSelection(entry, index)
+                    this.beginDragSelection(entry, this.waterfallEntryIndex(entry))
                   } else {
                     this.showActionMenu(entry, event)
                   }
@@ -5618,33 +5669,32 @@ struct Index {
             ).onCancel((): void => this.cancelDragSelectionGesture())
           )
         }
-        // WaterFlow does not use the top padding here as the scroll-content
-        // origin on this device. Put the breathing room on the first row's
-        // FlowItems instead; later rows remain unchanged and can still scroll
-        // naturally under the common TopFileOverlay, just like list/grid.
+        .id('waterfall-item-' + this.waterfallEntryIndex(entry).toString())
         .margin({ top: index < this.waterfallColumnCount() ? this.fileContentTopInset() : 0 })
         .onAppear(() => {
           this.resolveFileListImageRotation(entry)
           this.markWaterfallVisible(entry, true)
-          this.recordThumbnailMountedSource(entry, this.thumbnailSurfaceUri(entry, 'waterfall'), index,
+          this.recordThumbnailMountedSource(entry, this.thumbnailSurfaceUri(entry, 'waterfall'), this.waterfallEntryIndex(entry),
             'waterfall')
-          this.loadEntryPreview(entry, this.previewPriority(index, 'waterfall'))
-          this.enqueueWaterfallPreviewGeometry(entry, index)
-          this.enqueueWaterfallOriginal(entry, index)
+
+          this.enqueueWaterfallOriginal(entry, this.waterfallEntryIndex(entry))
         })
         .onDisAppear(() => {
           this.forgetRowHitArea(entry, 'waterfall')
           this.markWaterfallVisible(entry, false)
-          this.recordThumbnailVisibility(entry, index, 'waterfall', 0)
+          this.recordThumbnailVisibility(entry, this.waterfallEntryIndex(entry), 'waterfall', 0)
         })
       }, (entry: FileEntry) => entry.path)
     }
+    .id('main-waterfall')
     .columnsTemplate(this.waterfallColumnsTemplate())
     .columnsGap(8)
     .rowsGap(8)
-    // Only visible FlowItems are mounted; three load groups own disk prefetch.
+    // Only visible FlowItems are mounted; the bounded groups own disk prefetch.
     .cachedCount(0)
     .onScrollIndex((first: number, last: number): void => {
+      first = this.waterfallAbsoluteIndex(first)
+      last = this.waterfallAbsoluteIndex(last)
       this.waterfallVisibleStartIndex = Math.max(0, first)
       this.waterfallVisibleEndIndex = Math.max(this.waterfallVisibleStartIndex, last)
       this.updateTimelineFocusFromVisible(first, 'waterfall')
@@ -5653,25 +5703,37 @@ struct Index {
     .onScrollStart((): void => this.onFileContentScrollStart())
     .onScrollStop((): void => this.onFileContentScrollStop())
     .onDidScroll((): void => this.onDragSelectionContentScrolled())
-    .onReachEnd(() => this.loadNextDirectoryPage())
+    .onWillScroll((offset: number, _state: ScrollState, source: ScrollSource): ScrollResult =>
+      this.gateWaterfallScroll(offset, source))
+    .onTouch((event: TouchEvent): void => this.handleWaterfallTouch(event))
     .onAreaChange((_, area) => {
       this.recordFileScrollViewport('waterfall', area)
+      this.ensureWaterfallStarted()
       if (typeof area.width === 'number' && area.width > 0) {
         const columns = this.waterfallColumnCount()
         // 20 = 左右内边距，8 = 列间距；(columns - 1) 个间距
         this.waterfallColumnWidthVp =
           Math.max(1, (area.width - 20 - (columns - 1) * 8) / columns)
+        if (Math.abs(this.waterfallLayoutWidth - area.width) > 0.5) {
+          this.waterfallLayoutWidth = area.width
+          this.updateWaterfallLayout(true)
+        }
       }
     })
     .width('100%')
     .height('100%')
     .layoutWeight(1)
-    .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
+    // Resource edges may be in the middle of native content after eviction.
+    // One bounded visual rebound works identically at native/virtual edges.
+    .edgeEffect(EdgeEffect.None)
+    .translate({ y: this.waterfallPullOffset })
     // Match list/grid content origin: this is layout breathing room, not a
     // second mask. The existing TopFileOverlay remains the only top visual
     // gradient, while the first waterfall row starts below it instead of
     // being covered by the gradient.
     .padding({ left: 10, right: 10, top: 0, bottom: 0 })
+    this.WaterfallWaitingIndicator()
+    }.width('100%').height('100%').layoutWeight(1)
   }
 
   @Builder
@@ -8942,9 +9004,6 @@ struct Index {
     // reserved for the selected viewer image and its shared-element handoff;
     // doing it here for every visible row was the main source of scroll jank.
     this.setPreviewUri(entry, fileUri.getUriFromPath(localPath), localPath, canonical)
-    if (this.fileViewMode === 'waterfall' && this.waterfallVisiblePaths[entry.path] === true) {
-      this.enqueueWaterfallPreviewGeometry(entry, this.waterfallVisibleStartIndex)
-    }
   }
 
   /**
@@ -9307,8 +9366,8 @@ struct Index {
         this.waterfallDataSource.notifyItemChanged(wfIdx)
         // R2W：瀑布流子组件已由 @ObjectLink 局部刷新，这里不能再写 @State 数组。
         if (!EXPERIMENT_R2_WATERFALL_CELL &&
-          wfIdx < this.waterfallEntries.length && this.waterfallEntries[wfIdx].path === path) {
-          this.waterfallEntries[wfIdx] = this.waterfallDataSource.getData(wfIdx)
+          this.waterfallAbsoluteIndex(wfIdx) < this.waterfallEntries.length && this.waterfallEntries[this.waterfallAbsoluteIndex(wfIdx)].path === path) {
+          this.waterfallEntries[this.waterfallAbsoluteIndex(wfIdx)] = this.waterfallDataSource.getData(wfIdx)
         }
       }
     }
@@ -12461,7 +12520,7 @@ struct Index {
     const entry = items[anchorIndex]
     let y = 0
     try {
-      const rect = scroller.getItemRect(anchorIndex + childIndexOffset)
+      const rect = scroller.getItemRect(this.fileViewMode === 'waterfall' ? this.waterfallLocalIndex(anchorIndex) : anchorIndex + childIndexOffset)
       if (rect !== undefined && typeof rect.y === 'number') {
         y = rect.y
       }
@@ -12490,6 +12549,14 @@ struct Index {
     if (targetIndex < 0) {
       return
     }
+    if (this.fileViewMode === 'waterfall' && this.waterfallLocalIndex(targetIndex) < 0) {
+      this.ensureWaterfallIndex(targetIndex).then((): void => {
+        if (token === this.waterfallAnchorRestoreToken && this.waterfallLocalIndex(targetIndex) >= 0) {
+          this.restoreFileViewAnchor(anchor, token, attempt, maxAttempts)
+        }
+      })
+      return
+    }
     // WaterFlow with SLIDING_WINDOW may not have completed its first layout
     // pass when the mode state changes. Retry the same indexed jump for a
     // short bounded window; without this, the early scrollToIndex is ignored
@@ -12497,13 +12564,13 @@ struct Index {
     const isWaterfall = this.fileViewMode === 'waterfall'
     const maxRestoreAttempts = isWaterfall ? maxAttempts : 0
     try {
-      scroller.scrollToIndex(targetIndex + childIndexOffset, false, ScrollAlign.START, {
+      scroller.scrollToIndex(isWaterfall ? this.waterfallLocalIndex(targetIndex) : targetIndex + childIndexOffset, false, ScrollAlign.START, {
         extraOffset: LengthMetrics.vp(Math.max(-120, Math.min(160, anchor.y)))
       })
     } catch (error) {
       console.warn('[UgreenFileView] anchor restore failed: ' + JSON.stringify(error))
       try {
-        scroller.scrollToIndex(targetIndex + childIndexOffset, false, ScrollAlign.START)
+        scroller.scrollToIndex(isWaterfall ? this.waterfallLocalIndex(targetIndex) : targetIndex + childIndexOffset, false, ScrollAlign.START)
       } catch (_) {
         // The target container may not have completed its first layout pass.
       }
@@ -12517,22 +12584,393 @@ struct Index {
     this.waterfallAnchor = null
   }
 
+  /** One physical writer per original, shared by group preparation and Viewer. */
+  private async loadSharedImageOriginal(entry: FileEntry, progress?: BinaryProgressListener,
+    valid?: () => boolean, cancellation?: DownloadCancellation): Promise<string> {
+    const key = this.originalCacheKey(entry)
+    const existing = this.imageOriginalRequests.get(key)
+    if (existing !== undefined) {
+      try { return await existing } catch (error) {
+        if (valid !== undefined && !valid()) { throw new Error('Original cancelled') }
+        // The previous writer has closed its partial file in finally.
+        if (this.imageOriginalRequests.get(key) === existing) { this.imageOriginalRequests.delete(key) }
+        return await this.loadSharedImageOriginal(entry, progress, valid, cancellation)
+      }
+    }
+    if (valid !== undefined && !valid()) { return '' }
+    const request = this.ensureCachedFile(entry, progress, valid, cancellation)
+    this.imageOriginalRequests.set(key, request)
+    try { return await request } finally {
+      if (this.imageOriginalRequests.get(key) === request) { this.imageOriginalRequests.delete(key) }
+    }
+  }
+
+  /** One replay for a transient read failure, inside the same physical worker.
+   * No per-cell retry queue/timer; offline, permissions, cancellation and a
+   * changed remote file keep their existing handling. */
+  private async waterfallNetworkRequest<T>(valid: () => boolean, request: () => Promise<T>): Promise<T> {
+    try { return await request() } catch (error) {
+      const transient = error instanceof UgreenError &&
+        (error.kind === UgreenErrorKind.NAS_UNAVAILABLE ||
+          (error.kind === UgreenErrorKind.NETWORK && [0, 408, 425, 429, 500, 502, 503, 504].indexOf(error.status) >= 0))
+      if (!valid() || !transient) { throw error as Error }
+      if (error instanceof UgreenError && error.kind === UgreenErrorKind.NAS_UNAVAILABLE &&
+        !await NasConnection.shared().retryNow()) { throw error }
+      await new Promise<void>((resolve): void => { setTimeout(resolve, 250) })
+      if (!valid()) { throw new Error('Waterfall cancelled') }
+      return await request()
+    }
+  }
+
+  private ensureWaterfallStarted(): void {
+    if (this.fileViewMode !== 'waterfall' || this.waterfallBatches === null ||
+      this.waterfallEntries.length === 0 || this.waterfallBatches.first >= 0 ||
+      this.waterfallBatches.preparing >= 0 || this.waterfallBatches.error) { return }
+    const anchor = this.waterfallAnchor?.path ?? this.targetLocateEntryPath
+    const index = this.waterfallEntries.findIndex((entry: FileEntry): boolean => entry.path === anchor)
+    this.waterfallBatches.reset(this.waterfallEntries, Math.max(0, index))
+  }
+
+  private waterfallLocalIndex(index: number): number {
+    // Retained placeholders preserve layout, but are not a prepared return
+    // source. Locate/return must first restore that group's resources.
+    return this.waterfallBatches?.resident(index) === true ? this.waterfallBatches.localIndex(index) : -1
+  }
+  private waterfallAbsoluteIndex(index: number): number { return this.waterfallBatches?.absoluteIndex(index) ?? index }
+
+  private waterfallEntryIndex(entry: FileEntry): number {
+    const local = this.waterfallDataSource.indexOfPath(entry.path)
+    return local >= 0 ? this.waterfallAbsoluteIndex(local) : -1
+  }
+
+  private waterfallResourceResident(entry: FileEntry): boolean {
+    const revision = this.waterfallBatchEpoch
+    return revision >= 0 && this.waterfallDataSource.indexOfPath(entry.path) >= 0 &&
+      this.waterfallBatches?.resident(this.waterfallAbsoluteIndex(this.waterfallDataSource.indexOfPath(entry.path))) === true
+  }
+
+  private async ensureWaterfallIndex(index: number): Promise<void> {
+    this.cancelWaterfallPull()
+    this.ensureWaterfallStarted()
+    await this.waterfallBatches?.ensure(index)
+  }
+
+  private async jumpWaterfallTo(index: number, align: ScrollAlign): Promise<void> {
+    const token = ++this.waterfallJumpToken
+    await this.ensureWaterfallIndex(index)
+    if (token !== this.waterfallJumpToken || this.fileViewMode !== 'waterfall') { return }
+    await this.nextRenderFrame()
+    const local = this.waterfallLocalIndex(index)
+    if (local >= 0) { this.waterfallScroller.scrollToIndex(local, false, align) }
+  }
+
+  private async prepareWaterfallGeometry(entry: FileEntry,
+    valid: () => boolean): Promise<ViewerBitmapMetadata | null> {
+    await this.fileListRotationPreparation
+    await this.ensureCacheState()
+    if (!valid()) { throw new Error('Waterfall cancelled') }
+    this.resolveFileListImageRotation(entry)
+    let path = CacheManager.findExisting(this.cacheDirectory, entry.name, this.originalCacheKey(entry))
+    let geometry: ViewerBitmapMetadata | null = null
+    if (path.length === 0) {
+      if (!this.shouldAutoLoadViewerOriginal()) { throw new Error('Original network restricted') }
+      const info = await this.repository.originalImageInfo(entry, valid)
+      if (!valid()) { throw new Error('Waterfall cancelled') }
+      if (info !== null) {
+        geometry = this.viewerBitmapStore.metadataForInfo(entry.path, info.width, info.height,
+          info.orientation.toString(), this.imageVisualState(entry.path).userRotation)
+      } else {
+        if (!this.shouldAutoLoadViewerOriginal()) { throw new Error('Original network restricted') }
+        path = await this.loadSharedImageOriginal(entry, undefined, valid)
+      }
+    }
+    if (path.length > 0) {
+      geometry = await this.viewerBitmapStore.readMetadata(path, this.imageVisualState(entry.path).userRotation)
+      if (valid()) {
+        this.waterfallLocalPaths[entry.path] = path
+        this.waterfallLocalSignatures[entry.path] = this.waterfallEntrySignature(entry)
+      }
+    }
+    if (!valid()) { throw new Error('Waterfall cancelled') }
+    return geometry
+  }
+
+  private applyWaterfallLayout(entry: FileEntry, geometry: ViewerBitmapMetadata | null): void {
+    if (geometry === null) { this.waterfallRasterFailed[entry.path] = true; return }
+    this.resolveFileListImageRotation(entry)
+    const current = this.viewerBitmapStore.metadataForInfo(entry.path, geometry.physicalWidth,
+      geometry.physicalHeight, geometry.exifValue, this.imageVisualState(entry.path).userRotation)
+    this.updateImageVisualState(entry.path, (state: ImageVisualState): void => {
+      state.physicalWidth = current.physicalWidth; state.physicalHeight = current.physicalHeight
+      state.exifDisplayWidth = current.exifDisplayWidth; state.exifDisplayHeight = current.exifDisplayHeight
+      state.displayWidth = current.displayWidth; state.displayHeight = current.displayHeight
+      state.frameWidth = current.displayWidth; state.frameHeight = current.displayHeight
+      state.frameLocked = true
+    }, false)
+    this.setWaterfallAspectRatio(entry, current.displayWidth, current.displayHeight)
+  }
+
+  private publishWaterfallBatch(change: WaterfallBatchChange): void {
+    const batches = this.waterfallBatches
+    if (batches === null || this.fileViewMode !== 'waterfall') { return }
+    let anchor: FileViewAnchor | null = null
+    if (change === 'prepend') {
+      const index = this.waterfallVisibleStartIndex
+      const entry = this.waterfallEntries[index]
+      if (entry !== undefined) {
+        try {
+          const rect = this.waterfallScroller.getItemRect(index - this.waterfallPublishedFirst * WaterfallBatchCoordinator.SIZE)
+          if (rect !== undefined) { anchor = { path: entry.path, y: rect.y } }
+        } catch (_) {}
+      }
+    }
+    const entries = batches.published()
+    const previousCount = this.waterfallDataSource.totalCount()
+    const oldFirst = this.waterfallPublishedFirst
+    this.waterfallPublishedFirst = batches.first
+    this.updateWaterfallLayout(change === 'initial' || change === 'prepend')
+    if (change === 'initial') { this.waterfallDataSource.replace(entries) }
+    else if (change === 'prepend') {
+      this.waterfallDataSource.prepend(entries.slice(0, (oldFirst - batches.first) * WaterfallBatchCoordinator.SIZE))
+    } else if (entries.length > previousCount) { this.waterfallDataSource.append(entries.slice(previousCount)) }
+    // Only the bounded resident groups can own pixels. Refresh a restored group,
+    // not all previously visited placeholders in a large directory.
+    for (const group of batches.residentGroups()) {
+      const start = group * WaterfallBatchCoordinator.SIZE
+      for (let index = start; index < Math.min(start + WaterfallBatchCoordinator.SIZE, this.waterfallEntries.length); index++) {
+        if (batches.resident(index)) { this.notifyEntryChanged(this.waterfallEntries[index].path, 'waterfall') }
+      }
+    }
+    this.cancelWaterfallPull()
+    this.waterfallBlockedEdge = 0; this.waterfallBatchEpoch++
+    if (anchor !== null) {
+      const anchorPath = anchor.path
+      const index = entries.findIndex((entry: FileEntry): boolean => entry.path === anchorPath)
+      if (index >= 0) {
+        this.waterfallScroller.scrollToIndex(index, false, ScrollAlign.START, { extraOffset: LengthMetrics.vp(anchor.y) })
+      }
+    }
+    console.info('[WaterfallBatch] publish=' + change + ' groups=' + batches.first + '..' + batches.last +
+      ' catalog=' + this.waterfallEntries.length + ' resident=' + batches.residentFirst() + '..' + batches.residentLast() + ' items=' + entries.length)
+  }
+
+  /** One continuous masonry surface. Only bytes/pixels are grouped; every
+   * admitted item's frozen ratio remains in the native flow after eviction. */
+  private updateWaterfallLayout(rebuild: boolean = false): void {
+    const batches = this.waterfallBatches
+    if (batches === null || batches.first < 0) { return }
+    const entries = batches.published()
+    const columns = this.waterfallColumnCount()
+    const width = Math.max(1, ((this.waterfallLayoutWidth || this.effectivePageWidth()) - 20 - (columns - 1) * 8) / columns)
+    const changedFrom = rebuild ? 0 : Math.floor(this.waterfallLayoutCount / WaterfallBatchCoordinator.SIZE)
+    const firstGroup = batches.first + changedFrom
+    let tails = this.waterfallColumnTails.get(firstGroup - 1)?.slice() ??
+      new Array<number>(columns).fill(this.fileContentTopInset())
+    if (rebuild) {
+      this.waterfallGroupTops.clear(); this.waterfallGroupBottoms.clear(); this.waterfallColumnTails.clear()
+      tails = new Array<number>(columns).fill(this.fileContentTopInset())
+    }
+    for (let index = changedFrom * WaterfallBatchCoordinator.SIZE; index < entries.length; index++) {
+      const group = batches.first + Math.floor(index / WaterfallBatchCoordinator.SIZE)
+      if (index % WaterfallBatchCoordinator.SIZE === 0) { this.waterfallGroupTops.set(group, Math.min(...tails)) }
+      let lane = 0
+      for (let column = 1; column < columns; column++) { if (tails[column] < tails[lane]) { lane = column } }
+      tails[lane] += width / this.waterfallAspectRatio(entries[index]) + 8
+      if ((index + 1) % WaterfallBatchCoordinator.SIZE === 0 || index === entries.length - 1) {
+        this.waterfallGroupBottoms.set(group, Math.max(...tails))
+        this.waterfallColumnTails.set(group, tails.slice())
+      }
+    }
+    this.waterfallLayoutCount = entries.length
+    this.waterfallLayoutHeight = Math.max(...tails)
+  }
+
+  private evictWaterfallResources(entries: FileEntry[]): void {
+    const paths = new Set<string>(entries.map((entry: FileEntry): string => entry.path))
+    this.waterfallDecodeQueue = this.waterfallDecodeQueue.filter((entry: FileEntry): boolean => !paths.has(entry.path))
+    for (const entry of entries) {
+      const path = entry.path
+      this.waterfallOriginalLoader?.invalidate(entry)
+      const bitmap = this.waterfallBitmaps[path]
+      if (bitmap !== undefined && this.viewerPreviewBitmapAliases[path] === true && this.viewerPreviewBitmaps[path] === bitmap) {
+        this.viewerPreviewBitmapAliases[path] = false
+        this.removeViewerBitmap(this.waterfallBitmaps, path)
+      } else { this.releaseViewerBitmap(this.waterfallBitmaps, path).catch((): void => {}) }
+      this.waterfallOriginalUris[path] = ''; this.waterfallDecodedPaths[path] = false
+      this.notifyEntryChanged(path, 'waterfall')
+    }
+    this.waterfallBatchEpoch++
+  }
+
+  private waterfallFooterHeight(): number {
+    const epoch = this.waterfallBatchEpoch
+    const normal = this.floatingBarContentInset()
+    if (epoch < 0 || this.waterfallBatches === null || !this.waterfallBatches.hasNext() ||
+      this.waterfallBatches.residentLast() - this.waterfallBatches.residentFirst() <
+        WaterfallBatchCoordinator.MAX_RESIDENT_GROUPS - 1) { return normal }
+    // Short/wide panoramas must still allow the oldest group to leave the
+    // viewport before another group needs a resource slot.
+    const firstBottom = this.waterfallGroupBottoms.get(this.waterfallBatches.residentFirst()) ?? 0
+    return Math.max(normal, this.fileScrollViewport.height + firstBottom - this.waterfallLayoutHeight + 1)
+  }
+
+  @Builder
+  WaterfallEndSpace(): void {
+    Row().width('100%').height(this.waterfallFooterHeight()).hitTestBehavior(HitTestMode.None)
+  }
+
+  @Builder
+  WaterfallLoadingStatus(): void {
+    if (this.waterfallBatchEpoch >= 0 && this.waterfallBatches?.error) {
+      Text('点击重试').fontSize(14).fontColor('#888888').padding(16)
+        .onClick((): void => this.waterfallBatches?.retry())
+    } else if (this.waterfallPullOffset !== 0 && !this.waterfallBatches?.waiting()) {
+      Progress({ value: Math.min(100, Math.abs(this.waterfallPullOffset) * 200 / WaterfallEdgePull.THRESHOLD),
+        total: 100, type: ProgressType.Ring }).width(28).height(28).color('#2E6BFF').margin(12)
+    } else {
+      LoadingProgress().width(28).height(28).color('#2E6BFF').margin(12)
+    }
+  }
+
+  @Builder
+  WaterfallWaitingIndicator(): void {
+    Column() {
+      if (this.waterfallWaitingVisible()) {
+        this.WaterfallLoadingStatus()
+      }
+    }.width('100%').height(52).margin({ top: this.fileContentTopInset(), bottom: this.floatingBarContentInset() })
+      .hitTestBehavior(HitTestMode.Transparent)
+  }
+
+  private waterfallWaitingVisible(): boolean {
+    const epoch = this.waterfallBatchEpoch
+    const batches = this.waterfallBatches
+    if (epoch < 0 || batches === null) { return false }
+    if (this.waterfallDataSource.totalCount() === 0) { return true }
+    if (this.waterfallPullOffset !== 0 && this.waterfallBlockedEdge !== 0) { return true }
+    if (this.waterfallBlockedEdge > 0 && this.loadingNextPage) { return true }
+    if (!batches.waiting() && !batches.error) { return false }
+    return this.waterfallBlockedEdge !== 0 ||
+      this.waterfallVisibleEndIndex >= batches.residentLast() * WaterfallBatchCoordinator.SIZE
+  }
+
+  private canPullWaterfallEdge(edge: number): boolean {
+    const batches = this.waterfallBatches
+    return batches !== null && batches.first >= 0 && (edge < 0 ? batches.residentFirst() > 0 :
+      (batches.residentLast() + 1) * WaterfallBatchCoordinator.SIZE < this.waterfallEntries.length ||
+        this.currentPageHasMore || batches.error)
+  }
+
+  private handleWaterfallTouch(event: TouchEvent): void {
+    if (event.type === TouchType.Cancel || event.touches.length > 1 || this.showImageViewer ||
+      this.dragSelectionActive || this.screen !== 'files' || this.fileViewMode !== 'waterfall') {
+      this.cancelWaterfallPull(); return
+    }
+    const point = event.changedTouches[0] ?? event.touches[0]
+    if (event.type === TouchType.Down && point !== undefined) {
+      this.cancelWaterfallPull()
+      this.waterfallEdgePull.begin(point.id, point.windowX, point.windowY)
+    } else if (event.type === TouchType.Move && point !== undefined) {
+      // Native onWillScroll may report zero at its own content edge. Contact
+      // comes from the actual offset; distance always comes from the finger.
+      const direction = this.waterfallEdgePull.fingerDirection(point.windowY)
+      if (direction !== 0) {
+        const boundary = this.waterfallBoundaryOffset(direction)
+        const offset = this.waterfallScroller.currentOffset().yOffset
+        // The native footer omits the final masonry row gap; its actual end
+        // can be slightly before our conservative virtual resource boundary.
+        if (direction * (offset - boundary) >= -1 || (direction > 0 && this.waterfallScroller.isAtEnd())) {
+          this.waterfallEdgePull.contact(direction)
+          this.waterfallBlockedEdge = this.canPullWaterfallEdge(direction) ? direction : 0
+        }
+      }
+      this.waterfallEdgePull.move(point.id, point.windowX, point.windowY)
+      this.waterfallPullOffset = this.waterfallEdgePull.offset()
+    } else if (event.type === TouchType.Up) {
+      const edge = this.waterfallEdgePull.release()
+      if (this.waterfallPullOffset !== 0) {
+        this.getUIContext().animateTo({ duration: 220, curve: Curve.EaseOut }, (): void => { this.waterfallPullOffset = 0 })
+      }
+      if (edge !== 0 && this.canPullWaterfallEdge(edge)) { this.requestWaterfallEdge(edge) }
+    }
+  }
+
+  private cancelWaterfallPull(): void {
+    this.waterfallEdgePull.cancel()
+    this.waterfallPullOffset = 0
+  }
+
+  private async requestWaterfallEdge(edge: number): Promise<void> {
+    const batches = this.waterfallBatches
+    if (batches === null) { return }
+    this.waterfallBlockedEdge = edge
+    console.info('[WaterfallBatch] release=' + edge + ' resident=' + batches.residentFirst() + '..' + batches.residentLast())
+    if (edge > 0 && (batches.residentLast() + 1) * WaterfallBatchCoordinator.SIZE >= this.waterfallEntries.length &&
+      this.currentPageHasMore) {
+      const generation = this.waterfallGeneration
+      await this.loadNextDirectoryPage()
+      if (generation !== this.waterfallGeneration || this.fileViewMode !== 'waterfall') { return }
+    }
+    batches.edge(edge)
+    if (batches.error) { batches.retry() }
+    this.waterfallBatchEpoch++
+  }
+
+  private gateWaterfallScroll(delta: number, source: ScrollSource): ScrollResult {
+    const batches = this.waterfallBatches
+    if (batches === null || batches.first < 0) {
+      return { offsetRemain: delta }
+    }
+    const min = this.waterfallBoundaryOffset(-1)
+    const max = this.waterfallBoundaryOffset(1)
+    const offset = this.waterfallScroller.currentOffset().yOffset
+    // Keep the first visible line inside a resident group. Empty footer space
+    // is intentional: a short group can leave the viewport and free a slot.
+    let allowed = delta >= 0 ? Math.max(0, Math.min(delta, max - offset)) : Math.min(0, Math.max(delta, min - offset))
+    const edge = delta < 0 && offset + delta < min ? -1 : (delta > 0 && offset + delta > max ? 1 : 0)
+    // Consume inward finger travel in the rebound before scrolling content.
+    if (source === ScrollSource.DRAG && this.waterfallEdgePull.holding()) { allowed = 0 }
+    const canWait = this.canPullWaterfallEdge(edge)
+    if (edge !== 0 && canWait && this.waterfallBlockedEdge !== edge) { this.waterfallBlockedEdge = edge }
+    else if (edge === 0 && offset > min + 16 && offset < max - 16 && this.waterfallBlockedEdge !== 0) {
+      this.waterfallBlockedEdge = 0
+    }
+    return { offsetRemain: allowed }
+  }
+
+  private waterfallBoundaryOffset(edge: number): number {
+    const batches = this.waterfallBatches
+    if (batches === null || batches.first < 0) { return 0 }
+    const min = Math.max(0, (this.waterfallGroupTops.get(batches.residentFirst()) ?? 0) - this.fileContentTopInset())
+    if (edge < 0) { return min }
+    const firstBottom = this.waterfallGroupBottoms.get(batches.residentFirst()) ?? 0
+    const lastBottom = this.waterfallGroupBottoms.get(batches.residentLast()) ?? 0
+    const naturalMax = lastBottom + this.floatingBarContentInset() - this.fileScrollViewport.height
+    const releaseMax = batches.residentLast() - batches.residentFirst() >= WaterfallBatchCoordinator.MAX_RESIDENT_GROUPS - 1
+      ? firstBottom - this.fileContentTopInset() : naturalMax
+    return Math.max(min, naturalMax, releaseMax)
+  }
+
+
   private prepareWaterfallPipeline(): void {
-    this.waterfallGeneration += 1
-    this.waterfallOriginalLoader?.reset()
-    this.waterfallGeometryQueue.cancelPending()
-    this.waterfallDecodeQueue = []
-    this.waterfallDecodedPaths = {}
-    this.waterfallOriginalUris = {}
-    this.waterfallVisiblePaths = {}
-    this.waterfallSourceEpoch += 1
+    this.stopWaterfallPipeline()
+    this.postRenderFrame((): void => this.ensureWaterfallStarted())
   }
 
   private stopWaterfallPipeline(): void {
     // Abort HTTP immediately, retaining occupied slots until physical cleanup.
     this.waterfallGeneration += 1
     this.waterfallOriginalLoader?.reset()
-    this.waterfallGeometryQueue.cancelPending()
+    this.waterfallBatches?.reset()
+    this.waterfallLayoutCount = 0
+    this.waterfallColumnTails.clear()
+    this.waterfallDataSource.replace([])
+    this.waterfallGroupTops.clear(); this.waterfallGroupBottoms.clear()
+    this.waterfallLayoutHeight = 0
+    this.waterfallRasterFailed = {}
+    this.cancelWaterfallPull()
+    this.waterfallBlockedEdge = 0
+    this.waterfallJumpToken++
     this.waterfallDecodeQueue = []
     this.waterfallDecodedPaths = {}
     this.waterfallOriginalUris = {}
@@ -12723,18 +13161,17 @@ struct Index {
    */
   private resolveWaterfallImageStateInto(entry: FileEntry,
     state: WaterfallImageState): WaterfallImageState {
-    const source = this.fileImageSource(entry, 'waterfall')
+    const source = this.waterfallResourceResident(entry) ? this.fileImageSource(entry, 'waterfall') : ''
     const available = typeof source === 'string' ? source.length > 0 : true
     const aspectReady = this.waterfallAspectRatioReady(entry)
     state.available = available
+    state.failed = this.waterfallRasterFailed[entry.path] === true
     state.aspectReady = aspectReady
     if (!available) {
       state.source = ''
       state.orientation = ImageRotateOrientation.UP
       state.transitionId = ''
       state.syncLoad = false
-      state.sourceWidth = 0
-      state.sourceHeight = 0
       this.waterfallRenderedPreviewKey[entry.path] = ''
       return state
     }
@@ -12743,15 +13180,6 @@ struct Index {
       ? this.fileListImageBaseOrientation(entry) : ImageRotateOrientation.UP
     state.transitionId = this.fileImageTransitionId(entry, 'waterfall')
     state.syncLoad = this.fileImageShouldSyncLoad(entry)
-    if (aspectReady) {
-      const size = this.waterfallSourceSize(entry)
-      state.sourceWidth = size.width
-      state.sourceHeight = size.height
-    } else {
-      // 宽高比未就绪时不传 sourceSize（等 Image Kit 的真实几何）。
-      state.sourceWidth = 0
-      state.sourceHeight = 0
-    }
     this.waterfallRenderedPreviewKey[entry.path] = this.previewUri(entry)
     return state
   }
@@ -12832,6 +13260,8 @@ struct Index {
     if (entry.path.length === 0 || width <= 0 || height <= 0) {
       return
     }
+    const previous = this.waterfallAspectRatios[entry.path]
+    if (previous > 0 && Math.abs(previous - width / height) > 0.00001) { this.waterfallLayoutDirty = true }
     this.waterfallAspectRatios[entry.path] = width / height
     this.waterfallAspectSignatures[entry.path] = this.waterfallEntrySignature(entry,
       rotationOverride)
@@ -12855,111 +13285,37 @@ struct Index {
     this.waterfallAspectNotifyTimer = setTimeout((): void => {
       this.waterfallAspectNotifyTimer = 0
       this.waterfallAspectEpoch += 1
+      if (this.waterfallLayoutDirty) {
+        this.waterfallLayoutDirty = false
+        this.updateWaterfallLayout(true)
+      }
     }, 16)
   }
 
-  private enqueueWaterfallPreviewGeometry(entry: FileEntry, index: number = 0): void {
-    if (this.fileViewMode !== 'waterfall' || !this.isImage(entry) ||
-      !this.fileListRotationReady || this.waterfallAspectRatioReady(entry) ||
-      this.timelineScrubActive || this.fileContentScrolling ||
-      this.waterfallVisiblePaths[entry.path] !== true) {
-      return
-    }
-    const generation = this.waterfallGeneration
-    const queueKey = entry.path + '#waterfall-geometry:' + generation.toString()
-    this.waterfallGeometryQueue.enqueue(queueKey, this.previewPriority(index, 'waterfall'),
-      async (): Promise<void> => {
-        await this.loadWaterfallPreviewGeometry(entry, generation)
-      })
-  }
 
-  private async loadWaterfallPreviewGeometry(entry: FileEntry,
-    generation: number): Promise<void> {
-    await this.ensureCacheState()
-    if (generation !== this.waterfallGeneration || this.fileViewMode !== 'waterfall' ||
-      this.fileContentScrolling || this.timelineScrubActive ||
-      this.waterfallVisiblePaths[entry.path] !== true || this.waterfallAspectRatioReady(entry)) {
-      return
-    }
 
-    // Match the viewer's frame policy. An already cached original is
-    // authoritative; otherwise the persistent thumbnail supplies the same
-    // EXIF- and user-rotation-aware provisional geometry used on viewer entry.
-    let localPath = CacheManager.findExisting(this.cacheDirectory, entry.name,
-      this.originalCacheKey(entry))
-    let canonicalPreview = false
-    let usesPreview = false
-    if (localPath.length === 0) {
-      localPath = this.previewLocalPaths[entry.path]
-      canonicalPreview = this.previewCanonicalPaths[entry.path] === true
-      usesPreview = true
-      if (typeof localPath !== 'string' || localPath.length === 0 ||
-        this.previewLocalSignatures[entry.path] !== this.previewSignature(entry) ||
-        !CacheManager.exists(localPath)) {
-        localPath = this.repository.cachedThumbnailFast(entry, 'list')
-        canonicalPreview = false
-        if (localPath.length > 0 && CacheManager.exists(localPath)) {
-          this.previewLocalPaths[entry.path] = localPath
-          this.previewLocalSignatures[entry.path] = this.previewSignature(entry)
-          this.previewCanonicalPaths[entry.path] = false
-        }
-      }
-    }
-    if (typeof localPath !== 'string' || localPath.length === 0 || !CacheManager.exists(localPath)) {
-      return
-    }
 
-    const rotation = this.imageVisualState(entry.path).userRotation
-    const geometry = await this.readViewerImageGeometry(localPath, entry.path)
-    if (geometry === null || generation !== this.waterfallGeneration ||
-      this.fileViewMode !== 'waterfall' || this.fileContentScrolling ||
-      this.timelineScrubActive || this.waterfallVisiblePaths[entry.path] !== true ||
-      this.imageVisualState(entry.path).userRotation !== rotation) {
-      return
-    }
-    this.updateImageVisualState(entry.path, (state: ImageVisualState): void => {
-      state.physicalWidth = geometry.physicalWidth
-      state.physicalHeight = geometry.physicalHeight
-      state.exifDisplayWidth = geometry.exifDisplayWidth
-      state.exifDisplayHeight = geometry.exifDisplayHeight
-      state.displayWidth = geometry.displayWidth
-      state.displayHeight = geometry.displayHeight
-      state.thumbnailDisplayWidth = geometry.displayWidth
-      state.thumbnailDisplayHeight = geometry.displayHeight
-      if (!state.frameLocked) {
-        state.frameWidth = geometry.displayWidth
-        state.frameHeight = geometry.displayHeight
-      }
-      if (usesPreview) {
-        state.thumbnailOrientation = canonicalPreview
-          ? ImageRotateOrientation.UP : ImageRotateOrientation.AUTO
-      }
-    })
-    this.setWaterfallAspectRatio(entry, geometry.displayWidth, geometry.displayHeight)
-  }
 
   private enqueueWaterfallOriginal(entry: FileEntry, _index: number = 0,
     _priority: boolean = true): void {
-    const localPath = this.waterfallLocalPaths[entry.path]
-    if (typeof localPath === 'string' && localPath.length > 0 &&
-      this.waterfallLocalSignatures[entry.path] === this.waterfallEntrySignature(entry) &&
-      CacheManager.exists(localPath)) {
-      this.enqueueWaterfallDecode(entry)
-    } else if (typeof localPath === 'string' && localPath.length > 0) {
+    if (!this.waterfallResourceResident(entry)) { return }
+    const path = this.waterfallLocalPaths[entry.path]
+    if (typeof path === 'string' && path.length > 0 && !CacheManager.exists(path)) {
       this.waterfallLocalPaths[entry.path] = ''
       this.waterfallOriginalLoader?.invalidate(entry)
-    }
-    this.prefetchWaterfallRange(this.waterfallVisibleStartIndex, this.waterfallVisibleEndIndex)
+      this.waterfallOriginalLoader?.requestMember(entry)?.catch((): void => {})
+    } else { this.enqueueWaterfallDecode(entry) }
   }
 
   private prefetchWaterfallRange(first: number, last: number): void {
-    if (this.fileViewMode !== 'waterfall' || this.showImageViewer || this.viewerClosePending) { return }
-    this.waterfallOriginalLoader?.update(this.waterfallEntries, first, last,
-      this.fileContentScrolling || this.timelineScrubActive, this.networkPolicy.isMetered() ? 1 : 2)
+    if (this.fileViewMode !== 'waterfall') { return }
+    this.waterfallBatches?.setHidden(this.showImageViewer || this.viewerClosePending || this.viewerEntryTransitionActive)
+    this.waterfallBatches?.visible(first, last)
   }
 
   private enqueueWaterfallDecode(entry: FileEntry): void {
-    if (this.fileViewMode !== 'waterfall' || this.waterfallVisiblePaths[entry.path] !== true ||
+    if (this.fileViewMode !== 'waterfall' || !this.waterfallResourceResident(entry) ||
+      this.waterfallRasterFailed[entry.path] === true || this.waterfallVisiblePaths[entry.path] !== true ||
       this.waterfallDecodedPaths[entry.path] === true ||
       (this.waterfallActiveDecodePaths[entry.path] || 0) > 0 || this.timelineScrubActive ||
       this.fileContentScrolling) {
@@ -12978,7 +13334,7 @@ struct Index {
       this.waterfallDecodeQueue.length > 0) {
       const entry = this.waterfallDecodeQueue.shift() as FileEntry
       const localPath = this.waterfallLocalPaths[entry.path]
-      if (this.waterfallVisiblePaths[entry.path] !== true ||
+      if (!this.waterfallResourceResident(entry) || this.waterfallVisiblePaths[entry.path] !== true ||
         typeof localPath !== 'string' || localPath.length === 0 ||
         this.waterfallLocalSignatures[entry.path] !== this.waterfallEntrySignature(entry) ||
         this.waterfallDecodedPaths[entry.path] === true) {
@@ -13004,7 +13360,11 @@ struct Index {
       }
       const record = await this.viewerBitmapStore.decode(localPath, 'viewerPreview', rotation,
         this.waterfallSourceSize(entry))
-      if (record === null || generation !== this.waterfallGeneration ||
+      if (record === null && generation === this.waterfallGeneration) {
+        this.waterfallRasterFailed[entry.path] = true
+        this.notifyEntryChanged(entry.path, 'waterfall')
+      }
+      if (record === null || generation !== this.waterfallGeneration || !this.waterfallResourceResident(entry) ||
         this.fileViewMode !== 'waterfall' || this.waterfallVisiblePaths[entry.path] !== true ||
         this.imageVisualState(entry.path).userRotation !== rotation || this.fileContentScrolling ||
         this.timelineScrubActive || this.showImageViewer) {
@@ -13015,7 +13375,6 @@ struct Index {
       }
       this.installViewerBitmap(this.waterfallBitmaps, entry.path, record)
       this.applyDecodedBitmapGeometry(entry.path, record, false)
-      this.setWaterfallAspectRatio(entry, record.displayWidth, record.displayHeight)
       this.setWaterfallOriginalUri(entry.path, fileUri.getUriFromPath(localPath))
       this.waterfallDecodedPaths[entry.path] = true
     } catch (error) {
@@ -13023,7 +13382,9 @@ struct Index {
         JSON.stringify(error))
       if (generation === this.waterfallGeneration) {
         this.waterfallDecodedPaths[entry.path] = false
+        this.waterfallRasterFailed[entry.path] = true
         this.setWaterfallOriginalUri(entry.path, '')
+        this.notifyEntryChanged(entry.path, 'waterfall')
       }
     } finally {
       // Only the actual decoder owns this slot, even across directory resets.
@@ -13280,7 +13641,13 @@ struct Index {
     if (index < 0) {
       return
     }
-    const childIndex = this.fileViewMode === 'list' ? index + 1 : index
+    if (isWaterfall && this.waterfallLocalIndex(index) < 0) {
+      this.ensureWaterfallIndex(index).then((): void => {
+        if (this.waterfallLocalIndex(index) >= 0) { this.scrollToLocatedEntry(targetEntry, attempt) }
+      })
+      return
+    }
+    const childIndex = isWaterfall ? this.waterfallLocalIndex(index) : (this.fileViewMode === 'list' ? index + 1 : index)
     const scroller = isWaterfall ? this.waterfallScroller : this.fileListScroller
 
     this.locateScrollStartTime = this.getMonotonicNow()
@@ -14891,8 +15258,6 @@ struct Index {
     } catch (_) {}
     this.returnPerfSession.noteScrollStart(currentOffsetY, this.getMonotonicNow())
     this.cancelPendingPreviewLoads()
-    this.waterfallGeometryQueue.cancelPending()
-    this.waterfallOriginalLoader?.pause()
     this.waterfallDecodeQueue = []
     this.releaseTimelineFocusPinFromFileScroll()
   }
@@ -15007,7 +15372,9 @@ struct Index {
     }
     // Direct indexed jumps avoid a long inertial animation when the selected
     // month or year is far away and make the file surface track scrubbing.
-    scroller.scrollToIndex(targetIndex + childOffset, false, ScrollAlign.CENTER)
+    if (this.fileViewMode === 'waterfall') {
+      this.jumpWaterfallTo(targetIndex, ScrollAlign.CENTER)
+    } else { scroller.scrollToIndex(targetIndex + childOffset, false, ScrollAlign.CENTER) }
     this.timelineLastJumpDay = dayStart
     this.timelineLastJumpIndex = targetIndex
     this.timelineLastJumpPath = this.currentPath
@@ -15111,8 +15478,6 @@ struct Index {
       const entry = source[index]
       this.resolveFileListImageRotation(entry)
       if (this.fileViewMode === 'waterfall') {
-        this.loadEntryPreview(entry, this.previewPriority(index, 'waterfall'))
-        this.enqueueWaterfallPreviewGeometry(entry, index)
         this.enqueueWaterfallOriginal(entry, index, true)
       } else {
         this.loadEntryPreview(entry, this.previewPriority(index, this.fileViewMode))
@@ -16577,7 +16942,7 @@ struct Index {
       return
     }
     const snapshot = entries.slice()
-    this.loadPersistedImageDisplayState(snapshot).then((state: ImageDisplayState): void => {
+    this.fileListRotationPreparation = this.loadPersistedImageDisplayState(snapshot).then((state: ImageDisplayState): void => {
       if (generation !== this.fileListRotationGeneration) {
         return
       }
@@ -16644,7 +17009,7 @@ struct Index {
       this.waterfallDecodedPaths[entry.path] = false
     }
     if (this.fileViewMode === 'waterfall' && this.waterfallVisiblePaths[entry.path] === true) {
-      this.enqueueWaterfallPreviewGeometry(entry)
+
       this.enqueueWaterfallDecode(entry)
     }
   }
@@ -16948,6 +17313,7 @@ struct Index {
           }, () => {
             this.tapTrace('VISIBLE(shared) animStart')
             this.showImageViewer = true
+            this.waterfallBatches?.setHidden(true)
             this.imageChromeVisible = true
             this.imageChromeOpacity = 1
             this.imageTopChromeOffsetY = 0
@@ -16963,6 +17329,7 @@ struct Index {
         this.viewerFallbackEntryActive = true
         this.tapTrace('VISIBLE(fallback)')
         this.showImageViewer = true
+        this.waterfallBatches?.setHidden(true)
         await this.nextRenderFrame()
         await new Promise<void>((resolve: () => void): void => {
           this.getUIContext().animateTo({
@@ -17004,7 +17371,7 @@ struct Index {
       if (!this.showImageViewer) {
         return
       }
-      this.waterfallOriginalLoader?.pause()
+
       this.viewerPrefetchCoordinator?.onViewerOpened(initialIndex, this.viewerImages)
       this.prefetchViewerImages(initialIndex)
       this.statusText = ''
@@ -17184,7 +17551,8 @@ struct Index {
       if (index < 0) {
         return false
       }
-      const childIndex = this.fileViewMode === 'list' ? index + 1 : index
+      const childIndex = this.fileViewMode === 'waterfall' ? this.waterfallLocalIndex(index) : (this.fileViewMode === 'list' ? index + 1 : index)
+      if (childIndex < 0) { return false }
       const scroller = this.fileViewMode === 'waterfall'
         ? this.waterfallScroller : this.fileListScroller
       this.scrollItemIntoContentBand(scroller, childIndex, 0, false,
@@ -17277,6 +17645,12 @@ struct Index {
     sourceReady: () => boolean, prepareSource?: () => Promise<void>,
     positionGridSource: boolean = false): Promise<boolean> {
     if (!isCurrent()) { return false }
+    if (this.screen === 'files' && !this.showSearch && this.fileViewMode === 'waterfall') {
+      const index = this.waterfallEntries.findIndex((item: FileEntry): boolean => item.path === entry.path)
+      if (index < 0) { return false }
+      await this.ensureWaterfallIndex(index)
+      if (!isCurrent() || this.waterfallLocalIndex(index) < 0) { return false }
+    }
     // Ordinary Grid returns keep the mounted target/fade fast path. Only
     // explicit resize recovery may position a missing Grid thumbnail.
     if (this.screen === 'files' && !this.showSearch && this.fileViewMode === 'grid') {
@@ -17342,9 +17716,11 @@ struct Index {
   }
 
   private finishCloseImageViewer(shouldRestoreSearch: boolean): void {
-    if (!this.viewerClosePending) {
-      return
-    }
+    if (!this.viewerClosePending) { return }
+    this.postRenderFrame((): void => {
+      this.prefetchWaterfallRange(this.waterfallVisibleStartIndex, this.waterfallVisibleEndIndex)
+      this.warmTimelineVisibleEntries()
+    })
     const closingImages = this.viewerImages.slice()
     const returnedEntry = this.viewerImageEntry
     // R3.3 步骤 2 需要用到"返回目标 path"，但它在下面会被清空，先抓下来。
@@ -23814,55 +24190,16 @@ struct Index {
   }
 
   private syncWaterfallEntries(entries: FileEntry[], appendOnly: boolean): void {
-    const isLocating = this.targetLocateEntryPath.length > 0
-    if (isLocating) {
-      this.tapTrace('syncWaterfallEntries start', 'entries=' + entries.length.toString())
-    }
-    const nextImages: FileEntry[] = []
-    for (const entry of entries) {
-      if (!entry.isDirectory && this.isImage(entry)) {
-        nextImages.push(entry)
-      }
-    }
+    const images = entries.filter((entry: FileEntry): boolean => !entry.isDirectory && this.isImage(entry))
     const previous = this.waterfallEntries
-    if (appendOnly && nextImages.length >= previous.length) {
-      let keepsPrefix = true
-      for (let index = 0; index < previous.length; index++) {
-        if (!this.sameWaterfallEntry(nextImages[index], previous[index])) {
-          keepsPrefix = false
-          break
-        }
-      }
-      if (keepsPrefix && nextImages.length > previous.length) {
-        this.waterfallEntries = nextImages
-        this.waterfallDataSource.append(nextImages.slice(previous.length))
-        if (isLocating) {
-          this.tapTrace('syncWaterfallEntries end', 'images=' + this.waterfallEntries.length.toString())
-        }
-        return
-      }
-    }
-    let unchanged = previous.length === nextImages.length
-    if (unchanged) {
-      for (let index = 0; index < previous.length; index++) {
-        if (!this.sameWaterfallEntry(previous[index], nextImages[index])) {
-          unchanged = false
-          break
-        }
-      }
-    }
-    if (!unchanged) {
-      // WaterFlow and its PixelMap cache are keyed by path, but a NAS refresh
-      // can replace the file at the same path. Drop the complete waterfall
-      // pipeline before replacing the data source so an old aspect ratio or
-      // decoded bitmap cannot be attached to the new file.
-      this.resetWaterfallDirectoryState()
-      this.waterfallEntries = nextImages
-      this.waterfallDataSource.replace(nextImages)
-    }
-    if (isLocating) {
-      this.tapTrace('syncWaterfallEntries end', 'images=' + this.waterfallEntries.length.toString())
-    }
+    const prefix = images.length >= previous.length && previous.every(
+      (entry: FileEntry, index: number): boolean => this.sameWaterfallEntry(entry, images[index]))
+    if (!prefix || (!appendOnly && images.length !== previous.length)) { this.resetWaterfallDirectoryState() }
+    this.waterfallEntries = images
+    if (this.fileViewMode !== 'waterfall') { return }
+    if (prefix && this.waterfallBatches !== null && this.waterfallBatches.first >= 0) {
+      this.waterfallBatches.sync(images)
+    } else { this.ensureWaterfallStarted() }
   }
 
   private sameWaterfallEntry(left: FileEntry, right: FileEntry): boolean {
@@ -24096,6 +24433,7 @@ struct Index {
   }
 
   private loadEntryPreview(entry: FileEntry, priority: number = 0): void {
+    if (this.fileViewMode === 'waterfall' && !this.showSearch && !this.showImageViewer) { return }
     if (entry.isDirectory || (!this.isImage(entry) && !this.isVideo(entry) && !this.isAudio(entry))) {
       return
     }

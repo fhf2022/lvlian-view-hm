@@ -1,3 +1,4 @@
+import { OriginalImageInfo, OriginalImageInfoReader } from '../media/OriginalImageInfoReader'
 import { Context } from '@kit.AbilityKit'
 import { DownloadManager } from '../download/DownloadManager'
 import { CacheManager } from '../download/CacheManager'
@@ -937,6 +938,19 @@ export class UgreenRemoteRepository {
     const prepared = await this.thumbnailNormalizer.prepare(bytes, entry.path, entry.name + '.audio.preview.jpg',
       cacheDirectory, maxBytes, 'list', key, true)
     return prepared?.path ?? ''
+  }
+
+  async originalImageInfo(entry: FileEntry, valid: () => boolean): Promise<OriginalImageInfo | null> {
+    const scope = this.sessionIdentity()
+    if (!valid() || !NasConnection.shared().canRequest()) { return null }
+    const descriptor = await this.downloadDescriptor(entry.path)
+    const deadline = Date.now() + 12000
+    const reader = new OriginalImageInfoReader(entry.size,
+      async (offset: number, length: number): Promise<Uint8Array> => {
+        if (!valid() || scope !== this.sessionIdentity() || Date.now() > deadline) { throw new Error('Image header cancelled') }
+        return (await this.transport.requestBinaryRange(descriptor.url, offset, length, descriptor.headers, 5000)).bytes
+      })
+    return await reader.read()
   }
 
   /** Optional presentation follows playback readiness, never a whole-song download. */

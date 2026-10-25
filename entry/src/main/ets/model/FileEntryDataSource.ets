@@ -158,6 +158,15 @@ export class FileEntryDataSource implements IDataSource {
     }
   }
 
+  prepend(items: FileEntry[]): void {
+    if (items.length === 0) { return }
+    this.items = items.concat(this.items)
+    this.rebuildPathIndexes()
+    for (let index = 0; index < items.length; index++) {
+      for (const listener of this.listeners.slice()) { listener.onDataAdd(index) }
+    }
+  }
+
   /**
    * 在指定位置插入一条，并且【只通知这一个索引】（onDataAdd）。
    * 不要用 replace() 来做插入：新文件会改变 path 顺序 → replace 会退化成

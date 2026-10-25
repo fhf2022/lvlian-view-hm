@@ -13,7 +13,7 @@ function make(){
   fileListScroller:scroller,waterfallScroller:scroller,searchResultScroller:scroller,pageHeightVp:800,
   targetLocateEntryPath:'',fileScrollViewport:{y:40,height:760},fileContentTopInset:()=>134,topSafeInset:()=>40,floatingBarContentInset:()=>76,nextRenderFrame:async()=>{},
   showImageViewer:true,viewerImageEntry:entry,hasViewerTransitionSource:()=>true,
-  ensureViewerPreviewBitmap:async()=>{events.push(['preview'])}});
+  ensureViewerPreviewBitmap:async()=>{events.push(['preview'])},ensureWaterfallIndex:async()=>{},waterfallLocalIndex:i=>i});
  return {h,events,setRect:r=>{rect=r}};
 }
 async function run(){
@@ -34,6 +34,11 @@ async function run(){
  assert.deepEqual(t.events.find(e=>e[0]==='by'),['by',0,-34],'safe-area-expanded viewport uses its measured origin, not a fixed status-bar offset');
  t=make();t.h.fileViewMode='waterfall';await t.h.prepareMediaReturnSource(entry,()=>true,()=>true);
  assert.deepEqual(t.events[0],['rect',0],'WaterFlow indexes its reordered entries without list spacer');
+ t=make();t.h.fileViewMode='waterfall';let prepared=false;
+ t.h.ensureWaterfallIndex=async()=>{prepared=true};t.h.waterfallLocalIndex=i=>prepared?i:-1;
+ assert.equal(await t.h.prepareMediaReturnSource(entry,()=>true,()=>prepared),true,'prepare target group before native return positioning');
+ t=make();t.h.fileViewMode='waterfall';let cancelled=false;t.h.ensureWaterfallIndex=async()=>{cancelled=true};
+ assert.equal(await t.h.prepareMediaReturnSource(entry,()=>!cancelled,()=>true),false,'cancelled group preparation cannot position another page');
  t=make();t.h.showSearch=true;await t.h.prepareMediaReturnSource(entry,()=>true,()=>true);
  assert.deepEqual(t.events[0],['index',2,false,3],'search reuses image AUTO alignment and spacer');
  t=make();t.h.fileViewMode='grid';assert.equal(await t.h.prepareMediaReturnSource(entry,()=>true,()=>true),true);
