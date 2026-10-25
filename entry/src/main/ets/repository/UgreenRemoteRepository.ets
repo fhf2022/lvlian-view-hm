@@ -9,7 +9,9 @@ import { RemoteFileSignature } from '../media/MediaLocalStore'
 import { ThumbnailNormalizer } from '../media/ThumbnailNormalizer'
 import { ThumbnailProfile } from '../media/ThumbnailPolicy'
 import { ThumbnailCacheStore } from '../media/ThumbnailCacheStore'
-import { AudioArtworkReader } from '../media/AudioArtworkReader'
+import { AudioArtworkReader, AudioTagResult } from '../media/AudioArtworkReader'
+import { AudioPresentation, AudioTrackInfo } from '../media/AudioPlayerPolicy'
+import { AudioMetadataReader } from '../media/AudioMetadataReader'
 import { MediaPreviewManager } from '../media/MediaPreviewManager'
 import { DirectoryMetadataPage, DirectoryMetadataSnapshot, DirectoryMetadataStore } from './DirectoryMetadataStore'
 import { NetworkPolicy } from '../core/network/NetworkPolicy'
@@ -87,6 +89,9 @@ export class UgreenRemoteRepository {
   private thumbnailCacheStore: ThumbnailCacheStore = new ThumbnailCacheStore()
   private thumbnailRequests: Map<string, Promise<string>> = new Map<string, Promise<string>>()
   private audioArtworkMisses: Map<string, number> = new Map<string, number>()
+  private audioTagRequests: Map<string, Promise<AudioTagResult>> = new Map<string, Promise<AudioTagResult>>()
+  // Text only, keyed by the existing account/file version identity. Never retain image bytes.
+  private audioTagInfo: Map<string, AudioTrackInfo> = new Map<string, AudioTrackInfo>()
   private networkPolicy: NetworkPolicy = NetworkPolicy.shared()
   private meteredBackgroundRefreshAllowed: boolean = false
   private backgroundRefreshTimers: Record<string, number> = {}
@@ -116,6 +121,7 @@ export class UgreenRemoteRepository {
 
   async clearThumbnailCache(): Promise<void> {
     this.audioArtworkMisses.clear()
+    this.audioTagInfo.clear()
     await this.thumbnailCacheStore.clear()
   }
 
@@ -713,6 +719,7 @@ export class UgreenRemoteRepository {
       return
     }
     this.metadataScope = nextScope
+    this.audioTagInfo.clear()
     this.cacheGeneration += 1
     console.info('[DirTrace] CLEAR-ALL scope-changed gen=' + this.cacheGeneration.toString())
     this.directoryCache.clear()
@@ -924,6 +931,72 @@ export class UgreenRemoteRepository {
     if (!/\.(mp3|flac|m4a|aac)$/i.test(entry.name) || entry.size <= 0 ||
       !NasConnection.shared().canRequest()) { return '' }
     const scope = this.sessionIdentity()
+    const tags = await this.readRemoteAudioTags(entry, true)
+    const bytes = tags.artwork
+    if (bytes.length === 0 || scope !== this.sessionIdentity()) { return '' }
+    const prepared = await this.thumbnailNormalizer.prepare(bytes, entry.path, entry.name + '.audio.preview.jpg',
+      cacheDirectory, maxBytes, 'list', key, true)
+    return prepared?.path ?? ''
+  }
+
+  /** Optional presentation follows playback readiness, never a whole-song download. */
+  async prepareAudioPresentation(entry: FileEntry, localPath: string, cacheDirectory: string,
+    maxBytes: number, valid: () => boolean): Promise<AudioPresentation> {
+    const result = new AudioPresentation()
+    const scope = this.sessionIdentity()
+    const current = (): boolean => valid() && scope === this.sessionIdentity()
+    if (!current()) { return result }
+    try {
+      if (localPath.length > 0) { result.info = await AudioMetadataReader.read(localPath) }
+      if (!current()) { return new AudioPresentation() }
+      // A new list cover reads text and image together. An already cached cover
+      // instead permits a text-only pass which skips APIC/PICTURE/covr payloads.
+      result.coverPath = await this.prepareAudioThumbnail(entry, localPath, cacheDirectory, maxBytes)
+      if (!current()) { return new AudioPresentation() }
+      if (localPath.length === 0) {
+        const key = this.cacheKeyForFile(entry)
+        const cached = this.audioTagInfo.get(key)
+        if (cached !== undefined) {
+          this.audioTagInfo.delete(key); this.audioTagInfo.set(key, cached)
+          result.info = cached
+        } else { result.info = (await this.readRemoteAudioTags(entry, false, current)).info }
+      }
+    } catch (_) {
+      // Optional text/art failures leave playback and its filename fallback usable.
+    }
+    return current() ? result : new AudioPresentation()
+  }
+
+  private async readRemoteAudioTags(entry: FileEntry, artwork: boolean,
+    valid: () => boolean = (): boolean => true): Promise<AudioTagResult> {
+    if (!/\.(mp3|flac|m4a|aac)$/i.test(entry.name) || entry.size <= 0 ||
+      !valid() || !NasConnection.shared().canRequest()) { return new AudioTagResult() }
+    const identity = this.cacheKeyForFile(entry)
+    const key = identity + (artwork ? ':artwork' : ':text')
+    const pending = this.audioTagRequests.get(key) ??
+      (artwork ? undefined : this.audioTagRequests.get(identity + ':artwork'))
+    const scope = this.sessionIdentity()
+    if (pending !== undefined) {
+      const result = await pending
+      return valid() && scope === this.sessionIdentity() ? result : new AudioTagResult()
+    }
+    // One bounded lookup may serve the list and a rapidly reopened player.
+    // A departing consumer cannot cancel the shared lookup of a new consumer.
+    const request = this.loadRemoteAudioTags(entry, artwork)
+    this.audioTagRequests.set(key, request)
+    try {
+      const result = await request
+      if (scope !== this.sessionIdentity()) { return new AudioTagResult() }
+      this.audioTagInfo.delete(identity); this.audioTagInfo.set(identity, result.info)
+      while (this.audioTagInfo.size > 128) { this.audioTagInfo.delete(this.audioTagInfo.keys().next().value) }
+      return valid() ? result : new AudioTagResult()
+    } finally {
+      if (this.audioTagRequests.get(key) === request) { this.audioTagRequests.delete(key) }
+    }
+  }
+
+  private async loadRemoteAudioTags(entry: FileEntry, artwork: boolean): Promise<AudioTagResult> {
+    const scope = this.sessionIdentity()
     const descriptor = await this.downloadDescriptor(entry.path)
     const deadline = Date.now() + 8000
     let rangeFailed = false
@@ -939,12 +1012,9 @@ export class UgreenRemoteRepository {
         throw new Error('Audio tag range unavailable')
       }
     })
-    const bytes = await reader.read()
+    const result = await reader.readTags(artwork, true)
     if (rangeFailed) { throw new Error('Audio tag read interrupted') }
-    if (bytes.length === 0 || scope !== this.sessionIdentity()) { return '' }
-    const prepared = await this.thumbnailNormalizer.prepare(bytes, entry.path, entry.name + '.audio.preview.jpg',
-      cacheDirectory, maxBytes, 'list', key, true)
-    return prepared?.path ?? ''
+    return result
   }
 
   private async prepareThumbnailOnce(entry: FileEntry, cacheDirectory: string, maxBytes: number,

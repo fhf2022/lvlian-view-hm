@@ -13,6 +13,11 @@ export class AudioTrackInfo {
   album: string = ''
 }
 
+export class AudioPresentation {
+  info: AudioTrackInfo = new AudioTrackInfo()
+  coverPath: string = ''
+}
+
 export class AudioCoverRect {
   x: number = 0
   y: number = 0

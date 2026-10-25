@@ -1,4 +1,12 @@
+import { util } from '@kit.ArkTS'
+import { AudioTrackInfo } from './AudioPlayerPolicy'
+
 export type AudioArtworkRange = (offset: number, length: number) => Promise<Uint8Array>
+
+export class AudioTagResult {
+  artwork: Uint8Array = new Uint8Array(0)
+  info: AudioTrackInfo = new AudioTrackInfo()
+}
 
 /** Bounded tag reads only: browsing a song never downloads the audio payload. */
 export class AudioArtworkReader {
@@ -9,6 +17,11 @@ export class AudioArtworkReader {
   private requests: number = 0
   private windowStart: number = 0
   private window: Uint8Array = new Uint8Array(0)
+  private result: AudioTagResult = new AudioTagResult()
+  private wantArtwork: boolean = true
+  private wantMetadata: boolean = false
+  private primaryArtist: boolean = false
+  private atomsRead: number = 0
 
   private size: number
   private range: AudioArtworkRange
@@ -16,15 +29,49 @@ export class AudioArtworkReader {
   constructor(size: number, range: AudioArtworkRange) { this.size = size; this.range = range }
 
   async read(): Promise<Uint8Array> {
+    return (await this.readTags(true, false)).artwork
+  }
+
+  async readTags(artwork: boolean = true, metadata: boolean = true): Promise<AudioTagResult> {
+    this.wantArtwork = artwork; this.wantMetadata = metadata
+    this.result = new AudioTagResult(); this.primaryArtist = false; this.atomsRead = 0
     try {
       const header = await this.bytes(0, Math.min(12, this.size))
-      if (this.text(header, 0, 3) === 'ID3') { return await this.id3(header) }
-      if (this.text(header, 0, 4) === 'fLaC') { return await this.flac() }
-      if (this.text(header, 4, 4) === 'ftyp') { return await this.atoms(0, this.size, 0) }
+      if (this.text(header, 0, 3) === 'ID3') { await this.id3(header) }
+      else if (this.text(header, 0, 4) === 'fLaC') { await this.flac() }
+      else if (this.text(header, 4, 4) === 'ftyp') { await this.atoms(0, this.size, 0) }
     } catch (_) {
-      // Corrupt, oversized or unsupported tags retain the ordinary audio icon.
+      // Keep tags already read; a malformed optional image must not erase them.
     }
-    return new Uint8Array(0)
+    return this.result
+  }
+
+  private done(): boolean {
+    return (!this.wantArtwork || this.result.artwork.length > 0) &&
+      (!this.wantMetadata || (this.result.info.title.length > 0 &&
+        this.primaryArtist && this.result.info.album.length > 0))
+  }
+
+  private decodeText(bytes: Uint8Array, encoding: number): string {
+    if (bytes.length === 0 || bytes.length > 16 * 1024) { return '' }
+    let value = ''
+    if (encoding === 0) { value = this.text(bytes, 0, bytes.length) }
+    else {
+      let label = encoding === 3 ? 'utf-8' : 'utf-16be'
+      if (encoding === 1) { label = bytes[0] === 254 && bytes[1] === 255 ? 'utf-16be' : 'utf-16le' }
+      value = util.TextDecoder.create(label).decodeToString(bytes)
+    }
+    return value.replace(/\uFEFF/g, '').replace(/\u0000+/g, ' / ')
+      .replace(/[\u0001-\u001f\u007f]/g, '').replace(/(?:\s\/\s)+$/, '').trim().substring(0, 512)
+  }
+
+  private setText(field: string, value: string): void {
+    if (value.length === 0) { return }
+    const info = this.result.info
+    if (field === 'title' && info.title.length === 0) { info.title = value }
+    if (field === 'album' && info.album.length === 0) { info.album = value }
+    if (field === 'artist' && !this.primaryArtist) { info.artist = value; this.primaryArtist = true }
+    if (field === 'albumArtist' && info.artist.length === 0) { info.artist = value }
   }
 
   private async bytes(offset: number, length: number): Promise<Uint8Array> {
@@ -87,46 +134,73 @@ export class AudioArtworkReader {
     return this.image(frame.slice(offset))
   }
 
-  private async id3(header: Uint8Array): Promise<Uint8Array> {
+  private async id3(header: Uint8Array): Promise<void> {
     const version = header[3]
-    if (version < 2 || version > 4 || (version === 2 && (header[5] & 64) !== 0)) { return new Uint8Array(0) }
+    if (version < 2 || version > 4 || (version === 2 && (header[5] & 64) !== 0)) { return }
     const length = this.uint(header, 6, 4, true)
-    if (length > AudioArtworkReader.MAX_IMAGE_BYTES + 64 * 1024 || length === 0) { return new Uint8Array(0) }
-    let body = await this.bytes(10, length)
+    if (length === 0 || length > this.size - 10) { return }
     const unsync = (header[5] & 128) !== 0
-    if (version < 4 && unsync) { body = this.deUnsync(body) }
+    let body: Uint8Array | null = null
+    // ID3v2.2/2.3 tag-wide unsynchronisation changes physical frame offsets.
+    // Decode that bounded tag once; ordinary tags can skip large APIC frames.
+    if (version < 4 && unsync) {
+      if (length > AudioArtworkReader.MAX_IMAGE_BYTES + 64 * 1024) { return }
+      body = this.deUnsync(await this.bytes(10, length))
+    }
+    const end = body === null ? length : body.length
     let offset = 0
     if (version >= 3 && (header[5] & 64) !== 0) {
-      offset = this.uint(body, 0, 4, version === 4) + (version === 3 ? 4 : 0)
-      if (offset < 4) { return new Uint8Array(0) }
+      const extended = await this.id3Bytes(body, 0, 4)
+      offset = this.uint(extended, 0, 4, version === 4) + (version === 3 ? 4 : 0)
+      if (offset < 4 || offset > end) { return }
     }
     const frameHeader = version === 2 ? 6 : 10
-    for (let frames = 0; frames < 1024 && offset + frameHeader <= body.length; frames++) {
-      const id = this.text(body, offset, version === 2 ? 3 : 4)
-      const size = this.uint(body, offset + (version === 2 ? 3 : 4), version === 2 ? 3 : 4, version === 4)
-      if (size <= 0 || offset + frameHeader + size > body.length) { break }
-      if (id === 'APIC' || id === 'PIC') {
-        const flags = version === 2 ? 0 : body[offset + 9]
-        // Compression/encryption/grouping/data-length prefixes need a decoder;
-        // reject them rather than interpreting their prefix as image bytes.
-        if ((flags & (version === 4 ? 77 : 224)) === 0) {
-          let frame = body.slice(offset + frameHeader, offset + frameHeader + size)
-          if (version === 4 && (unsync || (flags & 2) !== 0)) { frame = this.deUnsync(frame) }
-          const result = this.picture(frame, version === 2)
-          if (result.length > 0) { return result }
-        }
+    for (let frames = 0; frames < 1024 && offset + frameHeader <= end && !this.done(); frames++) {
+      const frame = await this.id3Bytes(body, offset, frameHeader)
+      const id = this.text(frame, 0, version === 2 ? 3 : 4)
+      const size = this.uint(frame, version === 2 ? 3 : 4, version === 2 ? 3 : 4, version === 4)
+      if (size <= 0 || offset + frameHeader + size > end) { break }
+      const flags = version === 2 ? 0 : frame[9]
+      const picture = this.wantArtwork && this.result.artwork.length === 0 && (id === 'APIC' || id === 'PIC')
+      const field = this.wantMetadata ? this.id3TextField(id) : ''
+      const limit = picture ? AudioArtworkReader.MAX_IMAGE_BYTES + 64 * 1024 : 16 * 1024
+      // Reject compressed/encrypted/grouped frames instead of parsing prefixes as payload.
+      if ((picture || field.length > 0) && size <= limit && (flags & (version === 4 ? 77 : 224)) === 0) {
+        let payload = await this.id3Bytes(body, offset + frameHeader, size)
+        if (version === 4 && (unsync || (flags & 2) !== 0)) { payload = this.deUnsync(payload) }
+        if (picture) { this.result.artwork = this.picture(payload, version === 2) }
+        else if (payload[0] <= 3) { this.setText(field, this.decodeText(payload.slice(1), payload[0])) }
       }
       offset += frameHeader + size
     }
-    return new Uint8Array(0)
   }
 
-  private async flac(): Promise<Uint8Array> {
+  private async id3Bytes(body: Uint8Array | null, offset: number, length: number): Promise<Uint8Array> {
+    if (body === null) { return await this.bytes(10 + offset, length) }
+    if (offset < 0 || offset + length > body.length) { throw new Error('Truncated ID3 tag') }
+    return body.slice(offset, offset + length)
+  }
+
+  private id3TextField(id: string): string {
+    if (id === 'TIT2' || id === 'TT2') { return 'title' }
+    if (id === 'TPE1' || id === 'TP1') { return 'artist' }
+    if (id === 'TPE2' || id === 'TP2') { return 'albumArtist' }
+    if (id === 'TALB' || id === 'TAL') { return 'album' }
+    return ''
+  }
+
+  private async flac(): Promise<void> {
     let offset = 4
-    for (let blocks = 0; blocks < 64 && offset + 4 <= this.size; blocks++) {
+    for (let blocks = 0; blocks < 64 && offset + 4 <= this.size && !this.done(); blocks++) {
       const header = await this.bytes(offset, 4)
       const length = this.uint(header, 1, 3)
-      if ((header[0] & 127) === 6 && length > 0 && length <= AudioArtworkReader.MAX_IMAGE_BYTES + 64 * 1024) {
+      const kind = header[0] & 127
+      if (offset + 4 + length > this.size) { return }
+      if (kind === 4 && this.wantMetadata && length > 0) {
+        await this.vorbisComments(offset + 4, length)
+      }
+      if (kind === 6 && this.wantArtwork && this.result.artwork.length === 0 &&
+        length > 0 && length <= AudioArtworkReader.MAX_IMAGE_BYTES + 64 * 1024) {
         const body = await this.bytes(offset + 4, length)
         const type = this.uint(body, 0, 4)
         if (type === 3 || type === 0) {
@@ -135,21 +209,55 @@ export class AudioArtworkReader {
           pos += 16
           const imageLength = this.uint(body, pos, 4)
           if (imageLength > 0 && pos + 4 + imageLength <= body.length) {
-            const result = this.image(body.slice(pos + 4, pos + 4 + imageLength))
-            if (result.length > 0) { return result }
+            this.result.artwork = this.image(body.slice(pos + 4, pos + 4 + imageLength))
           }
         }
       }
       if ((header[0] & 128) !== 0) { break }
       offset += 4 + length
     }
-    return new Uint8Array(0)
   }
 
-  private async atoms(start: number, end: number, depth: number): Promise<Uint8Array> {
-    if (depth > 6) { return new Uint8Array(0) }
+  private littleUint(bytes: Uint8Array, offset: number): number {
+    if (offset < 0 || offset + 4 > bytes.length) { throw new Error('Truncated Vorbis comment') }
+    return bytes[offset] + bytes[offset + 1] * 256 + bytes[offset + 2] * 65536 + bytes[offset + 3] * 16777216
+  }
+
+  private async vorbisComments(start: number, length: number): Promise<void> {
+    const end = start + length
+    if (length < 8) { return }
+    const vendor = this.littleUint(await this.bytes(start, 4), 0)
+    let pos = start + 4 + vendor
+    if (pos + 4 > end) { return }
+    const count = this.littleUint(await this.bytes(pos, 4), 0); pos += 4
+    for (let index = 0; index < Math.min(count, 256) && pos + 4 <= end && !this.done(); index++) {
+      const size = this.littleUint(await this.bytes(pos, 4), 0); pos += 4
+      if (pos + size > end) { return }
+      if (size > 0) {
+        // Skip large lyrics/embedded-cover comments by offset, just like APIC.
+        const prefix = await this.bytes(pos, Math.min(size, 32))
+        const name = this.text(prefix, 0, prefix.length)
+        const equal = name.indexOf('=')
+        const key = name.substring(0, equal).toUpperCase()
+        let field = ''
+        if (key === 'TITLE') { field = 'title' }
+        if (key === 'ARTIST') { field = 'artist' }
+        if (key === 'ALBUM') { field = 'album' }
+        if (key === 'ALBUMARTIST' || key === 'ALBUM ARTIST') { field = 'albumArtist' }
+        if (equal > 0 && field.length > 0 && size > equal + 1 && size <= 16 * 1024) {
+          const bytes = await this.bytes(pos + equal + 1, size - equal - 1)
+          this.setText(field, this.decodeText(bytes, 3))
+        }
+      }
+      pos += size
+    }
+  }
+
+  private async atoms(start: number, end: number, depth: number): Promise<void> {
+    if (depth > 6) { return }
     let offset = start
-    for (let atoms = 0; atoms < 128 && offset + 8 <= end; atoms++) {
+    for (let atoms = 0; atoms < 128 && offset + 8 <= end && !this.done(); atoms++) {
+      if (++this.atomsRead > 512) { return }
       const header = await this.bytes(offset, Math.min(16, end - offset))
       const type = this.text(header, 4, 4)
       let size = this.uint(header, 0, 4)
@@ -157,19 +265,35 @@ export class AudioArtworkReader {
       if (size === 1) { size = this.uint(header, 8, 4) * 4294967296 + this.uint(header, 12, 4); prefix = 16 }
       if (size === 0) { size = end - offset }
       if (!Number.isSafeInteger(size) || size < prefix || offset + size > end) { break }
-      if (type === 'covr') {
+      const picture = type === 'covr' && this.wantArtwork && this.result.artwork.length === 0
+      const field = this.wantMetadata ? this.atomTextField(type) : ''
+      if ((picture || field.length > 0) && size >= prefix + 16) {
         const data = await this.bytes(offset + prefix, 16)
-        const length = this.uint(data, 0, 4) - 16
-        if (this.text(data, 4, 4) === 'data' && length > 0 && length <= AudioArtworkReader.MAX_IMAGE_BYTES &&
-          prefix + length + 16 <= size) { return this.image(await this.bytes(offset + prefix + 16, length)) }
+        const dataSize = this.uint(data, 0, 4)
+        const length = dataSize - 16
+        const limit = picture ? AudioArtworkReader.MAX_IMAGE_BYTES : 16 * 1024
+        if (this.text(data, 4, 4) === 'data' && length > 0 && length <= limit && dataSize <= size - prefix) {
+          const bytes = await this.bytes(offset + prefix + 16, length)
+          if (picture) { this.result.artwork = this.image(bytes) }
+          else {
+            const encoding = this.uint(data, 8, 4) & 16777215
+            if (encoding === 1 || encoding === 2) { this.setText(field, this.decodeText(bytes, encoding === 1 ? 3 : 2)) }
+          }
+        }
       }
       if (['moov', 'udta', 'meta', 'ilst'].indexOf(type) >= 0) {
-        const result = await this.atoms(offset + prefix + (type === 'meta' ? 4 : 0), offset + size, depth + 1)
-        if (result.length > 0) { return result }
+        await this.atoms(offset + prefix + (type === 'meta' ? 4 : 0), offset + size, depth + 1)
       }
       offset += size
     }
-    return new Uint8Array(0)
+  }
+
+  private atomTextField(type: string): string {
+    if (type === '©nam') { return 'title' }
+    if (type === '©ART') { return 'artist' }
+    if (type === 'aART') { return 'albumArtist' }
+    if (type === '©alb') { return 'album' }
+    return ''
   }
 
   private image(bytes: Uint8Array): Uint8Array {

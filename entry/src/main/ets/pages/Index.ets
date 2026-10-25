@@ -57,7 +57,6 @@ import { UserFileManager } from '../download/UserFileManager'
 import { AudioPlaybackManager } from '../media/AudioPlaybackManager'
 import { AudioPlayerPage } from '../components/AudioPlayerPage'
 import { AudioCoverRect, AudioLyricLine, AudioPlayerPolicy, AudioPlayMode } from '../media/AudioPlayerPolicy'
-import { AudioMetadataReader } from '../media/AudioMetadataReader'
 import { AudioSessionManager } from '../media/AudioSessionManager'
 import { VideoPlaybackManager } from '../media/VideoPlaybackManager'
 import { VideoPlayerControls } from '../components/VideoPlayerControls'
@@ -19434,19 +19433,16 @@ struct Index {
       !this.audioEntryCloseRequested && scope === this.repository.sessionIdentity() && this.audioEntry?.path === entry.path
     await entryTransition
     if (!valid()) { return }
-    const info = await AudioMetadataReader.read(localPath)
+    const presentation = await this.repository.prepareAudioPresentation(entry, localPath,
+      this.thumbnailDirectory, this.thumbnailCacheLimitBytes, valid)
     if (!valid()) { return }
+    const info = presentation.info
     if (info.title.length > 0) { this.audioTitle = info.title }
     this.audioArtist = info.artist
-    try {
-      const coverPath = await this.repository.prepareAudioThumbnail(entry, localPath,
-        this.thumbnailDirectory, this.thumbnailCacheLimitBytes)
-      if (!valid()) { return }
-      if (coverPath.length > 0) {
-        this.audioCover = fileUri.getUriFromPath(coverPath)
-        this.setPreviewUri(entry, this.audioCover, coverPath)
-      }
-    } catch (_) {}
+    if (presentation.coverPath.length > 0) {
+      this.audioCover = fileUri.getUriFromPath(presentation.coverPath)
+      this.setPreviewUri(entry, this.audioCover, presentation.coverPath)
+    }
     if (!valid()) { return }
     await this.audioSession.setMetadata(this.audioTitle, this.audioArtist, info.album, this.audioCover)
     if (!valid()) { return }
