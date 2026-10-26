@@ -26,6 +26,7 @@ import { GlassBarHost } from '../components/GlassBarHost'
 import { GlassMenuSurface } from '../components/GlassMenuSurface'
 import { GlassMenuRow } from '../components/GlassMenuRow'
 import { EntryDetailsContent } from '../components/EntryDetailsContent'
+import { AlertDialog as SystemAlertDialog, CustomContentDialog, ButtonOptions } from '@ohos.arkui.advanced.Dialog'
 import { FileRowStyle } from '../ui/FileRowStyle'
 import { FileGridLayout } from '../ui/FileGridLayout'
 import { FileGridCell, FileGridCellEvents } from '../components/FileGridCell'
@@ -117,6 +118,10 @@ type FileAction = 'share' | 'openWith' | 'quickView' | 'multiSelect' | 'download
   'saveGallery' | 'releaseCache' | 'rename' | 'details' | 'delete' | 'copy' | 'move'
 type DestinationOperation = 'copy' | 'move' | 'upload'
 type DeleteResolution = 'deleted' | 'failed' | 'unknown'
+
+// Request high refresh only while the two directory surfaces translate.
+// Display capabilities and system power policy still determine the final rate.
+const FILE_TRANSITION_FRAME_RATE: ExpectedFrameRateRange = { min: 0, max: 120, expected: 120 }
 
 // Shared-element transitions are deliberately separate from the 180 ms
 // Swiper animation.  The image should have enough time to travel from its
@@ -329,20 +334,6 @@ const WATERFALL_BITMAP_MEMORY_LIMIT_BYTES: number = 48 * 1024 * 1024
 interface ViewerReturnScrollOffset {
   xOffset: number
   yOffset: number
-}
-
-class DestinationEntry {
-  name: string = ''
-  path: string = ''
-  modifiedTime: number = 0
-  childCount: number = -1
-}
-
-class DestinationTreeRow {
-  entry: DestinationEntry = new DestinationEntry()
-  depth: number = 0
-  expanded: boolean = false
-  loading: boolean = false
 }
 
 interface PopupStateChange {
@@ -802,11 +793,11 @@ interface FileToolCircleButtonOptions {
 }
 
 // The file surface underneath a video is kept as the PiP restore destination.
-// A user may browse other tabs/directories while PiP is active; restoring must
+// A user may browse other tabs/directories while playback is in the background; restoring must
 // therefore put the player back over the directory that launched it, rather
 // than whatever page happened to be visible when the system restore button was
 // pressed.
-interface VideoPipOrigin {
+interface MediaPlaybackOrigin {
   screen: RemoteScreen
   selectedBottomTab: BottomTab
   rootKind: RootKind
@@ -819,6 +810,7 @@ interface VideoPipOrigin {
   navigationViewStateStack: DirectoryViewState[]
   navigationPageIndexStack: number[]
   navigationPageHasMoreStack: boolean[]
+  continuationAncestorAnchors: Map<string, string>
   currentPageIndex: number
   currentPageHasMore: boolean
   viewState: DirectoryViewState
@@ -896,12 +888,12 @@ struct Index {
     capture: (): ContinuationSnapshot => this.captureContinuation(),
     sending: (active: boolean): void => { this.continuationSending = active },
     pauseSourcePlayback: async (): Promise<void> => {
-      if (this.showAudioPlayer) { await this.audioManager.pause() }
-      else if (this.showVideoPlayer) { await this.videoPlaybackManager.pause() }
+      if (this.audioPlaybackUiVisible()) { await this.audioManager.pause() }
+      else if (this.videoPlaybackUiVisible()) { await this.videoPlaybackManager.pause() }
     },
     resumeSourcePlayback: async (): Promise<void> => {
-      if (this.showAudioPlayer) { await this.audioManager.play() }
-      else if (this.showVideoPlayer) { await this.videoPlaybackManager.play() }
+      if (this.audioPlaybackUiVisible()) { await this.audioManager.play() }
+      else if (this.videoPlaybackUiVisible()) { await this.videoPlaybackManager.play() }
     },
     restore: async (snapshot: ContinuationSnapshot, valid: () => boolean): Promise<void> => {
       await this.restoreContinuation(snapshot, valid)
@@ -956,11 +948,6 @@ struct Index {
   @State @Watch('onContinuationSceneChanged') showDestinationPicker: boolean = false
   @State destinationOperation: DestinationOperation = 'copy'
   @State destinationPath: string = ''
-  @State destinationEntries: DestinationEntry[] = []
-  @State destinationTreeRows: DestinationTreeRow[] = []
-  @State destinationExpandedPaths: string[] = []
-  @State destinationTreeLoadingPath: string = ''
-  @State destinationRootExpanded: boolean = true
   @State destinationLoading: boolean = false
   @State @Watch('onContinuationSceneChanged') destinationOperationRunning: boolean = false
   @State destinationPickerClosing: boolean = false
@@ -1095,6 +1082,8 @@ struct Index {
   // bottom-safe-area position should be recalculated by the new layout.
   @State @Watch('onContinuationSceneChanged') viewerTransitionActive: boolean = false
   @State @Watch('onContinuationSceneChanged') showAudioPlayer: boolean = false
+  @State @Watch('onContinuationSceneChanged') audioBackgrounded: boolean = false
+  private audioBackgroundOrigin: MediaPlaybackOrigin | null = null
   @State audioEntry: FileEntry | null = null
   @State audioLocalPath: string = ''
   @State audioPlaying: boolean = false
@@ -1136,6 +1125,8 @@ struct Index {
   private audioQueueSource: FileEntryDataSource = new FileEntryDataSource()
   private audioQueueScroller: Scroller = new Scroller()
   private audioSession: AudioSessionManager = new AudioSessionManager()
+  private audioCloseWork: Promise<void> = Promise.resolve()
+  private videoCloseWork: Promise<void> = Promise.resolve()
   private audioSessionUpdatedAt: number = 0
   private audioOwnsBusy: boolean = false
   private audioPageOriginX: number = 0
@@ -1308,6 +1299,8 @@ struct Index {
   abilityInBackground: boolean = false
   @StorageProp('transferNavigationRequest') @Watch('onTransferNavigationRequested')
   transferNavigationRequest: number = 0
+  @StorageProp('audioPlaybackNavigationRequest') @Watch('onAudioPlaybackNavigationRequested')
+  audioPlaybackNavigationRequest: number = 0
   @StorageProp('transferProtectionActive') transferProtectionActive: boolean = false
   @StorageProp('incomingShareRequest') @Watch('onIncomingShareRequested') incomingShareRequest: number = 0
   @State incomingShareUris: string[] = []
@@ -1365,7 +1358,7 @@ struct Index {
   private videoSurfaceWidthPx: number = 0
   private videoSurfaceHeightPx: number = 0
   private videoPipController: PiPWindow.PiPController | null = null
-  private videoPipOrigin: VideoPipOrigin | null = null
+  private videoPipOrigin: MediaPlaybackOrigin | null = null
   private videoPipHideOnStart: boolean = false
   // startPiP/stopPiP resolve asynchronously and the platform can deliver the
   // state callback on a later turn. Keep explicit in-flight guards so a fast
@@ -1443,10 +1436,9 @@ struct Index {
   private navigationViewStateStack: DirectoryViewState[] = []
   private navigationPageIndexStack: number[] = []
   private navigationPageHasMoreStack: boolean[] = []
-  private destinationPathStack: string[] = []
-  private destinationChildrenByPath: Map<string, DestinationEntry[]> = new Map<string, DestinationEntry[]>()
+  private destinationDataSource: FileEntryDataSource = new FileEntryDataSource()
+  private destinationRootPath: string = ''
   private destinationLoadToken: number = 0
-  private destinationTreeRequestToken: number = 0
   private destinationPickerCloseToken: number = 0
   private pendingContextAction: (() => void) | null = null
   /**
@@ -1827,10 +1819,12 @@ struct Index {
 
   private async showTrackedDialog(request: promptAction.ShowDialogOptions |
     (() => Promise<promptAction.ShowDialogSuccessResponse>)): Promise<promptAction.ShowDialogSuccessResponse> {
+    const contextToken = this.continuationContextToken
     this.continuationDialogCount++
     try {
-      return await (typeof request === 'function' ? request() :
-        this.getUIContext().getPromptAction().showDialog(request))
+      const result = await (typeof request === 'function' ? request() :
+        this.presentConfirmationDialog(request))
+      return contextToken === this.continuationContextToken ? result : { index: -1 }
     } finally {
       this.continuationDialogCount = Math.max(0, this.continuationDialogCount - 1)
     }
@@ -1862,11 +1856,11 @@ struct Index {
       this.showRenameDialog || this.showCreateFolderDialog || this.destinationFolderDialog) { return }
     const request = IncomingShareManager.shared().peek()
     if (request === undefined) { return }
-    if (this.showImageViewer || this.showAudioPlayer || this.showVideoPlayer ||
+    if (this.showImageViewer || this.audioPlaybackUiVisible() || this.videoPlaybackUiVisible() ||
       this.viewerClosing || this.viewerReturnOverlayVisible || this.audioClosing || this.videoOverlayClosing) {
       if (this.showImageViewer) { this.closeImageViewer() }
-      if (this.showAudioPlayer && !this.audioClosing) { this.closeAudioPlayer() }
-      if (this.showVideoPlayer && !this.videoOverlayClosing) { this.closeVideoPlayer() }
+      if (this.audioPlaybackUiVisible() && !this.audioClosing) { this.closeAudioPlayer() }
+      if (this.videoPlaybackUiVisible() && !this.videoOverlayClosing) { this.closeVideoPlayer() }
       // Media returns retain their existing animation and input-layer cleanup.
       this.incomingShareScheduled = true
       setTimeout((): void => {
@@ -1948,7 +1942,7 @@ struct Index {
       return entry !== null &&
         ContinuationPolicy.directChild(this.currentPath, entry.path) && this.imageScale === 1
     }
-    if (this.showAudioPlayer) {
+    if (this.audioPlaybackUiVisible()) {
       return this.audioDurationMs > 0 && this.audioManager.isReady() &&
         !this.audioManager.isSeeking() && this.audioEntry !== null &&
         ContinuationPolicy.directChild(this.currentPath, this.audioEntry.path)
@@ -1961,10 +1955,94 @@ struct Index {
   }
 
   private continuationCanReceive(): boolean {
-    return this.continuationOperationIdle() && !this.continuationSending &&
-      !this.fileContentTouchActive && !this.fileContentScrolling &&
-      !this.showImageViewer && !this.showAudioPlayer && !this.showVideoPlayer &&
-      (this.screen === 'files' || this.screen === 'login' || this.screen === 'otp')
+    return this.startupAuthorized && !this.startupRestoring && !this.continuationSending
+  }
+
+  private continuationContextToken: number = 0
+  private pageDialogClosers: Set<() => void> = new Set<() => void>()
+
+  private closePageDialogs(): void {
+    for (const close of Array.from(this.pageDialogClosers)) { close() }
+  }
+
+  private prepareForContinuation(keepAudio: boolean = false, keepVideo: boolean = false): void {
+    // Replace browsing context, not transfer queues or authenticated identity.
+    this.navigationRequestId++; this.directoryIndexRequestToken++
+    this.continuationContextToken++
+    this.closePageDialogs()
+    this.pendingOpenEntry = null; this.pendingContextAction = null
+    this.cancelFileTransition(); this.endDragSelection(); this.exitSelectionMode()
+    this.discardSearchSession(); this.closeActionMenu()
+    this.closeFileSortMenu(); this.closeSelectionMoreMenu(); this.closeImageMoreMenu()
+    this.destinationPickerCloseToken++; this.destinationLoadToken++
+    this.showDestinationPicker = false; this.destinationFolderDialog = false
+    this.destinationPickerClosing = false; this.destinationLoading = false
+    this.destinationDataSource.replace([])
+    this.showRenameDialog = false; this.showCreateFolderDialog = false
+    this.showAlbumPicker = false; this.showAlbumUpload = false; this.showAlbumDetails = false
+    this.albumConfirmationPending = false; this.albumReselectPending = false
+    this.cancelDropImport()
+    this.importExpanded = false; this.importSelecting = false
+    this.releaseViewerForReplacement()
+    if (!keepAudio) { this.closeAudioPlayer(true) }
+    if (!keepVideo) { this.closeVideoPlayer() }
+    this.fileContentScrolling = false; this.fileContentTouchActive = false
+    this.isNavigating = false; this.isBusy = false
+  }
+
+  private releaseViewerForReplacement(): void {
+    this.viewerReturnOverlayToken++
+    this.viewerReturnOverlayMountResolve?.(); this.viewerReturnOverlayMountResolve = null
+    this.viewerPrefetchCoordinator?.onViewerClosed()
+    this.viewerGeneration++; this.showImageViewer = false; this.viewerReturnOverlayVisible = false
+    this.viewerClosePending = true; this.finishCloseImageViewer(false)
+  }
+
+  private async prepareContinuationPlayback(scene: string, valid: () => boolean): Promise<void> {
+    const keep = scene === 'directory' || scene === 'image'
+    if (keep && this.showAudioPlayer && this.audioPlaying && !this.audioClosing) {
+      if (!this.audioBackgrounded) { this.audioBackgroundOrigin = this.captureMediaPlaybackOrigin() }
+      this.audioBackgrounded = true
+      this.audioEntryTransitionResolve?.(); this.audioEntryTransitionResolve = null
+      this.audioOpening = false; this.audioOwnsBusy = false
+      this.audioPageOpacity = 1; this.audioCoverHidden = false
+      this.audioTransitionCoverScale = 0
+      const hidden = this.audioReturnHiddenPath
+      this.audioReturnHiddenPath = ''
+      if (hidden.length > 0) { this.notifyEntryChanged(hidden, this.audioOriginSurface) }
+      this.showAudioQueue = false
+      this.audioFlightVisible = false; this.audioFlightSource = ''
+    } else if (this.showAudioPlayer) {
+      this.closeAudioPlayer(true)
+      await this.audioCloseWork
+    }
+    if (!valid()) { return }
+    if (keep && this.showVideoPlayer && this.videoPlaying && !this.videoCasting && !this.videoOverlayClosing) {
+      if (!this.videoPipBackgrounded) { await this.toggleVideoPip() }
+      if (!valid()) { return }
+      // Failed/unsupported PiP must not keep the old full-screen surface on top.
+      if (!this.videoPipBackgrounded) { this.closeVideoPlayer() }
+    } else if (this.showVideoPlayer) {
+      this.closeVideoPlayer()
+      await this.videoCloseWork
+    }
+  }
+
+  private audioPlaybackUiVisible(): boolean {
+    return this.showAudioPlayer && !this.audioBackgrounded
+  }
+
+  private onAudioPlaybackNavigationRequested(): void {
+    if (!this.audioBackgrounded || this.audioEntry === null ||
+      this.audioOriginScope !== this.repository.sessionIdentity()) { return }
+    if (this.continuationPending || this.continuationSending) { ContinuationManager.shared().cancel() }
+    const origin = this.audioBackgroundOrigin
+    if (origin !== null) { this.restoreMediaPlaybackOrigin(origin) }
+    this.audioBackgroundOrigin = null
+    this.audioBackgrounded = false
+    this.audioCoverRect = new AudioCoverRect()
+    this.audioCoverVisibleRatio = 0
+    this.updateBottomBarVisibility(true)
   }
 
   private captureContinuation(): ContinuationSnapshot {
@@ -1983,11 +2061,11 @@ struct Index {
     if (this.showImageViewer) {
       state.scene = 'image'; state.target = this.committedViewerEntry()?.path ?? ''
       state.anchor = state.target
-    } else if (this.showVideoPlayer) {
+    } else if (this.videoPlaybackUiVisible()) {
       state.scene = 'video'; state.target = this.videoEntry?.path ?? ''
       state.anchor = state.target; state.positionMs = Math.max(0, Math.floor(this.videoCurrentMs))
       state.playing = this.videoPlaying
-    } else if (this.showAudioPlayer) {
+    } else if (this.audioPlaybackUiVisible()) {
       // Older 1.0.10 receivers understand protocol 1 but have no audio scene.
       // Keep existing scenes compatible and let those peers reject audio early.
       state.protocol = 2
@@ -2006,6 +2084,10 @@ struct Index {
       this.screen === 'login' || this.screen === 'otp' || this.offlineCacheMode) {
       throw new ContinuationAccountRequired('请先登录相同 NAS 和账号')
     }
+    if (!valid()) { return }
+    await this.prepareContinuationPlayback(state.scene, valid)
+    if (!valid()) { return }
+    this.prepareForContinuation(this.audioBackgrounded, this.videoPipBackgrounded)
     const identity = this.repository.sessionIdentity()
     const request = this.navigationRequestId
     const unchanged = (): boolean => valid() && identity === this.repository.sessionIdentity() &&
@@ -2168,7 +2250,7 @@ struct Index {
     }
     this.fileGridCellEvents.longPress = (entry: FileEntry, event: GestureEvent): void => {
       if (this.selectionMode) {
-        this.beginDragSelection(entry, this.fileEntryDataSource.indexOfPath(entry.path))
+        this.beginDragSelection(entry, this.fileEntryDataSource.indexOfPath(entry.path), event)
       } else {
         this.showActionMenu(entry, event)
       }
@@ -2283,6 +2365,8 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    this.continuationContextToken++
+    this.closePageDialogs()
     this.cancelDropImport()
     CacheManager.offRemoved(this.cacheRemovalListener)
     if (this.removedPreviewTimer !== 0) { clearTimeout(this.removedPreviewTimer); this.removedPreviewTimer = 0 }
@@ -2697,7 +2781,7 @@ struct Index {
   }
 
   private async cacheGestureEntries(entries: FileEntry[],
-    pinnedPaths: string[]): Promise<GestureTransferCacheResult> {
+    pinnedPaths: string[], valid: () => boolean = (): boolean => true): Promise<GestureTransferCacheResult> {
     const localPaths: Record<string, string> = {}
     let failedCount = 0
     let nextIndex = 0
@@ -2705,13 +2789,13 @@ struct Index {
       while (true) {
         const index = nextIndex
         nextIndex += 1
-        if (index >= entries.length) {
+        if (index >= entries.length || !valid()) {
           return
         }
         const entry = entries[index]
         try {
-          const localPath = await this.ensureCachedFile(entry)
-          if (CacheManager.exists(localPath)) {
+          const localPath = await this.ensureCachedFile(entry, undefined, valid)
+          if (valid() && CacheManager.exists(localPath)) {
             // A later download in the same selection must not evict an
             // earlier record before HarmonyShare has consumed its URI.
             if (pinnedPaths.indexOf(localPath) < 0) {
@@ -2745,7 +2829,15 @@ struct Index {
     const selection = await this.filterGestureTransferEntries(candidates)
     // SharedData supports at most 500 records.
     const transferEntries = selection.entries.slice(0, 500)
-    for (const entry of transferEntries) {
+    this.pinTransferCacheTargets(transferEntries, pinnedPaths)
+    const cached = await this.cacheGestureEntries(transferEntries, pinnedPaths)
+    return { entries: cached.entries, localPaths: cached.localPaths,
+      failedCount: cached.failedCount,
+      skippedCount: selection.skippedCount + Math.max(0, selection.entries.length - 500) }
+  }
+
+  private pinTransferCacheTargets(entries: FileEntry[], pinnedPaths: string[]): void {
+    for (const entry of entries) {
       if (!this.isVideo(entry)) {
         // Pin even an as-yet missing destination before awaiting downloads:
         // DownloadManager releases its own pin as it returns, and another
@@ -2757,10 +2849,6 @@ struct Index {
         }
       }
     }
-    const cached = await this.cacheGestureEntries(transferEntries, pinnedPaths)
-    return { entries: cached.entries, localPaths: cached.localPaths,
-      failedCount: cached.failedCount,
-      skippedCount: selection.skippedCount + Math.max(0, selection.entries.length - 500) }
   }
 
   private canShowGestureShareFeedback(candidates: FileEntry[]): boolean {
@@ -3143,7 +3231,7 @@ struct Index {
   // do not use these flags to unmount material hosts or change the bar's mode.
   private parentOverlayOwnsInteraction(): boolean {
     return !this.startupAuthorized || this.startupRestoring || this.continuationSending ||
-      this.viewerOwnsParentInteraction() || this.showAudioPlayer ||
+      this.viewerOwnsParentInteraction() || this.audioPlaybackUiVisible() ||
       this.videoPlaybackUiVisible() || this.videoEntryTransitionActive ||
       this.contextMenuEntry !== null || this.showRenameDialog ||
       this.showDestinationPicker || this.showCreateFolderDialog ||
@@ -3266,6 +3354,7 @@ struct Index {
     this.getUIContext().animateTo({
       duration: 180,
       curve: Curve.FastOutSlowIn,
+      expectedFrameRateRange: FILE_TRANSITION_FRAME_RATE,
       finishCallbackType: FinishCallbackType.REMOVED,
       onFinish: (): void => {
         this.finishPreparedFileTransition(token)
@@ -3526,6 +3615,7 @@ struct Index {
     this.getUIContext().animateTo({
       duration: 180,
       curve: Curve.FastOutSlowIn,
+      expectedFrameRateRange: FILE_TRANSITION_FRAME_RATE,
       finishCallbackType: FinishCallbackType.REMOVED,
       onFinish: (): void => {
         this.finishBackFileTransition(token, incomingState, (): void => commitIncoming(preparedEntries))
@@ -3561,11 +3651,7 @@ struct Index {
       return true
     }
     if (this.showDestinationPicker) {
-      if (this.destinationExpandedPaths.length > 0) {
-        this.goDestinationBack()
-      } else {
-        this.closeDestinationPicker()
-      }
+      this.goDestinationBack()
       return true
     }
     if (this.showImageViewer) {
@@ -3582,7 +3668,7 @@ struct Index {
     }
     if (this.showAudioQueue) { this.showAudioQueue = false; return true }
     if (this.audioClosing) { return true }
-    if (this.showAudioPlayer) {
+    if (this.audioPlaybackUiVisible()) {
       this.closeAudioPlayer()
       return true
     }
@@ -3924,7 +4010,7 @@ struct Index {
         // Same page layer as Viewer; later sibling draws over Viewer during handoff.
         this.ViewerReturnOverlay()
       }
-      if (this.showAudioPlayer && this.audioEntry !== null) {
+      if (this.audioPlaybackUiVisible() && this.audioEntry !== null) {
         this.AudioPlayerOverlay()
       }
       if (this.audioFlightVisible) { this.AudioCoverFlight() }
@@ -4021,6 +4107,9 @@ struct Index {
       return { strategy: TouchTestStrategy.DEFAULT, id: '' }
     })
     .onTouch((event: TouchEvent): void => {
+      if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
+        this.cancelSelectedFileDrag()
+      }
       this.handleDragSelectionTouch(event)
       if (event.type === TouchType.Down) {
         this.fileContentTouchActive = true
@@ -4729,6 +4818,7 @@ struct Index {
               }
             }
             .width('100%')
+            .id('file-row:' + entry.path)
             .onAreaChange((_, area) => this.recordRowHitArea(entry, index, 'list', area))
             .onClick(() => this.handleFileEntryClick(entry))
             // 序列组：必须先长按成功，后面的 Pan 才会被识别。所以普通滑动
@@ -4739,7 +4829,7 @@ struct Index {
                 LongPressGesture({ repeat: false, duration: 380 })
                   .onAction((event: GestureEvent): void => {
                     if (this.selectionMode) {
-                      this.beginDragSelection(entry, index)
+                      this.beginDragSelection(entry, index, event)
                     } else {
                       this.showActionMenu(entry, event)
                     }
@@ -4978,7 +5068,7 @@ struct Index {
       systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false)
     }
     let selected = -1
-    try { selected = (await this.getUIContext().getPromptAction().showActionMenu(options)).index }
+    try { selected = (await this.showTrackedDialog(() => this.presentActionMenu(options))).index }
     catch (_) { return } // Dismissing the native action menu performs no task action.
     finally { this.albumUploadActionsOpen = false }
     if (this.screen !== 'downloads' || !this.albumUploadJobs.some((value: AlbumUploadJob): boolean => value.id === job.id)) { return }
@@ -5653,7 +5743,7 @@ struct Index {
               LongPressGesture({ repeat: false, duration: 380 })
                 .onAction((event: GestureEvent): void => {
                   if (this.selectionMode) {
-                    this.beginDragSelection(entry, this.waterfallEntryIndex(entry))
+                    this.beginDragSelection(entry, this.waterfallEntryIndex(entry), event)
                   } else {
                     this.showActionMenu(entry, event)
                   }
@@ -7403,28 +7493,6 @@ struct Index {
     return TransitionEffect.asymmetric(appear, disappear)
   }
 
-  /**
-   * Short, interruptible transition for the destination folder list. The
-   * list layout itself is animated by animateTo when the root is expanded or
-   * collapsed; this transition handles the list entering and leaving the
-   * Scroll content without a hard visual pop.
-   */
-  private destinationFolderListTransition(): TransitionEffect {
-    const appear = TransitionEffect.opacity(0)
-      .combine(TransitionEffect.scale({ x: 0.985, y: 0.985, z: 1 }))
-      .animation({
-        duration: 220,
-        curve: curves.interpolatingSpring(0, 1, 320, 30)
-      })
-    const disappear = TransitionEffect.opacity(0)
-      .combine(TransitionEffect.scale({ x: 1, y: 1, z: 1 }))
-      .animation({
-        duration: 150,
-        curve: Curve.EaseOut
-      })
-    return TransitionEffect.asymmetric(appear, disappear)
-  }
-
   @Builder
   FileSortOption(title: string, key: FileSortKey): void {
     Row() {
@@ -8023,26 +8091,14 @@ struct Index {
   DestinationPickerContent(): void {
     TaskPanelSection({ fillHeight: true, paddingSize: 0 }) {
       Stack() {
+        List() {
+          ListItem() { this.DestinationCloudRootRow() }
+          LazyForEach(this.destinationDataSource, (entry: FileEntry) => {
+            ListItem() { this.DestinationFolderRow(entry) }
+          }, (entry: FileEntry): string => entry.path)
+        }.width('100%').height('100%').cachedCount(2).scrollBar(BarState.Auto)
         if (this.destinationLoading) {
           LoadingProgress().width(24).height(24).color($r('sys.color.comp_background_emphasize'))
-            .accessibilityText(this.destinationOperationRunning ? '处理中' : '读取目录')
-        } else {
-          Scroll() {
-            Column() {
-              this.DestinationCloudRootRow()
-              if (this.destinationRootExpanded) {
-                ForEach(this.destinationTreeRows, (row: DestinationTreeRow) => {
-                  this.DestinationTreeRowView(row)
-                }, (row: DestinationTreeRow): string => row.entry.path)
-                if (this.destinationTreeRows.length === 0) {
-                  Text('暂无文件夹').fontSize(14).fontColor($r('sys.color.font_secondary'))
-                    .width('100%').textAlign(TextAlign.Center).padding(24)
-                }
-              }
-            }.width('100%').alignItems(HorizontalAlign.Start)
-          }.width('100%').height('100%').scrollBar(BarState.Auto).edgeEffect(EdgeEffect.Spring)
-            .align(Alignment.TopStart)
-            .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(16) })
         }
       }.width('100%').height('100%')
     }
@@ -8061,57 +8117,35 @@ struct Index {
   }
 
   @Builder
-  DestinationStorageVisual(): void {
-    Image($r('app.media.private_cloud')).width(FileRowStyle.iconSize).height(FileRowStyle.iconSize).objectFit(ImageFit.Contain)
-  }
-
-  @Builder
   DestinationCloudRootRow(): void {
-    Column() {
-      Row({ space: FileRowStyle.leadingGap }) {
-        Stack() { this.DestinationStorageVisual() }.width(FileRowStyle.leadingWidth).height(FileRowStyle.leadingHeight)
-        Text('我的云盘').fontSize(FileRowStyle.titleSize).fontWeight(FontWeight.Medium)
-          .fontColor($r('sys.color.font_primary')).layoutWeight(1)
-        SymbolGlyph(this.destinationRootExpanded ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_forward'))
-          .fontSize(18).fontColor([$r('sys.color.icon_secondary')]).width(24)
-      }.width('100%').padding({ left: FileRowStyle.horizontalPadding, right: FileRowStyle.horizontalPadding,
-        top: FileRowStyle.verticalPadding, bottom: FileRowStyle.verticalPadding })
-        .backgroundColor(this.destinationPath === this.destinationUserRootPath()
-          ? $r('app.color.surface_selected') : Color.Transparent)
-        .onClick(() => this.toggleDestinationRoot()).id('destination-picker-root')
-      Divider().strokeWidth(0.5).color($r('app.color.divider')).margin({ left: 56, right: FileRowStyle.horizontalPadding })
-    }.width('100%')
+    Row({ space: FileRowStyle.leadingGap }) {
+      SymbolGlyph(this.destinationPath === this.destinationRootPath ? $r('sys.symbol.house') : $r('sys.symbol.arrow_up'))
+        .fontSize(24).width(FileRowStyle.leadingWidth).height(FileRowStyle.leadingHeight)
+      Text(this.destinationPath === this.destinationRootPath ? this.destinationDisplayName() : '上一级')
+        .fontSize(FileRowStyle.titleSize).fontColor($r('sys.color.font_primary')).layoutWeight(1)
+    }.width('100%').padding({ left: FileRowStyle.horizontalPadding, right: FileRowStyle.horizontalPadding,
+      top: FileRowStyle.verticalPadding, bottom: FileRowStyle.verticalPadding })
+      .id('destination-picker-root').onClick((): void => {
+        if (this.destinationPath !== this.destinationRootPath) { this.goDestinationBack() }
+      })
   }
 
   @Builder
-  DestinationTreeRowView(row: DestinationTreeRow): void {
+  DestinationFolderRow(entry: FileEntry): void {
     Column() {
       Row({ space: FileRowStyle.leadingGap }) {
         Stack() { this.FolderIcon(FileRowStyle.iconSize) }.width(FileRowStyle.leadingWidth).height(FileRowStyle.leadingHeight)
         Column({ space: FileRowStyle.textGap }) {
-          Text(row.entry.name).fontSize(FileRowStyle.titleSize).fontColor($r('sys.color.font_primary'))
+          Text(entry.name).fontSize(FileRowStyle.titleSize).fontColor($r('sys.color.font_primary'))
             .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-          if (this.destinationEntryInfo(row.entry).length > 0) {
-            Text(this.destinationEntryInfo(row.entry)).fontSize(FileRowStyle.infoSize).fontColor($r('sys.color.font_secondary'))
-              .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
+          Text(this.destinationEntryInfo(entry)).fontSize(FileRowStyle.infoSize).fontColor($r('sys.color.font_secondary'))
         }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-        SymbolGlyph(row.expanded ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_forward'))
-          .fontSize(18).fontColor([$r('sys.color.icon_secondary')]).width(24)
-      }.width('100%').padding({ left: FileRowStyle.horizontalPadding + (row.depth + 1) * 24, right: FileRowStyle.horizontalPadding,
+        SymbolGlyph($r('sys.symbol.chevron_forward')).fontSize(18).fontColor([$r('sys.color.icon_secondary')]).width(24)
+      }.width('100%').padding({ left: FileRowStyle.horizontalPadding, right: FileRowStyle.horizontalPadding,
         top: FileRowStyle.verticalPadding, bottom: FileRowStyle.verticalPadding })
-        .backgroundColor(this.destinationPath === row.entry.path ? $r('app.color.surface_selected') : Color.Transparent)
-        .onClick(() => this.toggleDestinationFolder(row.entry))
-      if (row.loading) {
-        Row() {
-          LoadingProgress().width(18).height(18).color($r('sys.color.comp_background_emphasize'))
-            .accessibilityText('读取目录')
-        }.width('100%').padding({ left: 56 + (row.depth + 1) * 24, bottom: 8 })
-      }
-      Divider().strokeWidth(0.5).color($r('app.color.divider'))
-        .margin({ left: 56 + (row.depth + 1) * 24, right: FileRowStyle.horizontalPadding })
-    }.width('100%').id('destinationTreeRow_' + row.entry.path)
-      .transition(this.destinationFolderListTransition())
+        .onClick((): void => { this.loadDestinationEntries(entry.path) })
+      Divider().strokeWidth(0.5).color($r('app.color.divider')).margin({ left: 56, right: FileRowStyle.horizontalPadding })
+    }.width('100%').id('destination-folder:' + entry.path)
   }
 
   @Builder
@@ -12104,7 +12138,7 @@ struct Index {
     session.targetParentPath = ''
     session.targetNavigationDepth = this.navigationStack.length
     this.showImageViewer = false
-    this.showAudioPlayer = false
+    if (!this.audioBackgrounded) { this.showAudioPlayer = false }
     this.isBusy = false
     this.isNavigating = false
     this.statusText = ''
@@ -12121,7 +12155,7 @@ struct Index {
 
   private focusSearchInputWhenVisible(): void {
     if (!this.searchFocusPending || !this.showSearch || this.screen !== 'files' ||
-      this.showImageViewer || this.showAudioPlayer || this.showVideoPlayer) { return }
+      this.showImageViewer || this.audioPlaybackUiVisible() || this.videoPlaybackUiVisible()) { return }
     // Only a fresh search requests the keyboard. Rebuilds, scope changes and
     // returning from a result must not reclaim focus after the user dismisses it.
     this.searchFocusPending = false
@@ -12623,7 +12657,10 @@ struct Index {
   }
 
   private ensureWaterfallStarted(): void {
-    if (this.fileViewMode !== 'waterfall' || this.waterfallBatches === null ||
+    // A push still owes its final preview cleanup. Starting the incoming
+    // batch before that cleanup lets a warm group publish and then be erased.
+    if (this.screen !== 'files' || this.resetPreviewAfterPageTransition ||
+      this.fileViewMode !== 'waterfall' || this.waterfallBatches === null ||
       this.waterfallEntries.length === 0 || this.waterfallBatches.first >= 0 ||
       this.waterfallBatches.preparing >= 0 || this.waterfallBatches.error) { return }
     const anchor = this.waterfallAnchor?.path ?? this.targetLocateEntryPath
@@ -12941,7 +12978,12 @@ struct Index {
   private waterfallBoundaryOffset(edge: number): number {
     const batches = this.waterfallBatches
     if (batches === null || batches.first < 0) { return 0 }
-    const min = Math.max(0, (this.waterfallGroupTops.get(batches.residentFirst()) ?? 0) - this.fileContentTopInset())
+    // Masonry groups overlap vertically. The top of the first resident group
+    // may still contain the tails of evicted cells in other columns. Stop
+    // after those tails, so pulling up never reveals a screen of blank cells.
+    const first = batches.residentFirst()
+    const safeTop = first > batches.first ? this.waterfallGroupBottoms.get(first - 1) : undefined
+    const min = Math.max(0, (safeTop ?? this.waterfallGroupTops.get(first) ?? 0) - this.fileContentTopInset())
     if (edge < 0) { return min }
     const firstBottom = this.waterfallGroupBottoms.get(batches.residentFirst()) ?? 0
     const lastBottom = this.waterfallGroupBottoms.get(batches.residentLast()) ?? 0
@@ -14959,7 +15001,7 @@ struct Index {
   private async loadNextDirectoryPage(): Promise<void> {
     if (this.loadingNextPage || !this.currentPageHasMore || this.currentPath.length === 0 ||
       this.isBusy || this.isNavigating || this.showSearch ||
-      this.showAudioPlayer || this.screen !== 'files') {
+      this.audioPlaybackUiVisible() || this.screen !== 'files') {
       return
     }
     const path = this.currentPath
@@ -16193,7 +16235,7 @@ struct Index {
     // `contextMenuContext` records which set to render.
     const inFiles = this.screen === 'files' && !this.showSearch && !this.selectionMode &&
       !this.showDestinationPicker && !this.showRenameDialog && !this.showCreateFolderDialog &&
-      !this.showImageViewer && !this.showAudioPlayer && !this.videoPlaybackUiVisible() &&
+      !this.showImageViewer && !this.audioPlaybackUiVisible() && !this.videoPlaybackUiVisible() &&
       !this.showPageTransition && this.contextMenuEntry === null
     const inRecycle = this.showRecycleBinSettings && !this.recycleLoading &&
       this.contextMenuEntry === null
@@ -16546,26 +16588,91 @@ struct Index {
   }
 
   private presentEntryDetails(title: string, message: string): Promise<promptAction.ShowDialogSuccessResponse> {
+    return this.presentPageDialog((finish: (index: number) => void): void => {
+      this.EntryDetailsDialogContent(title, message, (): void => { finish(0) })
+    }, this.floatingPanelMaterial)
+  }
+
+  private confirmationButton(options: promptAction.ShowDialogOptions, index: number,
+    finish: (index: number) => void): ButtonOptions | undefined {
+    const button = options.buttons?.[index]
+    return button === undefined ? undefined : { value: button.text, fontColor: button.color,
+      action: (): void => { finish(index) } }
+  }
+
+  @Builder
+  ConfirmationDialogContent(options: promptAction.ShowDialogOptions, finish: (index: number) => void): void {
+    SystemAlertDialog({ primaryTitle: options.title, content: options.message ?? '',
+      primaryButton: this.confirmationButton(options, 0, finish),
+      secondaryButton: this.confirmationButton(options, 1, finish) })
+      .id('page-confirmation-dialog')
+  }
+
+  private presentConfirmationDialog(options: promptAction.ShowDialogOptions): Promise<promptAction.ShowDialogSuccessResponse> {
+    return this.presentPageDialog((finish: (index: number) => void): void => {
+      this.ConfirmationDialogContent(options, finish)
+    }, options.systemMaterial ?? this.floatingPanelMaterial)
+  }
+
+  private actionMenuButtons(options: promptAction.ActionMenuOptions,
+    finish: (index: number) => void): ButtonOptions[] {
+    const buttons: ButtonOptions[] = []
+    options.buttons.forEach((button: promptAction.Button | undefined, index: number): void => {
+      if (button !== undefined) {
+        buttons.push({ value: button.text, fontColor: button.color, action: (): void => { finish(index) } })
+      }
+    })
+    return buttons
+  }
+
+  @Builder
+  ActionMenuEmptyContent(): void {
+    Row() {}.height(0)
+  }
+
+  @Builder
+  ActionMenuDialogContent(options: promptAction.ActionMenuOptions, finish: (index: number) => void): void {
+    CustomContentDialog({ primaryTitle: options.title,
+      contentBuilder: (): void => { this.ActionMenuEmptyContent() }, buttons: this.actionMenuButtons(options, finish) })
+      .id('page-action-menu')
+  }
+
+  private presentActionMenu(options: promptAction.ActionMenuOptions): Promise<promptAction.ShowDialogSuccessResponse> {
+    return this.presentPageDialog((finish: (index: number) => void): void => {
+      this.ActionMenuDialogContent(options, finish)
+    }, options.systemMaterial ?? this.floatingPanelMaterial)
+  }
+
+  private presentPageDialog(builder: (finish: (index: number) => void) => void,
+    material: SystemUiMaterial): Promise<promptAction.ShowDialogSuccessResponse> {
     const prompt = this.getUIContext().getPromptAction()
     return new Promise<promptAction.ShowDialogSuccessResponse>((resolve, reject) => {
       let dialogId = -1
-      let confirmPending = false
-      const onConfirm = (): void => {
-        if (confirmPending) { return }
-        confirmPending = true
+      let closePending = false
+      let selected = -1
+      const finish = (index: number): void => {
+        if (closePending) { return }
+        closePending = true
+        selected = index
         if (dialogId >= 0) { prompt.closeCustomDialog(dialogId) }
       }
-      // Keep the platform's centred dialog and input mask. Custom content is
-      // needed because showDialog's generated text does not invert on thin glass.
-      prompt.openCustomDialog({ builder: () => { this.EntryDetailsDialogContent(title, message, onConfirm) },
+      const cancel = (): void => { finish(-1) }
+      this.pageDialogClosers.add(cancel)
+      prompt.openCustomDialog({ builder: () => { builder(finish) },
         alignment: DialogAlignment.Center, autoCancel: true,
         width: Math.min(400, this.effectivePageWidth() - Glass.windowInset * 2),
-        systemMaterial: this.floatingPanelMaterial,
-        onDidDisappear: (): void => resolve({ index: confirmPending ? 0 : -1 })
+        systemMaterial: material,
+        onDidDisappear: (): void => {
+          this.pageDialogClosers.delete(cancel)
+          resolve({ index: selected })
+        }
       }).then((id: number): void => {
         dialogId = id
-        if (confirmPending) { prompt.closeCustomDialog(id) }
-      }).catch(reject)
+        if (closePending) { prompt.closeCustomDialog(id) }
+      }).catch((error: Error): void => {
+        this.pageDialogClosers.delete(cancel)
+        reject(error)
+      })
     })
   }
 
@@ -16573,29 +16680,21 @@ struct Index {
     this.beginDestinationPickerForEntries(operation, [entry])
   }
 
-  private beginDestinationPickerForEntries(operation: DestinationOperation,
-    entries: FileEntry[]): void {
-    if (this.isBusy || this.destinationOperationRunning) {
-      return
-    }
-    this.destinationPickerCloseToken += 1
-    this.destinationOperation = operation
-    this.destinationSelectedEntries = entries.slice()
-    // Copy and move both target the current cloud provider. Keeping one
-    // destination model also prevents a local-public-directory capability
-    // from being touched by the path picker.
-    this.destinationPathStack = []
-    this.destinationPath = this.destinationUserRootPath()
-    this.destinationChildrenByPath.clear()
-    this.destinationTreeRows = []
-    this.destinationExpandedPaths = []
-    this.destinationTreeLoadingPath = ''
-    this.destinationRootExpanded = true
-    this.destinationPickerClosing = false
-    this.destinationOperationRunning = false
+  private beginDestinationPickerForEntries(operation: DestinationOperation, entries: FileEntry[]): void {
+    if (this.isBusy || this.destinationOperationRunning) { return }
+    this.destinationPickerCloseToken++
+    this.destinationOperation = operation; this.destinationSelectedEntries = entries.slice()
+    const roots = this.rootKind === 'personal' ? this.personalRoots : this.sharedRoots
+    this.destinationRootPath = roots.filter((entry: FileEntry): boolean => entry.isDirectory &&
+      (this.currentPath === entry.path || this.currentPath.startsWith(entry.path + '/')))
+      .sort((a: FileEntry, b: FileEntry): number => b.path.length - a.path.length)[0]?.path ?? this.destinationUserRootPath()
+    this.destinationPath = this.currentPath.startsWith(this.destinationRootPath + '/') || this.currentPath === this.destinationRootPath
+      ? this.currentPath : this.destinationRootPath
+    this.destinationDataSource.replace([])
+    this.destinationPickerClosing = false; this.destinationOperationRunning = false
     this.showDestinationPicker = true
     this.closeActionMenu()
-    this.loadDestinationEntries()
+    this.loadDestinationEntries(this.destinationPath)
   }
 
   private closeDestinationPicker(): void {
@@ -16606,21 +16705,14 @@ struct Index {
     this.destinationLoading = false
     const closeToken = ++this.destinationPickerCloseToken
     this.destinationLoadToken += 1
-    this.destinationTreeRequestToken += 1
-    this.destinationTreeLoadingPath = ''
     setTimeout(() => {
       if (closeToken !== this.destinationPickerCloseToken) {
         return
       }
       this.showDestinationPicker = false
       this.destinationPickerClosing = false
-      this.destinationPathStack = []
       this.destinationPath = ''
-      this.destinationEntries = []
-      this.destinationTreeRows = []
-      this.destinationExpandedPaths = []
-      this.destinationChildrenByPath.clear()
-      this.destinationRootExpanded = true
+      this.destinationDataSource.replace([])
       this.destinationSelectedEntries = []
       this.destinationFolderText = ''
       if (this.destinationOperation === 'upload') {
@@ -16634,139 +16726,33 @@ struct Index {
   }
 
 
-  private async loadDestinationEntries(): Promise<void> {
+  private async loadDestinationEntries(path: string = this.destinationPath, forceNetwork: boolean = false): Promise<void> {
+    if (this.destinationPickerClosing || this.destinationOperationRunning ||
+      (path !== this.destinationRootPath && !path.startsWith(this.destinationRootPath + '/'))) { return }
     const token = ++this.destinationLoadToken
+    const identity = this.repository.sessionIdentity()
     this.destinationLoading = true
-    this.destinationEntries = []
-    this.destinationTreeRows = []
-    const rootPath = this.destinationUserRootPath()
-    try {
-      const result = await this.fetchDestinationFolders(rootPath)
-      if (token === this.destinationLoadToken) {
-        this.destinationPath = rootPath
-        this.destinationEntries = result
-        this.destinationChildrenByPath.clear()
-        this.destinationExpandedPaths = []
-        this.rebuildDestinationTreeRows()
-      }
-    } catch (error) {
-      if (token === this.destinationLoadToken) {
-        this.destinationEntries = []
-        this.destinationTreeRows = []
-        this.reportError(error as Object, '读取目标目录失败')
-      }
-    } finally {
-      if (token === this.destinationLoadToken) {
-        this.destinationLoading = false
-      }
-    }
-  }
-
-  private async fetchDestinationFolders(path: string): Promise<DestinationEntry[]> {
-    const result: DestinationEntry[] = []
-    const rootType = path.length > 0 ? 3 : this.currentRootType
-    const entries = await this.repository.list(path, rootType)
-    for (const entry of entries) {
-      if (!entry.isDirectory) {
-        continue
-      }
-      const item = new DestinationEntry()
-      item.name = entry.name
-      item.path = entry.path
-      item.modifiedTime = entry.modifiedTime
-      item.childCount = entry.childCount
-      result.push(item)
-    }
-    result.sort((left: DestinationEntry, right: DestinationEntry): number => {
-      return left.name.localeCompare(right.name)
-    })
-    return result
-  }
-
-  private rebuildDestinationTreeRows(): void {
-    const rows: DestinationTreeRow[] = []
-    const appendRows = (entries: DestinationEntry[], depth: number): void => {
-      for (const entry of entries) {
-        const row = new DestinationTreeRow()
-        row.entry = entry
-        row.depth = depth
-        row.expanded = this.destinationExpandedPaths.indexOf(entry.path) >= 0
-        row.loading = this.destinationTreeLoadingPath === entry.path
-        rows.push(row)
-        if (row.expanded) {
-          const children = this.destinationChildrenByPath.get(entry.path)
-          if (children !== undefined) {
-            appendRows(children, depth + 1)
-          }
-        }
-      }
-    }
-    appendRows(this.destinationEntries, 0)
-    this.destinationTreeRows = rows
-  }
-
-  private async toggleDestinationFolder(entry: DestinationEntry): Promise<void> {
-    if (this.destinationLoading || this.destinationTreeLoadingPath.length > 0) {
-      return
-    }
-    const path = entry.path
     this.destinationPath = path
-    const isExpanded = this.destinationExpandedPaths.indexOf(path) >= 0
-    if (isExpanded) {
-      const prefix = path.replace(/[\\/]$/, '') + '/'
-      this.getUIContext().animateTo({
-        duration: 220,
-        curve: curves.interpolatingSpring(0, 1, 320, 30)
-      }, () => {
-        this.destinationExpandedPaths = this.destinationExpandedPaths.filter((item: string): boolean => {
-          return item !== path && !item.startsWith(prefix)
-        })
-        this.rebuildDestinationTreeRows()
-      })
-      return
-    }
-
-    const cachedChildren = this.destinationChildrenByPath.get(path)
-    if (cachedChildren !== undefined) {
-      this.getUIContext().animateTo({
-        duration: 220,
-        curve: curves.interpolatingSpring(0, 1, 320, 30)
-      }, () => {
-        this.destinationExpandedPaths = this.destinationExpandedPaths.concat([path])
-        this.rebuildDestinationTreeRows()
-      })
-      return
-    }
-
-    const requestToken = ++this.destinationTreeRequestToken
-    const closeToken = this.destinationPickerCloseToken
-    this.destinationTreeLoadingPath = path
-    this.rebuildDestinationTreeRows()
+    this.destinationDataSource.replace([])
     try {
-      const children = await this.fetchDestinationFolders(path)
-      if (requestToken !== this.destinationTreeRequestToken ||
-        closeToken !== this.destinationPickerCloseToken) {
-        return
+      const folders = await this.fetchDestinationFolders(path, forceNetwork)
+      if (token === this.destinationLoadToken && identity === this.repository.sessionIdentity()) {
+        this.destinationDataSource.replace(folders)
       }
-      this.destinationChildrenByPath.set(path, children)
-      this.getUIContext().animateTo({
-        duration: 220,
-        curve: curves.interpolatingSpring(0, 1, 320, 30)
-      }, () => {
-        this.destinationExpandedPaths = this.destinationExpandedPaths.concat([path])
-        this.rebuildDestinationTreeRows()
-      })
     } catch (error) {
-      if (requestToken === this.destinationTreeRequestToken &&
-        closeToken === this.destinationPickerCloseToken) {
-        this.reportError(error as Object, '读取目标目录失败')
-      }
+      if (token === this.destinationLoadToken) { this.reportError(error as Object, '读取目标目录失败') }
     } finally {
-      if (requestToken === this.destinationTreeRequestToken) {
-        this.destinationTreeLoadingPath = ''
-        this.rebuildDestinationTreeRows()
-      }
+      if (token === this.destinationLoadToken) { this.destinationLoading = false }
     }
+  }
+
+  private async fetchDestinationFolders(path: string, forceNetwork: boolean = false): Promise<FileEntry[]> {
+    // The mounted complete directory is already authoritative. Other levels
+    // share the repository's coalesced memory/disk index, never list all pages anew.
+    const entries = !forceNetwork && path === this.currentPath && !this.currentPageHasMore && this.directoryTimeline.complete
+      ? this.entries : (await this.repository.ensureDirectoryIndex(path, path === '' ? this.currentRootType : 3, forceNetwork)).entries
+    return entries.filter((entry: FileEntry): boolean => entry.isDirectory)
+      .sort((a: FileEntry, b: FileEntry): number => a.name.localeCompare(b.name))
   }
 
   private destinationUserRootPath(): string {
@@ -16774,44 +16760,10 @@ struct Index {
     return account.length > 0 ? '/home/' + account : '/home'
   }
 
-  private toggleDestinationRoot(): void {
-    if (this.destinationOperationRunning || this.destinationPickerClosing) { return }
-    const rootPath = this.destinationUserRootPath()
-    this.destinationPathStack = []
-    this.destinationPath = rootPath
-    const nextExpanded = !this.destinationRootExpanded
-    this.getUIContext().animateTo({
-      duration: 220,
-      curve: curves.interpolatingSpring(0, 1, 320, 30)
-    }, () => {
-      this.destinationRootExpanded = nextExpanded
-    })
-  }
-
   private goDestinationBack(): void {
     if (this.destinationOperationRunning || this.destinationPickerClosing) { return }
-    if (this.destinationTreeLoadingPath.length > 0) {
-      return
-    }
-    if (this.destinationExpandedPaths.length === 0) {
-      this.destinationLoading = false
-      this.closeDestinationPicker()
-      return
-    }
-    const expandedPath = this.destinationExpandedPaths[this.destinationExpandedPaths.length - 1]
-    const rootPath = this.destinationUserRootPath()
-    const parent = this.parentPath(expandedPath)
-    this.destinationPath = parent.indexOf(rootPath) === 0 ? parent : rootPath
-    const prefix = expandedPath.replace(/[\\/]$/, '') + '/'
-    this.getUIContext().animateTo({
-      duration: 220,
-      curve: curves.interpolatingSpring(0, 1, 320, 30)
-    }, () => {
-      this.destinationExpandedPaths = this.destinationExpandedPaths.filter((item: string): boolean => {
-        return item !== expandedPath && !item.startsWith(prefix)
-      })
-      this.rebuildDestinationTreeRows()
-    })
+    if (this.destinationPath === this.destinationRootPath) { this.closeDestinationPicker(); return }
+    this.loadDestinationEntries(this.parentPath(this.destinationPath))
   }
 
   private openDestinationFolderDialog(): void {
@@ -16841,29 +16793,26 @@ struct Index {
     }
     const parent = this.destinationPath.replace(/[\\/]$/, '')
     const path = parent.length > 0 ? parent + '/' + name : '/' + name
+    const navigation = this.navigationRequestId
+    const unchanged = (): boolean => navigation === this.navigationRequestId
     this.destinationOperationRunning = true
     this.destinationLoading = true
     try {
       await this.repository.createFolder(path)
+      if (!unchanged()) { return }
       this.destinationFolderDialog = false
       this.destinationFolderText = ''
-      const refreshedPath = this.destinationPath
-      const refreshedEntries = await this.fetchDestinationFolders(refreshedPath)
-      if (refreshedPath === this.destinationUserRootPath()) {
-        this.destinationEntries = refreshedEntries
-      } else {
-        this.destinationChildrenByPath.set(refreshedPath, refreshedEntries)
-      }
-      this.rebuildDestinationTreeRows()
+      const folders = await this.fetchDestinationFolders(this.destinationPath, true)
+      if (unchanged()) { this.destinationDataSource.replace(folders) }
     } catch (error) {
-      this.reportError(error as Object, '新建文件夹失败')
+      if (unchanged()) { this.reportError(error as Object, '新建文件夹失败') }
     } finally {
       this.destinationOperationRunning = false
       this.destinationLoading = false
     }
   }
 
-  private destinationEntryInfo(entry: DestinationEntry): string {
+  private destinationEntryInfo(entry: FileEntry): string {
     const parts: string[] = []
     if (entry.modifiedTime > 0) {
       parts.push(this.formatTime(entry.modifiedTime))
@@ -17089,6 +17038,8 @@ struct Index {
       return
     }
     const entries = this.destinationSelectedEntries.slice()
+    let navigation = this.navigationRequestId
+    const operation = this.destinationOperation
     const targetPath = this.destinationPath
     if (this.destinationOperation === 'move') {
       for (const entry of entries) {
@@ -17104,20 +17055,26 @@ struct Index {
     this.destinationLoading = true
     try {
       const paths = entries.map((entry: FileEntry): string => entry.path)
-      if (this.destinationOperation === 'copy') {
+      if (operation === 'copy') {
         await this.repository.copy(paths, targetPath)
       } else {
         await this.repository.move(paths, targetPath)
       }
-      await this.refreshCurrentDirectory()
-      this.statusText = this.destinationOperation === 'copy' ? '已复制到云盘' : '已移动到云盘'
+      if (navigation !== this.navigationRequestId) { return }
+      const refresh = this.refreshCurrentDirectory()
+      navigation = this.navigationRequestId
+      await refresh
+      if (navigation !== this.navigationRequestId) { return }
+      this.statusText = operation === 'copy' ? '已复制到云盘' : '已移动到云盘'
       HapticFeedback.success()
       this.showImmersiveToast(this.statusText)
       this.destinationLoading = false
       this.destinationOperationRunning = false
       this.closeDestinationPicker()
     } catch (error) {
-      this.reportError(error as Object, this.destinationOperation === 'copy' ? '复制失败' : '移动失败')
+      if (navigation === this.navigationRequestId) {
+        this.reportError(error as Object, operation === 'copy' ? '复制失败' : '移动失败')
+      }
     } finally {
       this.destinationOperationRunning = false
       this.destinationLoading = false
@@ -17133,6 +17090,7 @@ struct Index {
     const uris = this.incomingShareUris.slice()
     const target = this.destinationPath
     const scope = this.incomingShareScope
+    const navigation = this.navigationRequestId
     if (scope === '' || scope !== this.repository.cacheScopeHash()) {
       this.showImmersiveToast('登录状态已改变，请重新分享并选择上传位置')
       this.closeDestinationPicker()
@@ -17151,8 +17109,10 @@ struct Index {
     } finally {
       this.destinationLoading = false
       this.destinationOperationRunning = false
-      this.closeDestinationPicker()
-      this.openDownloads()
+      if (navigation === this.navigationRequestId) {
+        this.closeDestinationPicker()
+        this.openDownloads()
+      }
     }
   }
 
@@ -17696,6 +17656,13 @@ struct Index {
       const next = this.copyImageVisualState(this.imageVisualStates[entry.path])
       next.originalUri = ''
       next.originalOrientation = ImageRotateOrientation.AUTO
+      if (this.fileViewMode === 'waterfall' && this.waterfallResourceResident(entry)) {
+        // Closing Viewer must not unlock the admitted original geometry and
+        // replace it with the slightly different NAS-thumbnail dimensions.
+        next.visibleLayer = 'thumbnail'; next.progress = 0; next.progressKnown = false
+        nextStates[entry.path] = next
+        continue
+      }
       next.physicalWidth = 0
       next.physicalHeight = 0
       next.exifDisplayWidth = 0
@@ -18519,14 +18486,16 @@ struct Index {
     this.viewerHeaderTitle = this.viewerImages[index].name
     this.ensureViewerImageFrame(this.viewerImages[index])
     this.resetImageTransform()
+    // Establish the new group's membership before Viewer prefetch joins its
+    // shared downloads; the hidden native WaterFlow cannot move its focus back.
+    this.viewerReturnReadyPath = ''
+    this.prepareViewerReturnSource(this.viewerImages[index]).catch((error: Error): void => {
+      console.warn('[UgreenViewer] prepare swiped return source failed: ' + JSON.stringify(error))
+    })
     this.viewerPrefetchCoordinator?.onViewerIndexChanged(index, this.viewerImages)
     this.prefetchViewerImages(index)
     this.primeViewerFrameWindow(this.viewerImages, index, 2).catch((error: Error): void => {
       console.warn('[UgreenViewer] prepare frame window failed: ' + JSON.stringify(error))
-    })
-    this.viewerReturnReadyPath = ''
-    this.prepareViewerReturnSource(this.viewerImages[index]).catch((error: Error): void => {
-      console.warn('[UgreenViewer] prepare swiped return source failed: ' + JSON.stringify(error))
     })
   }
 
@@ -19686,12 +19655,25 @@ struct Index {
   private async openAudioPlayer(entry: FileEntry, keepQueue: boolean = false,
     continuationPosition: number = -1, continuationPlaying: boolean = true,
     continuationValid: (() => boolean) | null = null): Promise<void> {
-    if (this.isBusy || this.audioOpening || this.audioClosing || entry.isDirectory) { return }
+    const backgroundTrackChange = this.audioBackgrounded && keepQueue
+    if ((!backgroundTrackChange && this.isBusy) || this.audioOpening || this.audioClosing || entry.isDirectory) { return }
     this.closeActionMenu()
     if (!await this.confirmMeteredDownload(entry)) { return }
     await this.ensurePlaybackState()
     if (continuationValid !== null && !continuationValid()) { return }
-    if (this.isBusy || this.audioOpening || this.audioClosing) { return }
+    if ((!backgroundTrackChange && this.isBusy) || this.audioOpening || this.audioClosing) { return }
+    if (this.audioBackgrounded && !keepQueue && continuationPosition < 0 && this.audioEntry !== null &&
+      this.audioOriginScope === this.repository.sessionIdentity() && this.audioEntry.path === entry.path &&
+      this.originalCacheKey(this.audioEntry) === this.originalCacheKey(entry)) {
+      this.onAudioPlaybackNavigationRequested()
+      return
+    }
+    if (this.showVideoPlayer) {
+      this.closeVideoPlayer()
+      await this.videoCloseWork
+    }
+    const opening = !this.showAudioPlayer || (this.audioBackgrounded && !backgroundTrackChange)
+    if (!backgroundTrackChange) { this.audioBackgrounded = false; this.audioBackgroundOrigin = null }
     const token = ++this.audioOpenToken
     const scope = this.repository.sessionIdentity()
     const valid = (): boolean => token === this.audioOpenToken && !this.audioEntryCloseRequested &&
@@ -19699,11 +19681,12 @@ struct Index {
     // The transport guard expires after successful restoration. Playback
     // callbacks must retain their normal media-session lifetime afterwards.
     const openingValid = (): boolean => valid() && (continuationValid === null || continuationValid())
-    const opening = !this.showAudioPlayer
     const animateEntry = opening && continuationPosition < 0
-    this.isBusy = true
-    this.audioOwnsBusy = true
-    this.statusText = '正在准备音频…'
+    if (!backgroundTrackChange) {
+      this.isBusy = true
+      this.audioOwnsBusy = true
+      this.statusText = '正在准备音频…'
+    }
     if (!keepQueue || !this.showAudioPlayer) {
       const candidates = this.showSearch ? this.searchResults : this.entries
       this.audioQueue = candidates.filter((item: FileEntry): boolean => !item.isDirectory && this.isAudio(item))
@@ -19734,6 +19717,7 @@ struct Index {
     // transition. Only the optional artwork hand-off waits for the flight.
     const entryTransition = animateEntry ? this.animateOpenAudioPlayer(entry, token, scope) : Promise.resolve()
     try {
+      await this.audioCloseWork
       await this.audioManager.release()
       await this.audioSession.close()
       await this.ensureCacheState()
@@ -19771,7 +19755,7 @@ struct Index {
       await this.audioSession.open(getContext(this) as common.UIAbilityContext, entry.path,
         this.audioTitle, this.audioArtist, this.audioCover, {
           play: () => this.setAudioPlaying(true), pause: () => this.setAudioPlaying(false),
-          stop: () => this.closeAudioPlayer(), next: () => this.skipAudio(1),
+          stop: () => this.closeAudioPlayer(this.audioBackgrounded), next: () => this.skipAudio(1),
           previous: () => this.skipAudio(-1), seek: (position: number) => this.seekAudio(position),
           loopMode: (mode: AudioPlayMode): void => { this.audioMode = mode; this.updateAudioSession(true) }
         })
@@ -19782,7 +19766,7 @@ struct Index {
         await this.audioManager.play()
       }
       if (!openingValid()) { return }
-      this.statusText = ''
+      if (!backgroundTrackChange) { this.statusText = '' }
       // Artwork/tags are optional and settle after playback is usable. No
       // thumbnail or metadata decoder failure is allowed to stop an audio file.
       this.prepareAudioPresentation(entry, localPath, token, scope, entryTransition)
@@ -19823,7 +19807,9 @@ struct Index {
     await this.audioSession.setMetadata(this.audioTitle, this.audioArtist, info.album, this.audioCover)
     if (!valid()) { return }
     this.updateAudioSession(true)
-    const lyric = AudioPlayerPolicy.lyricEntry(entry, this.showSearch ? this.searchResults : this.entries)
+    const lyricEntries = this.audioBackgrounded && this.audioBackgroundOrigin !== null ? this.audioBackgroundOrigin.entries :
+      (this.showSearch ? this.searchResults : this.entries)
+    const lyric = AudioPlayerPolicy.lyricEntry(entry, lyricEntries)
     if (lyric !== undefined) {
       try {
         const path = await this.ensureCachedFile(lyric)
@@ -19846,7 +19832,7 @@ struct Index {
   private audioPageBusy(): boolean {
     // Short play/pause requests only serialize commands. Do not propagate
     // them into every Button.enabled state and flash the disabled styling.
-    return this.isBusy || this.audioOpening || this.audioClosing
+    return (!this.audioBackgrounded && this.isBusy) || this.audioOpening || this.audioClosing
   }
 
   private async setAudioPlaying(playing: boolean): Promise<void> {
@@ -19895,9 +19881,14 @@ struct Index {
     if (this.isBusy || entry.isDirectory) {
       return
     }
+    if (this.showAudioPlayer) {
+      this.closeAudioPlayer(true)
+      await this.audioCloseWork
+    }
     if (this.videoPipBackgrounded) {
       await this.stopVideoPipForReplacement()
     }
+    await this.videoCloseWork
     this.closeActionMenu()
     this.closeImageMoreMenu()
     if (!await this.confirmMeteredDownload(entry)) {
@@ -20700,17 +20691,18 @@ struct Index {
     this.videoViewportHeightVp = 0
     this.videoMediaSessionPositionAt = 0
     this.videoSourceHandle = null
-    this.videoPlaybackManager.release().catch((): void => {})
-    this.videoMediaSession.close().catch((error: Error): void => {
-      console.warn('[UgreenAVSession] close bridge failed: ' + JSON.stringify(error))
-    })
+    this.videoCloseWork = Promise.all([this.videoCloseWork, this.videoPlaybackManager.release(),
+      this.videoMediaSession.close()]).then((): void => {}).catch((error: Error): void => {
+        console.warn('[UgreenAVSession] close bridge failed: ' + JSON.stringify(error))
+      })
     if (shouldRestoreSearch) {
       this.restoreSearchSession()
     }
   }
 
   private videoNavigationEntries(): FileEntry[] {
-    const source = this.showSearch ? this.searchResults : this.entries
+    const source = this.videoPipBackgrounded && this.videoPipOrigin !== null ? this.videoPipOrigin.entries :
+      (this.showSearch ? this.searchResults : this.entries)
     return source.filter((candidate: FileEntry): boolean =>
       !candidate.isDirectory && this.isVideo(candidate))
   }
@@ -21416,10 +21408,13 @@ struct Index {
   }
 
   private captureVideoPipOrigin(): void {
-    if (this.videoPipOrigin !== null || !this.showVideoPlayer) {
-      return
+    if (this.videoPipOrigin === null && this.showVideoPlayer) {
+      this.videoPipOrigin = this.captureMediaPlaybackOrigin()
     }
-    this.videoPipOrigin = {
+  }
+
+  private captureMediaPlaybackOrigin(): MediaPlaybackOrigin {
+    return {
       screen: this.screen,
       selectedBottomTab: this.selectedBottomTab,
       rootKind: this.rootKind,
@@ -21432,6 +21427,7 @@ struct Index {
       navigationViewStateStack: this.cloneNavigationViewStateStack(this.navigationViewStateStack),
       navigationPageIndexStack: this.navigationPageIndexStack.slice(),
       navigationPageHasMoreStack: this.navigationPageHasMoreStack.slice(),
+      continuationAncestorAnchors: new Map(this.continuationAncestorAnchors),
       currentPageIndex: this.currentPageIndex,
       currentPageHasMore: this.currentPageHasMore,
       viewState: this.cloneDirectoryViewState(this.captureDirectoryViewState()),
@@ -21481,9 +21477,13 @@ struct Index {
   private restoreVideoPipOrigin(): void {
     const origin = this.videoPipOrigin
     this.videoPipOrigin = null
-    if (origin === null) {
-      return
-    }
+    if (origin !== null) { this.restoreMediaPlaybackOrigin(origin) }
+  }
+
+  private restoreMediaPlaybackOrigin(origin: MediaPlaybackOrigin): void {
+    this.closePageDialogs()
+    this.releaseViewerForReplacement()
+    this.discardSearchSession()
     this.navigationRequestId += 1
     this.isNavigating = false
     this.cancelFileTransition()
@@ -21505,19 +21505,11 @@ struct Index {
     this.navigationViewStateStack = this.cloneNavigationViewStateStack(origin.navigationViewStateStack)
     this.navigationPageIndexStack = origin.navigationPageIndexStack.slice()
     this.navigationPageHasMoreStack = origin.navigationPageHasMoreStack.slice()
+    this.continuationAncestorAnchors = new Map(origin.continuationAncestorAnchors)
     this.currentPageIndex = origin.currentPageIndex
     this.currentPageHasMore = origin.currentPageHasMore
     this.fileViewMode = origin.viewState.mode
     this.showSearch = false
-    // A search result is resolved to its real parent directory before the
-    // video is opened. Once PiP restoration has put that directory back under
-    // the player, Back must close the player to this directory instead of
-    // replaying the suspended search result return route.
-    if (this.searchSession !== null && this.searchSession.returnMode === 'video') {
-      this.searchSession.returnMode = 'none'
-      this.searchSession.targetParentPath = ''
-      this.searchSession.targetNavigationDepth = this.navigationStack.length
-    }
     this.replaceEntries(origin.entries.slice())
     this.resetPreviewState(false)
     this.restoreDirectoryViewState(origin.viewState)
@@ -21594,6 +21586,11 @@ struct Index {
         this.scheduleVideoPipRestore()
         break
       case PiPWindow.PiPState.ERROR:
+        if (this.videoPipBackgrounded) {
+          this.closeVideoPlayer()
+          this.showImmersiveToast('小窗播放已结束')
+          break
+        }
         this.videoPipActive = false
         this.videoPipHideOnStart = false
         this.videoPipStarting = false
@@ -21779,7 +21776,7 @@ struct Index {
 
   /** One cover owner from the mounted thumbnail to the measured player cover. */
   private async animateOpenAudioPlayer(entry: FileEntry, token: number, scope: string): Promise<void> {
-    const valid = (): boolean => token === this.audioOpenToken && !this.audioClosing && this.showAudioPlayer &&
+    const valid = (): boolean => token === this.audioOpenToken && !this.audioClosing && this.showAudioPlayer && !this.audioBackgrounded &&
       scope === this.repository.sessionIdentity() && this.audioEntry?.path === entry.path
     const source = this.refreshGridThumbnailArea(entry) ? this.audioThumbnailFrames.get(entry.path) : undefined
     const sourceTop = this.showSearch ? this.topSafeInset() + 124 : this.fileContentTopInset()
@@ -21909,8 +21906,8 @@ struct Index {
     this.showAudioQueue = false
     this.audioControlPending = false
     if (this.audioOwnsBusy) { this.isBusy = false; this.audioOwnsBusy = false }
-    this.audioManager.release().catch(() => {})
-    this.audioSession.close().catch(() => {})
+    this.audioCloseWork = Promise.all([this.audioCloseWork, this.audioManager.release(), this.audioSession.close()])
+      .then((): void => {}).catch((): void => {})
     const matchingOrigin = (): boolean => this.audioOriginScope === this.repository.sessionIdentity() &&
       this.audioOriginSurface === this.currentThumbnailSurface() &&
       this.audioOriginKey === this.currentRootType.toString() + ':' + this.currentPath
@@ -21980,13 +21977,14 @@ struct Index {
     this.audioFlightVisible = false
     this.audioFlightSource = ''
     this.showAudioPlayer = false; this.showAudioQueue = false
+    this.audioBackgrounded = false; this.audioBackgroundOrigin = null
     this.audioClosing = false; this.audioCoverHidden = false; this.audioPageOpacity = 1
     this.audioEntry = null; this.audioLocalPath = ''; this.audioCover = ''; this.audioLyrics = []
     this.audioPlaying = false; this.audioCurrentMs = 0; this.audioDurationMs = 0
     this.audioControlPending = false
     if (this.audioOwnsBusy) { this.audioOwnsBusy = false; this.isBusy = false }
-    this.audioManager.release().catch(() => {})
-    this.audioSession.close().catch(() => {})
+    this.audioCloseWork = Promise.all([this.audioCloseWork, this.audioManager.release(), this.audioSession.close()])
+      .then((): void => {}).catch((): void => {})
     if (restoreSearch) { this.restoreSearchSession() }
   }
 
@@ -22265,7 +22263,102 @@ struct Index {
 
   // Long press arms a snapshot. Apply the inclusive XOR interval only when
   // Pan succeeds, so a stationary long press cannot accidentally select one.
-  private beginDragSelection(entry: FileEntry, index: number): void {
+  private selectedDragTimer: number = 0
+  private selectedDragEntry: FileEntry | null = null
+  private selectedDragIndex: number = -1
+  private fileExportToken: number = 0
+  private fileExportPreparing: boolean = false
+  private fileExportDragging: boolean = false
+
+  @Builder
+  FileDragPreview(entry: FileEntry): void {
+    Row({ space: 12 }) {
+      Image(this.previewUri(entry).length > 0 ? this.previewUri(entry) : this.fileIcon(entry))
+        .width(48).height(48).objectFit(ImageFit.Cover).syncLoad(true).draggable(false)
+      Text(entry.name).fontSize(15).fontColor($r('app.color.text_primary'))
+        .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
+    }.width(260).height(72).padding(12).borderRadius(12).backgroundColor($r('app.color.page_background'))
+  }
+
+  private cancelSelectedFileDrag(): void {
+    if (this.selectedDragTimer > 0) { clearTimeout(this.selectedDragTimer); this.selectedDragTimer = 0 }
+    this.selectedDragEntry = null
+    // Keep the physical preparation slot until its canceled workers finish.
+    if (!this.fileExportDragging) { this.fileExportToken++ }
+  }
+
+  private beginDragSelection(entry: FileEntry, index: number, event?: GestureEvent): void {
+    this.cancelSelectedFileDrag()
+    // Moving promptly keeps range inversion. Holding an already-selected file
+    // lifts the selection for system drag, without first toggling its checkbox.
+    if (event !== undefined && this.isSelected(entry) && !entry.isDirectory) {
+      this.selectedDragEntry = entry; this.selectedDragIndex = index
+      this.selectedDragTimer = setTimeout((): void => {
+        this.selectedDragTimer = 0; this.selectedDragEntry = null
+        this.startSelectedFileDrag(entry, event)
+      }, 300)
+      return
+    }
+    this.startDragSelectionRange(entry, index)
+  }
+
+  private async startSelectedFileDrag(origin: FileEntry, event: GestureEvent): Promise<void> {
+    if (!this.selectionMode || !this.fileContentTouchActive || this.fileExportPreparing || this.fileExportDragging) { return }
+    const entries = this.selectedEntriesInCurrentDirectory().slice()
+    if (entries.length === 0 || entries.length > 500 || entries.some((entry: FileEntry): boolean => entry.isDirectory)) {
+      this.showImmersiveToast('请选择最多 500 个文件后拖出'); return
+    }
+    const finger = event.fingerList[0]
+    if (finger === undefined) { return }
+    const token = ++this.fileExportToken
+    const identity = this.repository.sessionIdentity()
+    const valid = (): boolean => token === this.fileExportToken && identity === this.repository.sessionIdentity() &&
+      this.selectionMode && (this.fileContentTouchActive || this.fileExportDragging)
+    const pinned: string[] = []
+    let preview: image.PixelMap | null = null
+    this.fileExportPreparing = true
+    try {
+      const allowed = await this.filterGestureTransferEntries(entries)
+      if (!valid()) { return }
+      if (allowed.entries.length !== entries.length) { throw new Error('请连接 NAS 或允许当前网络下载后拖出') }
+      // A full-width tablet row would be scaled down into an unreadable strip.
+      // Render one bounded native preview, independent of source layout mode.
+      preview = await this.getUIContext().getComponentSnapshot().createFromBuilder((): void => {
+        this.FileDragPreview(origin)
+      }, 0, false)
+      if (!valid()) { return }
+      this.showImmersiveToast('正在准备 ' + entries.length + ' 个文件，保持按住后拖出')
+      // The share preparation already pins cache destinations before its two
+      // workers start, so another file cannot evict one in this same drag.
+      this.pinTransferCacheTargets(entries, pinned)
+      const cached = await this.cacheGestureEntries(entries, pinned, valid)
+      if (!valid()) { return }
+      if (cached.entries.length !== entries.length) { throw new Error('部分文件未能下载，请重试') }
+      const data = new unifiedDataChannel.UnifiedData()
+      for (const entry of entries) {
+        const record = this.isImage(entry) ? new unifiedDataChannel.Image() :
+          (this.isVideo(entry) ? new unifiedDataChannel.Video() :
+            (this.isAudio(entry) ? new unifiedDataChannel.Audio() : new unifiedDataChannel.File()))
+        record.uri = fileUri.getUriFromPath(cached.localPaths[entry.path])
+        record.details = { name: entry.name }
+        data.addRecord(record)
+      }
+      this.fileExportDragging = true
+      this.fileExportPreparing = false
+      // No new gesture tree or page-wide draggable image behavior is introduced.
+      await this.getUIContext().getDragController().executeDrag({ pixelMap: preview, extraInfo: entries[0].name },
+        { pointerId: finger.id, data: data, previewOptions: { numberBadge: entries.length } })
+      console.info('[FileExport] system drag completed count=' + entries.length)
+    } catch (error) {
+      if (valid()) { this.reportError(error as Object, '拖出文件失败') }
+    } finally {
+      for (const path of pinned) { StorageBudget.unpin(path) }
+      if (preview !== null) { preview.release().catch((): void => {}) }
+      this.fileExportDragging = false; this.fileExportPreparing = false
+    }
+  }
+
+  private startDragSelectionRange(entry: FileEntry, index: number): void {
     if (!this.selectionMode) {
       return
     }
@@ -22287,6 +22380,7 @@ struct Index {
   }
 
   private endDragSelection(): void {
+    this.cancelSelectedFileDrag()
     this.stopDragSelectionAutoScroll()
     const needsScrollStop = this.dragSelectionDeferredScrollStop
     this.dragSelectionDeferredScrollStop = false
@@ -22305,6 +22399,12 @@ struct Index {
   }
 
   private extendDragSelection(event: GestureEvent): void {
+    if (this.fileExportPreparing || this.fileExportDragging) { return }
+    if (this.selectedDragEntry !== null) {
+      const entry = this.selectedDragEntry; const index = this.selectedDragIndex
+      this.cancelSelectedFileDrag()
+      this.startDragSelectionRange(entry, index)
+    }
     if (!this.dragSelectionActive || !this.selectionMode || this.dragSurface !== this.activeListSurface()) {
       return
     }
@@ -23649,9 +23749,17 @@ struct Index {
     this.directoryIndexRequestToken += 1
     this.pendingDirectoryIndexSnapshot = null
     this.timelineIndexing = false
-    if (this.currentPath.length === 0) {
+    const path = this.currentPath
+    const rootType = this.currentRootType
+    const rootKind = this.rootKind
+    const identity = this.repository.sessionIdentity()
+    const request = ++this.navigationRequestId
+    const unchanged = (): boolean => request === this.navigationRequestId && path === this.currentPath &&
+      rootType === this.currentRootType && rootKind === this.rootKind && identity === this.repository.sessionIdentity()
+    if (path.length === 0) {
       this.repository.clearDirectoryCache()
       const root = await this.repository.getRootWithCache(true)
+      if (!unchanged()) { return }
       this.clearConfirmedDeletedPaths(root.personal, excludedPaths, 4)
       this.clearConfirmedDeletedPaths(root.shared, excludedPaths, 3)
       this.personalRoots = this.filterDeletedEntries(root.personal, excludedPaths, 4)
@@ -23662,13 +23770,13 @@ struct Index {
       return
     }
     const visiblePageIndex = Math.max(1, this.currentPageIndex)
-    this.navigationRequestId += 1
     this.indexedDirectoryKey = ''
     this.indexedDirectoryContentSignature = ''
-    this.repository.invalidateDirectory(this.currentPath, this.currentRootType)
-    const refreshed = await this.loadVisibleDirectoryPages(this.currentPath, this.currentRootType,
+    this.repository.invalidateDirectory(path, rootType)
+    const refreshed = await this.loadVisibleDirectoryPages(path, rootType,
       visiblePageIndex, true)
-    this.clearConfirmedDeletedPaths(refreshed.entries, excludedPaths, this.currentRootType)
+    if (!unchanged()) { return }
+    this.clearConfirmedDeletedPaths(refreshed.entries, excludedPaths, rootType)
     const refreshedEntries = this.filterDeletedEntries(refreshed.entries, excludedPaths)
     this.setCurrentPageState(refreshed.pageIndex, refreshed.hasMore)
     this.replaceEntries(refreshedEntries)
@@ -24335,6 +24443,11 @@ struct Index {
     this.directoryCountRequests = {}
     this.directoryCountTimers = {}
     this.resetWaterfallDirectoryState()
+    if (this.fileViewMode === 'waterfall') {
+      // The native surface may retain exactly the same size across a directory
+      // change; onAreaChange is not a restart signal for the cleared source.
+      this.postRenderFrame((): void => this.ensureWaterfallStarted())
+    }
     if (resetScroll) {
       this.resetFileListScroll()
     }

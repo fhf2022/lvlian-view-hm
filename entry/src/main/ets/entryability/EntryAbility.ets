@@ -58,6 +58,7 @@ export default class EntryAbility extends UIAbility {
       this.context.restoreWindowStage(new LocalStorage());
     }
     AppStorage.setOrCreate('transferNavigationRequest', want.parameters?.transferEntry === true ? 1 : 0);
+    AppStorage.setOrCreate('audioPlaybackNavigationRequest', want.parameters?.audioPlaybackEntry === true ? 1 : 0);
     AppStorage.setOrCreate('abilityInBackground', false);
     IncomingShareManager.shared().receive(want);
     try {
@@ -150,6 +151,10 @@ export default class EntryAbility extends UIAbility {
       return;
     }
     IncomingShareManager.shared().receive(want);
+    if (want.parameters?.audioPlaybackEntry === true) {
+      const request = AppStorage.get<number>('audioPlaybackNavigationRequest') ?? 0;
+      AppStorage.setOrCreate('audioPlaybackNavigationRequest', request + 1);
+    }
     if (want.parameters?.transferEntry === true) {
       const previous = AppStorage.get<number>('transferNavigationRequest') ?? 0;
       AppStorage.setOrCreate('transferNavigationRequest', previous + 1);

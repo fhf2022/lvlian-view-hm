@@ -61,8 +61,9 @@ export class AudioSessionManager {
       })
       try {
         const agent = await wantAgent.getWantAgent({
-          wants: [{ bundleName: context.abilityInfo.bundleName, abilityName: context.abilityInfo.name }],
-          actionType: wantAgent.OperationType.START_ABILITIES, requestCode: 0,
+          wants: [{ bundleName: context.abilityInfo.bundleName, abilityName: context.abilityInfo.name,
+            parameters: { audioPlaybackEntry: true } }],
+          actionType: wantAgent.OperationType.START_ABILITIES, requestCode: 7107,
           actionFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
         })
         if (valid()) { await session.setLaunchAbility(agent) }

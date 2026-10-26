@@ -254,8 +254,11 @@ async function run() {
   assert.equal(await source.export(params), 1);
   exportEnabled = true;
   receiveEnabled = false;
-  receiver.receive({parameters: params});
-  assert.equal(storage.get('continuationPending'), false);
+  const queuedParams = {...params, linkfilesContinuationRequest: 'beeeeeef-1111-4111-8111-111111111111'};
+  receiver.receive({parameters: queuedParams});
+  assert.equal(storage.get('continuationPending'), true, 'a new Want waits for startup authorization instead of rejecting the old page');
+  assert.equal(receiver.incomingId, queuedParams.linkfilesContinuationRequest);
+  receiver.cancel();
   receiveEnabled = true;
   let finishJoin;
   delayJoin = new Promise(resolve => finishJoin = resolve);
@@ -338,14 +341,21 @@ async function run() {
     openVideoPlayer: async (...args) => mediaCalls.push(['video', ...args]),
     openAudioPlayer: async (...args) => mediaCalls.push(['audio', ...args])
   });
+  a.audioPlaybackUiVisible = () => a.showAudioPlayer && !a.audioBackgrounded;
+  a.videoPlaybackUiVisible = () => a.showVideoPlayer && !a.videoPipBackgrounded;
   assert.equal(a.continuationAvailable(), true);
   let closePrompt;
-  a.getUIContext = () => ({getPromptAction: () => ({showDialog: () => new Promise(resolve => closePrompt = resolve)})});
+  a.presentConfirmationDialog = () => new Promise(resolve => closePrompt = resolve);
   const prompt = a.showTrackedDialog({title: 'delete'});
   assert.equal(a.continuationAvailable(), false);
   closePrompt({index: 0}); await prompt;
   assert.equal(a.continuationDialogCount, 0);
   assert.equal(a.continuationAvailable(), true);
+  a.continuationContextToken = 0;
+  const stalePrompt = a.showTrackedDialog({title: 'stale delete'});
+  a.continuationContextToken++;
+  closePrompt({index: 1});
+  assert.equal((await stalePrompt).index, -1, 'old confirmation cannot mutate the incoming continuation');
   a.selectionMode = true; assert.equal(a.continuationAvailable(), false); a.selectionMode = false;
   a.searchSession = {}; assert.equal(a.continuationAvailable(), false); a.searchSession = null;
   a.directoryTimeline.complete = false; assert.equal(a.continuationAvailable(), false); a.directoryTimeline.complete = true;
@@ -367,7 +377,8 @@ async function run() {
   a.showVideoPlayer = false; a.showAudioPlayer = true; a.audioEntry = entry(sample.state.path + '/song.flac');
   a.audioDurationMs = 300000; let audioSeeking = false; let audioReady = true;
   a.audioManager = {isSeeking: () => audioSeeking, isReady: () => audioReady};
-  assert.equal(a.continuationAvailable(), true); assert.equal(a.continuationCanReceive(), false);
+  assert.equal(a.continuationAvailable(), true); assert.equal(a.continuationCanReceive(), true,
+    'receiver browsing/media context does not block replacement');
   for (const flag of ['audioOpening', 'audioClosing', 'audioControlPending', 'showAudioQueue']) {
     a[flag] = true; assert.equal(a.continuationAvailable(), false, flag); a[flag] = false;
   }
@@ -380,16 +391,24 @@ async function run() {
   assert.equal(audioCapture.state.positionMs, 97531); assert.equal(audioCapture.state.playing, false);
   a.showAudioPlayer = false;
   const originalRepository = a.repository;
+  let resets = 0;
+  // Native UI closure is tested independently; this adapter test owns the
+  // authenticated network and state-commit boundaries.
+  a.prepareContinuationPlayback = async () => {};
+  a.audioPlaybackUiVisible = () => a.showAudioPlayer && !a.audioBackgrounded;
+  a.videoPlaybackUiVisible = () => a.showVideoPlayer && !a.videoPipBackgrounded;
+  a.prepareForContinuation = () => { resets++; a.navigationRequestId++; a.searchSession = null; };
   a.repository = {...originalRepository, sessionIdentity: () => 'https://target-relay|another-uid'};
   await assert.rejects(a.restoreContinuation(sample, () => true), error => error instanceof ContinuationAccountRequired);
   assert.equal(a.entries, oldEntries);
   a.repository = {...originalRepository, listPage: async () => {throw new Error('permission denied')}};
   await assert.rejects(a.restoreContinuation(sample, () => true)); assert.equal(a.entries, oldEntries);
   a.repository = originalRepository;
-  await assert.rejects(a.restoreContinuation(sample, () => false)); assert.equal(a.entries, oldEntries);
+  await a.restoreContinuation(sample, () => false); assert.equal(a.entries, oldEntries);
   sample.state.scene = 'image'; sample.state.target = sample.entries[2].path;
   sample.state.view = 'waterfall';
   await a.restoreContinuation(sample, () => true);
+  assert.ok(resets > 0, 'same-account incoming context replaces the previous browsing scene');
   assert.equal(a.entries.length, 3);
   assert.deepEqual(Array.from(a.navigationStack), ['', '/home/test']);
   assert.deepEqual(Array.from(a.navigationRootTypeStack), [2, 3]);

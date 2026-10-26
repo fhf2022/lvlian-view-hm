@@ -72,6 +72,7 @@ export class WaterfallBatchCoordinator {
   setHidden(hidden: boolean): void { this.hidden = hidden; if (!hidden) { this.advance() } }
 
   visible(firstIndex: number, lastIndex: number): void {
+    if (this.hidden) { return }
     const next = Math.floor(Math.max(0, firstIndex) / WaterfallBatchCoordinator.SIZE)
     if (this.residents.has(next) && next !== this.focus) { this.focus = next; this.advance() }
   }
@@ -83,8 +84,11 @@ export class WaterfallBatchCoordinator {
 
   async ensure(index: number): Promise<void> {
     const group = Math.floor(index / WaterfallBatchCoordinator.SIZE)
-    if (!this.hasGroup(group) || (this.residents.has(group) && this.localIndex(index) >= 0 &&
-      this.batches.get(group)?.phase !== 'preparing')) { return }
+    if (!this.hasGroup(group)) { return }
+    if (this.residents.has(group) && this.localIndex(index) >= 0 && this.batches.get(group)?.phase !== 'preparing') {
+      this.focus = group
+      return
+    }
     this.jump = group; this.pending = group
     // Timeline scrubbing replaces a pending destination; do not retain a
     // promise/closure for every day the finger crossed.

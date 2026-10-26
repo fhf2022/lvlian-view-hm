@@ -187,10 +187,8 @@ export class ContinuationManager {
       return
     }
     if (this.handledRequests.includes(params.linkfilesContinuationRequest)) { return }
-    if (this.page !== null && !this.page.canReceive()) {
-      this.message('请结束当前操作后重新接续')
-      return
-    }
+    // Accept the requested replacement even when the existing page is busy.
+    // resumeIncoming waits only for authorization/startup, not browsing context.
     if (this.incomingId === params.linkfilesContinuationRequest) { return }
     this.cancel()
     this.incomingId = params.linkfilesContinuationRequest
