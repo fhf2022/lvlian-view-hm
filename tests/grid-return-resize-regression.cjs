@@ -16,7 +16,7 @@ const exportsObject = {};
 vm.runInNewContext(ts.transpileModule('export class Harness {\n' + names.map(method).join('\n') + '\n}', {
   compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS }
 }).outputText, { exports: exportsObject, console: { info() {}, warn() {} }, ViewerReturnSnapshot,
-  Math, Promise, setTimeout, IMAGE_RETURN_MOUNT_FRAME_LIMIT: 8, IMAGE_GEOMETRY_TRANSITION_DURATION: 240,
+  Math, Promise, setTimeout, FileGridLayout: { columns: () => 6 }, IMAGE_RETURN_MOUNT_FRAME_LIMIT: 8, IMAGE_GEOMETRY_TRANSITION_DURATION: 240,
   IMAGE_FALLBACK_TRANSITION_DURATION: 160, ScrollAlign: { AUTO: 3 }, Curve: { FastOutSlowIn: 1 } });
 const entry = { path: '/photos/current.jpg' };
 function make() {
@@ -25,6 +25,8 @@ function make() {
     thumbnailSurface: 'grid', thumbnailVisibleRatio: 1 };
   let mounted = true;
   Object.assign(h, { screen: 'files', showSearch: false, fileViewMode: 'grid', entries: [entry],
+    fileGridRows: { configure() {} }, nativeFileChildIndex: (_scroller, index) => index,
+    fileChildRect: (scroller, index) => scroller.getItemRect(index),
     pageWidthVp: 800, pageHeightVp: 1200, fileViewportVersion: 0, viewerReturnViewportVersion: 0,
     fileScrollViewport: { x: 0, y: 0, width: 800, height: 1200 }, targetLocateEntryPath: '',
     fileContentTopInset: () => 100, floatingBarContentInset: () => 76, bottomSafeInset: () => 0,

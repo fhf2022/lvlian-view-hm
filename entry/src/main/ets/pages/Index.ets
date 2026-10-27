@@ -29,6 +29,8 @@ import { EntryDetailsContent } from '../components/EntryDetailsContent'
 import { AlertDialog as SystemAlertDialog, CustomContentDialog, ButtonOptions } from '@ohos.arkui.advanced.Dialog'
 import { FileRowStyle } from '../ui/FileRowStyle'
 import { FileGridLayout } from '../ui/FileGridLayout'
+import { FileGridRows, FileGridRow } from '../model/FileGridRows'
+import { FileGridRowView } from '../components/FileGridRowView'
 import { FileGridCell, FileGridCellEvents } from '../components/FileGridCell'
 import { TaskPanel, TaskPanelFooter, TaskPanelSection } from '../components/TaskPanel'
 import { TaskPanelStyle } from '../ui/TaskPanelStyle'
@@ -1460,6 +1462,7 @@ struct Index {
   private contextMenuTouchY: number = 0
   private contextMenuScrollRect: BottomBarTouchRect = new BottomBarTouchRect()
   private fileEntryDataSource: FileEntryDataSource = new FileEntryDataSource()
+  private fileGridRows: FileGridRows = new FileGridRows(this.fileEntryDataSource)
   private waterfallDataSource: FileEntryDataSource = new FileEntryDataSource()
   private viewerImageDataSource: FileEntryDataSource = new FileEntryDataSource()
   private transitionFileEntryDataSource: FileEntryDataSource = new FileEntryDataSource()
@@ -5422,6 +5425,40 @@ struct Index {
     return FileGridLayout.columns(this.pageWidthVp, this.pageHeightVp)
   }
 
+  // Navigation and return positioning still use file indexes. Only the native
+  // grid's scroll/rectangle boundary translates them to full-width row indexes.
+  private nativeFileChildIndex(scroller: Scroller, index: number): number {
+    return scroller === this.fileListScroller && this.fileViewMode === 'grid'
+      ? this.fileGridRows.nativeIndex(index) : index
+  }
+
+  private fileGridRowCacheEnabled(row: FileGridRow): boolean {
+    // Keep the original individual Image anchors during interactive transitions.
+    // Animated formats and mixed rows must continue drawing their live content.
+    return !this.selectionMode && !this.viewerBlocksFileContent && !this.showImageViewer &&
+      !this.viewerEntryTransitionActive && !this.viewerClosePending && this.contextMenuEntry === null &&
+      row.entries.every((entry: FileEntry): boolean => this.isImage(entry) && !/\.(gif|webp)$/i.test(entry.name))
+  }
+
+  private fileChildRect(scroller: Scroller, index: number): RectResult {
+    const rect = scroller.getItemRect(this.nativeFileChildIndex(scroller, index))
+    if (scroller !== this.fileListScroller || this.fileViewMode !== 'grid' || rect.width <= 0) { return rect }
+    const columns = this.fileGridRows.columns
+    const width = (rect.width - (columns - 1) * FileGridLayout.gap) / columns
+    return { x: rect.x + (index % columns) * (width + FileGridLayout.gap), y: rect.y, width: width, height: rect.height }
+  }
+
+  private fileChildIndexAt(scroller: Scroller, x: number, y: number): number {
+    const row = scroller.getItemIndex(x, y)
+    if (row < 0 || scroller !== this.fileListScroller || this.fileViewMode !== 'grid') { return row }
+    const rect = scroller.getItemRect(row)
+    if (rect.width <= 0) { return -1 }
+    const columns = this.fileGridRows.columns
+    const column = Math.max(0, Math.min(columns - 1,
+      Math.floor((x - rect.x) * columns / (rect.width + FileGridLayout.gap))))
+    return this.fileGridRows.fileIndex(row, column)
+  }
+
   /** 瀑布流列数：目标列宽 240vp（区间 240–360vp）。列宽直接决定图片高度，所以比网格大一档。 */
   private waterfallColumnCount(): number {
     const width = this.pageWidthVp - 20
@@ -5529,94 +5566,26 @@ struct Index {
   @Builder
   GridFileList(): void {
     Grid(this.fileListScroller, this.fileGridOptions) {
-      LazyForEach(this.fileEntryDataSource, (entry: FileEntry, index: number) => {
+      LazyForEach(this.fileGridRows, (row: FileGridRow) => {
         GridItem() {
-          FileGridCell({
-            entry: entry,
-            selectionMode: this.selectionMode,
-            topInset: index < this.fileGridColumnCount() ? this.fileContentTopInset() : 0,
-            thumbnailId: this.gridThumbnailComponentId(entry),
-            events: this.fileGridCellEvents,
-            videoIndicator: () => { this.VideoTransferIndicator(entry) },
-            selectionIndicator: () => { this.SelectionCheckbox(entry) },
-            content: this.FileGridThumbnail.bind(this, entry, index)
-          })
-        }
-        .onAppear(() => {
-          this.resolveFileListImageRotation(entry)
-          this.loadEntryPreview(entry, this.previewPriority(index, 'grid'))
-          this.recordThumbnailMountedSource(entry, this.previewUri(entry), index, 'grid')
-          this.scheduleCachedDirectoryCount(entry)
-          if (!entry.isDirectory && this.isImage(entry)) {
-            this.imageTelemetry.recordPipelineStart(entry.path, 'grid')
-            this.returnPerfSession.recordItemMounted(entry.path)
+          if (row.entries.length > 0) {
+            FileGridRowView({ row: row, cell: this.FileGridInteractiveCell.bind(this) })
           }
-        })
-        .onDisAppear(() => {
-          this.forgetRowHitArea(entry, 'grid')
-          this.recordThumbnailVisibility(entry, index, 'grid', 0)
-        })
-      }, (entry: FileEntry) => entry.path)
+        }
+        .margin({ top: row.start === 0 ? this.fileContentTopInset() : 0 })
+        .renderGroup(this.fileGridRowCacheEnabled(row))
+      }, (row: FileGridRow): string => row.key)
     }
     .id('main-grid')
-    .columnsTemplate(this.fileGridColumns())
-    .columnsGap(FileGridLayout.gap)
+    .columnsTemplate('1fr')
+    .columnsGap(0)
     .rowsGap(FileGridLayout.gap)
-    // 每侧缓存的条目数 = cachedCount × 列数。官方 grid.d.ts 原文：
-    // "The number of the grid items to be cached before and after the currently displayed
-    //  one equals the value of cachedCount multiplied by the number of columns."
-    // 注：cachedCount 的单位是「行」而不是「条目」。
-    // 取 16 是保守值 —— 双参重载 cachedCount(count, show) 的文档注明上限为 16
-    // （单参重载未注明上限）。此前为 32，即 32 × 4 列 = 上下各 128 个条目，
-    // 缓存量偏大、内存占用高。
+    // One native GridItem now contains one visual row; the cached photo count
+    // stays equal to the former cachedCount × columns configuration.
     .cachedCount(EXPERIMENT_GRID_CACHED_COUNT)
-    // 诊断：触摸是否到达列表容器。用于区分两种情况 ——
-    //   有 [TouchTrace] 但没有 [TapTrace] >>> click  → UI 收到了触摸但 click 没触发（手势/命中问题）
-    //   连 [TouchTrace] 都没有                        → 被上层覆盖层挡住了
-    .onTouch((event: TouchEvent): void => {
-      if (this.closeSessionActive && event.type === TouchType.Down && !this.sessionChildDownLogged) {
-        const point = event.touches.length > 0 ? event.touches[0] : null
-        const ptrId = point !== null ? point.id : -1
-        if (this.sessionTrackedPointerId === -1 || ptrId === this.sessionTrackedPointerId) {
-          this.sessionChildDownLogged = true
-          const dt = this.getMonotonicNow() - this.closeAnimFinishMonotonic
-          const winStr = point !== null ? ' win=(' + Math.round(point.windowX).toString() + ',' + Math.round(point.windowY).toString() + ')' : ''
-          const locStr = point !== null ? ' loc=(' + Math.round(point.x).toString() + ',' + Math.round(point.y).toString() + ')' : ''
-          console.info('[TouchChain] #' + this.closeSessionId.toString() +
-            ' ChildDown +' + dt.toString() + 'ms ptr=' + ptrId.toString() +
-            winStr + locStr)
-        }
-      }
-      if (TAP_TRACE && event.type === TouchType.Down) {
-        const point = event.touches.length > 0 ? event.touches[0] : null
-        console.info('[TouchTrace] grid-down x=' +
-          (point === null ? -1 : Math.round(point.x)).toString() + ' y=' +
-          (point === null ? -1 : Math.round(point.y)).toString())
-      }
-    })
-    .parallelGesture(
-      PanGesture({ direction: PanDirection.Vertical, distance: 4 })
-        .onActionStart((event: GestureEvent): void => {
-          if (this.closeSessionActive && !this.sessionPanStartLogged) {
-            this.sessionPanStartLogged = true
-            const ptrId = event.fingerList.length > 0 ? event.fingerList[0].id : -1
-            const dt = this.getMonotonicNow() - this.closeAnimFinishMonotonic
-            const f = event.fingerList.length > 0 ? event.fingerList[0] : null
-            const winStr = f !== null ? ' win=(' + Math.round(f.globalX).toString() + ',' + Math.round(f.globalY).toString() + ')' : ''
-            console.info('[TouchChain] #' + this.closeSessionId.toString() +
-              ' PanStart +' + dt.toString() + 'ms ptr=' + ptrId.toString() + winStr)
-          }
-        })
-        .onActionUpdate((event: GestureEvent): void => {
-          if (this.closeSessionActive && this.sessionPanStartLogged && !this.sessionFirstPanUpdateLogged) {
-            this.sessionFirstPanUpdateLogged = true
-            const dt = this.getMonotonicNow() - this.closeAnimFinishMonotonic
-            console.info('[TouchChain] #' + this.closeSessionId.toString() +
-              ' FirstPanUpdate +' + dt.toString() + 'ms dy=' + Math.round(event.offsetY).toString())
-          }
-        })
-    )
-    .onScrollIndex((first: number, last: number): void => {
+    .onScrollIndex((firstRow: number, lastRow: number): void => {
+      const first = firstRow * this.fileGridRows.columns
+      const last = Math.min(this.entries.length - 1, (lastRow + 1) * this.fileGridRows.columns - 1)
       this.fileVisibleStartIndex = Math.max(0, first)
       this.fileVisibleEndIndex = Math.max(this.fileVisibleStartIndex, last)
       this.updateTimelineFocusFromVisible(first, 'grid')
@@ -5626,11 +5595,39 @@ struct Index {
     .onDidScroll((): void => this.onDragSelectionContentScrolled())
     .onAreaChange((_, area) => this.recordFileScrollViewport('grid', area))
     .onReachEnd(() => this.loadNextDirectoryPage())
-    .width('100%')
-    .layoutWeight(1)
+    .width('100%').layoutWeight(1)
     .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
     .contentEndOffset(this.floatingBarContentInset())
     .padding({ left: 0, right: 0, top: 0, bottom: 0 })
+  }
+
+  @Builder
+  private FileGridInteractiveCell(entry: FileEntry, index: number): void {
+    FileGridCell({
+      entry: entry,
+      selectionMode: this.selectionMode,
+      topInset: 0,
+      thumbnailId: this.gridThumbnailComponentId(entry),
+      events: this.fileGridCellEvents,
+      videoIndicator: () => { this.VideoTransferIndicator(entry) },
+      selectionIndicator: () => { this.SelectionCheckbox(entry) },
+      content: this.FileGridThumbnail.bind(this, entry, index)
+    })
+    .width((this.pageWidthVp - (this.fileGridColumnCount() - 1) * FileGridLayout.gap) / this.fileGridColumnCount())
+    .onAppear(() => {
+      this.resolveFileListImageRotation(entry)
+      this.loadEntryPreview(entry, this.previewPriority(index, 'grid'))
+      this.recordThumbnailMountedSource(entry, this.previewUri(entry), index, 'grid')
+      this.scheduleCachedDirectoryCount(entry)
+      if (!entry.isDirectory && this.isImage(entry)) {
+        this.imageTelemetry.recordPipelineStart(entry.path, 'grid')
+        this.returnPerfSession.recordItemMounted(entry.path)
+      }
+    })
+    .onDisAppear(() => {
+      this.forgetRowHitArea(entry, 'grid')
+      this.recordThumbnailVisibility(entry, index, 'grid', 0)
+    })
   }
 
   @Builder
@@ -12554,7 +12551,7 @@ struct Index {
     const entry = items[anchorIndex]
     let y = 0
     try {
-      const rect = scroller.getItemRect(this.fileViewMode === 'waterfall' ? this.waterfallLocalIndex(anchorIndex) : anchorIndex + childIndexOffset)
+      const rect = this.fileChildRect(scroller, this.fileViewMode === 'waterfall' ? this.waterfallLocalIndex(anchorIndex) : anchorIndex + childIndexOffset)
       if (rect !== undefined && typeof rect.y === 'number') {
         y = rect.y
       }
@@ -12598,13 +12595,13 @@ struct Index {
     const isWaterfall = this.fileViewMode === 'waterfall'
     const maxRestoreAttempts = isWaterfall ? maxAttempts : 0
     try {
-      scroller.scrollToIndex(isWaterfall ? this.waterfallLocalIndex(targetIndex) : targetIndex + childIndexOffset, false, ScrollAlign.START, {
+      scroller.scrollToIndex(this.nativeFileChildIndex(scroller, isWaterfall ? this.waterfallLocalIndex(targetIndex) : targetIndex + childIndexOffset), false, ScrollAlign.START, {
         extraOffset: LengthMetrics.vp(Math.max(-120, Math.min(160, anchor.y)))
       })
     } catch (error) {
       console.warn('[UgreenFileView] anchor restore failed: ' + JSON.stringify(error))
       try {
-        scroller.scrollToIndex(isWaterfall ? this.waterfallLocalIndex(targetIndex) : targetIndex + childIndexOffset, false, ScrollAlign.START)
+        scroller.scrollToIndex(this.nativeFileChildIndex(scroller, isWaterfall ? this.waterfallLocalIndex(targetIndex) : targetIndex + childIndexOffset), false, ScrollAlign.START)
       } catch (_) {
         // The target container may not have completed its first layout pass.
       }
@@ -13704,7 +13701,7 @@ struct Index {
 
     const t0 = this.getMonotonicNow()
     try {
-      scroller.scrollToIndex(childIndex, false, ScrollAlign.CENTER)
+      scroller.scrollToIndex(this.nativeFileChildIndex(scroller, childIndex), false, ScrollAlign.CENTER)
     } catch (_) {}
     const tScrollCost = this.getMonotonicNow() - t0
     this.tapTrace('scrollToIndex-sync', 'cost=' + tScrollCost.toString() + 'ms')
@@ -15416,7 +15413,7 @@ struct Index {
     // month or year is far away and make the file surface track scrubbing.
     if (this.fileViewMode === 'waterfall') {
       this.jumpWaterfallTo(targetIndex, ScrollAlign.CENTER)
-    } else { scroller.scrollToIndex(targetIndex + childOffset, false, ScrollAlign.CENTER) }
+    } else { scroller.scrollToIndex(this.nativeFileChildIndex(scroller, targetIndex + childOffset), false, ScrollAlign.CENTER) }
     this.timelineLastJumpDay = dayStart
     this.timelineLastJumpIndex = targetIndex
     this.timelineLastJumpPath = this.currentPath
@@ -17452,6 +17449,7 @@ struct Index {
     }
     this.pageWidthVp = width
     this.pageHeightVp = height
+    this.fileGridRows.configure(FileGridLayout.columns(width, height))
   }
 
   private mediaReturnBandTop(): number {
@@ -17548,7 +17546,7 @@ struct Index {
           hasRect = itemHeight > 0
         }
       } else {
-        const rect = scroller.getItemRect(childIndex)
+        const rect = this.fileChildRect(scroller, childIndex)
         if (rect !== undefined && typeof rect.y === 'number' && rect.height > 0) {
           itemY = rect.y
           itemHeight = rect.height
@@ -17565,7 +17563,7 @@ struct Index {
       // 目标还没挂载：先滚进视口，下一帧拿到真实矩形后再按可视带校正。
       if (attempt < 8) {
         try {
-          scroller.scrollToIndex(childIndex, false, ScrollAlign.AUTO)
+          scroller.scrollToIndex(this.nativeFileChildIndex(scroller, childIndex), false, ScrollAlign.AUTO)
         } catch (_) {
         }
         // Media returns retry from their bounded rendered-frame loop. Only
@@ -22445,7 +22443,7 @@ struct Index {
       ? Math.max(top + 1, Math.min(bottom - 1, this.dragSelectionY)) : this.dragSelectionY
     if (this.dragSelectionScrollRunning || this.dragSurface === 'grid') {
       try {
-        const childIndex = this.dragSelectionScroller().getItemIndex(x - viewport.x, y - viewport.y)
+        const childIndex = this.fileChildIndexAt(this.dragSelectionScroller(), x - viewport.x, y - viewport.y)
         const index = childIndex - (this.dragSurface === 'list' ? 1 : 0)
         if (index >= 0 && index < this.dragSelectionEntries().length) {
           this.applyDragSelectionHit(index)
