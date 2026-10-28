@@ -19,6 +19,9 @@ export class ContinuationState {
   sort: DirectorySortKey = 'time'
   ascending: boolean = false
   anchor: string = ''
+  // Optional so older peers can still exchange protocol 1/2 snapshots.
+  anchorFraction?: number
+  anchorAtStart?: boolean
   target: string = ''
   positionMs: number = 0
   playing: boolean = false
@@ -89,6 +92,10 @@ export class ContinuationPolicy {
       typeof state.playing !== 'boolean' || !ContinuationPolicy.integer(state.positionMs) ||
       state.positionMs > 7 * 24 * 3600000 || !ContinuationPolicy.integer(state.count) || state.count > ContinuationPolicy.MAX_ENTRIES ||
       !ContinuationPolicy.text(state.anchor, 4096) || !ContinuationPolicy.text(state.target, 4096) ||
+      (state.anchorFraction !== undefined && (typeof state.anchorFraction !== 'number' ||
+        !Number.isFinite(state.anchorFraction) || state.anchorFraction < 0 || state.anchorFraction >= 1 ||
+        typeof state.anchorAtStart !== 'boolean' || state.anchor.length === 0)) ||
+      (state.anchorAtStart !== undefined && (typeof state.anchorAtStart !== 'boolean' || state.anchorFraction === undefined)) ||
       (state.anchor.length > 0 && !ContinuationPolicy.listedChild(state.path, state.anchor)) ||
       (state.scene !== 'directory' && !ContinuationPolicy.directChild(state.path, state.target)) ||
       (state.scene === 'directory' && state.target !== '')) {

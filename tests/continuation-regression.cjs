@@ -142,7 +142,10 @@ async function run() {
   for (const mutation of [
     x => x.protocol = 3, x => x.createdAt -= policy.MAX_AGE_MS + 1,
     x => x.count = policy.MAX_ENTRIES + 1, x => x.anchor = '/home/elsewhere/a.jpg',
-    x => {x.scene = 'video'; x.target = '/outside/video.mp4';}, x => x.playing = 'yes'
+    x => {x.scene = 'video'; x.target = '/outside/video.mp4';}, x => x.playing = 'yes',
+    x => {x.anchorFraction = NaN; x.anchorAtStart = false;}, x => {x.anchorFraction = 1; x.anchorAtStart = false;},
+    x => {x.anchorFraction = -0.1; x.anchorAtStart = false;}, x => {x.anchorFraction = 0.2;},
+    x => {x.anchorAtStart = false;}, x => {x.anchorFraction = 0.3; x.anchorAtStart = 'false';}
   ]) {
     const altered = JSON.parse(JSON.stringify(s.state)); mutation(altered);
     assert.throws(() => policy.validate(altered));
@@ -158,12 +161,15 @@ async function run() {
   assert.throws(() => policy.ancestors('/secret/Photos', roots));
   cases++;
 
+  s.state.view = 'grid'; s.state.anchorFraction = 0.35; s.state.anchorAtStart = false;
+  policy.validate(s.state);
   shortWrites = true;
   const asset = await store.write(context, s, () => true);
   shortWrites = false;
   const roundTrip = await store.read(context, s.state.requestId, asset, () => true);
   assert.equal(roundTrip.entries.length, 3);
   assert.equal(roundTrip.entries[2].path, s.entries[2].path);
+  assert.equal(roundTrip.state.anchorFraction, 0.35); assert.equal(roundTrip.state.anchorAtStart, false);
   assert.equal(positions.size, 0);
   await assert.rejects(store.read(context, s.state.requestId, {...asset, name: '../../secret'}, () => true));
   await assert.rejects(store.read(context, s.state.requestId, {...asset, size: '1'}, () => true));

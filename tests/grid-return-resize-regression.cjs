@@ -2,7 +2,7 @@
 const assert = require('node:assert/strict'), fs = require('node:fs'), vm = require('node:vm');
 const ts = require(process.argv[2]);
 const source = fs.readFileSync('entry/src/main/ets/pages/Index.ets', 'utf8');
-const names = ['recordFilePageSize', 'mediaReturnBandTop', 'mediaReturnBandBottom',
+const names = ['recordFilePageSize', 'updateFilePageSize', 'mediaReturnBandTop', 'mediaReturnBandBottom',
   'gridViewerReturnTargetVisible', 'waitForFileViewport', 'scrollMediaReturnSourceIntoView',
   'scrollItemIntoContentBand', 'prepareMediaReturnSource', 'closeGridViewerWithReturnOverlay'];
 function method(name) {
@@ -11,12 +11,16 @@ function method(name) {
   const end = source.slice(start + 1).search(/^  (?:private |@Builder)/m);
   return source.slice(start, start + end + 1);
 }
+const layoutExports = {};
+vm.runInNewContext(ts.transpileModule(fs.readFileSync('entry/src/main/ets/ui/FileGridLayout.ets', 'utf8'), {
+  compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS }
+}).outputText, { exports: layoutExports });
 class ViewerReturnSnapshot { constructor() { this.target = {}; } }
 const exportsObject = {};
 vm.runInNewContext(ts.transpileModule('export class Harness {\n' + names.map(method).join('\n') + '\n}', {
   compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS }
 }).outputText, { exports: exportsObject, console: { info() {}, warn() {} }, ViewerReturnSnapshot,
-  Math, Promise, setTimeout, FileGridLayout: { columns: () => 6 }, IMAGE_RETURN_MOUNT_FRAME_LIMIT: 8, IMAGE_GEOMETRY_TRANSITION_DURATION: 240,
+  Math, Promise, setTimeout, FileGridLayout: layoutExports.FileGridLayout, IMAGE_RETURN_MOUNT_FRAME_LIMIT: 8, IMAGE_GEOMETRY_TRANSITION_DURATION: 240,
   IMAGE_FALLBACK_TRANSITION_DURATION: 160, ScrollAlign: { AUTO: 3 }, Curve: { FastOutSlowIn: 1 } });
 const entry = { path: '/photos/current.jpg' };
 function make() {
@@ -25,8 +29,7 @@ function make() {
     thumbnailSurface: 'grid', thumbnailVisibleRatio: 1 };
   let mounted = true;
   Object.assign(h, { screen: 'files', showSearch: false, fileViewMode: 'grid', entries: [entry],
-    fileGridRows: { configure() {} }, nativeFileChildIndex: (_scroller, index) => index,
-    fileChildRect: (scroller, index) => scroller.getItemRect(index),
+    canAnchorGridViewport: () => false,
     pageWidthVp: 800, pageHeightVp: 1200, fileViewportVersion: 0, viewerReturnViewportVersion: 0,
     fileScrollViewport: { x: 0, y: 0, width: 800, height: 1200 }, targetLocateEntryPath: '',
     fileContentTopInset: () => 100, floatingBarContentInset: () => 76, bottomSafeInset: () => 0,

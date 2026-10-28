@@ -80,7 +80,6 @@ Object.assign(t.h, {
   dragSelectionBandTop: () => 100, dragSelectionBandBottom: () => 650,
   dragSelectionEntries: () => [{}, {}, {}],
   dragSelectionScroller: () => ({ getItemIndex: (x, y) => { points.push([x, y]); return 2; } }),
-  fileChildIndexAt: (scroller, x, y) => scroller.getItemIndex(x, y),
   applyDragSelectionHit: index => hits.push(index)
 });
 t.h.updateDragSelectionHit();

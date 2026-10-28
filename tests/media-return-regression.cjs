@@ -10,7 +10,6 @@ function make(){
  const h=new exportsObject.Harness(),events=[];let rect={y:160,height:60};
  const scroller={getItemRect(i){events.push(['rect',i]);return rect},scrollToIndex(i,anim,align){events.push(['index',i,anim,align])},scrollBy(x,y){events.push(['by',x,y]);rect={...rect,y:rect.y-y}}};
  Object.assign(h,{screen:'files',showSearch:false,fileViewMode:'list',entries:[other,entry],waterfallEntries:[entry,other],searchResults:[other,entry],
-  nativeFileChildIndex:(_scroller,index)=>index,fileChildRect:(scroller,index)=>scroller.getItemRect(index),
   fileListScroller:scroller,waterfallScroller:scroller,searchResultScroller:scroller,pageHeightVp:800,
   targetLocateEntryPath:'',fileScrollViewport:{y:40,height:760},fileContentTopInset:()=>134,topSafeInset:()=>40,floatingBarContentInset:()=>76,nextRenderFrame:async()=>{},
   showImageViewer:true,viewerImageEntry:entry,hasViewerTransitionSource:()=>true,
