@@ -4,8 +4,8 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const ts = require(process.argv[2]);
 const source = fs.readFileSync('entry/src/main/ets/pages/Index.ets', 'utf8');
-const names = ['gridThumbnailComponentId', 'refreshGridThumbnailArea',
-  'hasViewerTransitionSource', 'updateDragSelectionHit'];
+const names = ['gridThumbnailComponentId', 'gridTileComponentId', 'gridEntryUsesFileTile', 'refreshGridThumbnailArea',
+  'hasViewerTransitionSource', 'updateDragSelectionHit', 'audioThumbnailIconSize'];
 function method(name) {
   const start = source.search(new RegExp('^  private (?:async )?' + name + '\\(', 'm'));
   assert.ok(start >= 0, name);
@@ -36,7 +36,7 @@ function make() {
       thumbnailIndex: index, thumbnailSurface: surface, thumbnailX: area.globalPosition.x,
       thumbnailY: area.globalPosition.y, thumbnailWidth: area.width, thumbnailHeight: area.height
     }),
-    recordRowHitArea() {}, isImage: () => true, imageVisualState: () => state,
+    recordRowHitArea() {}, isImage: () => true, isVideo: () => false, imageVisualState: () => state,
     thumbnailSurfaceUri: () => 'cached', thumbnailSurfaceIsCurrent: () => true,
     fileContentTopInset: () => 100, topSafeInset: () => 20, bottomSafeInset: () => 0,
     pageHeightVp: 900, viewerPreviewBitmaps: { [entry.path]: {} }
@@ -88,4 +88,30 @@ assert.deepEqual(hits, [2], 'grid selection can hit an item without per-row geom
 t.h.dragSelectionScroller = () => ({ getItemIndex: () => -1 });
 t.h.updateDragSelectionHit();
 assert.deepEqual(hits, [2], 'a gap must not select a distant or stale row');
+
+t = make();
+let tileArea;
+t.h.isImage = () => false;
+t.h.getUIContext = () => ({ px2vp: n => n / 2, getComponentUtils: () => ({
+  getRectangleById: id => id.startsWith('file-grid-tile:')
+    ? { size: { width: 282, height: 282 }, windowOffset: { x: 578, y: 808 } }
+    : { size: { width: 96, height: 96 }, windowOffset: { x: 672, y: 870 } }
+}) });
+t.h.recordRowHitArea = (_e, _i, _surface, area) => { tileArea = area; };
+assert.equal(t.h.refreshGridThumbnailArea(entry), true);
+assert.deepEqual([t.state.thumbnailWidth, t.state.thumbnailHeight], [48, 48],
+  'audio shared-element flights use the inner artwork');
+assert.deepEqual([tileArea.width, tileArea.height, tileArea.globalPosition.x], [141, 141, 289],
+  'the lifted context menu uses the complete named tile');
+t = make(); t.h.isImage = () => false; t.h.isVideo = () => true;
+assert.equal(t.h.refreshGridThumbnailArea(entry), true);
+assert.equal(t.queried.length, 1, 'video geometry still uses the original full-square cover ID');
+assert.equal(t.state.thumbnailWidth, 141);
+t.h.audioOriginSurface = 'grid';
+assert.equal(t.h.audioThumbnailIconSize({ width: 81, height: 81 }), 81,
+  'default audio artwork uses the measured adaptive icon width for opening and returning');
+for (const surface of ['list', 'search']) {
+  t.h.audioOriginSurface = surface;
+  assert.equal(t.h.audioThumbnailIconSize({ width: 40, height: 34 }), 32);
+}
 console.log('Grid geometry regression passed');

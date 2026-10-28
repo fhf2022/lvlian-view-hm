@@ -21,8 +21,11 @@ function EmptyGridCellSlot(): void { Column() {}.width(0).height(0) }
 export struct FileGridCell {
   @ObjectLink entry: FileEntry
   @Prop selectionMode: boolean = false
+  @Prop showName: boolean = false
+  @Prop tileWidth: number = 120
   @Prop topInset: number = 0
   @Prop thumbnailId: string = ''
+  @Prop tileId: string = ''
   events: FileGridCellEvents = new FileGridCellEvents()
   @BuilderParam content: () => void = EmptyGridCellSlot
   @BuilderParam videoIndicator: () => void = EmptyGridCellSlot
@@ -32,25 +35,40 @@ export struct FileGridCell {
     Stack({ alignContent: Alignment.BottomEnd }) {
       Column({ space: 0 }) {
         Stack({ alignContent: Alignment.Center }) {
-          this.content()
+          if (this.showName) {
+            Column({ space: Math.max(4, Math.min(10, this.tileWidth * 0.04)) }) {
+              Stack({ alignContent: Alignment.Center }) {
+                this.content()
+              }
+              .width(FileGridLayout.fileIconSize(this.tileWidth))
+              .height(FileGridLayout.fileIconSize(this.tileWidth))
+              // Shared-element media flights start at the artwork, not the
+              // surrounding card or its filename.
+              .id(this.thumbnailId)
+              Text(this.entry.name)
+                .fontSize(FileGridLayout.fileLabelFontSize(this.tileWidth))
+                .lineHeight(FileGridLayout.fileLabelFontSize(this.tileWidth) * 1.35)
+                .fontColor($r('app.color.text_primary'))
+                .maxLines(2)
+                .height(FileGridLayout.fileLabelFontSize(this.tileWidth) * 2.7)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .width('100%')
+                .textAlign(TextAlign.Center)
+            }
+            .width('100%')
+            .padding({ left: Math.max(6, Math.min(16, this.tileWidth * 0.06)),
+              right: Math.max(6, Math.min(16, this.tileWidth * 0.06)) })
+          } else {
+            this.content()
+          }
         }
         .width('100%')
         .aspectRatio(1)
         .borderRadius(0)
-        .id(this.thumbnailId)
+        .id(this.showName ? this.tileId : this.thumbnailId)
         .onVisibleAreaChange([0.0, 0.999], (_expanding: boolean, ratio: number): void => {
           this.events.visible(this.entry, ratio)
         })
-        if (this.entry.isDirectory) {
-          Text(this.entry.name)
-            .fontSize(11)
-            .fontColor($r('app.color.text_primary'))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .width('100%')
-            .textAlign(TextAlign.Center)
-            .margin({ top: 2 })
-        }
       }
       .width('100%')
       .padding(FileGridLayout.cellPadding)

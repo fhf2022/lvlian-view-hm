@@ -1294,9 +1294,11 @@ struct Index {
   @State defaultAudioViewMode: FileViewMode = 'list'
   // This is derived from the metadata already loaded for the current
   // directory. It deliberately does not trigger a second directory scan.
-  // 当前目录是不是「图片目录」（全部都是图片/视频才为真）——决定用哪套呈现方式
+  // Default presentation and waterfall availability are separate: a mixed
+  // directory can contain images without meeting the photo-default threshold.
   @State currentDirectoryIsPhotoAlbum: boolean = false
   @State currentDirectoryIsAudioAlbum: boolean = false
+  @State currentDirectoryHasImages: boolean = false
   // 每个目录【本次运行期间】临时切过的视图模式（右下角按钮切的）。
   // 只存内存：进子目录再返回仍然保持，重启应用就回到设置里的默认值。
   private directoryViewModeOverrides: Record<string, FileViewMode> = {}
@@ -2181,7 +2183,7 @@ struct Index {
     this.setCurrentPageState(Math.max(1, Math.ceil(entries.length / 200)), false)
     this.replaceEntries(ordered, false, true)
     this.fileViewMode = state.path === '' ? 'list' :
-      (state.view === 'waterfall' && !this.currentDirectoryIsPhotoAlbum ? 'grid' : state.view)
+      (state.view === 'waterfall' && !this.currentDirectoryHasImages ? 'grid' : state.view)
     this.updateTopTitle(this.fileTitle(state.path))
     this.topTitleOpacity = 1
     this.updateBottomBarVisibility(false)
@@ -2313,7 +2315,7 @@ struct Index {
       this.endDragSelection()
     }
     this.fileGridCellEvents.dragCancel = (): void => this.cancelDragSelectionGesture()
-    this.fileGridCellEvents.isVideo = (entry: FileEntry): boolean => this.isVideo(entry)
+    this.fileGridCellEvents.isVideo = (entry: FileEntry): boolean => !entry.isDirectory && this.isVideo(entry)
     // ── R2 推广：瀑布流接线 ────────────────────────────────────────────────
     // 就地自增同样必须开，否则 waterfallDataSource.notifyItemChanged 仍走 clone
     // 路径 → 换实例 → @ObjectLink 断链。
@@ -4820,7 +4822,7 @@ struct Index {
     Column({ space: 12 }) {
       if (this.fileViewMode === 'grid') {
         this.GridFileList()
-      } else if (this.fileViewMode === 'waterfall' && this.currentDirectoryIsPhotoAlbum) {
+      } else if (this.fileViewMode === 'waterfall' && this.currentDirectoryHasImages) {
         this.WaterfallFileList()
       } else {
       List({ space: 0, scroller: this.fileListScroller }) {
@@ -5576,7 +5578,8 @@ struct Index {
           })
       }
     } else if (entry.isDirectory) {
-      this.FolderIcon(44)
+      this.FolderIcon(FileGridLayout.fileIconSize(
+        FileGridLayout.cellWidth(this.pageWidthVp, this.fileGridColumnCount())))
     } else {
       Image(this.fileIcon(entry))
         .width(48)
@@ -5622,15 +5625,18 @@ struct Index {
     FileGridCell({
       entry: entry,
       selectionMode: this.selectionMode,
+      showName: this.gridEntryUsesFileTile(entry),
+      tileWidth: FileGridLayout.cellWidth(this.pageWidthVp, this.fileGridColumnCount()),
       topInset: 0,
       thumbnailId: this.gridThumbnailComponentId(entry),
+      tileId: this.gridTileComponentId(entry),
       events: this.fileGridCellEvents,
       videoIndicator: () => { this.VideoTransferIndicator(entry) },
       selectionIndicator: () => { this.SelectionCheckbox(entry) },
       content: this.FileGridThumbnail.bind(this, entry, index)
     })
     .transition(TransitionEffect.IDENTITY)
-    .width((this.pageWidthVp - (this.fileGridColumnCount() - 1) * FileGridLayout.gap) / this.fileGridColumnCount())
+    .width(FileGridLayout.cellWidth(this.pageWidthVp, this.fileGridColumnCount()))
     .onAppear(() => {
       this.resolveFileListImageRotation(entry)
       this.loadEntryPreview(entry, this.previewPriority(index, 'grid'))
@@ -9870,6 +9876,14 @@ struct Index {
     return 'file-grid-thumbnail:' + entry.path
   }
 
+  private gridTileComponentId(entry: FileEntry): string {
+    return 'file-grid-tile:' + entry.path
+  }
+
+  private gridEntryUsesFileTile(entry: FileEntry): boolean {
+    return entry.isDirectory || (!this.isImage(entry) && !this.isVideo(entry))
+  }
+
   // Grid cells do not need to report a new window position on every scroll
   // frame. Read the exact mounted thumbnail only when an interaction needs
   // it; this also handles mixed rows, first-row margins and width changes.
@@ -9897,7 +9911,19 @@ struct Index {
         globalPosition: { x: ui.px2vp(rect.windowOffset.x), y: ui.px2vp(rect.windowOffset.y) }
       }
       this.recordThumbnailArea(entry, currentIndex, 'grid', area)
-      this.recordRowHitArea(entry, currentIndex, 'grid', area)
+      // Non-image cards include a filename. Keep the lifted menu's rectangle
+      // on the whole square, while media flights still use the inner artwork.
+      if (this.gridEntryUsesFileTile(entry)) {
+        const tile = ui.getComponentUtils().getRectangleById(this.gridTileComponentId(entry))
+        if (tile.size.width <= 0 || tile.size.height <= 0 ||
+          !Number.isFinite(tile.size.width) || !Number.isFinite(tile.size.height) ||
+          !Number.isFinite(tile.windowOffset.x) || !Number.isFinite(tile.windowOffset.y)) { return false }
+        this.recordRowHitArea(entry, currentIndex, 'grid', {
+          width: ui.px2vp(tile.size.width), height: ui.px2vp(tile.size.height),
+          position: { x: 0, y: 0 },
+          globalPosition: { x: ui.px2vp(tile.windowOffset.x), y: ui.px2vp(tile.windowOffset.y) }
+        })
+      } else { this.recordRowHitArea(entry, currentIndex, 'grid', area) }
       return true
     } catch (_) {
       // An offscreen or not-yet-mounted cell must not use its old rectangle.
@@ -12364,7 +12390,8 @@ struct Index {
     // 该目录本次运行期间被手动切过 → 保持那个模式；否则用设置里的默认视图。
     const recorded = this.directoryViewModeOverrides[
       this.currentRootType.toString() + ':' + this.currentPath]
-    const preferred = recorded !== undefined ? recorded : this.preferredViewMode()
+    const requested = recorded !== undefined ? recorded : this.preferredViewMode()
+    const preferred = requested === 'waterfall' && !this.currentDirectoryHasImages ? 'grid' : requested
     if (this.fileViewMode === preferred) {
       return
     }
@@ -12442,7 +12469,7 @@ struct Index {
     // Ordinary folders still keep the existing list/grid switch. The
     // waterfall mode is only a valid target after an image has appeared in
     // the already-loaded metadata for this directory.
-    const nextMode: FileViewMode = this.currentDirectoryIsPhotoAlbum
+    const nextMode: FileViewMode = this.currentDirectoryHasImages
       ? (this.fileViewMode === 'list'
         ? 'grid' : (this.fileViewMode === 'grid' ? 'waterfall' : 'list'))
       : (this.fileViewMode === 'list' ? 'grid' : 'list')
@@ -13009,6 +13036,12 @@ struct Index {
 
 
   private prepareWaterfallPipeline(): void {
+    // Files hidden by the image-only view must not remain selected for a later
+    // delete, move or share. This runs once on entry, never while scrolling.
+    if (this.selectedPaths.length > 0) {
+      this.setSelectedPaths(this.waterfallEntries.filter((entry: FileEntry): boolean =>
+        this.isSelected(entry)).map((entry: FileEntry): string => entry.path))
+    }
     this.stopWaterfallPipeline()
     this.postRenderFrame((): void => this.ensureWaterfallStarted())
   }
@@ -21909,6 +21942,11 @@ struct Index {
     this.audioCoverRect = rect
   }
 
+  private audioThumbnailIconSize(rect: AudioCoverRect | undefined): number {
+    if (this.audioOriginSurface === 'list' || this.audioOriginSurface === 'search') { return 32 }
+    return rect?.width ?? 48
+  }
+
   /** One cover owner from the mounted thumbnail to the measured player cover. */
   private async animateOpenAudioPlayer(entry: FileEntry, token: number, scope: string): Promise<void> {
     const valid = (): boolean => token === this.audioOpenToken && !this.audioClosing && this.showAudioPlayer && !this.audioBackgrounded &&
@@ -21920,7 +21958,7 @@ struct Index {
       this.pageHeightVp - this.bottomSafeInset() - 8, this.pageWidthVp)
     // Copy the source before hiding it: its mounted placeholder may report a
     // different area while the transition is being prepared.
-    const iconSize = this.audioOriginSurface === 'list' || this.audioOriginSurface === 'search' ? 32 : 48
+    const iconSize = this.audioThumbnailIconSize(source)
     const start = source === undefined ? new AudioCoverRect() :
       AudioPlayerPolicy.thumbnailRect(source, this.audioCover.length > 0, iconSize)
     try {
@@ -22065,7 +22103,7 @@ struct Index {
       frame.x >= -1 && frame.x + frame.width <= this.pageWidthVp + 1 &&
       [frame.x, frame.y, frame.width, frame.height].every((value: number): boolean => Number.isFinite(value))
     const hasTarget = returnReady && isCurrent()
-    const iconSize = this.audioOriginSurface === 'list' || this.audioOriginSurface === 'search' ? 32 : 48
+    const iconSize = this.audioThumbnailIconSize(target)
     const landing = target === undefined ? new AudioCoverRect() :
       AudioPlayerPolicy.thumbnailRect(target, this.audioCover.length > 0, iconSize)
     this.audioFlightSource = this.audioCover.length > 0 ? this.audioCover : this.fileIcon(entry)
@@ -22354,7 +22392,7 @@ struct Index {
     if (this.fileViewMode === 'grid') {
       return 'grid'
     }
-    if (this.fileViewMode === 'waterfall' && this.currentDirectoryIsPhotoAlbum) {
+    if (this.fileViewMode === 'waterfall' && this.currentDirectoryHasImages) {
       return 'waterfall'
     }
     return 'list'
@@ -23014,15 +23052,20 @@ struct Index {
     return this.allEntriesSelected() ? '取消全选' : '全选'
   }
 
+  private selectionEntries(): FileEntry[] {
+    return this.fileViewMode === 'waterfall' ? this.waterfallEntries : this.entries
+  }
+
   private allEntriesSelected(): boolean {
-    return this.entries.length > 0 && this.selectedPaths.length === this.entries.length &&
-      this.entries.every((entry: FileEntry): boolean => this.isSelected(entry))
+    const entries = this.selectionEntries()
+    return entries.length > 0 && this.selectedPaths.length === entries.length &&
+      entries.every((entry: FileEntry): boolean => this.isSelected(entry))
   }
 
   private toggleSelectAll(): void {
     const nextPaths = this.allEntriesSelected()
       ? []
-      : this.entries.map((entry: FileEntry): string => entry.path)
+      : this.selectionEntries().map((entry: FileEntry): string => entry.path)
     this.setSelectedPaths(nextPaths)
   }
 
@@ -23033,7 +23076,7 @@ struct Index {
       return []
     }
     if (this.selectedEntriesCache === null) {
-      this.selectedEntriesCache = this.entries.filter((entry: FileEntry): boolean => this.isSelected(entry))
+      this.selectedEntriesCache = this.selectionEntries().filter((entry: FileEntry): boolean => this.isSelected(entry))
     }
     return this.selectedEntriesCache
   }
@@ -24222,22 +24265,12 @@ struct Index {
     this.entries = sortedEntries
     this.endDragSelection()
     this.selectedEntriesCache = null
-    this.currentDirectoryIsPhotoAlbum = this.isPhotoAlbumDirectory(this.entries)
-    this.currentDirectoryIsAudioAlbum = this.isAudioAlbumDirectory(this.entries)
-    // 这里只做「无图目录不能停在瀑布流」的兜底。默认视图的下发只在进/回目录时
-    // （restore/settleDirectoryViewState）—— 绝不能放这里：replaceEntries 在加载、
-    // 排序、刷新、分页追加时都会跑，在这里改模式会反复启停瀑布流管线、拖垮加载。
-    if (!this.currentDirectoryIsPhotoAlbum && this.fileViewMode === 'waterfall') {
-      this.stopWaterfallPipeline()
-      this.fileViewMode = 'list'
-      this.waterfallAnchor = null
-    }
     if (!appendWaterfall) {
       this.imageTelemetry.reset()
       this.returnPerfSession.resetAll()
     }
     this.fileEntryDataSource.replace(this.entries)
-    this.syncWaterfallEntries(this.entries, appendWaterfall)
+    this.syncDirectoryMediaEntries(this.entries, appendWaterfall)
     this.rebuildTimelineIndexes()
     this.refreshFileListImageRotations(this.entries)
     this.scheduleDirectoryVideoReconcile(this.entries)
@@ -24375,8 +24408,9 @@ struct Index {
       return
     }
     this.entries = next
+    this.selectedEntriesCache = null
     this.fileEntryDataSource.insertAt(index, entry)
-    this.syncWaterfallEntries(this.entries, false)
+    this.syncDirectoryMediaEntries(this.entries, false)
     this.rebuildTimelineIndexes()
     this.scheduleDirectoryVideoReconcile([entry])
   }
@@ -24422,23 +24456,46 @@ struct Index {
     this.entries = sorted
     this.endDragSelection()
     this.selectedEntriesCache = null
-    this.currentDirectoryIsPhotoAlbum = this.isPhotoAlbumDirectory(this.entries)
-    this.currentDirectoryIsAudioAlbum = this.isAudioAlbumDirectory(this.entries)
     this.fileEntryDataSource.append(appended)
-    this.syncWaterfallEntries(this.entries, true)
+    this.syncDirectoryMediaEntries(this.entries, true)
     this.rebuildTimelineIndexes()
     this.refreshFileListImageRotations(this.entries)
     this.scheduleDirectoryVideoReconcile(appended)
     this.scheduleCurrentDirectoryIndex()
   }
 
-  private syncWaterfallEntries(entries: FileEntry[], appendOnly: boolean): void {
-    const images = entries.filter((entry: FileEntry): boolean => !entry.isDirectory && this.isImage(entry))
+  private syncDirectoryMediaEntries(entries: FileEntry[], appendOnly: boolean): void {
+    // Reuse the catalog pass: no extra directory scan, image decoding or NAS
+    // request is needed for default presentation and waterfall availability.
+    const images: FileEntry[] = []
+    let mediaCount = 0
+    let largeImageCount = 0
+    let audioCount = 0
+    for (const entry of entries) {
+      if (entry.isDirectory) { continue }
+      if (this.isImage(entry)) {
+        images.push(entry); mediaCount++
+        // Only the mixed-directory default uses this threshold. Small images
+        // remain in the catalog; stop size checks once six >1 MiB images exist.
+        if (largeImageCount < 6 && entry.size > 1024 * 1024) { largeImageCount++ }
+      }
+      else if (this.isVideo(entry)) { mediaCount++ }
+      else if (this.isAudio(entry)) { audioCount++ }
+    }
+    this.currentDirectoryIsPhotoAlbum = entries.length > 0 &&
+      (mediaCount === entries.length || largeImageCount >= 6)
+    this.currentDirectoryIsAudioAlbum = entries.length > 0 && audioCount === entries.length
     const previous = this.waterfallEntries
     const prefix = images.length >= previous.length && previous.every(
       (entry: FileEntry, index: number): boolean => this.sameWaterfallEntry(entry, images[index]))
     if (!prefix || (!appendOnly && images.length !== previous.length)) { this.resetWaterfallDirectoryState() }
     this.waterfallEntries = images
+    this.currentDirectoryHasImages = images.length > 0
+    if (!this.currentDirectoryHasImages && this.fileViewMode === 'waterfall') {
+      this.stopWaterfallPipeline()
+      this.fileViewMode = 'grid'
+      this.waterfallAnchor = null
+    }
     if (this.fileViewMode !== 'waterfall') { return }
     if (prefix && this.waterfallBatches !== null && this.waterfallBatches.first >= 0) {
       this.waterfallBatches.sync(images)
@@ -24454,33 +24511,6 @@ struct Index {
       left.thumbnailUrl === right.thumbnailUrl && left.coverUrl === right.coverUrl &&
       left.mimeType === right.mimeType && left.etag === right.etag &&
       left.checksum === right.checksum
-  }
-
-  /**
-   * 这个目录算不算「图片目录」——用【图片目录的呈现方式】（默认视图、网格/瀑布流那套）。
-   *
-   * 规则（用户定）：目录里【全部】都是图片或视频才算图片目录（且至少有一条）；
-   * 只要有任何一个别的文件、或者子目录，就算【文件目录】，用文件目录的呈现方式。
-   * 注意：这不是"怎么画每条内容"——单条要不要显示缩略图由 isImage(entry) 各自决定。
-   */
-  private isPhotoAlbumDirectory(entries: FileEntry[]): boolean {
-    if (entries.length === 0) {
-      return false
-    }
-    for (const entry of entries) {
-      if (entry.isDirectory) {
-        return false
-      }
-      if (!this.isImage(entry) && !this.isVideo(entry)) {
-        return false
-      }
-    }
-    return true
-  }
-
-  private isAudioAlbumDirectory(entries: FileEntry[]): boolean {
-    return entries.length > 0 && entries.every((entry: FileEntry): boolean =>
-      !entry.isDirectory && this.isAudio(entry))
   }
 
   /**
@@ -24501,7 +24531,7 @@ struct Index {
     if (this.fileViewMode === 'list') {
       return $r('sys.symbol.square_grid_2x2')
     }
-    if (this.fileViewMode === 'grid' && this.currentDirectoryIsPhotoAlbum) {
+    if (this.fileViewMode === 'grid' && this.currentDirectoryHasImages) {
       // Official ArkUI system symbol for the waterfall target mode.
       return $r('sys.symbol.waterfall')
     }

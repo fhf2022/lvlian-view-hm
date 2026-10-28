@@ -6,8 +6,22 @@ export class FileGridLayout {
   private static readonly targetVisibleImages: number = 36
   private static readonly minimumThumbnailWidth: number = 80
 
+  static cellWidth(width: number, columns: number): number {
+    return (width - (columns - 1) * FileGridLayout.gap) / columns
+  }
+
   static thumbnailWidth(width: number, columns: number): number {
-    return (width - (columns - 1) * FileGridLayout.gap) / columns - 2 * FileGridLayout.cellPadding
+    return FileGridLayout.cellWidth(width, columns) - 2 * FileGridLayout.cellPadding
+  }
+
+  // File cards share the photo grid's square geometry, but use bounded icon
+  // and label sizes rather than stretching artwork or tiny fixed labels.
+  static fileIconSize(cellWidth: number): number {
+    return Math.max(36, Math.min(88, (cellWidth - 2 * FileGridLayout.cellPadding) * 0.4))
+  }
+
+  static fileLabelFontSize(cellWidth: number): number {
+    return Math.max(12, Math.min(14, cellWidth * 0.07))
   }
 
   static columns(width: number, height: number): number {

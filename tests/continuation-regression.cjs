@@ -339,7 +339,7 @@ async function run() {
       listPage: async () => ({entries: sample.entries.slice(0, 1)})},
     isImage: e => e.name.endsWith('.jpg'), isVideo: e => e.name.endsWith('.mp4'), isAudio: e => e.name.endsWith('.flac'),
     discardSearchSession() {}, setCurrentPageState(page, more) {a.currentPageHasMore = more},
-    replaceEntries(entries) {a.entries = entries; a.currentDirectoryIsPhotoAlbum = true;},
+    replaceEntries(entries) {a.entries = entries; a.currentDirectoryHasImages = entries.some(e => a.isImage(e));},
     updateTopTitle(title) {a.topTitle = title;}, fileTitle: p => p,
     updateBottomBarVisibility() {}, resetTimelineInteraction() {}, resetPreviewState() {},
     nextRenderFrame: async () => {}, scrollToLocatedEntry: e => mediaCalls.push(['anchor', e.path]),

@@ -28,7 +28,8 @@ function harness() {
         waterfallAnchor: null, targetLocateEntryPath: '', resetPreviewAfterPageTransition: true,
         pageTransitionToken: 5, showPageTransition: true, waterfallAspectEpoch: 0, previewGeneration: 0,
         previewRecoveryAttempts: new Map(), previewReloadPaths: new Set(), previewQueue: { cancelPending() { } },
-        pendingVisibleLoads: new Map(), postRenderFrame: fn => frames.push(fn), schedulePreviewWarmup() { }, resetFileListScroll() { }
+        pendingVisibleLoads: new Map(), postRenderFrame: fn => frames.push(fn), schedulePreviewWarmup() { },
+        resetFileListScroll() { }, rememberGridViewportAnchor() { }
     });
     h.waterfallBatches = new WaterfallBatchCoordinator({
         async geometry(entry) { geometry.push(entry.path); return { displayWidth: 1200, displayHeight: 1600 }; },
