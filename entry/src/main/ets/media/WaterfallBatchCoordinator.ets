@@ -1,17 +1,19 @@
 import { FileEntry } from '../model/FileEntry'
 import { ViewerBitmapMetadata } from './ViewerBitmapStore'
+import { DownloadCancellation } from '../core/network/DownloadCancellation'
 
 export type WaterfallBatchChange = 'initial' | 'append' | 'prepend' | 'resident'
-type BatchPhase = 'preparing' | 'originals' | 'complete' | 'failed'
+type BatchPhase = 'preparing' | 'ready' | 'originals' | 'complete' | 'failed'
 
 export interface WaterfallBatchDelegate {
-  geometry: (entry: FileEntry, valid: () => boolean) => Promise<ViewerBitmapMetadata | null>
+  geometry: (entry: FileEntry, valid: () => boolean, cancellation: DownloadCancellation) => Promise<ViewerBitmapMetadata | null>
   layout?: (entry: FileEntry, info: ViewerBitmapMetadata | null) => void
   thumbnail: (entry: FileEntry, valid: () => boolean) => Promise<void>
   publish: (change: WaterfallBatchChange) => void
   originals: (entries: FileEntry[], retry: boolean) => void
   evict: (entries: FileEntry[]) => void
   changed: () => void
+  canEvict?: (entries: FileEntry[]) => boolean
 }
 
 class Batch {
@@ -45,14 +47,19 @@ export class WaterfallBatchCoordinator {
   private preparation: Promise<void> = Promise.resolve()
   private waiters: Map<number, (() => void)[]> = new Map<number, (() => void)[]>()
   private delegate: WaterfallBatchDelegate
+  private direction: number = 1
+  private staged: number = -1
+  private preparationCancellation: DownloadCancellation = new DownloadCancellation()
 
   constructor(delegate: WaterfallBatchDelegate) { this.delegate = delegate }
 
   reset(entries: FileEntry[] = [], initialIndex: number = 0): void {
+    this.preparationCancellation.cancel()
     this.session++; this.hidden = false; this.entries = entries; this.batches.clear(); this.residents.clear()
     this.first = -1; this.last = -1; this.preparing = -1; this.error = false
     this.focus = Math.max(0, Math.floor(initialIndex / WaterfallBatchCoordinator.SIZE))
     this.pending = -1; this.jump = this.focus; this.admittedEnd = 0
+    this.direction = 1; this.staged = -1
     this.waiters.forEach((callbacks: (() => void)[]): void => callbacks.forEach((callback: () => void): void => callback()))
     this.waiters.clear()
     if (entries.length > 0) { this.request(this.focus) }
@@ -64,9 +71,23 @@ export class WaterfallBatchCoordinator {
     const tail = this.batches.get(this.last)
     if (tail !== undefined) {
       const next = this.groupEntries(tail.index)
-      if (next.length > tail.entries.length) { tail.entries = next; this.request(tail.index, true); return }
+      if (next.length > tail.entries.length) { this.refreshEntries(tail, next); return }
+    }
+    const staged = this.batches.get(this.staged)
+    if (staged !== undefined && !this.residents.has(staged.index)) {
+      const next = this.groupEntries(staged.index)
+      if (next.length > staged.entries.length) { this.refreshEntries(staged, next); return }
     }
     this.advance()
+  }
+
+  private refreshEntries(batch: Batch, entries: FileEntry[]): void {
+    batch.entries = entries
+    const pending = this.pending
+    this.preparationCancellation.cancel()
+    this.preparing = -1
+    this.request(batch.index, true, !this.residents.has(batch.index))
+    if (pending >= 0 && pending !== batch.index) { this.pending = pending }
   }
 
   setHidden(hidden: boolean): void { this.hidden = hidden; if (!hidden) { this.advance() } }
@@ -74,10 +95,16 @@ export class WaterfallBatchCoordinator {
   visible(firstIndex: number, lastIndex: number): void {
     if (this.hidden) { return }
     const next = Math.floor(Math.max(0, firstIndex) / WaterfallBatchCoordinator.SIZE)
-    if (this.residents.has(next) && next !== this.focus) { this.focus = next; this.advance() }
+    if (this.residents.has(next) && next !== this.focus) {
+      this.direction = next > this.focus ? 1 : -1
+      this.focus = next
+      this.delegate.originals(this.originalTargets(), false)
+      this.advance()
+    } else if (this.pending >= 0) { this.advance() }
   }
 
   edge(direction: number): void {
+    this.direction = direction < 0 ? -1 : 1
     const target = direction < 0 ? this.residentFirst() - 1 : this.residentLast() + 1
     if (this.hasGroup(target)) { this.pending = target; this.advance() }
   }
@@ -162,8 +189,8 @@ export class WaterfallBatchCoordinator {
   hasNext(): boolean { return this.hasGroup(this.last + 1) }
   hasPrevious(): boolean { return this.first > 0 }
   waiting(): boolean {
-    return this.preparing >= 0 || (this.pending >= 0 && !this.residents.has(this.pending)) ||
-      this.batches.get(this.residentLast())?.phase === 'originals'
+    return (this.first < 0 && this.preparing >= 0) ||
+      (this.pending >= 0 && !this.residents.has(this.pending))
   }
 
   private hasGroup(index: number): boolean { return index >= 0 && index * WaterfallBatchCoordinator.SIZE < this.entries.length }
@@ -188,47 +215,46 @@ export class WaterfallBatchCoordinator {
   }
 
   private advance(): void {
-    if (this.preparing >= 0 || ((this.hidden || this.error) && this.jump < 0)) { return }
+    if (this.preparing >= 0 || (this.hidden && this.jump < 0)) { return }
     if (this.pending >= 0 && !this.residents.has(this.pending)) { this.request(this.pending); return }
-    // Only an explicit edge release or indexed jump admits another group.
-    // Completing originals / changing the visible range cannot request it.
+    if (this.error || this.first < 0) { return }
+    const target = this.direction < 0 ? this.residentFirst() - 1 : this.residentLast() + 1
+    if (this.hasGroup(target) && this.batches.get(target)?.phase !== 'ready' &&
+      this.batches.get(target)?.phase !== 'failed') { this.request(target, false, true) }
   }
 
-  private request(group: number, refresh: boolean = false): void {
+  private request(group: number, refresh: boolean = false, stageOnly: boolean = false): void {
     if (!this.hasGroup(group)) { return }
     if (this.preparing >= 0) { if (this.preparing !== group) { this.pending = group }; return }
     if (!refresh && this.residents.has(group)) { return }
-    // An adjacent group cannot bypass an unfinished original batch.
-    const boundary = this.batches.get(group > this.focus ? group - 1 : group + 1)
-    if (this.jump !== group && boundary !== undefined && boundary.phase !== 'complete') { this.pending = group; return }
-    if (this.residents.size >= WaterfallBatchCoordinator.MAX_RESIDENT_GROUPS && !this.residents.has(group)) {
-      const resourceFirst = Math.min(...Array.from(this.residents))
-      const resourceLast = Math.max(...Array.from(this.residents))
-      const edge = group < this.residentFirst() ? resourceLast : resourceFirst
-      const candidates = Array.from(this.residents).filter((index: number): boolean =>
-        index !== this.focus && (this.jump === group || index === edge ||
-          index < this.residentFirst() || index > this.residentLast()) &&
-          (this.batches.get(index)?.phase === 'complete' || this.batches.get(index)?.phase === 'failed'))
-      candidates.sort((a: number, b: number): number => Math.abs(b - group) - Math.abs(a - group))
-      if (candidates.length === 0) { this.pending = group; return }
-      const evicted = candidates[0]; this.residents.delete(evicted)
-      this.delegate.evict(this.batches.get(evicted)?.entries ?? [])
-    }
     let batch = this.batches.get(group)
+    if (!refresh && batch?.phase === 'ready') {
+      if (!stageOnly) { this.admit(batch) }
+      return
+    }
+    if (stageOnly && this.staged >= 0 && this.staged !== group && !this.residents.has(this.staged)) {
+      const old = this.batches.get(this.staged)
+      if (old?.phase === 'ready' && (this.staged < this.first || this.staged > this.last)) {
+        this.batches.delete(this.staged)
+      }
+    }
     if (batch === undefined) { batch = new Batch(group, this.groupEntries(group)); this.batches.set(group, batch) }
     if (!this.residents.has(group)) { batch.completed.clear(); batch.failed.clear() }
-    batch.phase = 'preparing'; this.preparing = group; this.pending = group; this.error = false
+    batch.phase = 'preparing'; this.preparing = group
+    if (stageOnly) { this.staged = group } else { this.pending = group; this.error = false }
+    this.preparationCancellation = new DownloadCancellation()
     this.delegate.changed()
     const current = batch
     const session = this.session
     // A reset cannot release native IO slots which are still finishing.
     this.preparation = this.preparation.catch((): void => {}).then(async (): Promise<void> => {
-      if (session === this.session && this.preparing === current.index) { await this.prepare(current, session) }
+      if (session === this.session && this.preparing === current.index) { await this.prepare(current, session, stageOnly) }
     })
   }
 
-  private async prepare(batch: Batch, session: number): Promise<void> {
-    const valid = (): boolean => session === this.session && this.preparing === batch.index
+  private async prepare(batch: Batch, session: number, stageOnly: boolean): Promise<void> {
+    const cancellation = this.preparationCancellation
+    const valid = (): boolean => session === this.session && this.preparing === batch.index && !cancellation.isCancelled()
     try {
       let cursor = 0
       let geometryFailed = false
@@ -237,7 +263,7 @@ export class WaterfallBatchCoordinator {
           const index = cursor++
           if (batch.geometry[index] === undefined) {
             try {
-              const geometry = await this.delegate.geometry(batch.entries[index], valid)
+              const geometry = await this.delegate.geometry(batch.entries[index], valid, cancellation)
               if (valid()) { batch.geometry[index] = geometry }
             } catch (_) { geometryFailed = true }
           }
@@ -258,34 +284,53 @@ export class WaterfallBatchCoordinator {
       }
       await Promise.all([thumbnailWorker(), thumbnailWorker()])
       if (!valid()) { return }
-      const oldFirst = this.first; const oldLast = this.last
-      const outside = this.first < 0 || batch.index < this.first - 1 || batch.index > this.last + 1
-      if (outside) { this.first = batch.index; this.last = batch.index; this.focus = batch.index }
-      else { this.first = Math.min(this.first, batch.index); this.last = Math.max(this.last, batch.index) }
-      if (this.jump === batch.index) { this.focus = batch.index }
-      this.residents.add(batch.index); batch.phase = 'originals'; this.preparing = -1
-      this.admittedEnd = Math.min(this.entries.length, (this.last + 1) * WaterfallBatchCoordinator.SIZE)
-      if (this.pending === batch.index) { this.pending = -1 }; if (this.jump === batch.index) { this.jump = -1 }
-      const change: WaterfallBatchChange = outside ? 'initial' : (this.first < oldFirst ? 'prepend' : (this.last > oldLast ? 'append' : 'resident'))
-      this.delegate.publish(change)
-      this.delegate.originals(this.originalTargets(), false)
-      const callbacks = this.waiters.get(batch.index) ?? []; this.waiters.delete(batch.index)
-      callbacks.forEach((callback: () => void): void => callback())
-      // Re-entering an already resident far destination can reuse completed
-      // requests. They will not emit another download completion callback.
-      if (batch.entries.every((entry: FileEntry, index: number): boolean =>
-        batch.geometry[index] === null || batch.completed.has(entry.path))) {
-        batch.phase = 'complete'; this.advance()
-      } else if (batch.failed.size > 0) {
-        batch.phase = 'failed'; this.error = this.hasActiveFailure()
-      }
-      this.delegate.changed()
+      batch.phase = 'ready'; this.preparing = -1
+      if (!stageOnly || this.pending === batch.index || this.jump === batch.index) { this.admit(batch) }
+      else { this.delegate.changed(); this.advance() }
     } catch (_) {
       if (valid()) {
-        this.preparing = -1; this.error = true; batch.phase = 'failed'; this.delegate.changed()
+        this.preparing = -1; this.error = !stageOnly || this.pending === batch.index; batch.phase = 'failed'; this.delegate.changed()
         const callbacks = this.waiters.get(batch.index) ?? []; this.waiters.delete(batch.index)
         callbacks.forEach((callback: () => void): void => callback())
       }
     }
+  }
+
+  private admit(batch: Batch): void {
+    const group = batch.index
+    if (this.residents.size >= WaterfallBatchCoordinator.MAX_RESIDENT_GROUPS && !this.residents.has(group)) {
+      const edge = group < this.residentFirst() ? Math.max(...Array.from(this.residents)) : Math.min(...Array.from(this.residents))
+      const candidates = Array.from(this.residents).filter((index: number): boolean =>
+        index !== this.focus && (this.jump === group || index === edge ||
+          index < this.residentFirst() || index > this.residentLast()) &&
+        (this.jump === group || this.delegate.canEvict?.(this.batches.get(index)?.entries ?? []) !== false))
+      candidates.sort((a: number, b: number): number => Math.abs(b - group) - Math.abs(a - group))
+      if (candidates.length === 0) { this.pending = group; return }
+      const evicted = candidates[0]; this.residents.delete(evicted)
+      this.delegate.evict(this.batches.get(evicted)?.entries ?? [])
+    }
+    const oldFirst = this.first; const oldLast = this.last
+    const outside = this.first < 0 || batch.index < this.first - 1 || batch.index > this.last + 1
+    if (outside) { this.first = batch.index; this.last = batch.index; this.focus = batch.index }
+    else { this.first = Math.min(this.first, batch.index); this.last = Math.max(this.last, batch.index) }
+    if (this.jump === batch.index) { this.focus = batch.index }
+    this.residents.add(batch.index); batch.phase = 'originals'
+    this.admittedEnd = Math.min(this.entries.length, (this.last + 1) * WaterfallBatchCoordinator.SIZE)
+    if (this.pending === batch.index) { this.pending = -1 }; if (this.jump === batch.index) { this.jump = -1 }
+    const change: WaterfallBatchChange = outside ? 'initial' : (this.first < oldFirst ? 'prepend' : (this.last > oldLast ? 'append' : 'resident'))
+    this.delegate.publish(change)
+    this.delegate.originals(this.originalTargets(), false)
+    const callbacks = this.waiters.get(batch.index) ?? []; this.waiters.delete(batch.index)
+    callbacks.forEach((callback: () => void): void => callback())
+    // Re-entering an already resident far destination can reuse completed
+    // requests. They will not emit another download completion callback.
+    if (batch.entries.every((entry: FileEntry, index: number): boolean =>
+      batch.geometry[index] === null || batch.completed.has(entry.path))) {
+      batch.phase = 'complete'
+    } else if (batch.failed.size > 0) {
+      batch.phase = 'failed'; this.error = this.hasActiveFailure()
+    }
+    this.delegate.changed()
+    this.advance()
   }
 }

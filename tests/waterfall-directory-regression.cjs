@@ -8,7 +8,8 @@ const compile = (source, bindings = {}) => {
         } }).outputText, { exports, console, ...bindings });
     return exports;
 };
-const { WaterfallBatchCoordinator } = compile(fs.readFileSync('entry/src/main/ets/media/WaterfallBatchCoordinator.ets', 'utf8'));
+const cancellation = compile(fs.readFileSync('entry/src/main/ets/core/network/DownloadCancellation.ets', 'utf8'));
+const { WaterfallBatchCoordinator } = compile(fs.readFileSync('entry/src/main/ets/media/WaterfallBatchCoordinator.ets', 'utf8'), { require: () => cancellation });
 const source = fs.readFileSync('entry/src/main/ets/pages/Index.ets', 'utf8');
 function method(name) {
     const start = source.search(new RegExp('^  private (?:async )?' + name + '\\(', 'm'));
@@ -55,10 +56,10 @@ function harness() {
     assert.equal(first.count(), 0);
     await first.frame();
     assert.equal(first.count(), 12, 'same-size native surface must regain a group after final cleanup without onAreaChange');
-    assert.equal(first.geometry.length, 12, 'one start, not a canceled metadata pass followed by another');
+    assert.equal(first.geometry.length, 24, 'one published group and exactly one prepared neighbour');
     first.h.ensureWaterfallStarted();
     await first.frame();
-    assert.equal(first.geometry.length, 12, 'native area callback cannot duplicate the explicit restart');
+    assert.equal(first.geometry.length, 24, 'native area callback cannot duplicate the explicit restart');
     // Resetting an already published group is also followed by a valid start.
     first.h.resetPreviewState(false);
     assert.equal(first.count(), 0);

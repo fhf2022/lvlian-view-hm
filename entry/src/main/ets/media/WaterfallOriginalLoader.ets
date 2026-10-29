@@ -36,8 +36,25 @@ export class WaterfallOriginalLoader {
   private wanted: Set<string> = new Set<string>()
   private requests: Map<string, OriginalRequest> = new Map<string, OriginalRequest>()
   private delegate: WaterfallOriginalDelegate
+  private preparation: (() => Promise<void>)[] = []
 
   constructor(delegate: WaterfallOriginalDelegate) { this.delegate = delegate }
+
+  // Rare formats requiring a full original for geometry share the exact
+  // same physical slots as ordinary group downloads.
+  runPreparation<T>(operation: () => Promise<T>, cancellation: DownloadCancellation, limit: number = 2): Promise<T> {
+    this.limit = Math.max(1, Math.min(2, limit))
+    return new Promise<T>((resolve, reject) => {
+      const unsubscribe = cancellation.subscribe((): void => reject(new Error('Geometry cancelled')))
+      this.preparation.push(async (): Promise<void> => {
+        try {
+          if (cancellation.isCancelled()) { throw new Error('Geometry cancelled') }
+          resolve(await operation())
+        } catch (error) { reject(error as Object) } finally { unsubscribe() }
+      })
+      this.pump()
+    })
+  }
 
   update(entries: FileEntry[], limit: number = 2): void {
     this.limit = Math.max(1, Math.min(2, limit))
@@ -99,6 +116,12 @@ export class WaterfallOriginalLoader {
   }
 
   private pump(): void {
+    while (this.active < this.limit && this.preparation.length > 0) {
+      const work = this.preparation.shift()
+      if (work === undefined) { break }
+      this.active++
+      work().finally((): void => { this.active--; this.pump() })
+    }
     for (const entry of this.targets) {
       if (this.active >= this.limit) { break }
       const request = this.request(entry)

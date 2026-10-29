@@ -133,7 +133,8 @@ export class HttpTransport {
    * the file at the requested offset and corrupt the sparse .part file.
    */
   async requestBinaryRange(url: string, start: number, length: number,
-    headers: Record<string, string> = {}, readTimeoutMs: number = 120000): Promise<BinaryRangeResult> {
+    headers: Record<string, string> = {}, readTimeoutMs: number = 120000,
+    cancellation?: DownloadCancellation): Promise<BinaryRangeResult> {
     const safeStart = Math.max(0, Math.floor(start))
     const safeLength = Math.max(1, Math.floor(length))
     const attempt = NasConnection.shared().begin(url)
@@ -222,7 +223,10 @@ export class HttpTransport {
     request.on('headersReceive', headersCallback)
     request.on('dataReceive', dataCallback)
     request.on('dataEnd', endCallback)
+    const unsubscribe = cancellation?.subscribe((): void =>
+      failStream(new UgreenError(UgreenErrorKind.NETWORK, '分段读取已取消', 499)))
     try {
+      if (cancellation?.isCancelled()) { throw rangeError ?? new UgreenError(UgreenErrorKind.NETWORK, '分段读取已取消', 499) }
       responseCode = await request.requestInStream(url, {
         method: http.RequestMethod.GET,
         header: requestHeaders,
@@ -275,6 +279,7 @@ export class HttpTransport {
       }
       throw this.requestFailure(error as Object, url, attempt)
     } finally {
+      unsubscribe?.()
       request.destroy()
       request.off('dataReceive', dataCallback)
       request.off('dataEnd', endCallback)

@@ -113,8 +113,12 @@ export class StorageBudget {
       (a: StorageFile, b: StorageFile): number => a.accessedAt - b.accessedAt)
     for (const item of candidates) {
       if (projected <= StorageBudget.limit) { break }
-      if (item.path === path || StorageBudget.pins.has(item.path) || protectedPaths.indexOf(item.path) >= 0) { continue }
-      if (StorageBudget.evict(item.path)) { projected -= item.size }
+      if (!StorageBudget.files.has(item.path)) { continue }
+      const companion = StorageBudget.resumeCompanion(item.path)
+      if (item.path === path || StorageBudget.pins.has(item.path) || protectedPaths.indexOf(item.path) >= 0 ||
+        companion === path || StorageBudget.pins.has(companion) || protectedPaths.indexOf(companion) >= 0) { continue }
+      const removed = StorageBudget.evict(item.path)
+      if (removed >= 0) { projected -= removed }
     }
     if (projected > StorageBudget.limit) {
       throw new UgreenError(UgreenErrorKind.UNKNOWN, '临时缓存空间不足，请提高缓存上限或移除未完成下载')
@@ -125,18 +129,39 @@ export class StorageBudget {
     const protectedPaths = StorageBudget.protectedFiles()
     for (const item of Array.from(StorageBudget.files.values())) {
       // Task removal owns resumable partials; automatic pressure may evict them.
-      if (item.path.endsWith('.part') || StorageBudget.pins.has(item.path) ||
+      const companion = StorageBudget.resumeCompanion(item.path)
+      if (item.path.endsWith('.part') || (companion.endsWith('.part') && StorageBudget.files.has(companion)) ||
+        StorageBudget.pins.has(item.path) || StorageBudget.pins.has(companion) ||
+        protectedPaths.indexOf(companion) >= 0 ||
         protectedPaths.indexOf(item.path) >= 0) { continue }
       StorageBudget.evict(item.path)
     }
   }
-  private static evict(path: string): boolean {
-    try { fileIo.unlinkSync(path) } catch (_) { return false }
+  private static evict(path: string): number {
+    let removed = StorageBudget.files.get(path)?.size ?? 0
+    try { fileIo.unlinkSync(path) } catch (_) { return -1 }
     StorageBudget.files.delete(path)
-    for (const listener of StorageBudget.listeners) {
-      try { listener(path) } catch (error) { console.warn('[StorageBudget] ' + String(error)) }
+    const companion = StorageBudget.resumeCompanion(path)
+    let companionRemoved = false
+    if (companion.length > 0) {
+      try {
+        fileIo.unlinkSync(companion)
+        removed += StorageBudget.files.get(companion)?.size ?? 0
+        StorageBudget.files.delete(companion)
+        companionRemoved = true
+      } catch (_) {}
     }
-    return true
+    for (const listener of StorageBudget.listeners) {
+      try {
+        listener(path)
+        if (companionRemoved) { listener(companion) }
+      } catch (error) { console.warn('[StorageBudget] ' + String(error)) }
+    }
+    return removed
+  }
+  private static resumeCompanion(path: string): string {
+    if (path.endsWith('.part.resume.json')) { return path.slice(0, -'.resume.json'.length) }
+    return path.endsWith('.part') ? path + '.resume.json' : ''
   }
   static metadataUsage(): number {
     let bytes = 0

@@ -940,7 +940,8 @@ export class UgreenRemoteRepository {
     return prepared?.path ?? ''
   }
 
-  async originalImageInfo(entry: FileEntry, valid: () => boolean): Promise<OriginalImageInfo | null> {
+  async originalImageInfo(entry: FileEntry, valid: () => boolean,
+    cancellation?: DownloadCancellation): Promise<OriginalImageInfo | null> {
     const scope = this.sessionIdentity()
     if (!valid() || !NasConnection.shared().canRequest()) { return null }
     const descriptor = await this.downloadDescriptor(entry.path)
@@ -948,7 +949,7 @@ export class UgreenRemoteRepository {
     const reader = new OriginalImageInfoReader(entry.size,
       async (offset: number, length: number): Promise<Uint8Array> => {
         if (!valid() || scope !== this.sessionIdentity() || Date.now() > deadline) { throw new Error('Image header cancelled') }
-        return (await this.transport.requestBinaryRange(descriptor.url, offset, length, descriptor.headers, 5000)).bytes
+        return (await this.transport.requestBinaryRange(descriptor.url, offset, length, descriptor.headers, 5000, cancellation)).bytes
       })
     return await reader.read()
   }

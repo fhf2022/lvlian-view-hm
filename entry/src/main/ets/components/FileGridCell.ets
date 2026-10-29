@@ -73,6 +73,16 @@ export struct FileGridCell {
       .width('100%')
       .padding(FileGridLayout.cellPadding)
       if (this.events.isVideo(this.entry)) {
+        Image($r('app.media.video_thumbnail_badge'))
+          .width(Math.max(12, Math.min(22, this.tileWidth * 0.1)))
+          .aspectRatio(1.5)
+          .objectFit(ImageFit.Contain)
+          .position({ left: Math.max(4, this.tileWidth * 0.03),
+            bottom: Math.max(4, this.tileWidth * 0.03) })
+          .draggable(false)
+          .hitTestBehavior(HitTestMode.None)
+          .accessibilityLevel('no')
+          .id('file-grid-video-badge:' + this.entry.path)
         this.videoIndicator()
       }
       if (this.selectionMode) {

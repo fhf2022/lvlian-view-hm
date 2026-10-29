@@ -75,6 +75,9 @@ export class OriginalImageInfoReader {
         throw new Error('Invalid EXIF orientation')
       }
       const value = this.uint(bytes, offset + 8, 2, little)
+      // Huawei photos can store the undefined value 0. Image Kit renders
+      // that as upright; it must not turn a header read into a full download.
+      if (value === 0) { this.info.orientation = 1; return }
       if (value < 1 || value > 8) { throw new Error('Invalid EXIF orientation') }
       this.info.orientation = value
       return

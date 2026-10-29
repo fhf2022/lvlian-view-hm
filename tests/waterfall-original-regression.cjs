@@ -37,6 +37,12 @@ function harness(){
  const q=harness();q.loader.update(q.entries.slice(0,12));
  for(let i=0;i<12;i++){assert.ok(q.jobs[i]);q.jobs[i].finish();await tick();}
  assert.equal(q.jobs.length,12,'explicit one-group targets, not full directory');assert.equal(q.max,2);
+ const {DownloadCancellation}=load('core/network/DownloadCancellation');const prep=harness();prep.loader.update(prep.entries.slice(0,12));
+ const signal=new DownloadCancellation();let end,started=false;
+ const geometry=prep.loader.runPreparation(async()=>{started=true;prep.running++;prep.max=Math.max(prep.max,prep.running);try{await new Promise(r=>end=r);return '/geometry'}finally{prep.running--}},signal);
+ assert.equal(started,false,'fallback geometry cannot bypass two physical slots');prep.jobs[0].finish();await tick();assert.equal(started,true);
+ signal.cancel();await assert.rejects(geometry);assert.equal(prep.loader.active,2,'cancellation cannot release an occupied IO slot early');
+ prep.jobs[1].finish();await tick();assert.equal(prep.max,2);end();await tick();assert.equal(prep.max,2);
  const index=fs.readFileSync('entry/src/main/ets/pages/Index.ets','utf8');
  assert.doesNotMatch(index,/waterfallOriginalLoader\?\.pause/,'scrolling and Viewer never interrupt group originals');
  console.log('PASS explicit group targets, 2 physical slots, queued Viewer promotion/shared promise, reset/account isolation, retry and no directory-wide loading');

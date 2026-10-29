@@ -28,5 +28,9 @@ function clean(){assert.equal(fds.size,0,'all file descriptors close');assert.ok
  await run((h,resolve)=>{chunk(h,'DATA');h.dataEnd();resolve(200)});assert.equal(value('/part'),'DATA','missing header event falls back to final response code');clean();
  put('/part','OLD');const suffix='X'.repeat(1024*1024);await run((h,resolve)=>{chunk(h,suffix);h.headersReceive({'status-line':'HTTP/1.1 206 Partial Content','content-range':'bytes 3-'+(suffix.length+2)+'/'+(suffix.length+3),'content-length':String(suffix.length),etag:'"v1"'});h.dataEnd();resolve(206)},3,suffix.length+3,'"v1"');assert.equal(value('/part'),'OLD'+suffix);assert.ok(maxRead<=65536);clean();
  put('/part','OLD');const signal=new DownloadCancellation();await assert.rejects(run((h)=>{chunk(h,'HALF');signal.cancel()},0,9,'',signal),e=>e.status===499);assert.equal(value('/part'),'OLD');clean();
- console.log('PASS actual HTTP stream: headers/data reordering, missing final status-line/redirect header, no-copy normal path, validated bounded resume, wrong ETag/HTTP-error prefix protection, cancellation and cleanup');
+ const rangeSignal=new DownloadCancellation();let startedRange;
+ scenario=()=>{startedRange=true;queueMicrotask(()=>rangeSignal.cancel())};
+ await assert.rejects(new HttpTransport().requestBinaryRange('https://nas/header',0,65536,{},5000,rangeSignal),e=>e.status===499);
+ assert.ok(startedRange,'stalled header request was actually started');clean();
+ console.log('PASS actual HTTP stream: headers/data reordering, missing final status-line/redirect header, no-copy normal path, validated bounded resume, wrong ETag/HTTP-error prefix protection, active range cancellation and cleanup');
 })().catch(e=>{console.error(e);process.exitCode=1});
