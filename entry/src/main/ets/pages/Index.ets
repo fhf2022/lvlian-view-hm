@@ -1753,19 +1753,6 @@ struct Index {
   private imageViewerWindow: window.Window | null = null
   private imageViewerPreviousOrientation: window.Orientation | null = null
   private imageViewerRotationToken: number = 0
-  private imageViewerWindowSizeChange = (_size: window.Size): void => {
-    if (!this.showImageViewer) {
-      return
-    }
-    // The Image/Swiper area reports the final vp size through onAreaChange.
-    // Clamp the current zoom after that layout pass so a portrait-to-landscape
-    // change cannot leave the image outside the new viewport.
-    setTimeout((): void => {
-      if (this.showImageViewer) {
-        this.normalizeImageTransform()
-      }
-    }, 0)
-  }
   private cachePreferences: preferences.Preferences | null = null
   private networkPreferences: preferences.Preferences | null = null
   private playbackPreferences: preferences.Preferences | null = null
@@ -3049,7 +3036,6 @@ struct Index {
         this.imageViewerWindow = win
         if (this.imageViewerPreviousOrientation === null) {
           this.imageViewerPreviousOrientation = win.getPreferredOrientation()
-          win.on('windowSizeChange', this.imageViewerWindowSizeChange)
         }
         // Official restricted auto-rotation follows the motion sensor only
         // when the system rotation lock allows it.
@@ -3076,7 +3062,6 @@ struct Index {
       return
     }
     try {
-      win.off('windowSizeChange', this.imageViewerWindowSizeChange)
       if (previous !== null) {
         await win.setPreferredOrientation(previous).catch((error: Error) => {
           console.warn('[UgreenImage] restore orientation failed: ' + JSON.stringify(error))
@@ -9558,6 +9543,9 @@ struct Index {
    * frame atomically when the original pixels are revealed.
    */
   private viewerImageFrameAspectRatio(entry: FileEntry): number {
+    // Frame dimensions live in the private metadata map. Subscribe the frame
+    // itself so original metadata updates its size as well as the Image source.
+    const _epoch = this.imageVisualEpoch
     const state = this.imageVisualState(entry.path)
     if (state.frameWidth > 0 && state.frameHeight > 0) {
       return Math.max(0.05, Math.min(20, state.frameWidth / state.frameHeight))
@@ -9567,11 +9555,23 @@ struct Index {
     return viewportWidth / viewportHeight
   }
 
-  private viewerImageFrameUsesWidth(entry: FileEntry): boolean {
-    const frameRatio = this.viewerImageFrameAspectRatio(entry)
-    const viewportRatio = Math.max(0.05,
-      Math.min(20, Math.max(1, this.imageViewportWidthVp) / Math.max(1, this.imageViewportHeightVp)))
-    return frameRatio >= viewportRatio
+  private viewerImageFrameWidth(entry: FileEntry): number {
+    return Math.min(Math.max(1, this.imageViewportWidthVp),
+      Math.max(1, this.imageViewportHeightVp) * this.viewerImageFrameAspectRatio(entry))
+  }
+
+  private viewerImageFrameHeight(entry: FileEntry): number {
+    return this.viewerImageFrameWidth(entry) / this.viewerImageFrameAspectRatio(entry)
+  }
+
+  private handleImageViewportArea(area: Area): void {
+    if (typeof area.width !== 'number' || typeof area.height !== 'number' ||
+      area.width <= 0 || area.height <= 0 ||
+      (area.width === this.imageViewportWidthVp && area.height === this.imageViewportHeightVp)) { return }
+    this.imageViewportWidthVp = area.width
+    this.imageViewportHeightVp = area.height
+    // Use the committed viewport rather than a timer after a window event.
+    this.normalizeImageTransform()
   }
 
   /**
@@ -10233,18 +10233,8 @@ struct Index {
     this.viewerGeometryBound = true
     this.traceStateWrite('StateWrite:vet.on')
     this.viewerEntryTransitionActive = true
-    // ── 最小单变量实验（方案 b）：补一次局部刷新，让 source 在动画前真正带上 id ──
-    //
-    // 背景（OpenAnimProbe 已坐实）：GridThumbCell 并不订阅 vet / geometry 状态，
-    // 因此在 `startViewerEntryTransition` → `showImageViewer=true` 之间那个关键静默帧
-    // （openImageViewer 里的 nextRenderFrame）里，cell 从不 rebuild → 真实 Image 节点
-    // 仍挂着旧的 `geometryTransition('')` → source 被 Blank 顶掉时配对不上
-    // → 首次打开没有共享元素动画（代码层却已经打了 entry-source-bound）。
-    //
-    // 这里只补一次【现有】的局部 invalidation，让该 cell 在 showImageViewer 之前重建并拿到新 id。
-    // ⚠️ 这是诊断性的复用：transition 与 preview 是两类状态，正式方案应把 transition 刷新拆成
-    //    独立输入（transitionRevision / 显式 @Prop）；本实验只验证"是否只缺一次局部 invalidation"。
-    // ⚠️ 只在闸门通过（真的要走共享元素）时才补，fallback 分支不受影响。
+    // Only the tapped cell must update its shared-element id and PixelMap.
+    // Keep normal scrolling on the existing URI-backed thumbnail path.
     this.notifyEntryChanged(entry.path, 'grid')
   }
 
@@ -10410,14 +10400,7 @@ struct Index {
         this.continuationDialogCount > 0 || this.showRenameDialog)
       .width('100%')
       .height('100%')
-      .onAreaChange((_, area) => {
-        if (typeof area.width === 'number' && area.width > 0) {
-          this.imageViewportWidthVp = area.width
-        }
-        if (typeof area.height === 'number' && area.height > 0) {
-          this.imageViewportHeightVp = area.height
-        }
-      })
+      .onAreaChange((_, area) => this.handleImageViewportArea(area))
       .onAnimationStart((index: number, targetIndex: number) => {
         if (index !== targetIndex) {
           this.viewerTransitionActive = true
@@ -10562,51 +10545,22 @@ struct Index {
 
   @Builder
   ViewerImagePage(entry: FileEntry, index: number): void {
-    Stack() {
-      if (this.viewerImageFrameUsesWidth(entry)) {
-        Stack() {
-          this.ViewerImageLayers(entry)
-        }
-        .width('100%')
-        .aspectRatio(this.viewerImageFrameAspectRatio(entry))
-        // 兜底：高度不许超过父容器。'100%' 取的是【真实布局】，不是会过期的视口状态值
-        // —— 旋转瞬间分支可能按旧朝向选错，这一层保证盒子永远不会撑出屏幕。
-        .constraintSize({ maxHeight: '100%' })
-        .onAreaChange((_, area) => this.recordViewerFrameArea(entry, index, area))
-        .scale({
-          x: this.viewerPageVisualScale(entry, index),
-          y: this.viewerPageVisualScale(entry, index),
-          z: 1
-        })
-        .translate({
-          x: this.viewerPageOffsetX(index),
-          y: this.viewerPageOffsetY(index),
-          z: 0
-        })
-      } else {
-        Stack() {
-          this.ViewerImageLayers(entry)
-        }
-        .height('100%')
-        .aspectRatio(this.viewerImageFrameAspectRatio(entry))
-        // 兜底：宽度不许超过父容器（同样用 '100%' 取真实布局）。
-        .constraintSize({ maxWidth: '100%' })
-        .onAreaChange((_, area) => this.recordViewerFrameArea(entry, index, area))
-        .scale({
-          x: this.viewerPageVisualScale(entry, index),
-          y: this.viewerPageVisualScale(entry, index),
-          z: 1
-        })
-        .translate({
-          x: this.viewerPageOffsetX(index),
-          y: this.viewerPageOffsetY(index),
-          z: 0
-        })
+    Stack({ alignContent: Alignment.Center }) {
+      // One frame and one Image survive source changes and window rotation.
+      // Position the frame by its center so resizing never pivots around a corner.
+      Stack({ alignContent: Alignment.Center }) {
+        this.ViewerImageLayers(entry)
       }
+      .width(this.viewerImageFrameWidth(entry))
+      .height(this.viewerImageFrameHeight(entry))
+      .id('viewer-image-frame:' + entry.path)
+      .onAreaChange((_, area) => this.recordViewerFrameArea(entry, index, area))
+      .scale({ x: this.viewerPageVisualScale(entry, index),
+        y: this.viewerPageVisualScale(entry, index), z: 1, centerX: '50%', centerY: '50%' })
+      .translate({ x: this.viewerPageOffsetX(index), y: this.viewerPageOffsetY(index), z: 0 })
     }
     .width('100%')
     .height('100%')
-    .alignContent(Alignment.Center)
     .clip(true)
     // VisionImageAnalyzer installs its long-press interaction on the child
     // Image. Bind the viewer gestures in parallel so a normal moving finger
@@ -17267,6 +17221,8 @@ struct Index {
       this.showImageMoreMenu = false
       this.viewerOverlayEntry = null
       this.viewerLastNavigationDirection = 1
+      this.imageViewportWidthVp = Math.max(1, this.pageWidthVp)
+      this.imageViewportHeightVp = Math.max(1, this.pageHeightVp)
       this.resetImageTransform()
       this.viewerTransitionActive = false
       this.viewerSurfaceOpacity = 1
@@ -17290,16 +17246,8 @@ struct Index {
       if (this.viewerEntryTransitionActive) {
         await this.nextRenderFrame()
         this.tapTrace('entry-frame1-done')
-        // ── 实验 A（单变量）：source 多留一个完整渲染周期 ──────────────────────
-        //
-        // 背景（R3.3 回归已坐实）：entry 的局部 notify 让 GridThumbCell 在交换前
-        // ~1ms 就 build 出 tid=X，但「cell 执行了 build」≠「带 X 的 Image 已完成一次
-        // ArkUI 渲染/几何注册」；实测这一帧不足以注册 source → 打开动画消失。
-        // （此前 b1 版"有动画"是骑在"关闭时残留的 X"上，R3.3 正确清掉残留后即暴露。）
-        //
-        // 这里只多等一个渲染帧，让带 X 的 source 完整存活一个渲染周期再交换。
-        // ⚠️ 这不是 setTimeout 盲等，而是与"渲染注册时序"直接相关的帧同步。
-        // ⚠️ 若仍失败就到此为止，不要继续加帧（那说明需要改 source 的显式输入/生命周期）。
+        // Let the source Image register its shared-element id before the
+        // single viewer Image is inserted into the hierarchy.
         await this.nextRenderFrame()
         this.tapTrace('entry-frame2-done')
         await new Promise<void>((resolve: () => void): void => {

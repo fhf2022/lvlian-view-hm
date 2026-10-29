@@ -49,7 +49,7 @@
 
 详细步骤、权限说明和常见问题见[使用说明](docs/USER_GUIDE.md)。
 
-当前版本为 **1.0.11**，正式 HAP 见 [GitHub Release](https://github.com/fhf2022/lvlian-view-hm/releases/tag/v1.0.11)。本版包含音频播放、封面与系统播控、连续返回动画、默认视图、系统分享上传，以及玻璃控件、搜索和传输缓存修复，详见[更新记录](CHANGELOG.md)。[跨设备接续](docs/CONTINUATION.md)支持目录、图片、音频和普通视频，已完成手机→平板正常接续与返回验证；建议两端均更新到本版，其他方向及异常组合的验证范围见专题文档。
+当前版本为 **1.0.12**，正式 HAP 见 [GitHub Release](https://github.com/fhf2022/lvlian-view-hm/releases/tag/v1.0.12)。本版优化平板图库滚动、分组瀑布流及旋转定位，支持混合图片目录和分屏拖动上传，完善音视频流式播放、后台保活和返回动画，详见[更新记录](CHANGELOG.md)。[跨设备接续](docs/CONTINUATION.md)支持目录、图片、音频和普通视频；建议两端均更新到本版，验证范围见专题文档。
 
 ## 使用边界
 
