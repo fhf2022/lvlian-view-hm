@@ -13369,8 +13369,7 @@ struct Index {
     if (this.fileViewMode !== 'waterfall' || !this.waterfallResourceResident(entry) ||
       this.waterfallRasterFailed[entry.path] === true || this.waterfallVisiblePaths[entry.path] !== true ||
       this.waterfallDecodedPaths[entry.path] === true ||
-      (this.waterfallActiveDecodePaths[entry.path] || 0) > 0 || this.timelineScrubActive ||
-      this.fileContentScrolling) {
+      (this.waterfallActiveDecodePaths[entry.path] || 0) > 0 || this.timelineScrubActive) {
       return
     }
     if (this.waterfallDecodeQueue.some((item: FileEntry): boolean => item.path === entry.path)) {
@@ -13381,8 +13380,10 @@ struct Index {
   }
 
   private drainWaterfallDecodes(): void {
-    while (this.fileViewMode === 'waterfall' && !this.fileContentScrolling && !this.timelineScrubActive &&
-      !this.showImageViewer && this.waterfallActiveDecodes < 1 &&
+    // One measured limit during both moving and stationary content. Starting a
+    // scroll must not cancel useful native decode work or clear its queue.
+    while (this.fileViewMode === 'waterfall' && !this.timelineScrubActive &&
+      !this.showImageViewer && this.waterfallActiveDecodes < ThumbnailPolicy.WATERFALL_MAX_CONCURRENT_DECODES &&
       this.waterfallDecodeQueue.length > 0) {
       const entry = this.waterfallDecodeQueue.shift() as FileEntry
       const localPath = this.waterfallLocalPaths[entry.path]
@@ -13405,7 +13406,7 @@ struct Index {
       if (!this.waterfallAspectRatioReady(entry)) {
         const geometry = await this.readViewerImageGeometry(localPath, entry.path)
         if (generation !== this.waterfallGeneration || this.fileViewMode !== 'waterfall' ||
-          this.fileContentScrolling || this.timelineScrubActive || this.showImageViewer ||
+          this.timelineScrubActive || this.showImageViewer ||
           this.waterfallVisiblePaths[entry.path] !== true ||
           this.imageVisualState(entry.path).userRotation !== rotation) { return }
         if (geometry !== null) { this.setWaterfallAspectRatio(entry, geometry.displayWidth, geometry.displayHeight) }
@@ -13418,7 +13419,7 @@ struct Index {
       }
       if (record === null || generation !== this.waterfallGeneration || !this.waterfallResourceResident(entry) ||
         this.fileViewMode !== 'waterfall' || this.waterfallVisiblePaths[entry.path] !== true ||
-        this.imageVisualState(entry.path).userRotation !== rotation || this.fileContentScrolling ||
+        this.imageVisualState(entry.path).userRotation !== rotation ||
         this.timelineScrubActive || this.showImageViewer) {
         if (record !== null) {
           await this.viewerBitmapStore.release(record)
@@ -14277,7 +14278,10 @@ struct Index {
     this.showStorageSettings = true
     this.showNetworkSettings = false
     this.showPlaybackSettings = false
-    this.ensureCacheState()
+    // Physical inventory belongs to an explicit storage inspection, not each
+    // image completion while the user is browsing.
+    this.ensureCacheState().then((): Promise<void> => this.refreshCacheUsage())
+      .catch((error: Error): void => console.warn('[UgreenCache] usage refresh failed: ' + error.message))
     this.updateTopTitle('缓存与存储')
     this.updateBottomBarVisibility(true)
   }
@@ -15310,7 +15314,6 @@ struct Index {
     } catch (_) {}
     this.returnPerfSession.noteScrollStart(currentOffsetY, this.getMonotonicNow())
     this.cancelPendingPreviewLoads()
-    this.waterfallDecodeQueue = []
     this.releaseTimelineFocusPinFromFileScroll()
   }
 
@@ -22293,7 +22296,10 @@ struct Index {
     const directory = this.cacheDirectory.length > 0 ? this.cacheDirectory : context.cacheDir
     const localPath = await this.repository.download(entry, directory, this.cacheLimitBytes,
       onProgress, shouldContinue, cancellation)
-    await this.refreshCacheUsage()
+    // Downloads and thumbnail writes already enforce their own budgets.
+    // Completing an original must not stat every unrelated thumbnail or
+    // rewrite the persistent index before its image can be displayed.
+    this.cacheUsageBytes = StorageBudget.usage()
     return localPath
   }
 

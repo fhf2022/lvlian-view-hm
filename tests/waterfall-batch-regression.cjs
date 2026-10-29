@@ -32,6 +32,12 @@ blocked.c.reset(blocked.entries);await tick();for(let group=1;group<=3;group++){
 blocked.c.edge(1);await tick();assert.equal(blocked.c.resident(0),true,'visible resource group cannot be evicted');assert.equal(blocked.c.published().length,48);
 mayEvict=true;blocked.c.visible(24,35);await tick();assert.equal(blocked.c.published().length,60,'admission proceeds once old group is outside viewport');
 const far=harness();far.c.reset(far.entries);await tick();await far.c.ensure(73);await tick();assert.equal(far.c.residentFirst(),6);await far.c.ensure(1);await tick();assert.equal(far.c.localIndex(1),1);
+// A cold timeline jump leaves the old native surface visible while preparing.
+// Its edge callbacks must not replace the explicit far destination.
+const intent=harness();intent.c.reset(intent.entries);await tick();const cold=deferred();intent.holdGeometry=cold.promise;
+const jumped=intent.c.ensure(73);await tick();intent.c.visible(0,11);intent.c.edge(1);intent.c.edge(-1);cold.resolve();await jumped;await tick();
+assert.equal(intent.c.residentFirst(),6,'old viewport edge cannot pull a cold timeline jump back to its old group');assert.equal(intent.c.focus,6);assert.equal(intent.c.localIndex(73),1);
+intent.c.edge(1);await tick();assert.equal(intent.c.resident(84),true,'new destination still admits normal edge gestures after the jump');
 const failure=harness();failure.c.delegate.geometry=async(entry)=>{if(entry.path==='/image/12')throw Error('network');return {displayWidth:1000,displayHeight:1500}};
 failure.c.reset(failure.entries);await tick();assert.equal(failure.c.error,false,'failed speculative preparation must not block current group');assert.equal(failure.published.length,1);
 failure.c.edge(1);await tick();assert.equal(failure.c.error,true,'requested group exposes preparation failure');

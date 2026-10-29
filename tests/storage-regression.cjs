@@ -60,6 +60,15 @@ const context={cacheDir:'/cache',tempDir:'/temp',filesDir:'/files',databaseDir:'
  const unlink=io.unlinkSync;io.unlinkSync=p=>{if(p===meta)throw Error('busy metadata');return unlink(p)};
  assert.throws(()=>B.admit('/cache/new',96));assert.equal(B.usage(),5,'failed companion removal must still count its bytes');
  io.unlinkSync=unlink;B.clearDisposable();assert.equal(B.usage(),0,'orphan left by failed unlink is cleaned later');
+ // Production supplies empty audio/video paths when nothing is playing.
+ // An absent resume companion is also empty; neither may protect every image.
+ files.clear();put('/cache/old.jpg',90,1);put('/cache/playing.mp4',10,2);
+ B.initialize(context,100);B.protect(()=>['','','/cache/playing.mp4']);B.pin('');
+ B.admit('/cache/next.jpg',40);assert.ok(!files.has('/cache/old.jpg'),'quota pressure evicts ordinary originals with empty player paths');assert.ok(files.has('/cache/playing.mp4'),'real player source stays protected');
+ B.unpin('');put('/cache/old.jpg',90,1);B.scan();B.setLimit(10);assert.ok(!files.has('/cache/old.jpg'),'empty admission path cannot protect all files when lowering quota');
+ put('/cache/old.jpg',20,1);put(part,8,2);put(meta,2,3);B.scan();B.pin('');B.clearDisposable();
+ assert.ok(!files.has('/cache/old.jpg'),'manual clear ignores empty companion and empty protection entries');assert.ok(files.has(part)&&files.has(meta),'manual clear still retains resume pair');assert.ok(files.has('/cache/playing.mp4'));
+ B.unpin('');B.protect(()=>[]);
  console.log('PASS: paired partial metadata, manual clear, orphan cleanup, quota accounting and pin protection');
  console.log('PASS: cached public directory grant works in background; a fresh process cannot invoke background picker');
  console.log('PASS: restart recovers interrupted public copy');console.log('PASS: shared quota, LRU, partial eviction, pins, limit rollback, public isolation, copy rollback/retry, deferred cleanup, collision and traversal');

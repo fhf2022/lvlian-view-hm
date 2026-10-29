@@ -115,8 +115,11 @@ export class StorageBudget {
       if (projected <= StorageBudget.limit) { break }
       if (!StorageBudget.files.has(item.path)) { continue }
       const companion = StorageBudget.resumeCompanion(item.path)
+      // No companion is an empty sentinel, also used by inactive player paths.
+      // It must never make an ordinary cached file look protected.
       if (item.path === path || StorageBudget.pins.has(item.path) || protectedPaths.indexOf(item.path) >= 0 ||
-        companion === path || StorageBudget.pins.has(companion) || protectedPaths.indexOf(companion) >= 0) { continue }
+        (companion.length > 0 && (companion === path || StorageBudget.pins.has(companion) ||
+          protectedPaths.indexOf(companion) >= 0))) { continue }
       const removed = StorageBudget.evict(item.path)
       if (removed >= 0) { projected -= removed }
     }
@@ -131,8 +134,8 @@ export class StorageBudget {
       // Task removal owns resumable partials; automatic pressure may evict them.
       const companion = StorageBudget.resumeCompanion(item.path)
       if (item.path.endsWith('.part') || (companion.endsWith('.part') && StorageBudget.files.has(companion)) ||
-        StorageBudget.pins.has(item.path) || StorageBudget.pins.has(companion) ||
-        protectedPaths.indexOf(companion) >= 0 ||
+        StorageBudget.pins.has(item.path) || (companion.length > 0 &&
+          (StorageBudget.pins.has(companion) || protectedPaths.indexOf(companion) >= 0)) ||
         protectedPaths.indexOf(item.path) >= 0) { continue }
       StorageBudget.evict(item.path)
     }

@@ -104,6 +104,9 @@ export class WaterfallBatchCoordinator {
   }
 
   edge(direction: number): void {
+    // Until an indexed destination is admitted, edge callbacks still belong
+    // to the old native surface. They must not replace a cold timeline jump.
+    if (this.jump >= 0) { return }
     this.direction = direction < 0 ? -1 : 1
     const target = direction < 0 ? this.residentFirst() - 1 : this.residentLast() + 1
     if (this.hasGroup(target)) { this.pending = target; this.advance() }
