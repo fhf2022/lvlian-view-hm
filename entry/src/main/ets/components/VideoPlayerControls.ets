@@ -50,19 +50,20 @@ export struct VideoPlayerControls {
 
   build(): void {
     Stack({ alignContent: Alignment.TopStart }) {
-      Button() {
+      Stack({ alignContent: Alignment.Center }) {
         SymbolGlyph(this.playing ? $r('sys.symbol.pause') : $r('sys.symbol.play'))
           .fontSize(24).fontColor([Color.White]).draggable(false).hitTestBehavior(HitTestMode.None)
-      }.type(ButtonType.Normal).padding(0).width(28).height(40).backgroundColor(Color.Transparent)
-        .stateEffect(false).hoverEffect(HoverEffect.None).draggable(false)
+      }.width(28).height(40).draggable(false).focusable(true).accessibilityRole(AccessibilityRoleType.BUTTON)
+        .opacity(this.isEnabled ? 1 : 0.4)
         .id('video-play-toggle').accessibilityText(this.playing ? '暂停视频' : '播放视频')
         .enabled(this.isEnabled).onClick(() => this.onToggle())
-      Button() {
+      Stack({ alignContent: Alignment.Center }) {
         Text(this.rate.toString() + '×').fontSize(14).minFontSize(11).maxFontSize(14).maxLines(1)
           .width('100%').textAlign(TextAlign.Center).fontColor('#E5EEF8')
           .draggable(false).hitTestBehavior(HitTestMode.None)
-      }.type(ButtonType.Normal).padding(0).width(32).height(40).position({ x: 28, y: 0 })
-        .backgroundColor(Color.Transparent).stateEffect(false).hoverEffect(HoverEffect.None).draggable(false)
+      }.width(32).height(40).position({ x: 28, y: 0 })
+        .draggable(false).focusable(true).accessibilityRole(AccessibilityRoleType.BUTTON)
+        .opacity(this.isEnabled && this.rateEnabled ? 1 : 0.4)
         .id('video-playback-rate').accessibilityText('调整播放倍速').enabled(this.isEnabled && this.rateEnabled)
         .onClick(() => {
           this.ratePreview = this.rate
@@ -93,11 +94,11 @@ export struct VideoPlayerControls {
         .position({ x: videoControlGeometry(this.controlWidth).timelineX +
           videoControlGeometry(this.controlWidth).timelineWidth - 28,
           y: videoControlGeometry(this.controlWidth).timeY })
-      Button() {
+      Stack({ alignContent: Alignment.Center }) {
         Image($r('app.media.video_rotate')).width(22).height(22).syncLoad(true)
           .draggable(false).hitTestBehavior(HitTestMode.None)
-      }.type(ButtonType.Normal).padding(0).width(32).height(40).backgroundColor(Color.Transparent)
-        .stateEffect(false).hoverEffect(HoverEffect.None).draggable(false)
+      }.width(32).height(40).draggable(false).focusable(true).accessibilityRole(AccessibilityRoleType.BUTTON)
+        .opacity(this.isEnabled && !this.rotating ? 1 : 0.4)
         .id('video-rotate').enabled(this.isEnabled && !this.rotating)
         .accessibilityText(this.landscape ? '切换竖屏' : '切换横屏')
         .position({ x: videoControlGeometry(this.controlWidth).rotateX, y: 0 }).onClick(() => this.onRotate())
@@ -119,12 +120,13 @@ export struct VideoPlayerControls {
         }, onCommit: (value: number) => this.onRate(videoRateAt(value)) })
       Row() {
         Text('0.25×').fontSize(11).fontColor('#9DA6B2').layoutWeight(1).textAlign(TextAlign.Start)
-        Button() {
+        Stack({ alignContent: Alignment.Center }) {
           Image($r('app.media.playback_rate_reset')).width(16).height(16).syncLoad(true)
             .draggable(false).hitTestBehavior(HitTestMode.None)
-        }.type(ButtonType.Normal).padding(0).width(32).height(16).backgroundColor(Color.Transparent)
+        }.width(32).height(16)
           .responseRegion({ x: 0, y: 0, width: 32, height: 32 })
-          .stateEffect(false).hoverEffect(HoverEffect.None).draggable(false)
+          .draggable(false).focusable(true).accessibilityRole(AccessibilityRoleType.BUTTON)
+          .opacity(this.isEnabled && this.rateEnabled && !this.ratePending ? 1 : 0.4)
           .enabled(this.isEnabled && this.rateEnabled && !this.ratePending)
           .id('video-rate-reset').accessibilityText('恢复 1 倍').onClick(() => this.resetRate())
         Text('4×').fontSize(11).fontColor('#9DA6B2').layoutWeight(1).textAlign(TextAlign.End)

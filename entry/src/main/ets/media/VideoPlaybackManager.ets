@@ -40,6 +40,7 @@ export class VideoPlaybackManager {
   private seekWaiter: ((requestedMs: number) => void) | null = null
   private cancelStateWait: (() => void) | null = null
   private cancelSeekWait: (() => void) | null = null
+  private playbackControl: Promise<void> = Promise.resolve()
 
   async open(handle: VideoSourceHandle, positionMs: number,
     callbacks: VideoPlaybackCallbacks, autoPlay: boolean = true): Promise<void> {
@@ -75,7 +76,11 @@ export class VideoPlaybackManager {
       } else if (state === 'playing') {
         this.completionReported = false
       }
-      this.callbacks.onState(state)
+      // Native prepared is not yet UI-ready: saved-position seek still owns
+      // the player. Publish readiness from configure after that seek completes.
+      if (state !== 'prepared' || !this.configuring) {
+        this.callbacks.onState(state)
+      }
       if (state === 'prepared' || state === 'playing' || state === 'paused' ||
         state === 'completed') {
         // Some platform versions emit an error while an asynchronous source
@@ -98,8 +103,7 @@ export class VideoPlaybackManager {
       // A few device builds update AVPlayer.state to completed without
       // delivering stateChange. Keep the controls authoritative at the end
       // of the timeline using the documented 100 ms timeUpdate cadence.
-      if (!this.completionReported && this.durationHintMs > 0 &&
-        this.currentTimeHintMs >= Math.max(0, this.durationHintMs - 200)) {
+      if (!this.completionReported && player.state === 'completed') {
         this.completionReported = true
         this.callbacks.onState('completed')
       }
@@ -166,10 +170,12 @@ export class VideoPlaybackManager {
   }
 
   async attachSurface(surfaceId: string, positionMs: number = 0): Promise<void> {
+    if (surfaceId.length === 0) { return }
     this.surfaceId = surfaceId
     if (this.player !== null && this.handle !== null && !this.configured && !this.configuring) {
       await this.configure(this.handle, positionMs)
-    } else if (this.player !== null && this.player.state !== 'released') {
+    } else if (this.player !== null && this.player.surfaceId !== surfaceId &&
+      (this.isPlayableState(this.player.state) || this.player.state === 'stopped')) {
       this.player.surfaceId = surfaceId
     }
   }
@@ -177,20 +183,40 @@ export class VideoPlaybackManager {
   async play(): Promise<void> {
     this.pendingPlay = true
     this.completionReported = false
-    if (this.player !== null && this.isPlayableState(this.player.state)) {
-      await this.player.play()
-    }
+    await this.applyPlaybackIntent()
   }
 
   async pause(): Promise<void> {
     this.pendingPlay = false
-    if (this.player !== null && this.player.state === 'playing') {
-      await this.player.pause()
-    }
+    await this.applyPlaybackIntent()
+  }
+
+  private async applyPlaybackIntent(): Promise<void> {
+    const player = this.player
+    const generation = this.generation
+    if (player === null || !this.configured) { return }
+    // One command at a time. A pause arriving during play must run after the
+    // native transition, rather than being discarded while still prepared.
+    const work = this.playbackControl.then(async (): Promise<void> => {
+      if (!this.isCurrentPlayer(player, generation)) { return }
+      const playing = this.pendingPlay
+      if (playing && (player.state === 'prepared' || player.state === 'paused' ||
+        player.state === 'completed')) {
+        await player.play()
+      } else if (!playing && player.state === 'playing') {
+        await player.pause()
+      } else {
+        return
+      }
+      if (!this.isCurrentPlayer(player, generation)) { return }
+      await this.waitForPlayerState(player, generation, playing ? 'playing' : 'paused')
+    })
+    this.playbackControl = work.catch((): void => {})
+    await work
   }
 
   seek(timeMs: number): void {
-    if (this.player === null || !this.isSeekableState(this.player.state)) {
+    if (!this.configured || this.player === null || !this.isSeekableState(this.player.state)) {
       return
     }
     const targetMs = Math.max(0, Math.floor(timeMs))
@@ -267,6 +293,7 @@ export class VideoPlaybackManager {
     this.surfaceId = ''
     this.callbacks = null
     this.pendingPlay = false
+    this.playbackControl = Promise.resolve()
     this.configured = false
     this.configuring = false
     this.pendingPlayerError = null
@@ -314,9 +341,8 @@ export class VideoPlaybackManager {
     }
     try {
       // AVPlayer starts in idle.  The source assignment is the state
-      // transition to initialized; surface/audio/scale are static properties
-      // and are only valid after that transition (see MediaKit AVPlayer
-      // state machine).  Setting them first makes prepare fail with 5400102.
+      // transition to initialized. Surface and audio configuration belong to
+      // that state; videoScaleType is dynamic and requires prepared instead.
       if (handle.localPath.length > 0) {
         const sourceFile = await fileIo.open(handle.localPath, fileIo.OpenMode.READ_ONLY)
         openedFd = sourceFile.fd
@@ -349,7 +375,7 @@ export class VideoPlaybackManager {
         // initialized state.  Static AVPlayer properties and prepare() are
         // state-gated, so wait for the real state transition instead of
         // guessing a render/timer frame.
-        await this.waitForInitialized(player, generation)
+        await this.waitForPlayerState(player, generation, 'initialized')
       }
       if (!this.isCurrentPlayer(player, generation)) { return }
       if (player.state !== 'initialized') {
@@ -360,11 +386,6 @@ export class VideoPlaybackManager {
         usage: audio.StreamUsage.STREAM_USAGE_MOVIE,
         rendererFlags: 0
       }
-      // FIT stretches the decoded frame to the complete surface and therefore
-      // changes its aspect ratio when the window is portrait/landscape. The
-      // Video component's ImageFit.Contain equivalent for AVPlayer is
-      // SCALED_ASPECT: keep the source ratio and center any required bars.
-      player.videoScaleType = media.VideoScaleType.VIDEO_SCALE_TYPE_SCALED_ASPECT
       if (handle.mediaSource === null) {
         // A local FD does not go through setMediaSource(), so apply the same
         // strategy at the initialized state before prepare().
@@ -375,10 +396,17 @@ export class VideoPlaybackManager {
       if (!this.isCurrentPlayer(player, generation)) {
         return
       }
-      this.configured = true
+      // Some device builds resolve prepare() before stateChange('prepared').
+      // The actual state gates dynamic properties, metadata, seek and play;
+      // resolving the command alone cannot authorize those operations.
+      await this.waitForPlayerState(player, generation, 'prepared')
+      if (!this.isCurrentPlayer(player, generation)) { return }
+      // Match ImageFit.Contain without stretching the source aspect ratio.
+      player.videoScaleType = media.VideoScaleType.VIDEO_SCALE_TYPE_SCALED_ASPECT
       if (this.callbacks !== null) {
         if (player.duration > 0) {
-          this.callbacks.onDuration(player.duration)
+          this.durationHintMs = player.duration
+          this.callbacks.onDuration(this.durationHintMs)
         }
         if (player.width > 0 && player.height > 0) {
           this.callbacks.onSize(player.width, player.height)
@@ -393,13 +421,15 @@ export class VideoPlaybackManager {
           return
         }
       }
+      this.configured = true
+      this.callbacks?.onState('prepared')
+      if (!this.isCurrentPlayer(player, generation)) { return }
       if (this.pendingPlay) {
-        await player.play()
-        // Some device builds complete play() without publishing a
-        // stateChange('playing') event to this listener.  A fulfilled play()
-        // is the authoritative completion of the requested transition, so
-        // synchronize the page state here as well.
-        if (this.isCurrentPlayer(player, generation) && this.callbacks !== null) {
+        await this.play()
+        // A command acknowledgement is not a state transition. Only recover
+        // a missing event when the native state actually confirms playback.
+        if (this.isCurrentPlayer(player, generation) && this.state() === 'playing' &&
+          this.callbacks !== null) {
           this.callbacks.onState('playing')
         }
       }
@@ -450,9 +480,16 @@ export class VideoPlaybackManager {
     this.callbacks.onError(error)
   }
 
-  private waitForInitialized(player: media.AVPlayer, generation: number): Promise<void> {
-    if (player.state === 'initialized') {
+  private waitForPlayerState(player: media.AVPlayer, generation: number,
+    expected: media.AVPlayerState): Promise<void> {
+    if (!this.isCurrentPlayer(player, generation)) {
+      return Promise.reject(new Error('视频播放器已切换'))
+    }
+    if (player.state === expected) {
       return Promise.resolve()
+    }
+    if (player.state === 'error') {
+      return Promise.reject(new Error('视频数据源状态异常: error'))
     }
     return new Promise<void>((resolve, reject) => {
       let settled: boolean = false
@@ -471,8 +508,8 @@ export class VideoPlaybackManager {
         }
       }
       const onState = (state: media.AVPlayerState): void => {
-        console.info('[UgreenVideo] wait initialized state=' + state)
-        if (state === 'initialized') {
+        console.info('[UgreenVideo] wait ' + expected + ' state=' + state)
+        if (state === expected) {
           finish(null)
         } else if (state === 'error' || state === 'released') {
           finish(new Error('视频数据源状态异常: ' + state))
@@ -482,10 +519,10 @@ export class VideoPlaybackManager {
       // service publishes its first playlist.  A five-second guard made a
       // healthy remote HLS source look like a playback failure on a relay
       // with a cold decoder, so leave enough time for the native source to
-      // reach initialized while still bounding a genuinely dead request.
+      // reach its required state while still bounding a genuinely dead request.
       const timeoutId = setTimeout((): void => {
         if (generation === this.generation && this.player === player) {
-          finish(new Error('视频数据源等待 initialized 超时，当前状态: ' + player.state))
+          finish(new Error('视频数据源等待 ' + expected + ' 超时，当前状态: ' + player.state))
         } else {
           finish(new Error('视频播放器已切换'))
         }
@@ -494,7 +531,7 @@ export class VideoPlaybackManager {
       // replace or unregister the permanent playback state listener.
       this.stateWaiter = onState
       this.cancelStateWait = () => finish(new Error('视频播放器已切换'))
-      if (player.state === 'initialized') {
+      if (player.state === expected) {
         finish(null)
       }
     })
@@ -532,7 +569,11 @@ export class VideoPlaybackManager {
       }, 30000)
       this.seekWaiter = onSeekDone
       this.cancelSeekWait = () => finish(new Error('视频播放器已切换'))
-      player.seek(targetMs)
+      try {
+        player.seek(targetMs)
+      } catch (error) {
+        finish(new Error('视频恢复播放位置失败: ' + String(error)))
+      }
     })
   }
 

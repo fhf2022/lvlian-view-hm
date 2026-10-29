@@ -21,6 +21,7 @@ export interface PlayerGestureActions {
 
 /** One axis per touch; a pending single tap never fires after a double tap or drag. */
 export class PlayerGestures {
+  private static readonly TOP_EDGE_INSET_VP: number = 32
   private actions: PlayerGestureActions
   private state: PlayerGestureState | null = null
   private x: number = 0
@@ -38,6 +39,9 @@ export class PlayerGestures {
   isActive(): boolean { return this.state !== null }
 
   down(x: number, y: number, state: PlayerGestureState): void {
+    // Reserve the system-panel pull area for the whole touch sequence. Do not
+    // install an overlay or cancel a valid drag when it later crosses the edge.
+    if (y < PlayerGestures.TOP_EDGE_INSET_VP) { this.cancel(); return }
     if (this.state !== null) { this.cancel() }
     this.secondTap = this.tapTimer >= 0 && Date.now() - this.lastTap <= 280
     if (this.secondTap) { clearTimeout(this.tapTimer); this.tapTimer = -1 }

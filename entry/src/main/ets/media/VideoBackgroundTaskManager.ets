@@ -48,15 +48,19 @@ export class VideoBackgroundTaskManager {
   async release(context: Context): Promise<void> {
     this.desired = false
     this.operation += 1
-    await this.queue.catch((): void => {})
-    if (this.subscribed) {
-      try { backgroundTaskManager.off('continuousTaskCancel', this.cancelled) } catch (_) {}
-      this.subscribed = false
-    }
-    if (!this.running) {
-      return
-    }
-    await this.stop(context)
+    // Teardown is part of the same lane as start/pause. A subsequent video
+    // must not observe running=true while the old stop is still in flight.
+    const work = this.queue.then(async (): Promise<void> => {
+      if (this.subscribed) {
+        try { backgroundTaskManager.off('continuousTaskCancel', this.cancelled) } catch (_) {}
+        this.subscribed = false
+      }
+      await this.stop(context)
+    })
+    this.queue = work.catch((error: Object): void => {
+      console.warn('[UgreenVideo] background task release failed: ' + JSON.stringify(error))
+    })
+    await work
   }
 
   private async start(context: Context): Promise<void> {
@@ -82,7 +86,10 @@ export class VideoBackgroundTaskManager {
     const agent = await wantAgent.getWantAgent(info)
     const request = new backgroundTaskManager.ContinuousTaskRequest()
     request.backgroundTaskModes = [backgroundTaskManager.BackgroundTaskMode.MODE_AUDIO_PLAYBACK]
-    request.backgroundTaskSubmodes = [backgroundTaskManager.BackgroundTaskSubmode.SUBMODE_AVSESSION_AUDIO_PLAYBACK]
+    // MODE_AUDIO_PLAYBACK pairs with NORMAL_NOTIFICATION. The AVSession
+    // subtype belongs to MODE_AV_PLAYBACK_AND_RECORD, not this main mode.
+    // With an active AVSession the system still uses its media notification.
+    request.backgroundTaskSubmodes = [backgroundTaskManager.BackgroundTaskSubmode.SUBMODE_NORMAL_NOTIFICATION]
     request.wantAgent = agent
     request.combinedTaskNotification = false
     const result = await backgroundTaskManager.startBackgroundRunning(context, request)

@@ -1401,8 +1401,8 @@ struct Index {
   private videoPlayerPreviousOrientation: window.Orientation | null = null
   private videoOrientationToken: number = 0
   // System-bar changes are asynchronous. Serialize them so a sensor callback
-  // cannot finish after a close/portrait request and hide the bars again.
-  private videoSystemBarsLandscape: boolean | null = null
+  // cannot finish after a close/PiP request and hide the bars again.
+  private videoSystemBarsImmersive: boolean | null = null
   private videoSystemBarsQueue: Promise<void> = Promise.resolve()
   private videoSystemBarsToken: number = 0
   private videoWindowSizeChange = (size: window.Size): void => {
@@ -1416,7 +1416,7 @@ struct Index {
     this.videoLandscape = size.width > size.height
     const win = this.videoPlayerWindow
     if (win !== null) {
-      this.setVideoSystemBars(win, this.videoLandscape).catch((error: Error): void => {
+      this.setVideoSystemBars(win, !this.videoPipBackgrounded).catch((error: Error): void => {
         console.warn('[UgreenVideo] sync system bars after window rotation failed: ' +
           JSON.stringify(error))
       })
@@ -2655,6 +2655,9 @@ struct Index {
       this.videoPipRestoring = false
       this.restoreVideoPipOrigin()
       this.videoPipBackgrounded = false
+      if (this.videoPlayerWindow !== null) {
+        this.setVideoSystemBars(this.videoPlayerWindow, true).catch((): void => {})
+      }
       this.observeVideoVolume()
       this.revealVideoChrome()
       this.updateBottomBarVisibility(true)
@@ -2681,7 +2684,7 @@ struct Index {
     // Explicit PiP is already a background playback mode. Do not let the
     // page-hide callback immediately pause the same player while the system
     // is transferring its surface into the PiP window.
-    if (this.showVideoPlayer && this.videoPlaying && !this.backgroundVideoPlayback &&
+    if (this.showVideoPlayer && !this.backgroundVideoPlayback &&
       !this.videoPipActive && !this.videoPipBackgrounded) {
       // A forced background pause is still routed through the same local/cast
       // control path as the system media-session pause command.
@@ -3085,13 +3088,6 @@ struct Index {
 
   private topSafeInset(): number {
     return this.getUIContext().px2vp(this.statusBarHeightPx)
-  }
-
-  // The video surface is already laid out edge-to-edge. Once landscape video
-  // hides the status bar, retaining the portrait avoid-area inset would leave
-  // a visible empty strip above the controls while the window is rotating.
-  private videoTopInset(): number {
-    return this.videoLandscape ? 0 : this.topSafeInset()
   }
 
   private videoBottomInset(): number {
@@ -11191,13 +11187,13 @@ struct Index {
         barStyle: BarStyle.STACK,
         paddingStart: LengthMetrics.vp(0),
         paddingEnd: LengthMetrics.vp(0),
-        backgroundColor: Color.Transparent
+        backgroundColor: Color.Transparent,
+        backgroundBlurStyle: BlurStyle.NONE
       })
       .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM],
         [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
       .width('100%')
       .height(HeaderStyle.overlayHeight)
-      .margin({ top: this.videoTopInset() })
       .backgroundColor(Color.Transparent)
       .opacity(this.videoChromeVisible ? 1 : 0)
       .translate({ x: 0, y: this.videoChromeVisible ? 0 : -14, z: 0 })
@@ -11213,17 +11209,16 @@ struct Index {
   @Builder
   VideoPlayerHeaderContent(): void {
     Row({ space: HeaderStyle.gap }) {
-    Button() {
+    Stack({ alignContent: Alignment.Center }) {
       SymbolGlyph($r('sys.symbol.chevron_backward'))
         .fontSize(HeaderStyle.iconSize)
         .fontColor([$r('sys.color.font_on_primary')])
+        .draggable(false).hitTestBehavior(HitTestMode.None)
     }
-      .type(ButtonType.Normal)
       .width(HeaderStyle.controlHeight)
       .height(HeaderStyle.controlHeight)
-      .borderRadius(HeaderStyle.controlHeight / 2)
-      .backgroundColor(Color.Transparent)
-      .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true, '#44202020'))
+      .draggable(false).focusable(true).accessibilityRole(AccessibilityRoleType.BUTTON)
+      .id('video-back').accessibilityText('返回')
       .onClick(() => this.closeVideoPlayer(true))
     Text(this.videoEntry === null ? '' : (this.videoEntry as FileEntry).name)
       .fontSize(HeaderStyle.titleSize)
@@ -11234,7 +11229,7 @@ struct Index {
       .layoutWeight(1)
       .maxLines(1)
       .textOverflow({ overflow: TextOverflow.Ellipsis })
-    Button() {
+    Stack({ alignContent: Alignment.Center }) {
       // Keep the supplied PiP artwork as a hand-drawn vector asset.  The
       // SVG has no raster background, so it stays crisp at every density.
       Image($r('app.media.video_pip_icon'))
@@ -11242,13 +11237,13 @@ struct Index {
         .height(HeaderStyle.iconSize)
         .objectFit(ImageFit.Contain)
         .syncLoad(true)
+        .draggable(false).hitTestBehavior(HitTestMode.None)
     }
-      .type(ButtonType.Normal)
       .width(HeaderStyle.controlHeight)
       .height(HeaderStyle.controlHeight)
-      .backgroundColor(Color.Transparent)
-      .borderRadius(HeaderStyle.controlHeight / 2)
-      .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true, '#44202020'))
+      .draggable(false).focusable(true).accessibilityRole(AccessibilityRoleType.BUTTON)
+      .id('video-pip').accessibilityText('小窗播放')
+      .opacity(this.videoSurfaceReady && this.videoPrepared && !this.videoPipCreating && !this.isBusy ? 1 : 0.4)
       .enabled(this.videoSurfaceReady && this.videoPrepared &&
         !this.videoPipCreating && !this.isBusy)
       .onClick(() => this.toggleVideoPip())
@@ -11268,8 +11263,6 @@ struct Index {
     }
       .width(HeaderStyle.controlHeight)
       .height(HeaderStyle.controlHeight)
-      .borderRadius(HeaderStyle.controlHeight / 2)
-      .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true, '#44202020'))
     }
       .width('100%')
       .height(HeaderStyle.overlayHeight)
@@ -11287,6 +11280,7 @@ struct Index {
       .fillColor(this.videoCasting
         ? $r('sys.color.icon_emphasize') : $r('sys.color.font_on_primary'))
       .syncLoad(true)
+      .draggable(false)
   }
 
   @Builder
@@ -19418,7 +19412,7 @@ struct Index {
       // visually contradictory enabled switch after the parent option is off.
       this.videoBackgroundAutoPip = false
     }
-    if (!value && this.showVideoPlayer && this.videoPlaying) {
+    if (!value && this.showVideoPlayer) {
       this.pauseVideoFromMediaSession(true)
     }
     await this.persistPlaybackPreferences()
@@ -20086,10 +20080,12 @@ struct Index {
         return
       }
       await this.videoPlaybackManager.release()
+      if (token !== this.videoOpenToken) { return }
       const previousEntry = this.videoEntry
       if (previousEntry !== null && previousEntry.path !== entry.path) {
         await this.videoTransferManager.releaseSource(previousEntry)
       }
+      if (token !== this.videoOpenToken) { return }
       const handle = await this.videoTransferManager.openSource(entry)
       if (token !== this.videoOpenToken) {
         await this.videoTransferManager.releaseSource(entry)
@@ -20098,6 +20094,10 @@ struct Index {
       if (continuationValid !== null && !continuationValid()) { throw new Error('Continuation cancelled') }
       const position = continuationPosition >= 0 ? continuationPosition :
         await this.videoTransferManager.playbackPosition(entry)
+      if (token !== this.videoOpenToken) {
+        await this.videoTransferManager.releaseSource(entry)
+        return
+      }
       if (this.videoPosterUri.length === 0) {
         this.videoPosterUri = this.previewUri(entry)
       }
@@ -20273,6 +20273,10 @@ struct Index {
           this.reportError(error, '视频播放失败')
         }
       }, continuationPosition >= 0 ? continuationPlaying : this.autoPlayOnOpen)
+      if (token !== this.videoOpenToken) { return }
+      if (this.playbackBackgroundActive && !this.backgroundVideoPlayback) {
+        await this.videoPlaybackManager.pause()
+      }
       if (continuationValid !== null && !continuationValid()) { throw new Error('Continuation cancelled') }
       if (token !== this.videoOpenToken) {
         return
@@ -20286,33 +20290,39 @@ struct Index {
         this.videoOverlayOpacity = useGeometryTransition ? 1 : 0
         if (useGeometryTransition) {
           await this.nextRenderFrame()
+          if (token !== this.videoOpenToken) { return }
           await new Promise<void>((resolve: () => void): void => {
             this.getUIContext().animateTo({
               duration: VIDEO_GEOMETRY_TRANSITION_DURATION,
               curve: Curve.FastOutSlowIn,
               onFinish: resolve
             }, (): void => {
+              if (token !== this.videoOpenToken) { return }
               this.showVideoPlayer = true
               this.videoChromeVisible = true
             })
           })
           await this.nextRenderFrame()
+          if (token !== this.videoOpenToken) { return }
           this.clearVideoEntryTransition()
         } else {
           this.showVideoPlayer = true
           await this.nextRenderFrame()
+          if (token !== this.videoOpenToken) { return }
           await new Promise<void>((resolve: () => void): void => {
             this.getUIContext().animateTo({
               duration: VIDEO_FALLBACK_TRANSITION_DURATION,
               curve: Curve.EaseOut,
               onFinish: resolve
             }, (): void => {
+              if (token !== this.videoOpenToken) { return }
               this.videoOverlayOpacity = 1
               this.videoChromeVisible = true
             })
           })
         }
       }
+      if (token !== this.videoOpenToken) { return }
       if (continuationValid !== null && !continuationValid()) { throw new Error('Continuation cancelled') }
       this.revealVideoSurfaceIfReady(entry)
       this.videoOpeningPath = ''
@@ -20329,6 +20339,10 @@ struct Index {
     } catch (error) {
       if (token === this.videoOpenToken) {
         await this.videoPlaybackManager.release()
+        await this.videoTransferManager.releaseSource(entry).catch((): void => {})
+        if (token !== this.videoOpenToken) { return }
+        this.suspendVideoInteractions()
+        this.restoreVideoPlayerOrientation()
         this.videoSourceHandle = null
         this.videoSourceKey = ''
         this.videoLocalPath = ''
@@ -20361,7 +20375,6 @@ struct Index {
         this.syncVideoBackgroundTask()
         this.videoMediaSession.close().catch((): void => {})
         if (continuationValid !== null && !continuationValid()) {
-          await this.videoTransferManager.releaseSource(entry)
           this.statusText = ''
         } else {
         this.reportError(error as Object, '视频播放失败')
@@ -20450,9 +20463,14 @@ struct Index {
       !this.videoPrepared || this.videoControlPending) {
       return
     }
-    if (this.videoCasting) {
+    const token = this.videoOpenToken
+    const casting = this.videoCasting
+    const current = (): boolean => token === this.videoOpenToken &&
+      this.showVideoPlayer && casting === this.videoCasting
+    if (casting) {
       this.videoControlPending = true
       this.videoMediaSession.sendCastControl({ command: 'play' }).then((): void => {
+        if (!current()) { return }
         this.videoPlaying = true
         this.syncVideoBackgroundTask()
         this.updateVideoPipControlStatus()
@@ -20460,7 +20478,7 @@ struct Index {
       }).catch((error: Error): void => {
         console.warn('[UgreenAVSession] remote play command failed: ' + JSON.stringify(error))
       }).finally((): void => {
-        this.videoControlPending = false
+        if (current()) { this.videoControlPending = false }
       })
       return
     }
@@ -20472,8 +20490,9 @@ struct Index {
     }
     this.videoControlPending = true
     this.videoPlaybackManager.play().then((): void => {
+      if (!current()) { return }
       if (this.showVideoPlayer) {
-        this.videoPlaying = true
+        this.videoPlaying = this.videoPlaybackManager.state() === 'playing'
         this.syncVideoBackgroundTask()
         this.updateVideoPipControlStatus()
         this.updateVideoMediaSession(true)
@@ -20482,18 +20501,23 @@ struct Index {
       console.warn('[UgreenAVSession] play command could not be applied: ' +
         JSON.stringify(error))
     }).finally((): void => {
-      this.videoControlPending = false
+      if (current()) { this.videoControlPending = false }
     })
   }
 
   private pauseVideoFromMediaSession(force: boolean = false): void {
-    if (!this.showVideoPlayer || this.videoEntry === null || (!force && this.isBusy) ||
-      this.videoControlPending) {
+    if (!this.showVideoPlayer || this.videoEntry === null ||
+      (!force && (this.isBusy || this.videoControlPending))) {
       return
     }
-    if (this.videoCasting) {
+    const token = this.videoOpenToken
+    const casting = this.videoCasting
+    const current = (): boolean => token === this.videoOpenToken &&
+      this.showVideoPlayer && casting === this.videoCasting
+    if (casting) {
       this.videoControlPending = true
       this.videoMediaSession.sendCastControl({ command: 'pause' }).then((): void => {
+        if (!current()) { return }
         this.videoPlaying = false
         this.syncVideoBackgroundTask()
         this.updateVideoPipControlStatus()
@@ -20501,18 +20525,15 @@ struct Index {
       }).catch((error: Error): void => {
         console.warn('[UgreenAVSession] remote pause command failed: ' + JSON.stringify(error))
       }).finally((): void => {
-        this.videoControlPending = false
+        if (current()) { this.videoControlPending = false }
       })
       return
     }
-    if (this.videoPlaybackManager.state() !== 'playing') {
-      this.videoPlaying = false
-      this.syncVideoBackgroundTask()
-      this.updateVideoMediaSession(true)
-      return
-    }
+    // Record pause even during prepare or an in-flight play; the manager
+    // applies the intent when the native transition finishes.
     this.videoControlPending = true
     this.videoPlaybackManager.pause().then((): void => {
+      if (!current()) { return }
       if (this.showVideoPlayer) {
         this.videoPlaying = false
         this.syncVideoBackgroundTask()
@@ -20523,7 +20544,7 @@ struct Index {
       console.warn('[UgreenAVSession] pause command could not be applied: ' +
         JSON.stringify(error))
     }).finally((): void => {
-      this.videoControlPending = false
+      if (current()) { this.videoControlPending = false }
     })
   }
 
@@ -20532,9 +20553,14 @@ struct Index {
       this.videoControlPending) {
       return
     }
-    if (this.videoCasting) {
+    const token = this.videoOpenToken
+    const casting = this.videoCasting
+    const current = (): boolean => token === this.videoOpenToken &&
+      this.showVideoPlayer && casting === this.videoCasting
+    if (casting) {
       this.videoControlPending = true
       this.videoMediaSession.sendCastControl({ command: 'stop' }).then((): void => {
+        if (!current()) { return }
         this.videoCurrentMs = 0
         this.videoPlaying = false
         this.syncVideoBackgroundTask()
@@ -20543,12 +20569,13 @@ struct Index {
       }).catch((error: Error): void => {
         console.warn('[UgreenAVSession] remote stop command failed: ' + JSON.stringify(error))
       }).finally((): void => {
-        this.videoControlPending = false
+        if (current()) { this.videoControlPending = false }
       })
       return
     }
     this.videoControlPending = true
     this.videoPlaybackManager.pause().then((): void => {
+      if (!current()) { return }
       this.videoPlaybackManager.seek(0)
       this.videoCurrentMs = 0
       this.videoPlaying = false
@@ -20559,7 +20586,7 @@ struct Index {
       console.warn('[UgreenAVSession] stop command could not be applied: ' +
         JSON.stringify(error))
     }).finally((): void => {
-      this.videoControlPending = false
+      if (current()) { this.videoControlPending = false }
     })
   }
 
@@ -20817,7 +20844,6 @@ struct Index {
     if (closingEntry !== null) {
       this.videoTransferManager.savePlaybackPosition(closingEntry, closingPosition)
         .catch((): void => {})
-      this.videoTransferManager.releaseSource(closingEntry).catch((): void => {})
     }
     this.showVideoPlayer = false
     this.videoOverlayClosing = false
@@ -20859,7 +20885,14 @@ struct Index {
     this.videoViewportHeightVp = 0
     this.videoMediaSessionPositionAt = 0
     this.videoSourceHandle = null
-    this.videoCloseWork = Promise.all([this.videoCloseWork, this.videoPlaybackManager.release(),
+    // Keep the source pinned until AVPlayer has released its decoder and FD.
+    // The next open awaits this whole chain, including source cleanup.
+    const released = this.videoPlaybackManager.release().then(async (): Promise<void> => {
+      if (closingEntry !== null) {
+        await this.videoTransferManager.releaseSource(closingEntry)
+      }
+    })
+    this.videoCloseWork = Promise.all([this.videoCloseWork, released,
       this.videoMediaSession.close()]).then((): void => {}).catch((error: Error): void => {
         console.warn('[UgreenAVSession] close bridge failed: ' + JSON.stringify(error))
       })
@@ -20908,7 +20941,6 @@ struct Index {
     // so its onLoad callback does not fire a second time. Rebind the new
     // AVPlayer to that already-real surface explicitly.
     this.handleVideoSurfaceLoad()
-    await this.videoTransferManager.releaseSource(previous)
   }
 
   private videoWindowIsLandscape(win: window.Window): boolean {
@@ -20948,8 +20980,8 @@ struct Index {
    * expose the per-bar call at runtime.
    */
   private async applyVideoSystemBarVisibility(win: window.Window,
-    landscape: boolean): Promise<void> {
-    const enabled = !landscape
+    immersive: boolean): Promise<void> {
+    const enabled = !immersive
     let statusUpdated = false
     let navigationUpdated = false
     try {
@@ -20979,17 +21011,17 @@ struct Index {
   /**
    * Window callbacks are synchronous while system-bar APIs return Promises.
    * Keep requests in one chain and invalidate stale requests when a newer
-   * orientation or close operation is issued.
+   * playback-window or close operation is issued.
    */
-  private setVideoSystemBars(win: window.Window, landscape: boolean,
+  private setVideoSystemBars(win: window.Window, immersive: boolean,
     allowWhenClosed: boolean = false): Promise<void> {
     if (!allowWhenClosed && (!this.showVideoPlayer || this.videoPlayerWindow !== win)) {
       return Promise.resolve()
     }
-    if (!allowWhenClosed && this.videoSystemBarsLandscape === landscape) {
+    if (!allowWhenClosed && this.videoSystemBarsImmersive === immersive) {
       return this.videoSystemBarsQueue
     }
-    this.videoSystemBarsLandscape = landscape
+    this.videoSystemBarsImmersive = immersive
     const token = this.videoSystemBarsToken + 1
     this.videoSystemBarsToken = token
     const operation = this.videoSystemBarsQueue
@@ -21001,7 +21033,7 @@ struct Index {
         if (!allowWhenClosed && (!this.showVideoPlayer || this.videoPlayerWindow !== win)) {
           return
         }
-        await this.applyVideoSystemBarVisibility(win, landscape)
+        await this.applyVideoSystemBarVisibility(win, immersive)
       })
     this.videoSystemBarsQueue = operation.catch((error: Object): void => {
       console.warn('[UgreenVideo] system bar update failed: ' + JSON.stringify(error))
@@ -21044,7 +21076,7 @@ struct Index {
           console.warn('[UgreenVideo] read initial video window size failed: ' +
             JSON.stringify(error))
         }
-        this.setVideoSystemBars(win, this.videoLandscape).catch((error: Error): void => {
+        this.setVideoSystemBars(win, !this.videoPipBackgrounded).catch((error: Error): void => {
           console.warn('[UgreenVideo] set initial video system bars failed: ' +
             JSON.stringify(error))
         })
@@ -21068,12 +21100,11 @@ struct Index {
    * Keep the rotation behavior aligned with the official video-show sample:
    * the window (rather than the video pixels) changes orientation, landscape
    * multi-window is enabled for the landscape presentation, and system bars
-   * are hidden only while that presentation is active.
+   * stay hidden in both player orientations.
    */
   private async applyVideoWindowOrientation(win: window.Window, landscape: boolean): Promise<void> {
     // Update the overlay immediately, then let windowSizeChange confirm the
-    // committed dimensions. This removes the portrait status-bar inset during
-    // the orientation animation instead of one frame after it completes.
+    // committed dimensions. System bars stay hidden through either orientation.
     this.videoLandscape = landscape
     if (landscape) {
       try {
@@ -21084,7 +21115,7 @@ struct Index {
         console.warn('[UgreenVideo] enable landscape multi-window failed: ' +
           JSON.stringify(error))
       }
-      await this.setVideoSystemBars(win, true)
+      await this.setVideoSystemBars(win, !this.videoPipBackgrounded)
       await win.setPreferredOrientation(window.Orientation.USER_ROTATION_LANDSCAPE)
       return
     }
@@ -21095,7 +21126,7 @@ struct Index {
       console.warn('[UgreenVideo] disable landscape multi-window failed: ' +
         JSON.stringify(error))
     }
-    await this.setVideoSystemBars(win, false)
+    await this.setVideoSystemBars(win, !this.videoPipBackgrounded)
     await win.setPreferredOrientation(window.Orientation.USER_ROTATION_PORTRAIT)
   }
 
@@ -21147,7 +21178,7 @@ struct Index {
   private restoreVideoPlayerOrientation(): void {
     this.videoOrientationToken += 1
     this.videoOrientationChanging = false
-    this.videoSystemBarsLandscape = null
+    this.videoSystemBarsImmersive = null
     this.videoSystemBarsToken += 1
     const win = this.videoPlayerWindow
     const previous = this.videoPlayerPreviousOrientation
@@ -21396,7 +21427,7 @@ struct Index {
         await this.videoPlaybackManager.play()
       }
       if (!current() || casting !== this.videoCasting) { return }
-      this.videoPlaying = !shouldPause
+      this.videoPlaying = casting ? !shouldPause : this.videoPlaybackManager.state() === 'playing'
       this.syncVideoBackgroundTask()
       this.updateVideoPipControlStatus()
       this.updateVideoMediaSession(true)
@@ -21611,6 +21642,9 @@ struct Index {
     this.suspendVideoInteractions()
     this.videoPipHideOnStart = false
     this.videoPipBackgrounded = true
+    if (this.videoPlayerWindow !== null) {
+      this.setVideoSystemBars(this.videoPlayerWindow, false).catch((): void => {})
+    }
     // The player remains alive and the original XComponent stays mounted in a
     // 1x1 host. Only the surrounding controls are removed, revealing the file
     // page that launched the video underneath the system PiP window.
