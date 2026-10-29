@@ -1145,6 +1145,7 @@ struct Index {
   private audioSession: AudioSessionManager = new AudioSessionManager()
   private audioCloseWork: Promise<void> = Promise.resolve()
   private videoCloseWork: Promise<void> = Promise.resolve()
+  private videoWindowRestoreWork: Promise<void> = Promise.resolve()
   private audioSessionUpdatedAt: number = 0
   private audioOwnsBusy: boolean = false
   private audioPageOriginX: number = 0
@@ -20342,7 +20343,8 @@ struct Index {
         await this.videoTransferManager.releaseSource(entry).catch((): void => {})
         if (token !== this.videoOpenToken) { return }
         this.suspendVideoInteractions()
-        this.restoreVideoPlayerOrientation()
+        await this.restoreVideoPlayerOrientation()
+        if (token !== this.videoOpenToken) { return }
         this.videoSourceHandle = null
         this.videoSourceKey = ''
         this.videoLocalPath = ''
@@ -20742,6 +20744,7 @@ struct Index {
       return
     }
     const entry = this.videoEntry as FileEntry
+    const token = this.videoOpenToken
     this.videoOverlayClosing = true
     this.videoCloseRequested = false
     this.videoPlaying = false
@@ -20767,20 +20770,26 @@ struct Index {
       this.videoSurfaceOpacity = 0
       this.videoPosterOpacity = 1
     }
-    if (this.videoEntry === null || this.videoEntry.path !== entry.path) {
+    if (token !== this.videoOpenToken || this.videoEntry === null || this.videoEntry.path !== entry.path) {
       return
     }
 
+    // Restore window chrome while the opaque poster still covers the parent.
+    // Geometry must target the file page's final safe-area layout.
+    await this.restoreVideoPlayerOrientation()
+    if (token !== this.videoOpenToken || !this.showVideoPlayer ||
+      this.videoEntry?.path !== entry.path) { return }
     const useGeometryTransition = this.startVideoExitTransition(entry)
     if (useGeometryTransition) {
       await this.nextRenderFrame()
+      if (token !== this.videoOpenToken) { return }
       await new Promise<void>((resolve: () => void): void => {
         this.getUIContext().animateTo({
           duration: VIDEO_GEOMETRY_TRANSITION_DURATION,
           curve: Curve.FastOutSlowIn,
           onFinish: resolve
         }, (): void => {
-          this.showVideoPlayer = false
+          if (token === this.videoOpenToken) { this.showVideoPlayer = false }
         })
       })
     } else {
@@ -20790,13 +20799,13 @@ struct Index {
           curve: Curve.EaseIn,
           onFinish: resolve
         }, (): void => {
-          this.videoOverlayOpacity = 0
+          if (token === this.videoOpenToken) { this.videoOverlayOpacity = 0 }
         })
       })
-      this.showVideoPlayer = false
+      if (token === this.videoOpenToken) { this.showVideoPlayer = false }
     }
     await this.nextRenderFrame()
-    if (this.videoEntry !== null && this.videoEntry.path === entry.path) {
+    if (token === this.videoOpenToken && this.videoEntry !== null && this.videoEntry.path === entry.path) {
       this.closeVideoPlayer()
     }
   }
@@ -20820,10 +20829,29 @@ struct Index {
         return
       }
     }
+    const closing = this.finishCloseVideoPlayer()
+    this.videoCloseWork = Promise.all([this.videoCloseWork, closing])
+      .then((): void => {}).catch((error: Error): void => {
+        console.warn('[UgreenAVSession] close bridge failed: ' + JSON.stringify(error))
+      })
+  }
+
+  private async finishCloseVideoPlayer(): Promise<void> {
     const closingEntry = this.videoEntry
     const closingPosition = this.videoCurrentMs
     const shouldRestoreSearch = this.searchSession !== null && this.searchSession.returnMode === 'video'
+    const token = this.videoOpenToken + 1
+    this.videoOpenToken = token
+    this.videoOverlayClosing = this.showVideoPlayer && !this.videoPipBackgrounded
+    this.videoChromeVisible = false
+    this.videoSurfaceOpacity = 0
+    this.videoPosterOpacity = 1
     const context = getContext(this) as Context
+    this.videoBackgroundTask.release(context).catch((error: Object): void => {
+      console.warn('[UgreenVideo] release background task failed: ' + JSON.stringify(error))
+    })
+    await this.restoreVideoPlayerOrientation()
+    if (token !== this.videoOpenToken) { return }
     this.videoPipBackgrounded = false
     this.videoPipOrigin = null
     this.videoPipHideOnStart = false
@@ -20836,11 +20864,6 @@ struct Index {
     this.videoCastPreparing = false
     this.videoCasting = false
     this.videoWasPlayingBeforeCast = false
-    this.videoBackgroundTask.release(context).catch((error: Object): void => {
-      console.warn('[UgreenVideo] release background task failed: ' + JSON.stringify(error))
-    })
-    this.restoreVideoPlayerOrientation()
-    this.videoOpenToken += 1
     if (closingEntry !== null) {
       this.videoTransferManager.savePlaybackPosition(closingEntry, closingPosition)
         .catch((): void => {})
@@ -20892,13 +20915,10 @@ struct Index {
         await this.videoTransferManager.releaseSource(closingEntry)
       }
     })
-    this.videoCloseWork = Promise.all([this.videoCloseWork, released,
-      this.videoMediaSession.close()]).then((): void => {}).catch((error: Error): void => {
-        console.warn('[UgreenAVSession] close bridge failed: ' + JSON.stringify(error))
-      })
     if (shouldRestoreSearch) {
       this.restoreSearchSession()
     }
+    await Promise.all([released, this.videoMediaSession.close()])
   }
 
   private videoNavigationEntries(): FileEntry[] {
@@ -21175,27 +21195,34 @@ struct Index {
       })
   }
 
-  private restoreVideoPlayerOrientation(): void {
+  private restoreVideoPlayerOrientation(): Promise<void> {
     this.videoOrientationToken += 1
     this.videoOrientationChanging = false
-    this.videoSystemBarsImmersive = null
-    this.videoSystemBarsToken += 1
     const win = this.videoPlayerWindow
     const previous = this.videoPlayerPreviousOrientation
     this.videoPlayerWindow = null
     this.videoPlayerPreviousOrientation = null
     if (win === null) {
-      return
+      return this.videoWindowRestoreWork
     }
+    this.videoSystemBarsImmersive = null
+    this.videoSystemBarsToken += 1
     try {
       win.off('windowSizeChange', this.videoWindowSizeChange)
     } catch (error) {
       console.warn('[UgreenVideo] release window size listener failed: ' +
         JSON.stringify(error))
     }
-    this.restoreVideoWindowState(win, previous).catch((error: Error): void => {
+    this.videoWindowRestoreWork = this.videoWindowRestoreWork.then(async (): Promise<void> => {
+      await this.restoreVideoWindowState(win, previous)
+      // System-bar visibility and avoid-area layout are separate updates.
+      // Keep the poster until the restored parent has committed its layout.
+      await this.nextRenderFrame()
+      await this.nextRenderFrame()
+    }).catch((error: Error): void => {
       console.warn('[UgreenVideo] restore video window state failed: ' + JSON.stringify(error))
     })
+    return this.videoWindowRestoreWork
   }
 
   private async restoreVideoWindowState(win: window.Window,
@@ -21776,8 +21803,6 @@ struct Index {
         if (this.videoPipBackgrounded) {
           // Closing or dragging away the system PiP also closes the retained
           // player. The file directory is already visible underneath.
-          this.videoPipBackgrounded = false
-          this.videoPipOrigin = null
           this.closeVideoPlayer()
         }
         break
