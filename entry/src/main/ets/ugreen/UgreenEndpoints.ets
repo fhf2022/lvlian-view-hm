@@ -113,12 +113,8 @@ export class UgreenEndpoints {
     return this.baseUrl + '/ugreen/v2/filemgr/rename'
   }
 
-  copyPaths(): string {
-    return this.baseUrl + '/ugreen/v2/filemgr/copy'
-  }
-
-  movePaths(): string {
-    return this.baseUrl + '/ugreen/v2/filemgr/move'
+  copyOrMovePaths(): string {
+    return this.baseUrl + '/ugreen/v2/filemgr/cpOrMvPath'
   }
 
   deletePaths(): string {

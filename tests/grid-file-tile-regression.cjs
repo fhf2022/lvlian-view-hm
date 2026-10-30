@@ -14,13 +14,16 @@ vm.runInNewContext(ts.transpileModule(fs.readFileSync('entry/src/main/ets/ui/Fil
 const { FileGridLayout } = layoutModule;
 let stack, nodes;
 function native(type) {
+  let leaf;
   return new Proxy({}, { get: (_, key) => {
     if (key === 'create') return value => {
       const node = { type, value, parent: stack.at(-1) };
-      nodes.push(node); stack.push(node);
+      nodes.push(node);
+      if (type === 'Image') leaf = node;
+      else stack.push(node);
     };
     if (key === 'pop') return () => stack.pop();
-    return (...args) => { stack.at(-1)[key] = args[0]; };
+    return (...args) => { (type === 'Image' ? leaf : stack.at(-1))[key] = args[0]; };
   } });
 }
 const gesture = new Proxy({}, { get: () => () => {} });
@@ -32,10 +35,12 @@ const exportsObject = {};
 vm.runInNewContext(ts.transpileModule('export class Tile extends View {' + render.getText(source) + '}', {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2021 }
 }).outputText, { exports: exportsObject, View, Stack: native('Stack'), Column: native('Column'),
-  Row: native('Row'), Text: native('Text'), If: { create() {}, pop() {} }, Gesture: gesture,
+  Row: native('Row'), Text: native('Text'), Image: native('Image'),
+  If: { create() {}, pop() {}, canRetake: () => false }, Gesture: gesture,
   GestureGroup: gesture, LongPressGesture: gesture, PanGesture: gesture,
   GesturePriority: {}, GestureMode: {}, PanDirection: {}, Alignment: { Center: 'center', BottomEnd: 'bottom-end' },
   TextAlign: { Center: 'center' }, TextOverflow: { Ellipsis: 'ellipsis' }, FileGridLayout,
+  ImageFit: { Contain: 'contain' }, HitTestMode: { None: 'none' }, $r: value => value,
   ObservedObject: { GetRawObject: value => value } });
 for (const tileWidth of [80, 100, 205, 320]) {
 for (const kind of ['photo', 'video', 'file']) {
@@ -70,6 +75,13 @@ for (const kind of ['photo', 'video', 'file']) {
     assert.equal(contentParent, square, 'photos/videos retain the full-square shared-element source');
   }
   assert.equal(videoIndicators, kind === 'video' ? 1 : 0, 'video progress remains on the outer card exactly once');
+  const badge = nodes.filter(n => n.type === 'Image');
+  assert.equal(badge.length, kind === 'video' ? 1 : 0);
+  if (kind === 'video') {
+    assert.ok(badge[0].position.left > 0 && badge[0].position.bottom > 0);
+    assert.equal(badge[0].position.right, undefined, 'video badge stays at the lower left');
+    assert.equal(badge[0].draggable, false);
+  }
 }
 }
 assert.ok(FileGridLayout.fileIconSize(205) > FileGridLayout.fileIconSize(100), 'tablet icons grow with the tile');

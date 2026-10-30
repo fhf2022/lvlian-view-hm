@@ -139,14 +139,14 @@ export class ThumbnailCacheStore {
     this.schedulePersist()
   }
 
-  async enforceLimit(maxBytes: number): Promise<void> {
-    if (this.directory.length === 0) {
+  async enforceLimit(maxBytes: number, shouldContinue: () => boolean = (): boolean => true): Promise<void> {
+    if (!shouldContinue() || this.directory.length === 0) {
       return
     }
     await CacheManager.runSerialized(async (): Promise<void> => {
-      await this.enforceLimitNow(maxBytes)
+      if (shouldContinue()) { await this.enforceLimitNow(maxBytes, shouldContinue) }
     })
-    await this.flushPersist()
+    if (shouldContinue()) { await this.flushPersist() }
   }
 
   async usage(): Promise<number> {
@@ -166,8 +166,8 @@ export class ThumbnailCacheStore {
     await this.flushPersist()
   }
 
-  private async enforceLimitNow(maxBytes: number): Promise<void> {
-    if (maxBytes <= 0) {
+  private async enforceLimitNow(maxBytes: number, shouldContinue: () => boolean): Promise<void> {
+    if (!shouldContinue() || maxBytes <= 0) {
       return
     }
     const indexedAccess: Record<string, number> = {}
@@ -178,7 +178,10 @@ export class ThumbnailCacheStore {
       indexedAccess[item.path] = previous === undefined
         ? item.lastAccessAt : Math.max(previous, item.lastAccessAt)
     }
-    const files = await this.listPhysicalFiles()
+    const files = await this.listPhysicalFiles(shouldContinue)
+    // A cancelled partial inventory cannot invalidate aliases or prime the
+    // shared physical inventory as if its unvisited files were missing.
+    if (files === null || !shouldContinue()) { return }
     const present = new Set<string>(files.map((file: ThumbnailPhysicalFile): string => file.path))
     for (const path of Array.from(this.keysByPath.keys())) {
       if (!present.has(path)) { CacheManager.reportRemoved(path) }
@@ -194,6 +197,7 @@ export class ThumbnailCacheStore {
     })
     const removedPaths = new Set<string>()
     for (const file of files) {
+      if (!shouldContinue()) { return }
       if (total <= maxBytes) {
         break
       }
@@ -209,6 +213,7 @@ export class ThumbnailCacheStore {
         // the remaining LRU candidates from being considered.
       }
     }
+    if (!shouldContinue()) { return }
     CacheManager.primeThumbnailInventory(this.directory,
       files.filter((file: ThumbnailPhysicalFile): boolean => !removedPaths.has(file.path))
         .map((file: ThumbnailPhysicalFile): CachedFile => {
@@ -216,7 +221,7 @@ export class ThumbnailCacheStore {
         }))
   }
 
-  private async listPhysicalFiles(): Promise<ThumbnailPhysicalFile[]> {
+  private async listPhysicalFiles(shouldContinue: () => boolean): Promise<ThumbnailPhysicalFile[] | null> {
     const result: ThumbnailPhysicalFile[] = []
     let names: string[] = []
     try {
@@ -225,6 +230,7 @@ export class ThumbnailCacheStore {
       return result
     }
     for (let offset = 0; offset < names.length; offset += 8) {
+      if (!shouldContinue()) { return null }
       const batch = await Promise.all(names.slice(offset, offset + 8).map(
         async (name: string): Promise<ThumbnailPhysicalFile | null> => {
           const path = this.directory + '/' + name
@@ -236,7 +242,7 @@ export class ThumbnailCacheStore {
         }))
       for (const file of batch) { if (file !== null) { result.push(file) } }
     }
-    return result
+    return shouldContinue() ? result : null
   }
 
   private removeKeysForPath(path: string): void {

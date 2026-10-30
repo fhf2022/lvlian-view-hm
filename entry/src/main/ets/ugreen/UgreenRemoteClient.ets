@@ -618,26 +618,25 @@ export class UgreenRemoteClient {
   }
 
   async copy(paths: string[], targetPath: string): Promise<void> {
-    await this.withReconnect(async (): Promise<void> => {
-      const urls = this.requireEndpoints()
-      const headers = this.withHeaders(await this.authHeaders(), 'content-type', 'application/json')
-      const body: JsonObject = {}
-      body['paths'] = paths
-      body['target_path'] = targetPath
-      const response = await this.transport.requestJson(urls.copyPaths(), http.RequestMethod.POST, body, headers, false, 60000)
-      this.successData(response.body, '文件复制失败')
-    })
+    await this.copyOrMove(paths, targetPath, false)
   }
 
   async move(paths: string[], targetPath: string): Promise<void> {
+    await this.copyOrMove(paths, targetPath, true)
+  }
+
+  private async copyOrMove(paths: string[], targetPath: string, move: boolean): Promise<void> {
     await this.withReconnect(async (): Promise<void> => {
       const urls = this.requireEndpoints()
       const headers = this.withHeaders(await this.authHeaders(), 'content-type', 'application/json')
       const body: JsonObject = {}
-      body['paths'] = paths
-      body['target_path'] = targetPath
-      const response = await this.transport.requestJson(urls.movePaths(), http.RequestMethod.POST, body, headers, false, 60000)
-      this.successData(response.body, '文件移动失败')
+      body['src'] = paths
+      body['dst'] = targetPath
+      body['type'] = move
+      body['action_type'] = 0
+      body['intranet_share_id'] = 0
+      const response = await this.transport.requestJson(urls.copyOrMovePaths(), http.RequestMethod.POST, body, headers, false, 60000)
+      this.successData(response.body, move ? '文件移动失败' : '文件复制失败')
     })
   }
 
@@ -819,7 +818,7 @@ export class UgreenRemoteClient {
   private successData(body: JsonObject, context: string): JsonObject {
     const code = this.numberValue(body['code'])
     if (code !== 200) {
-      const message = this.stringValue(body['msg'], context)
+      const message = this.stringValue(body['msg'], context).trim() || context
       let kind = UgreenErrorKind.UNKNOWN
       if (this.isAuthenticationFailure(code, message)) {
         kind = UgreenErrorKind.AUTH_EXPIRED

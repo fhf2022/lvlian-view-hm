@@ -11,12 +11,14 @@ function method(name) {
   return source.slice(start, start + end + 1);
 }
 const exportsObject = {};
-let cached = '', usage = 0, context = { cacheDir: '/cache' };
+let cached = '', usage = 0, scanned = 0, physicalReads = 0, context = { cacheDir: '/cache' };
 vm.runInNewContext(ts.transpileModule('export class Page {\n' +
-  ['ensureCachedFile', 'openStorageSettings'].map(method).join('\n') + '\n}', {
+  ['ensureCachedFile', 'openStorageSettings', 'refreshCacheUsage'].map(method).join('\n') + '\n}', {
   compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS }
 }).outputText, { exports: exportsObject, console, getContext: () => context,
-  CacheManager: { findExisting: () => cached }, StorageBudget: { usage: () => usage } });
+  CacheManager: { findExisting: () => cached }, StorageBudget: { usage: () => usage,
+    scan: () => { scanned++; return usage; }, thumbnailAllowance: () => 512,
+    persistentUsage: () => { physicalReads++; return 400; } } });
 const tick = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
 (async () => {
   const page = new exportsObject.Page(), downloads = [];
@@ -46,13 +48,33 @@ const tick = async () => { for (let i = 0; i < 20; i++) await Promise.resolve();
   assert.equal(page.cacheUsageBytes, 120, 'a failed download cannot invent a successful cache size');
 
   let refreshed = 0, release;
-  page.screen = 'settings'; page.isBusy = false;
+  page.screen = 'settings'; page.isBusy = false; page.storageUsageRefreshToken = 0;
   page.ensureCacheState = () => new Promise(resolve => { release = resolve; });
-  page.refreshCacheUsage = async () => { refreshed++; };
+  page.refreshCacheUsage = exportsObject.Page.prototype.refreshCacheUsage;
+  page.repository.enforceThumbnailCacheLimit = async () => { refreshed++; };
   page.updateTopTitle = () => {}; page.updateBottomBarVisibility = () => {};
   page.openStorageSettings(); assert.equal(page.showStorageSettings, true);
   assert.equal(refreshed, 0, 'storage inspection waits for initialization');
   release(); await tick(); assert.equal(refreshed, 1, 'explicit storage inspection still refreshes physical usage');
   page.screen = 'files'; page.openStorageSettings(); await tick(); assert.equal(refreshed, 1);
+
+  page.screen = 'settings'; page.openStorageSettings(); page.screen = 'files'; release(); await tick();
+  assert.equal(refreshed, 1, 'leaving before initialization prevents the full scan'); assert.equal(scanned, 1);
+
+  let finishScan, scanValid;
+  page.ensureCacheState = async () => {};
+  page.repository.enforceThumbnailCacheLimit = async (_limit, valid) => {
+    scanValid = valid; refreshed++; await new Promise(resolve => finishScan = resolve);
+  };
+  page.screen = 'settings'; page.openStorageSettings(); await tick(); assert.equal(scanValid(), true);
+  page.showStorageSettings = false; assert.equal(scanValid(), false, 'in-flight inventory observes page exit');
+  finishScan(); await tick(); assert.equal(physicalReads, 1, 'cancelled inventory cannot trigger a late full physical-usage walk');
+
+  page.repository.enforceThumbnailCacheLimit = async () => { refreshed++; };
+  page.ensureCacheState = () => new Promise(resolve => { release = resolve; });
+  page.openStorageSettings(); const firstRelease = release;
+  page.showStorageSettings = false; page.openStorageSettings(); const secondRelease = release;
+  const prior = refreshed; firstRelease(); secondRelease(); await tick();
+  assert.equal(refreshed, prior + 1, 'reopening cannot revive the previous storage request');
   console.log('PASS original completion: no full thumbnail inventory; live byte count, quota/cancel propagation, cache hits/failures and explicit storage refresh');
 })().catch(error => { console.error(error); process.exitCode = 1; });

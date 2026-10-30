@@ -67,7 +67,12 @@ export class WaterfallBatchCoordinator {
 
   sync(entries: FileEntry[]): void {
     this.entries = entries
-    if (this.first < 0) { if (entries.length > 0 && this.preparing < 0) { this.request(this.focus) }; return }
+    if (this.first < 0) {
+      if (entries.length > 0 && this.preparing < 0 && !this.error) {
+        this.request(this.jump >= 0 ? this.jump : this.focus)
+      }
+      return
+    }
     const tail = this.batches.get(this.last)
     if (tail !== undefined) {
       const next = this.groupEntries(tail.index)
@@ -93,7 +98,7 @@ export class WaterfallBatchCoordinator {
   setHidden(hidden: boolean): void { this.hidden = hidden; if (!hidden) { this.advance() } }
 
   visible(firstIndex: number, lastIndex: number): void {
-    if (this.hidden) { return }
+    if (this.hidden || this.jump >= 0) { return }
     const next = Math.floor(Math.max(0, firstIndex) / WaterfallBatchCoordinator.SIZE)
     if (this.residents.has(next) && next !== this.focus) {
       this.direction = next > this.focus ? 1 : -1
@@ -109,17 +114,16 @@ export class WaterfallBatchCoordinator {
     if (this.jump >= 0) { return }
     this.direction = direction < 0 ? -1 : 1
     const target = direction < 0 ? this.residentFirst() - 1 : this.residentLast() + 1
-    if (this.hasGroup(target)) { this.pending = target; this.advance() }
+    if (this.hasGroup(target)) {
+      this.pending = target
+      if (this.batches.get(target)?.phase === 'failed') { this.request(target, true) }
+      else { this.advance() }
+    }
   }
 
   async ensure(index: number): Promise<void> {
     const group = Math.floor(index / WaterfallBatchCoordinator.SIZE)
     if (!this.hasGroup(group)) { return }
-    if (this.residents.has(group) && this.localIndex(index) >= 0 && this.batches.get(group)?.phase !== 'preparing') {
-      this.focus = group
-      return
-    }
-    this.jump = group; this.pending = group
     // Timeline scrubbing replaces a pending destination; do not retain a
     // promise/closure for every day the finger crossed.
     this.waiters.forEach((callbacks: (() => void)[], target: number): void => {
@@ -128,6 +132,19 @@ export class WaterfallBatchCoordinator {
         callbacks.forEach((callback: () => void): void => callback())
       }
     })
+    if (this.preparing >= 0 && this.preparing !== group) {
+      this.preparationCancellation.cancel()
+      this.preparing = -1
+    }
+    if (this.residents.has(group) && this.localIndex(index) >= 0 && this.batches.get(group)?.phase !== 'preparing') {
+      this.focus = group; this.jump = -1; this.pending = -1
+      this.error = this.hasActiveFailure()
+      this.delegate.originals(this.originalTargets(), false)
+      this.delegate.changed()
+      this.advance()
+      return
+    }
+    this.jump = group; this.pending = group
     const waiting = new Promise<void>((resolve): void => {
       const callbacks = this.waiters.get(group) ?? []
       callbacks.push(resolve); this.waiters.set(group, callbacks)
@@ -138,6 +155,9 @@ export class WaterfallBatchCoordinator {
 
   retry(): void {
     this.error = false
+    if (this.pending >= 0 && !this.residents.has(this.pending)) {
+      this.request(this.pending, true); return
+    }
     let batch = this.batches.get(this.pending >= 0 ? this.pending : this.focus)
     for (const group of Array.from(this.residents)) {
       const candidate = this.batches.get(group)
@@ -219,7 +239,11 @@ export class WaterfallBatchCoordinator {
 
   private advance(): void {
     if (this.preparing >= 0 || (this.hidden && this.jump < 0)) { return }
-    if (this.pending >= 0 && !this.residents.has(this.pending)) { this.request(this.pending); return }
+    if (this.pending >= 0 && !this.residents.has(this.pending)) {
+      // Visibility and network-completion callbacks are not user retries.
+      if (this.batches.get(this.pending)?.phase !== 'failed') { this.request(this.pending) }
+      return
+    }
     if (this.error || this.first < 0) { return }
     const target = this.direction < 0 ? this.residentFirst() - 1 : this.residentLast() + 1
     if (this.hasGroup(target) && this.batches.get(target)?.phase !== 'ready' &&
@@ -249,14 +273,17 @@ export class WaterfallBatchCoordinator {
     this.delegate.changed()
     const current = batch
     const session = this.session
+    const cancellation = this.preparationCancellation
     // A reset cannot release native IO slots which are still finishing.
     this.preparation = this.preparation.catch((): void => {}).then(async (): Promise<void> => {
-      if (session === this.session && this.preparing === current.index) { await this.prepare(current, session, stageOnly) }
+      if (session === this.session && this.preparing === current.index && !cancellation.isCancelled()) {
+        await this.prepare(current, session, stageOnly, cancellation)
+      }
     })
   }
 
-  private async prepare(batch: Batch, session: number, stageOnly: boolean): Promise<void> {
-    const cancellation = this.preparationCancellation
+  private async prepare(batch: Batch, session: number, stageOnly: boolean,
+    cancellation: DownloadCancellation): Promise<void> {
     const valid = (): boolean => session === this.session && this.preparing === batch.index && !cancellation.isCancelled()
     try {
       let cursor = 0
@@ -288,7 +315,8 @@ export class WaterfallBatchCoordinator {
       await Promise.all([thumbnailWorker(), thumbnailWorker()])
       if (!valid()) { return }
       batch.phase = 'ready'; this.preparing = -1
-      if (!stageOnly || this.pending === batch.index || this.jump === batch.index) { this.admit(batch) }
+      if (this.jump === batch.index ||
+        (this.jump < 0 && (!stageOnly || this.pending === batch.index))) { this.admit(batch) }
       else { this.delegate.changed(); this.advance() }
     } catch (_) {
       if (valid()) {
@@ -301,6 +329,18 @@ export class WaterfallBatchCoordinator {
 
   private admit(batch: Batch): void {
     const group = batch.index
+    const oldFirst = this.first; const oldLast = this.last
+    const outside = this.first < 0 || batch.index < this.first - 1 || batch.index > this.last + 1
+    if (outside) {
+      // A far indexed jump replaces the surface. Keep reusable geometry, but
+      // let the existing loader cancel originals for every discarded group.
+      for (const previous of Array.from(this.residents)) {
+        if (previous !== group) {
+          this.residents.delete(previous)
+          this.delegate.evict(this.batches.get(previous)?.entries ?? [])
+        }
+      }
+    }
     if (this.residents.size >= WaterfallBatchCoordinator.MAX_RESIDENT_GROUPS && !this.residents.has(group)) {
       const edge = group < this.residentFirst() ? Math.max(...Array.from(this.residents)) : Math.min(...Array.from(this.residents))
       const candidates = Array.from(this.residents).filter((index: number): boolean =>
@@ -312,8 +352,6 @@ export class WaterfallBatchCoordinator {
       const evicted = candidates[0]; this.residents.delete(evicted)
       this.delegate.evict(this.batches.get(evicted)?.entries ?? [])
     }
-    const oldFirst = this.first; const oldLast = this.last
-    const outside = this.first < 0 || batch.index < this.first - 1 || batch.index > this.last + 1
     if (outside) { this.first = batch.index; this.last = batch.index; this.focus = batch.index }
     else { this.first = Math.min(this.first, batch.index); this.last = Math.max(this.last, batch.index) }
     if (this.jump === batch.index) { this.focus = batch.index }

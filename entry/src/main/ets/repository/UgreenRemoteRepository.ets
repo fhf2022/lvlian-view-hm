@@ -116,8 +116,8 @@ export class UgreenRemoteRepository {
     return await this.thumbnailCacheStore.usage()
   }
 
-  async enforceThumbnailCacheLimit(maxBytes: number): Promise<void> {
-    await this.thumbnailCacheStore.enforceLimit(maxBytes)
+  async enforceThumbnailCacheLimit(maxBytes: number, shouldContinue?: () => boolean): Promise<void> {
+    await this.thumbnailCacheStore.enforceLimit(maxBytes, shouldContinue)
   }
 
   async clearThumbnailCache(): Promise<void> {
