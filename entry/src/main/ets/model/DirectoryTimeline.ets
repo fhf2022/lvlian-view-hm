@@ -56,9 +56,9 @@ export class DirectoryTimelinePolicy {
   static readonly DAY_MS: number = 24 * 60 * 60 * 1000
   static readonly MINIMUM_SPAN_MS: number = 30 * DirectoryTimelinePolicy.DAY_MS
 
-  static minimumImageCount(visibleImageCount: number): number {
+  static minimumImageCount(viewportImageCapacity: number): number {
     return Math.max(DirectoryTimelinePolicy.MINIMUM_IMAGE_COUNT,
-      Math.max(0, visibleImageCount) * 6)
+      Math.max(0, viewportImageCapacity) * 6)
   }
 
   static build(entries: FileEntry[], complete: boolean = true): DirectoryTimeline {

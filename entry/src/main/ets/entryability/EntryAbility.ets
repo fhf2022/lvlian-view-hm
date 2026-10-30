@@ -17,17 +17,23 @@ export default class EntryAbility extends UIAbility {
       AppStorage.setOrCreate('statusBarHeightPx', area.topRect.height);
     } else if (type === window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR) {
       AppStorage.setOrCreate('navigationBarHeightPx', area.bottomRect.height);
+    } else if (type === window.AvoidAreaType.TYPE_CUTOUT) {
+      const top = area.topRect;
+      AppStorage.setOrCreate('displayCutoutTopPx', top.height > 0 ? Math.max(0, top.top + top.height) : 0);
     }
   }
 
   private observeAvoidAreas(win: window.Window): void {
     AppStorage.setOrCreate('statusBarHeightPx', 0);
     AppStorage.setOrCreate('navigationBarHeightPx', 0);
+    AppStorage.setOrCreate('displayCutoutTopPx', 0);
     try {
       this.updateAvoidArea(window.AvoidAreaType.TYPE_SYSTEM,
         win.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM));
       this.updateAvoidArea(window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR,
         win.getWindowAvoidArea(window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR));
+      this.updateAvoidArea(window.AvoidAreaType.TYPE_CUTOUT,
+        win.getWindowAvoidArea(window.AvoidAreaType.TYPE_CUTOUT));
       win.on('avoidAreaChange', (data: window.AvoidAreaOptions) => {
         this.updateAvoidArea(data.type, data.area);
       });

@@ -1315,6 +1315,7 @@ struct Index {
   @State bottomBarOffsetY: number = 0
   @State bottomBarOpacity: number = 1
   @StorageProp('statusBarHeightPx') statusBarHeightPx: number = 0
+  @StorageProp('displayCutoutTopPx') displayCutoutTopPx: number = 0
   @StorageProp('navigationBarHeightPx') navigationBarHeightPx: number = 0
   @StorageProp('isDarkTheme') isDarkTheme: boolean = false
   @StorageProp('abilityInBackground') @Watch('onAbilityBackgroundChanged')
@@ -3095,6 +3096,11 @@ struct Index {
     return this.videoLandscape ? 0 : this.bottomSafeInset()
   }
 
+  private videoHeaderTopInset(): number {
+    return this.videoLandscape ? 0 : this.getUIContext().px2vp(
+      Math.max(this.statusBarHeightPx, this.displayCutoutTopPx))
+  }
+
   // All file view modes share the same content origin below the common
   // TopFileOverlay. Keeping this in one helper prevents WaterFlow from
   // drifting away from the list/grid header geometry.
@@ -3157,42 +3163,28 @@ struct Index {
     if (this.floatingTimelineHeight() <= 0) {
       return false
     }
-    const visibleImageCount = this.timelineVisibleImageCount()
+    const viewportImageCapacity = this.timelineViewportImageCapacity()
+    if (viewportImageCapacity <= 0) { return false }
     const currentDirectoryKey = this.currentRootType.toString() + ':' + this.currentPath
     // The index is keyed by directory. During a push/pop the live page and its
     // metadata can be one step apart; never paint the previous directory's
     // rail over the incoming page.
     return this.fileSortKey === 'time' && !this.showPageTransition &&
       this.indexedDirectoryKey === currentDirectoryKey && this.directoryTimeline.eligible(
-      DirectoryTimelinePolicy.minimumImageCount(visibleImageCount)) &&
+      DirectoryTimelinePolicy.minimumImageCount(viewportImageCapacity)) &&
       this.shouldShowFileToolsBar()
   }
 
-  private timelineVisibleImageCount(): number {
-    let source = this.entries
-    let start = this.fileVisibleStartIndex
-    let end = this.fileVisibleEndIndex
-    if (this.fileViewMode === 'waterfall') {
-      source = this.waterfallEntries
-      start = this.waterfallVisibleStartIndex
-      end = this.waterfallVisibleEndIndex
-    } else if (this.fileViewMode === 'list') {
-      // List index zero is the fixed top spacer, not a file entry.
-      start = Math.max(0, start - 1)
-      end = Math.max(start, end - 1)
-    }
-    if (source.length === 0 || end < start) {
-      return 0
-    }
-    const lower = Math.max(0, start)
-    const upper = Math.min(source.length - 1, end)
-    let count = 0
-    for (let index = lower; index <= upper; index += 1) {
-      if (!source[index].isDirectory && this.isImage(source[index])) {
-        count += 1
-      }
-    }
-    return count
+  private timelineViewportImageCapacity(): number {
+    const width = this.pageWidthVp
+    const height = this.pageHeightVp
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) { return 0 }
+    // A directory has one eligibility rule across List/Grid/WaterFlow. Use
+    // the existing grid geometry as the six-screen reference, not whichever
+    // items a lazy container or one prepared waterfall group reports today.
+    const columns = this.fileGridColumnCount()
+    const rowHeight = FileGridLayout.cellWidth(width, columns) + FileGridLayout.gap
+    return columns * Math.ceil(height / rowHeight)
   }
 
   private floatingTimelineBottom(): number {
@@ -11169,6 +11161,7 @@ struct Index {
       .width('100%')
       .height(HeaderStyle.overlayHeight)
       .backgroundColor(Color.Transparent)
+      .margin({ top: this.videoHeaderTopInset() })
       .opacity(this.videoChromeVisible ? 1 : 0)
       .translate({ x: 0, y: this.videoChromeVisible ? 0 : -14, z: 0 })
       .hitTestBehavior(this.videoChromeVisible
