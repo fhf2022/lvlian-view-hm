@@ -12886,12 +12886,13 @@ struct Index {
 
   @Builder
   WaterfallLoadingStatus(): void {
-    if (this.waterfallBatchEpoch >= 0 && this.waterfallBatches?.error) {
-      Text('点击重试').fontSize(14).fontColor('#888888').padding(16)
-        .onClick((): void => this.waterfallBatches?.retry())
-    } else if (this.waterfallPullOffset !== 0 && !this.waterfallBatches?.waiting()) {
+    if (this.waterfallPullOffset !== 0) {
       Progress({ value: Math.min(100, Math.abs(this.waterfallPullOffset) * 200 / WaterfallEdgePull.THRESHOLD),
         total: 100, type: ProgressType.Ring }).width(28).height(28).color('#2E6BFF').margin(12)
+        .style({ enableSmoothEffect: false })
+    } else if (this.waterfallBatchEpoch >= 0 && this.waterfallBatches?.error) {
+      Text('点击重试').fontSize(14).fontColor('#888888').padding(16)
+        .onClick((): void => this.waterfallBatches?.retry())
     } else {
       LoadingProgress().width(28).height(28).color('#2E6BFF').margin(12)
     }

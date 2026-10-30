@@ -38,6 +38,16 @@ const wait=harness();wait.p.waterfallDataSource={totalCount:()=>12};wait.p.water
 // Exercise the real touch -> boundary -> release chain. Native/inertial deltas
 // cannot stand in for finger travel, including the native zero-delta edge.
 const touch=(p,type,y,x=400,touches=1)=>p.handleWaterfallTouch({type,touches:Array.from({length:touches},(_,id)=>({id,windowX:x,windowY:y})),changedTouches:[{id:0,windowX:x,windowY:y}]});
+// Ring closure and release share the exact threshold, symmetrically at both edges.
+for(const edge of [-1,1]){
+ const h=harness(),p=h.p;h.setCount(60);h.setResident(2,4);p.updateWaterfallLayout(true);h.setOffset(p.waterfallBoundaryOffset(edge));
+ const at=distance=>400-edge*distance;
+ touch(p,TouchType.Down,400);touch(p,TouchType.Move,at(55));assert.equal(Math.abs(p.waterfallPullOffset)*200/56,55*100/56);touch(p,TouchType.Up,at(55));assert.equal(p.edges.length,0);
+ touch(p,TouchType.Down,400);touch(p,TouchType.Move,at(56));assert.equal(Math.abs(p.waterfallPullOffset),28);assert.equal(p.edges.length,0,'closed ring never loads while held');touch(p,TouchType.Up,at(56));assert.deepEqual(p.edges,[edge]);
+ touch(p,TouchType.Down,400);touch(p,TouchType.Move,at(200));assert.equal(Math.abs(p.waterfallPullOffset),28,'extra outward travel saturates');
+ touch(p,TouchType.Move,at(199));assert.equal(Math.abs(p.waterfallPullOffset),27.5,'one pixel of retreat immediately opens the ring');touch(p,TouchType.Up,at(199));assert.equal(p.edges.length,1,'retreat disarms release');
+ touch(p,TouchType.Down,400);touch(p,TouchType.Move,at(56));touch(p,TouchType.Move,at(28));assert.equal(Math.abs(p.waterfallPullOffset),14,'reverse follows original half-ring path');touch(p,TouchType.Move,at(56));touch(p,TouchType.Up,at(56));assert.deepEqual(p.edges,[edge,edge],'closing again re-arms the same gesture');
+}
 const drag=harness(),d=drag.p;d.updateWaterfallLayout(true);drag.setOffset(d.waterfallBoundaryOffset(1));
 touch(d,TouchType.Down,400);touch(d,TouchType.Move,350);assert.equal(d.edges.length,0,'holding never loads');touch(d,TouchType.Up,350);assert.equal(d.edges.length,0,'under-threshold release does not load');
 touch(d,TouchType.Down,400);touch(d,TouchType.Move,340);assert.equal(d.edges.length,0,'armed but still holding does not load');assert.ok(d.waterfallPullOffset<0);touch(d,TouchType.Up,340);assert.deepEqual(d.edges,[1]);assert.equal(d.waterfallPullOffset,0);touch(d,TouchType.Up,340);assert.equal(d.edges.length,1,'same gesture cannot trigger twice');

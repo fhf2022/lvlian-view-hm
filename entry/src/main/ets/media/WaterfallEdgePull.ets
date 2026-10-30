@@ -23,7 +23,10 @@ export class WaterfallEdgePull {
     if (pointer !== this.pointer || (Math.abs(x - this.startX) > 16 &&
       Math.abs(x - this.startX) > Math.abs(y - this.startY))) { this.cancel(); return }
     if (this.edge !== 0) {
-      this.distance = Math.max(0, this.distance + (this.y - y) * this.edge)
+      // Saturate at the armed position: excess travel must not create a
+      // hidden distance the user has to undo before the ring opens again.
+      this.distance = Math.max(0, Math.min(WaterfallEdgePull.THRESHOLD,
+        this.distance + (this.y - y) * this.edge))
       if (this.distance === 0) { this.edge = 0 }
     }
     this.y = y

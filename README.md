@@ -49,7 +49,7 @@
 
 详细步骤、权限说明和常见问题见[使用说明](docs/USER_GUIDE.md)。
 
-当前版本为 **1.0.12**，正式 HAP 见 [GitHub Release](https://github.com/fhf2022/lvlian-view-hm/releases/tag/v1.0.12)。本版优化平板图库滚动、分组瀑布流及旋转定位，支持混合图片目录和分屏拖动上传，完善音视频流式播放、后台保活和返回动画，详见[更新记录](CHANGELOG.md)。[跨设备接续](docs/CONTINUATION.md)支持目录、图片、音频和普通视频；建议两端均更新到本版，验证范围见专题文档。
+当前版本为 **1.0.13**，正式 HAP 见 [GitHub Release](https://github.com/fhf2022/lvlian-view-hm/releases/tag/v1.0.13)。本版修复瀑布流旋转、长图定位、反向补组和 NAS 复制／移动，完善超位拖动圆环与加载取消，详见[更新记录](CHANGELOG.md)。[跨设备接续](docs/CONTINUATION.md)支持目录、图片、音频和普通视频；建议两端均更新到本版，验证范围见专题文档。
 
 ## 使用边界
 
