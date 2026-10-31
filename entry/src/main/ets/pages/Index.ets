@@ -7694,6 +7694,9 @@ struct Index {
         preview: this.NativeActionMenuPreview,
         previewAnimationOptions: { scale: [1, this.contextMenuLayout.scale] },
         previewBorderRadius: this.contextMenuPreviewSurface === 'list' ? 20 : 14,
+        // Blur the page with the native menu mask, not the preview or menu
+        // surface. ArkUI owns its window bounds and exit/rotation lifecycle.
+        mask: { backgroundBlurStyle: BlurStyle.BACKGROUND_REGULAR },
         placement: Placement.BottomLeft,
         borderRadius: 22,
         transition: this.actionMenuSurfaceTransition(),
