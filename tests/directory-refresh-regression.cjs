@@ -11,7 +11,7 @@ function method(name) {
 }
 const exported = {};
 vm.runInNewContext(ts.transpileModule('export class Page {\n' +
-  ['refreshCurrentDirectory', 'confirmDestinationOperation'].map(method).join('\n') + '\n}', {
+  ['refreshCurrentDirectory', 'destinationPathKey', 'destinationContainsSource', 'confirmDestinationOperation'].map(method).join('\n') + '\n}', {
   compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS }
 }).outputText, { exports: exported, HapticFeedback: { success() {} } });
 const tick = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
@@ -22,7 +22,7 @@ function make(root = false) {
   Object.assign(page, {
     currentPath: root ? '' : '/home/user/Photos', currentRootType: root ? 2 : 3,
     rootKind: 'personal', currentPageIndex: 1, directoryIndexRequestToken: 0, navigationRequestId: 1,
-    destinationOperation: 'copy', destinationSelectedEntries: [{ path: '/home/user/Photos/a.jpg' }],
+    destinationSourceFolders: new Set(), destinationOperation: 'copy', destinationSelectedEntries: [{ path: '/home/user/Photos/a.jpg' }],
     destinationPath: '/home/user/Other', destinationLoading: false,
     repository: { sessionIdentity: () => identity, clearDirectoryCache() {}, invalidateDirectory() {},
       getRootWithCache: () => pending, copy: async () => {} },

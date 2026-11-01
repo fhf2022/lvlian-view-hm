@@ -1,4 +1,5 @@
 import { GlassControlGeometry as Glass } from '../ui/GlassControlGeometry'
+import { ContentDivider } from './ContentDivider'
 
 /** All anchored More menus share one row; the owner supplies the action/slide group. */
 @Component
@@ -28,7 +29,7 @@ export struct GlassMenuRow {
       .onClick(() => this.onActivate())
 
       if (this.showDivider) {
-        Divider().strokeWidth(0.5).color($r('sys.color.comp_divider')).margin({ left: 10, right: 10 })
+        ContentDivider({ startInset: 10, endInset: 8, lineColor: $r('sys.color.comp_divider') })
       }
     }
     .width('100%')

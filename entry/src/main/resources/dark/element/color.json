@@ -1,22 +1,6 @@
 {
   "color": [
     {
-      "name": "album_picker_panel",
-      "value": "#202122"
-    },
-    {
-      "name": "album_picker_header",
-      "value": "#343536"
-    },
-    {
-      "name": "album_picker_fade_start",
-      "value": "#00303234"
-    },
-    {
-      "name": "album_picker_background",
-      "value": "#303234"
-    },
-    {
       "name": "album_upload_error",
       "value": "#FFB4AB"
     },
@@ -94,15 +78,11 @@
     },
     {
       "name": "task_panel_background",
-      "value": "#202122"
+      "value": "#2E3033"
     },
     {
       "name": "task_panel_control_background",
       "value": "#343536"
-    },
-    {
-      "name": "task_panel_content_background",
-      "value": "#303234"
     }
   ]
 }

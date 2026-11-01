@@ -9,11 +9,15 @@
 | 语言与 UI | ArkTS / ArkUI，Stage 模型 |
 | SDK | HarmonyOS API 26；最低兼容与目标均为 `26.0.0` |
 | 工程模型 | Hvigor / OHPM，`modelVersion: 26.0.0` |
-| 设备类型 | `phone`、`tablet`、`2in1` |
+| 设备类型 | `phone`、`tablet`、`2in1`、`tv`（TV 基础适配，暂无真机验收） |
 | 应用版本 | 以 [`AppScope/app.json5`](../AppScope/app.json5) 的 `versionName`、`versionCode` 为准 |
 | 主模块 | `entry` |
 
 使用能够安装 API 26 SDK 的 DevEco Studio。建议采用与工程对应的 26.0.0 Release 工具链；提交应用市场的包还需检查 SDK 的 `releaseType` 为 `Release`。API 23、24 尚未做兼容适配，不能仅下调 `compatibleSdkVersion` 就视为支持。
+
+TV 基础适配已声明 `tv`，仍要求 API 26。页面创建时只读取一次系统 `deviceInfo.deviceType`，TV 在共用 `FileGridLayout` 中使用约 60 张可见图片、最多 12 列的预算；标准 16:9 窗口为 10 列。其他设备保留原有 36 张、最多 7 列的预算。实际网格、目录快照、返回定位、多选几何和时间轴门槛共用同一列数入口；没有另外实现电视图库或提高下载、解码并发。
+
+AI 识图先通过 `canIUse('SystemCapability.AI.VisionImageAnalyzer')` 检查，再按需创建控制器；不支持的设备不会在页面初始化时构造该原生服务。隔空传送继续沿用已有系统能力检查。遥控器走焦及系统相册、分享、接续等能力尚无 TV 真机验证，构建通过不代表这些能力在电视上全部可用。AGC 上架时需将支持设备与包含 `tv` 的新包保持一致，不能复用旧三端包的设备声明。
 
 宿主机回归使用 Node.js 与 TypeScript；相册回归依赖 `node:sqlite`，建议使用 **Node.js 24 LTS**。ArkTS 应用本身仍由 DevEco 工具链编译。
 
@@ -77,6 +81,17 @@ $typescriptRuntime = 'C:/Program Files/Huawei/DevEco Studio/tools/ohpm/node_modu
 ```
 
 这些脚本执行生产逻辑并模拟系统服务、文件 IO 或 NAS 故障，适合检查队列、存储、分页、进度和取消竞争；不等同于真实 NAS、ArkUI 渲染或系统授权验证。ArkTS 单元用例位于 `entry/src/test`，设备测试位于 `entry/src/ohosTest`，可使用 IDE 测试入口执行。
+
+1.0.15 共运行 54 个 `tests/*-regression.cjs` 脚本。新增文件夹分享用真实临时文件系统、模拟 HarmonyOS API 执行生产材料化与两并发缓存逻辑，覆盖目录分页、Unicode、同名文件、混合批次、账号取消、空间不足、文件句柄、重启日志恢复和保留期；`share-flow-regression.cjs` 检查单项／多选入口和分享参数。系统传送另外在手机、平板上验证，主机回归不替代系统分享与手势验收。
+
+## 共享 UI 与分享准备
+
+- `FileListRow` 统一列表的图标槽、标题、次要信息及尾部插槽；`ContentDivider` 统一线宽，由调用方指定文字缩进。文件列表、搜索、回收站、目标选择及传输行复用布局，各自保留业务操作。
+- `TaskPanel` / `TaskPanelStyle` 统一不透明的文件夹、相册选择与确认卡片；`CreateFolderDialog` 共用居中原生弹窗和宽度约束。复制／移动目标过滤源目录及其后代。
+- 普通单项、多选与手势分享共用 `prepareShareEntries`、缓存工人、记录构建及 UTD 规则。包含文件夹时，`FolderSharePreparer` 将整个批次准备到同一个公共 DOWNLOAD 暂存任务；纯文件分享继续复用私有缓存。
+- `DownloadDestination.directoryUri()` 复用普通下载已有的官方 DOWNLOAD 模式授权；公开文件只登记具体拥有的路径，由 `StorageBudget` 计入限额，不扫描整个公共下载目录。分享回调表示系统已接手，不表示传输完成，因此保留 24 小时读取期，通过私有日志在重启后恢复和精确清理。
+
+实现与实际验证边界见[文件夹分享](FOLDER_SHARING.md)。没有新增权限、ZIP 打包或另一套下载器。
 
 传输与图库验证优先使用合成文件和独立测试目录。验证缩略图或 UI 时，不应顺带上传整个个人相册。
 

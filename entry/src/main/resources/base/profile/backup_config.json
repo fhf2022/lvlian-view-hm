@@ -5,6 +5,7 @@
     "data/storage/el2/base/files/ugreen-video-transfers/",
     "data/storage/el2/base/files/ugreen-upload-tasks/",
     "data/storage/el2/base/files/ugreen-album-uploads/",
+    "data/storage/el2/base/files/ugreen-folder-shares/",
     "data/storage/el2/base/files/ugreen-thumbnail-cache/",
     "data/storage/el2/base/files/ugreen-thumbnail-index.json",
     "data/storage/el2/base/preferences/ugreen-login-settings*",

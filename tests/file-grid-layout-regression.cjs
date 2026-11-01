@@ -20,6 +20,22 @@ const cases = [
   [1920, 1080, 7, 'large landscape window'], [1080, 1920, 5, 'large portrait window']
 ];
 for (const [w, h, expected, description] of cases) assert.equal(layout.columns(w, h), expected, description);
+for (const [w, h, expected] of cases) assert.equal(layout.columns(w, h, false), expected,
+  'an explicit non-TV keeps every existing phone/tablet/fold rule');
+for (const [w, h] of [[960, 540], [1280, 720], [1920, 1080], [3840, 2160]]) {
+  assert.equal(layout.columns(w, h, true), 10, 'standard TV landscape uses ten columns in logical vp');
+  assert.equal(layout.columns(w, h), 7, 'a wide non-TV still has the accepted seven-column cap');
+}
+assert.equal(layout.columns(2560, 720, true), 12, 'ultrawide TV remains bounded');
+for (let w = 240; w <= 3840; w += 23) {
+  for (let h = 240; h <= 2160; h += 37) {
+    const columns = layout.columns(w, h, true);
+    assert.ok(Number.isInteger(columns) && columns >= 2 && columns <= 12);
+    assert.ok(layout.thumbnailWidth(w, columns) >= 80 - 1e-6, 'TV split/narrow windows respect thumbnail minimum');
+    assert.ok(layout.columns(w + 1, h, true) >= columns);
+    assert.ok(layout.columns(w, h + 1, true) <= columns);
+  }
+}
 for (const width of [0, -1, NaN, Infinity]) assert.equal(layout.columns(width, 900), 2);
 for (const height of [0, -1, NaN, Infinity]) {
   assert.equal(layout.columns(960, height), 7, 'unmeasured height remains capped');
@@ -60,4 +76,9 @@ vm.runInNewContext(ts.transpileModule('export class Page {\n' + method + '\n}', 
 }).outputText, { exports: pageExports, FileGridLayout: layout });
 const p = new pageExports.Page();
 for (const [w, h, expected] of cases) { p.pageWidthVp = w; p.pageHeightVp = h; assert.equal(p.fileGridColumnCount(), expected); }
-console.log('PASS: shared grid density — 4-column phones, 5/7 tablet, 6-column square/folded windows, bounded workload, usable thumbnails and history independence');
+p.isTvDevice = true;
+for (const [w, h] of [[960, 540], [1920, 1080], [3840, 2160]]) {
+  p.pageWidthVp = w; p.pageHeightVp = h;
+  assert.equal(p.fileGridColumnCount(), 10, 'page/snapshot/return geometry opt into TV through the same method');
+}
+console.log('PASS: shared grid density — unchanged phones/tablets/folds; explicit TV ten-column landscape, twelve-column cap, narrow-window minimum and history independence');

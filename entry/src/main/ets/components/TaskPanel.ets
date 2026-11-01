@@ -10,7 +10,13 @@ export struct TaskPanel {
   @Prop title: string = ''
   @Prop idPrefix: string = 'task-panel'
   @Prop fillHeight: boolean = true
+  @Prop floating: boolean = false
+  @Prop compact: boolean = false
+  @Prop closing: boolean = false
+  @Prop viewportWidth: number = 360
+  @Prop viewportHeight: number = 800
   @Prop safeTop: number = 0
+  @Prop safeBottom: number = 0
   @Prop hasFooter: boolean = false
   @Prop closeEnabled: boolean = true
   @Prop showAuxiliary: boolean = false
@@ -22,29 +28,57 @@ export struct TaskPanel {
   @BuilderParam content: () => void = EmptyTaskPanelSlot
   @BuilderParam footer: () => void = EmptyTaskPanelSlot
 
-  build() {
-    Column() {
+  @Builder
+  PanelBody(): void {
       Column() {
         TaskPanelHeader({ title: this.title, idPrefix: this.idPrefix,
           closeEnabled: this.closeEnabled, showAuxiliary: this.showAuxiliary,
           auxiliaryEnabled: this.auxiliaryEnabled, auxiliaryIcon: this.auxiliaryIcon,
           auxiliaryLabel: this.auxiliaryLabel, onClose: this.onClose, onAuxiliary: this.onAuxiliary })
         Column() { this.content() }
-          .width('100%').layoutWeight(this.fillHeight ? 1 : 0)
-          .padding({ left: TaskPanelStyle.inset, right: TaskPanelStyle.inset })
+          .width('100%').layoutWeight(this.floating || this.fillHeight ? 1 : 0)
+          .padding({ left: this.floating ? 0 : TaskPanelStyle.inset,
+            right: this.floating ? 0 : TaskPanelStyle.inset })
           .alignItems(HorizontalAlign.Start)
         if (this.hasFooter) { this.footer() }
       }
-      .width('100%').layoutWeight(this.fillHeight ? 1 : 0)
+      .width('100%').layoutWeight(!this.floating && this.fillHeight ? 1 : 0)
+      .height(this.floating ? Math.max(TaskPanelStyle.minimumBodyHeight,
+        TaskPanelStyle.height(this.viewportHeight, this.safeTop, this.safeBottom, this.compact)) : undefined)
       .backgroundColor($r('app.color.task_panel_background'))
-      .borderRadius({ topLeft: TaskPanelStyle.corner, topRight: TaskPanelStyle.corner })
+      .borderRadius(this.floating ? 0 : { topLeft: TaskPanelStyle.corner, topRight: TaskPanelStyle.corner })
       .clip(true)
       .id(this.idPrefix + '-panel')
+  }
+
+  build() {
+    if (this.floating) {
+      Stack() {
+        Button() {}.type(ButtonType.Normal).width('100%').height('100%')
+          .padding(0).borderRadius(0).backgroundColor('#59000000').stateEffect(false)
+          .hitTestBehavior(HitTestMode.Block)
+          .onClick(() => { if (this.closeEnabled) { this.onClose() } })
+          .id(this.idPrefix + '-backdrop')
+        if (!this.closing) {
+          Scroll() { this.PanelBody() }
+            .width(TaskPanelStyle.width(this.viewportWidth, 0.9, this.compact))
+            .height(TaskPanelStyle.height(this.viewportHeight, this.safeTop, this.safeBottom, this.compact))
+            .offset({ y: (this.safeTop - this.safeBottom) / 2 })
+            .scrollBar(BarState.Off)
+            .backgroundColor($r('app.color.task_panel_background'))
+            .borderRadius(TaskPanelStyle.corner).clip(true)
+            // Empty card space belongs to the card, never to its backdrop.
+            .hitTestBehavior(HitTestMode.Default)
+            .id(this.idPrefix + '-card').transition(TaskPanelStyle.transition())
+        }
+      }.width('100%').height('100%').hitTestBehavior(HitTestMode.Default)
+    } else {
+      Column() { this.PanelBody() }
+        .width('100%').height(this.fillHeight ? '100%' : undefined)
+        .padding({ top: this.fillHeight ? this.safeTop + HeaderStyle.topPadding : 0 })
+        .backgroundColor(Color.Transparent)
+        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
     }
-    .width('100%').height(this.fillHeight ? '100%' : undefined)
-    .padding({ top: this.fillHeight ? this.safeTop + HeaderStyle.topPadding : 0 })
-    .backgroundColor(Color.Transparent)
-    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 }
 
@@ -100,8 +134,6 @@ export struct TaskPanelSection {
     Column() { this.content() }
       .width('100%').height(this.fillHeight ? '100%' : undefined)
       .padding(this.paddingSize).alignItems(HorizontalAlign.Start)
-      .backgroundColor($r('app.color.task_panel_content_background'))
-      .borderRadius(TaskPanelStyle.sectionCorner).clip(true)
   }
 }
 

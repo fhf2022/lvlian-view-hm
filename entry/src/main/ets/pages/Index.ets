@@ -25,13 +25,15 @@ import { GlassMaterial } from '../ui/GlassMaterial'
 import { GlassBarHost } from '../components/GlassBarHost'
 import { GlassMenuSurface } from '../components/GlassMenuSurface'
 import { GlassMenuRow } from '../components/GlassMenuRow'
+import { ContentDivider } from '../components/ContentDivider'
+import { FileListRow } from '../components/FileListRow'
 import { EntryDetailsContent } from '../components/EntryDetailsContent'
 import { AlertDialog as SystemAlertDialog, CustomContentDialog, ButtonOptions } from '@ohos.arkui.advanced.Dialog'
 import { FileRowStyle } from '../ui/FileRowStyle'
 import { FileGridLayout } from '../ui/FileGridLayout'
 import { FileGridCell, FileGridCellEvents } from '../components/FileGridCell'
 import { TaskPanel, TaskPanelFooter, TaskPanelSection } from '../components/TaskPanel'
-import { TaskPanelStyle } from '../ui/TaskPanelStyle'
+import { CreateFolderDialog } from '../components/CreateFolderDialog'
 import { DirectoryHeaderState } from '../ui/DirectoryHeaderState'
 import { AlbumUploadManager } from '../upload/AlbumUploadManager'
 import { AlbumUploadJob, LocalImageAlbum } from '../upload/AlbumUploadModel'
@@ -47,12 +49,14 @@ import { audio, AVVolumePanel } from '@kit.AudioKit'
 import { AVCastPicker, AVCastPickerState, avSession } from '@kit.AVSessionKit'
 import { visionImageAnalyzer } from '@kit.VisionKit'
 import { hilog, hiTraceMeter } from '@kit.PerformanceAnalysisKit'
-import { systemDateTime } from '@kit.BasicServicesKit'
+import { deviceInfo, systemDateTime } from '@kit.BasicServicesKit'
 import { DownloadDescriptor, DownloadTaskRecord, FileEntry } from '../model/FileEntry'
 import { FileSelectionModel, FileSelectionState } from '../model/FileSelectionModel'
 import { DragSelectionScrollPolicy } from '../model/DragSelectionScrollPolicy'
 import { ContextMenuPreviewLayout, ContextPreviewRect } from '../model/ContextMenuPreviewLayout'
 import { CacheManager } from '../download/CacheManager'
+import { FolderSharePreparer, FolderSharePage, FolderShareSource, ShareFileMaterializer } from '../share/FolderSharePreparer'
+import { util } from '@kit.ArkTS'
 import { DownloadQueueManager } from '../download/DownloadQueueManager'
 import { UserFileManager } from '../download/UserFileManager'
 import { AudioPlaybackManager } from '../media/AudioPlaybackManager'
@@ -846,10 +850,12 @@ interface GestureTransferCacheResult {
   entries: FileEntry[]
   localPaths: Record<string, string>
   failedCount: number
+  failureMessage?: string
 }
 
 interface GestureTransferPreparedData extends GestureTransferCacheResult {
   skippedCount: number
+  sharedUris: Record<string, string>
 }
 
 class ImageDisplayState {
@@ -891,6 +897,8 @@ class RowHitArea {
 @Entry
 @Component
 struct Index {
+  // Device type is constant: query once, never in a cell builder or resize callback.
+  private readonly isTvDevice: boolean = deviceInfo.deviceType === deviceInfo.DeviceTypes.TYPE_TV
   @StorageProp('continuationPending') @Watch('onContinuationNoticeChanged') continuationPending: boolean = false
   @StorageProp('continuationWaitingForAccount') @Watch('onContinuationNoticeChanged')
   continuationWaitingForAccount: boolean = false
@@ -1258,8 +1266,6 @@ struct Index {
   @State @Watch('onContinuationSceneChanged') showAlbumUpload: boolean = false
   @State albumUploadStarting: boolean = false
   @State albumUploadSelection: LocalImageAlbum = new LocalImageAlbum()
-  private albumConfirmationPending: boolean = false
-  private albumReselectPending: boolean = false
   @State @Watch('onContinuationSceneChanged') showAlbumDetails: boolean = false
   private albumUploadActionsOpen: boolean = false
   @State albumDetailsId: string = ''
@@ -1450,8 +1456,7 @@ struct Index {
   private fileListPersistedDisplayState: ImageDisplayState = new ImageDisplayState()
   private fileListRotationReady: boolean = false
   private fileListRotationPreparation: Promise<void> | null = null
-  private imageAnalyzerController: visionImageAnalyzer.VisionImageAnalyzerController =
-    new visionImageAnalyzer.VisionImageAnalyzerController()
+  private imageAnalyzerController: visionImageAnalyzer.VisionImageAnalyzerController | null = null
   // Keep the already rendered parent pages so system/back navigation does not
   // need to round-trip to the NAS again.
   private navigationEntryStack: FileEntry[][] = []
@@ -1461,6 +1466,7 @@ struct Index {
   private navigationPageHasMoreStack: boolean[] = []
   private destinationDataSource: FileEntryDataSource = new FileEntryDataSource()
   private destinationRootPath: string = ''
+  private destinationSourceFolders: Set<string> = new Set<string>()
   private destinationLoadToken: number = 0
   private destinationPickerCloseToken: number = 0
   private pendingContextAction: (() => void) | null = null
@@ -1830,6 +1836,7 @@ struct Index {
   private gestureShareRegistered: boolean = false
   private gestureSharePageVisible: boolean = true
   private gestureSharePreparing: boolean = false
+  private folderSharePreparer: FolderSharePreparer = new FolderSharePreparer()
   private gestureShareCallback = (target: harmonyShare.SharableTarget): void => {
     this.handleGestureShare(target)
   }
@@ -2004,9 +2011,9 @@ struct Index {
     this.showDestinationPicker = false; this.destinationFolderDialog = false
     this.destinationPickerClosing = false; this.destinationLoading = false
     this.destinationDataSource.replace([])
+    this.destinationSourceFolders.clear()
     this.showRenameDialog = false; this.showCreateFolderDialog = false
     this.showAlbumPicker = false; this.showAlbumUpload = false; this.showAlbumDetails = false
-    this.albumConfirmationPending = false; this.albumReselectPending = false
     this.cancelDropImport()
     this.importExpanded = false; this.importSelecting = false
     this.releaseViewerForReplacement()
@@ -2524,8 +2531,15 @@ struct Index {
   }
 
   private configureImageAnalyzer(): void {
+    if (!canIUse('SystemCapability.AI.VisionImageAnalyzer')) {
+      this.imageAnalyzerTypes = []
+      this.imageAnalyzerSupported = false
+      return
+    }
     try {
-      const supportTypes = this.imageAnalyzerController.getImageAnalyzerSupportTypes()
+      const controller = this.imageAnalyzerController ?? new visionImageAnalyzer.VisionImageAnalyzerController()
+      this.imageAnalyzerController = controller
+      const supportTypes = controller.getImageAnalyzerSupportTypes()
       const enabledTypes: ImageAnalyzerType[] = []
       for (const type of supportTypes) {
         if ((type === ImageAnalyzerType.TEXT ||
@@ -2542,13 +2556,13 @@ struct Index {
       if (this.imageAnalyzerSupported && !this.imageAnalyzerListenerBound) {
         this.imageAnalyzerListenerBound = true
         try {
-          this.imageAnalyzerController.on('aiButtonStatusChange',
+          controller.on('aiButtonStatusChange',
             (status: visionImageAnalyzer.AIButtonStatus): void => {
               this.imageAnalyzerActive =
                 status === visionImageAnalyzer.AIButtonStatus.SELECTED
               console.info('[UgreenImageAnalyzer] aiButtonStatus=' + status.toString())
             })
-          this.imageAnalyzerController.on('imageAnalyzerVisibilityChange',
+          controller.on('imageAnalyzerVisibilityChange',
             (visibility: visionImageAnalyzer.ImageAnalyzerVisibility): void => {
               if (visibility === visionImageAnalyzer.ImageAnalyzerVisibility.HIDDEN) {
                 this.imageAnalyzerActive = false
@@ -2568,18 +2582,20 @@ struct Index {
   }
 
   private releaseImageAnalyzer(): void {
+    const controller = this.imageAnalyzerController
+    if (controller === null) { return }
     try {
       if (this.imageAnalyzerListenerBound) {
         this.imageAnalyzerListenerBound = false
         this.imageAnalyzerActive = false
         try {
-          this.imageAnalyzerController.off('aiButtonStatusChange')
-          this.imageAnalyzerController.off('imageAnalyzerVisibilityChange')
+          controller.off('aiButtonStatusChange')
+          controller.off('imageAnalyzerVisibilityChange')
         } catch (error) {
           console.warn('[UgreenImageAnalyzer] unbind failed: ' + JSON.stringify(error))
         }
       }
-      this.imageAnalyzerController.setImageAnalyzerVisibility(
+      controller.setImageAnalyzerVisibility(
         visionImageAnalyzer.ImageAnalyzerVisibility.HIDDEN)
     } catch (error) {
       console.warn('[UgreenImageAnalyzer] hide failed: ' + JSON.stringify(error))
@@ -2767,7 +2783,7 @@ struct Index {
    * 于是"没有内容的界面"上截屏手势也被吃掉、还会弹"无可分享内容"。
    */
   private hasGestureShareContent(): boolean {
-    return this.gestureShareCandidates().some((entry: FileEntry): boolean => !entry.isDirectory)
+    return this.gestureShareCandidates().length > 0
   }
 
   private onGestureShareStateChanged(): void {
@@ -2800,13 +2816,13 @@ struct Index {
     }
   }
 
-  private async filterGestureTransferEntries(entries: FileEntry[]): Promise<GestureTransferSelection> {
+  private async filterGestureTransferEntries(entries: FileEntry[], allowMetered: boolean = false): Promise<GestureTransferSelection> {
     await this.ensureNetworkState()
     await this.ensureCacheState()
     const allowed: FileEntry[] = []
     let skippedCount = 0
     for (const entry of entries) {
-      // The gesture API transfers records, not remote directory trees.
+      // Remote trees are materialized separately; this worker only receives files.
       if (entry.isDirectory) {
         skippedCount += 1
         continue
@@ -2833,8 +2849,8 @@ struct Index {
       // Unknown and cellular networks are controlled by the existing settings:
       // original images use the image switch, all other files use the download
       // continuation switch. Cached files above remain available offline.
-      const canDownload = this.isImage(entry)
-        ? this.meteredAutoOriginal : this.meteredDownloadContinue
+      const canDownload = allowMetered || (this.isImage(entry)
+        ? this.meteredAutoOriginal : this.meteredDownloadContinue)
       if (canDownload) {
         allowed.push(entry)
       } else {
@@ -2845,33 +2861,40 @@ struct Index {
   }
 
   private async cacheGestureEntries(entries: FileEntry[],
-    pinnedPaths: string[], valid: () => boolean = (): boolean => true): Promise<GestureTransferCacheResult> {
+    pinnedPaths: string[], valid: () => boolean = (): boolean => true,
+    materialize?: ShareFileMaterializer): Promise<GestureTransferCacheResult> {
     const localPaths: Record<string, string> = {}
     let failedCount = 0
     let nextIndex = 0
+    let stopped = false
+    let failureMessage = ''
+    const current = (): boolean => valid() && !stopped
     const worker = async (): Promise<void> => {
       while (true) {
         const index = nextIndex
         nextIndex += 1
-        if (index >= entries.length || !valid()) {
+        if (index >= entries.length || !current()) {
           return
         }
         const entry = entries[index]
         try {
-          const localPath = await this.ensureCachedFile(entry, undefined, valid)
-          if (valid() && CacheManager.exists(localPath)) {
+          const localPath = await this.ensureCachedFile(entry, undefined, current)
+          if (current() && CacheManager.exists(localPath)) {
             // A later download in the same selection must not evict an
             // earlier record before HarmonyShare has consumed its URI.
             if (pinnedPaths.indexOf(localPath) < 0) {
               StorageBudget.pin(localPath)
               pinnedPaths.push(localPath)
             }
-            localPaths[entry.path] = localPath
+            localPaths[entry.path] = materialize === undefined ? localPath : await materialize(entry, localPath)
           } else {
             failedCount += 1
+            if (materialize !== undefined) { stopped = true }
           }
         } catch (error) {
           failedCount += 1
+          if (failureMessage.length === 0) { failureMessage = (error as Error)?.message ?? '' }
+          if (materialize !== undefined) { stopped = true }
           console.warn('[UgreenShare] cache file failed: ' + entry.name + ' ' + JSON.stringify(error))
         }
       }
@@ -2885,19 +2908,79 @@ struct Index {
     const cachedEntries = entries.filter((entry: FileEntry): boolean => {
       return typeof localPaths[entry.path] === 'string' && CacheManager.exists(localPaths[entry.path])
     })
-    return { entries: cachedEntries, localPaths: localPaths, failedCount: failedCount }
+    return { entries: cachedEntries, localPaths: localPaths, failedCount: failedCount, failureMessage: failureMessage }
   }
 
   private async prepareGestureShare(candidates: FileEntry[],
     pinnedPaths: string[]): Promise<GestureTransferPreparedData> {
-    const selection = await this.filterGestureTransferEntries(candidates)
-    // SharedData supports at most 500 records.
-    const transferEntries = selection.entries.slice(0, 500)
-    this.pinTransferCacheTargets(transferEntries, pinnedPaths)
-    const cached = await this.cacheGestureEntries(transferEntries, pinnedPaths)
-    return { entries: cached.entries, localPaths: cached.localPaths,
-      failedCount: cached.failedCount,
-      skippedCount: selection.skippedCount + Math.max(0, selection.entries.length - 500) }
+    const scope = this.repository.sessionIdentity()
+    const valid = (): boolean => scope === this.repository.sessionIdentity() &&
+      this.gestureSharePageVisible && !this.abilityInBackground &&
+      this.gestureShareCandidates().length === candidates.length && this.gestureShareCandidates().every(
+        (entry: FileEntry, index: number): boolean => entry.path === candidates[index].path)
+    return await this.prepareShareEntries(candidates, pinnedPaths, valid)
+  }
+
+  private async prepareShareEntries(candidates: FileEntry[], pins: string[], valid: () => boolean,
+    allowMetered: boolean = false): Promise<GestureTransferPreparedData> {
+    await this.ensureNetworkState()
+    await this.ensureCacheState()
+    const selected = candidates.slice(0, 500)
+    if (selected.some((entry: FileEntry): boolean => entry.isDirectory)) {
+      await this.folderSharePreparer.initialize(getContext(this) as Context)
+    }
+    const localPaths: Record<string, string> = {}
+    const sharedUris: Record<string, string> = {}
+    const source: FolderShareSource = {
+      valid: valid,
+      list: async (entry: FileEntry, page: number): Promise<FolderSharePage> => {
+        if (this.networkClass === 'offline' || this.offlineCacheMode || !NasConnection.shared().canRequest()) {
+          throw new Error('请恢复 NAS 连接后准备文件夹')
+        }
+        return await this.repository.listPage(entry.path, entry.rootType, page, true)
+      },
+      cache: async (entries: FileEntry[], owned: string[], current: () => boolean,
+        materialize: ShareFileMaterializer): Promise<Record<string, string>> => {
+        const allowed = await this.filterGestureTransferEntries(entries, allowMetered)
+        if (allowed.skippedCount > 0 || !current()) { throw new Error('文件夹内有文件无法读取，请检查网络与流量设置') }
+        this.pinTransferCacheTargets(entries, owned)
+        const cached = await this.cacheGestureEntries(entries, owned, current, materialize)
+        if (cached.failedCount > 0) { throw new Error(cached.failureMessage || '文件夹内有文件未准备完成') }
+        return cached.localPaths
+      }
+    }
+    if (selected.some((entry: FileEntry): boolean => entry.isDirectory)) {
+      // HarmonyShare requires a consistent source location for a mixed batch.
+      const results = await this.folderSharePreparer.prepareSelection(selected, this.repository.cacheScopeHash(), source, pins)
+      if (!valid()) { throw new Error('账号或当前页面已变化，已停止准备分享') }
+      for (const entry of selected) {
+        localPaths[entry.path] = results[entry.path].path
+        sharedUris[entry.path] = results[entry.path].uri
+      }
+      return { entries: selected, localPaths: localPaths, sharedUris: sharedUris,
+        failedCount: 0, skippedCount: Math.max(0, candidates.length - 500) }
+    }
+    const selection = await this.filterGestureTransferEntries(selected.filter(
+      (entry: FileEntry): boolean => !entry.isDirectory), allowMetered)
+    this.pinTransferCacheTargets(selection.entries, pins)
+    const cached = await this.cacheGestureEntries(selection.entries, pins, valid)
+    if (!valid()) { throw new Error('账号或当前页面已变化，已停止准备分享') }
+    for (const path of Object.keys(cached.localPaths)) { localPaths[path] = cached.localPaths[path] }
+    return { entries: selected.filter((entry: FileEntry): boolean => !!localPaths[entry.path]),
+      localPaths: localPaths, sharedUris: sharedUris, failedCount: cached.failedCount,
+      skippedCount: selection.skippedCount + Math.max(0, candidates.length - 500) }
+  }
+
+  private preparedShareData(prepared: GestureTransferPreparedData): systemShare.SharedData {
+    const records = prepared.entries.map((entry: FileEntry): systemShare.SharedRecord =>
+      this.shareRecord(entry, prepared.localPaths[entry.path], prepared.sharedUris[entry.path] ?? ''))
+    if (records.length === 0) { throw new Error('没有可分享的文件') }
+    if (new util.TextEncoder().encodeInto(JSON.stringify(records)).byteLength > 180 * 1024) {
+      throw new Error('分享项目名称较长，请减少本次选择数量')
+    }
+    const data = new systemShare.SharedData(records[0])
+    for (let index = 1; index < records.length; index++) { data.addRecord(records[index]) }
+    return data
   }
 
   private pinTransferCacheTargets(entries: FileEntry[], pinnedPaths: string[]): void {
@@ -2945,7 +3028,7 @@ struct Index {
       return
     }
     if (!this.gestureSharePageVisible || this.abilityInBackground ||
-      !candidates.some((entry: FileEntry): boolean => !entry.isDirectory)) {
+      candidates.length === 0) {
       await this.rejectGestureShare(target, harmonyShare.SharableErrorCode.NO_CONTENT_ERROR)
       return
     }
@@ -3001,17 +3084,12 @@ struct Index {
       }
 
       stage = 'submit'
-      const sharedData = new systemShare.SharedData(this.shareRecord(
-        cached.entries[0], cached.localPaths[cached.entries[0].path]))
-      for (let index = 1; index < cached.entries.length; index += 1) {
-        const entry = cached.entries[index]
-        sharedData.addRecord(this.shareRecord(entry, cached.localPaths[entry.path]))
-      }
+      const sharedData = this.preparedShareData(cached)
       console.info('[UgreenShare] submit count=' + cached.entries.length.toString() +
         ' elapsedMs=' + (this.getMonotonicNow() - startedAt).toString())
       shareRequested = true
       await target.share(sharedData)
-      console.info('[UgreenShare] share completed elapsedMs=' +
+      console.info('[UgreenShare] share handed over elapsedMs=' +
         (this.getMonotonicNow() - startedAt).toString())
       if ((cached.skippedCount > 0 || cached.failedCount > 0) && this.canShowGestureShareFeedback(candidates)) {
         this.showImmersiveToast('已提交 ' + cached.entries.length.toString() + ' 个文件，' +
@@ -3684,7 +3762,7 @@ struct Index {
       ContinuationManager.shared().cancel(); return true
     }
     if (!this.startupAuthorized) { this.exitBeforeAuthorization(); return true }
-    if (this.showAlbumPicker) { this.albumConfirmationPending = false; this.showAlbumPicker = false; return true }
+    if (this.showAlbumPicker) { this.showAlbumPicker = false; return true }
     if (this.showAlbumUpload) {
       if (!this.albumUploadStarting) { this.showAlbumUpload = false }
       return true
@@ -4595,6 +4673,24 @@ struct Index {
   }
 
   @Builder
+  FileListRowTrailing(entry: FileEntry): void {
+    this.VideoTransferIndicator(entry)
+    if (this.selectionMode) { this.SelectionCheckbox(entry) }
+    else if (entry.isDirectory) { this.FileRowChevron() }
+  }
+
+  @Builder
+  DirectoryRowTrailing(entry: FileEntry): void {
+    if (entry.isDirectory) { this.FileRowChevron() }
+  }
+
+  @Builder
+  SearchRowTrailing(entry: FileEntry): void {
+    this.VideoTransferIndicator(entry)
+    if (entry.isDirectory) { this.FileRowChevron() }
+  }
+
+  @Builder
   SearchScopeButton(title: string, scope: RemoteSearchScope): void {
     Button(title)
       .height(36)
@@ -4729,33 +4825,10 @@ struct Index {
 
           ForEach(this.searchResults, (entry: FileEntry, index: number) => {
             ListItem() {
-              Row() {
-                this.FileLeadingVisual(entry, index, 'search')
-                Column() {
-                  Text(entry.name)
-                    .fontSize(16)
-                    .fontColor($r('app.color.text_primary'))
-                    .maxLines(1)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  Text(this.searchResultLocation(entry))
-                    .fontSize(12)
-                    .fontColor($r('app.color.text_muted'))
-                    .margin({ top: 4 })
-                    .maxLines(1)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
-                }
-                .alignItems(HorizontalAlign.Start)
-                .layoutWeight(1)
-                .margin({ left: 10 })
-                this.VideoTransferIndicator(entry)
-                if (entry.isDirectory) {
-                  SymbolGlyph($r('sys.symbol.chevron_forward'))
-                    .fontSize(18)
-                    .fontColor([$r('sys.color.icon_secondary')])
-                }
-              }
-              .width('100%')
-              .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+              FileListRow({ title: entry.name, info: this.searchResultLocation(entry),
+                startInset: 16, endInset: 16, leadingGap: 10,
+                leading: (): void => { this.FileLeadingVisual(entry, index, 'search') },
+                trailing: (): void => { this.SearchRowTrailing(entry) } })
             }
             .onClick(() => this.openSearchResult(entry))
           }, (entry: FileEntry) => entry.path)
@@ -4833,46 +4906,10 @@ struct Index {
 
         LazyForEach(this.fileEntryDataSource, (entry: FileEntry, index: number) => {
           ListItem() {
-            Column() {
-              Row() {
-                Row() {
-                  this.FileLeadingVisual(entry, index, 'list')
-                }
-                .margin({ right: FileRowStyle.leadingGap })
-                Column() {
-                  Text(entry.name)
-                    .fontSize(FileRowStyle.titleSize)
-                    .fontColor($r('app.color.text_primary'))
-                    .maxLines(1)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  if (this.entryInfo(entry).length > 0) {
-                    Text(this.entryInfo(entry))
-                      .fontSize(FileRowStyle.infoSize)
-                      .fontColor($r('app.color.text_muted'))
-                      .margin({ top: FileRowStyle.textGap })
-                  }
-                }
-                .alignItems(HorizontalAlign.Start)
-                .layoutWeight(1)
-                this.VideoTransferIndicator(entry)
-                if (this.selectionMode) {
-                  this.SelectionCheckbox(entry)
-                } else if (entry.isDirectory) {
-                  this.FileRowChevron()
-                }
-              }
-              .width('100%')
-              .alignItems(VerticalAlign.Center)
-              .padding({ left: FileRowStyle.horizontalPadding, right: FileRowStyle.horizontalPadding,
-                top: FileRowStyle.verticalPadding, bottom: FileRowStyle.verticalPadding })
-
-              if (index < this.entries.length - 1) {
-                Divider()
-                  .width('calc(100% - 16vp)')
-                  .strokeWidth(0.5)
-                  .color($r('app.color.divider'))
-              }
-            }
+            FileListRow({ title: entry.name, info: this.entryInfo(entry),
+              showDivider: index < this.entries.length - 1,
+              leading: (): void => { this.FileLeadingVisual(entry, index, 'list') },
+              trailing: (): void => { this.FileListRowTrailing(entry) } })
             .width('100%')
             .id('file-row:' + entry.path)
             .onAreaChange((_, area) => this.recordRowHitArea(entry, index, 'list', area))
@@ -5156,31 +5193,14 @@ struct Index {
 
   @Builder
   AlbumUploadOverlay(): void {
-    Column() {}.width(0).height(0)
-      .bindContentCover($$this.showAlbumPicker, this.AlbumUploadPickerContent, {
-        modalTransition: ModalTransition.DEFAULT, enableSafeArea: false,
-        backgroundColor: Color.Transparent,
-        onDisappear: () => {
-          // Open the next modal only after the native picker has released its input layer.
-          if (!this.albumConfirmationPending) { return }
-          this.albumConfirmationPending = false
-          if (this.albumUploadContextValid()) { this.showAlbumUpload = true }
-        }
-      })
-    Column() {}.width(0).height(0)
-      .bindSheet($$this.showAlbumUpload, this.AlbumUploadOverlayContent, {
-        height: SheetSize.FIT_CONTENT, dragBar: false, showClose: false,
-        radius: { topLeft: TaskPanelStyle.corner, topRight: TaskPanelStyle.corner },
-        backgroundColor: $r('app.color.task_panel_background'),
-        onWillDismiss: (action: DismissSheetAction): void => {
-          if (!this.albumUploadStarting) { action.dismiss(); this.showAlbumUpload = false }
-        },
-        onDisappear: () => {
-          if (!this.albumReselectPending) { return }
-          this.albumReselectPending = false
-          if (this.albumUploadContextValid()) { this.showAlbumPicker = true }
-        }
-      })
+    // Both steps stay in the resizable page, using the same card geometry.
+    // There is no native modal input layer to wait for between these steps.
+    if (this.showAlbumPicker || this.showAlbumUpload) {
+      Stack() {
+        if (this.showAlbumPicker) { this.AlbumUploadPickerContent() }
+        else { this.AlbumUploadOverlayContent() }
+      }.width('100%').height('100%').zIndex(25)
+    }
     Column() {}.width(0).height(0)
       .bindSheet($$this.showAlbumDetails, this.AlbumUploadDetailsContent, {
         height: '85%', dragBar: true, showClose: true,
@@ -5190,11 +5210,16 @@ struct Index {
 
   @Builder
   AlbumUploadPickerContent(): void {
-    AlbumUploadPicker({ visible: $showAlbumPicker, safeTop: this.topSafeInset(), safeBottom: this.bottomSafeInset(),
+    AlbumUploadPicker({ visible: $showAlbumPicker, viewportWidth: this.pageWidthVp, viewportHeight: this.pageHeightVp,
+      safeTop: this.topSafeInset(), safeBottom: this.bottomSafeInset(),
+      onNotice: (message: string): void => {
+        if (this.showAlbumPicker && this.albumUploadContextValid()) { this.showImmersiveToast(message) }
+      },
       onSelected: (album: LocalImageAlbum): void => {
+        if (!this.showAlbumPicker || !this.albumUploadContextValid()) { return }
         this.albumUploadSelection = album
-        this.albumConfirmationPending = this.albumUploadContextValid()
         this.showAlbumPicker = false
+        this.showAlbumUpload = true
       } })
   }
 
@@ -5207,11 +5232,14 @@ struct Index {
   AlbumUploadOverlayContent(): void {
     AlbumUploadSheet({ visible: $showAlbumUpload, album: this.albumUploadSelection,
       destination: this.albumUploadDestination, starting: this.albumUploadStarting,
-      contentMaxHeight: Math.max(80, this.pageHeightVp * 0.85 - this.topSafeInset() - this.bottomSafeInset() -
-        TaskPanelStyle.compactChromeHeight),
+      viewportWidth: this.pageWidthVp, viewportHeight: this.pageHeightVp,
+      safeTop: this.topSafeInset(), safeBottom: this.bottomSafeInset(),
+      onNotice: (message: string): void => {
+        if (this.showAlbumUpload && this.albumUploadContextValid()) { this.showImmersiveToast(message) }
+      },
       onReselect: (): void => {
-        if (this.albumUploadStarting) { return }
-        this.albumReselectPending = true; this.showAlbumUpload = false
+        if (this.albumUploadStarting || !this.albumUploadContextValid()) { return }
+        this.showAlbumUpload = false; this.showAlbumPicker = true
       },
       onStart: async (album: LocalImageAlbum): Promise<void> => {
         if (this.albumUploadStarting || !this.albumUploadContextValid()) {
@@ -5387,8 +5415,6 @@ struct Index {
       this.albumUploadDestination = destination
       this.albumUploadRootType = rootType
       this.albumUploadScope = scope
-      this.albumConfirmationPending = false
-      this.albumReselectPending = false
       this.showAlbumPicker = true
       return
     }
@@ -5475,7 +5501,7 @@ struct Index {
   }
 
   private fileGridColumnCount(): number {
-    return FileGridLayout.columns(this.pageWidthVp, this.pageHeightVp)
+    return FileGridLayout.columns(this.pageWidthVp, this.pageHeightVp, this.isTvDevice)
   }
 
   /** 瀑布流列数：目标列宽 240vp（区间 240–360vp）。列宽直接决定图片高度，所以比网格大一档。 */
@@ -5911,43 +5937,10 @@ struct Index {
 
         LazyForEach(this.transitionFileEntryDataSource, (entry: FileEntry, index: number) => {
           ListItem() {
-            Column() {
-              Row() {
-                Row() {
-                  this.FileLeadingVisual(entry)
-                }
-                .margin({ right: FileRowStyle.leadingGap })
-                Column() {
-                  Text(entry.name)
-                    .fontSize(FileRowStyle.titleSize)
-                    .fontColor($r('app.color.text_primary'))
-                    .maxLines(1)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  if (this.entryInfo(entry).length > 0) {
-                    Text(this.entryInfo(entry))
-                      .fontSize(FileRowStyle.infoSize)
-                      .fontColor($r('app.color.text_muted'))
-                      .margin({ top: FileRowStyle.textGap })
-                  }
-                }
-                .alignItems(HorizontalAlign.Start)
-                .layoutWeight(1)
-                if (entry.isDirectory) {
-                  this.FileRowChevron()
-                }
-              }
-              .width('100%')
-              .alignItems(VerticalAlign.Center)
-              .padding({ left: FileRowStyle.horizontalPadding, right: FileRowStyle.horizontalPadding,
-                top: FileRowStyle.verticalPadding, bottom: FileRowStyle.verticalPadding })
-
-              if (index < snapshotEntries.length - 1) {
-                Divider()
-                  .width('calc(100% - 16vp)')
-                  .strokeWidth(0.5)
-                  .color($r('app.color.divider'))
-              }
-            }
+            FileListRow({ title: entry.name, info: this.entryInfo(entry),
+              showDivider: index < snapshotEntries.length - 1,
+              leading: (): void => { this.FileLeadingVisual(entry) },
+              trailing: (): void => { this.DirectoryRowTrailing(entry) } })
             .width('100%')
           }
         }, (entry: FileEntry) => entry.path)
@@ -6400,11 +6393,7 @@ struct Index {
 
   @Builder
   SettingsGroupDivider(): void {
-    Divider()
-      .width('calc(100% - 84vp)')
-      .strokeWidth(0.5)
-      .color($r('app.color.divider'))
-      .margin({ left: 68 })
+    ContentDivider({ startInset: 68, endInset: 16 })
   }
 
   // ── Recycle bin page ─────────────────────────────────────────────────────
@@ -6465,44 +6454,10 @@ struct Index {
    */
   @Builder
   RecycleRow(entry: FileEntry, index: number): void {
-    Column() {
-      Row() {
-        Row() {
-          this.FileLeadingVisual(entry)
-        }
-        .margin({ right: 8 })
-
-        Column() {
-          Text(entry.name)
-            .fontSize(16)
-            .fontColor($r('app.color.text_primary'))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-          if (this.recycleEntryInfo(entry).length > 0) {
-            Text(this.recycleEntryInfo(entry))
-              .fontSize(12)
-              .fontColor($r('app.color.text_muted'))
-              .margin({ top: 4 })
-          }
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-
-        if (entry.isDirectory) {
-          this.FileRowChevron()
-        }
-      }
-      .width('100%')
-      .alignItems(VerticalAlign.Center)
-      .padding({ left: 8, right: 8, top: 12, bottom: 12 })
-
-      if (index < this.recycleEntries.length - 1) {
-        Divider()
-          .width('calc(100% - 16vp)')
-          .strokeWidth(0.5)
-          .color($r('app.color.divider'))
-      }
-    }
+    FileListRow({ title: entry.name, info: this.recycleEntryInfo(entry),
+      showDivider: index < this.recycleEntries.length - 1,
+      leading: (): void => { this.FileLeadingVisual(entry) },
+      trailing: (): void => { this.DirectoryRowTrailing(entry) } })
     .width('100%')
     .onClick(() => this.onRecycleEntryClick(entry))
     .priorityGesture(
@@ -7484,28 +7439,6 @@ struct Index {
     return TransitionEffect.asymmetric(appear, disappear)
   }
 
-  /**
-   * Official ArkUI transition for the copy/move destination sheet.
-   * The sheet is a bottom card: it enters from the bottom edge and returns
-   * to that same edge when dismissed. The safe-area layer and the underlying
-   * file-management page stay in place while the card moves above them.
-   */
-  private destinationPickerSurfaceTransition(): TransitionEffect {
-    const appear = TransitionEffect.move(TransitionEdge.BOTTOM)
-      .combine(TransitionEffect.opacity(0))
-      .animation({
-        duration: 340,
-        curve: curves.interpolatingSpring(0, 1, 320, 30)
-      })
-    const disappear = TransitionEffect.move(TransitionEdge.BOTTOM)
-      .combine(TransitionEffect.opacity(0))
-      .animation({
-        duration: 180,
-        curve: Curve.EaseIn
-      })
-    return TransitionEffect.asymmetric(appear, disappear)
-  }
-
   @Builder
   FileSortOption(title: string, key: FileSortKey): void {
     Row() {
@@ -7528,10 +7461,7 @@ struct Index {
     .backgroundColor(Color.Transparent)
     .onClick(() => this.selectFileSort(key))
     if (key !== 'size') {
-      Divider()
-        .width('100%')
-        .strokeWidth(0.5)
-        .color($r('sys.color.comp_divider'))
+      ContentDivider({ startInset: 10, endInset: 8, lineColor: $r('sys.color.comp_divider') })
     }
   }
 
@@ -7955,21 +7885,14 @@ struct Index {
   ActionContextMenuSurface(entry: FileEntry): void {
     Column() {
         Row() {
-          if (entry.isDirectory) {
-            this.ActionQuickButton($r('sys.symbol.doc_text_on_doc_text'), '复制',
-              () => this.beginDestinationPicker('copy', entry))
-            this.ActionQuickButton($r('sys.symbol.move'), '移动',
-              () => this.beginDestinationPicker('move', entry))
-          } else {
-            if (this.actionSupportsShare(entry)) {
-              this.ActionQuickButton($r('sys.symbol.share'), '分享',
-                () => this.shareViewerImage(entry))
-            }
-            this.ActionQuickButton($r('sys.symbol.doc_text_on_doc_text'), '复制',
-              () => this.beginDestinationPicker('copy', entry))
-            this.ActionQuickButton($r('sys.symbol.move'), '移动',
-              () => this.beginDestinationPicker('move', entry))
+          if (this.actionSupportsShare(entry)) {
+            this.ActionQuickButton($r('sys.symbol.share'), '分享',
+              () => this.shareEntry(entry))
           }
+          this.ActionQuickButton($r('sys.symbol.doc_text_on_doc_text'), '复制',
+            () => this.beginDestinationPicker('copy', entry))
+          this.ActionQuickButton($r('sys.symbol.move'), '移动',
+            () => this.beginDestinationPicker('move', entry))
         }
         .width('100%')
         .height(58)
@@ -8064,13 +7987,7 @@ struct Index {
       .height(50)
       .padding({ left: 16, right: 10 })
       if (!last) {
-        // 用 100% 宽 + 左右 margin，别用 calc：菜单这种嵌套结构里
-        // calc(100% - 24vp) 有时量出 0 宽，线就整条不见了。
-        Divider()
-          .width('100%')
-          .strokeWidth(0.5)
-          .color($r('app.color.divider'))
-          .margin({ left: 12, right: 12 })
+        ContentDivider({ startInset: 16, endInset: 10 })
       }
     }
     .width('100%')
@@ -8085,22 +8002,18 @@ struct Index {
 
   @Builder
   DestinationPickerOverlay(): void {
-    Stack({ alignContent: Alignment.TopStart }) {
-      Button() {}.type(ButtonType.Normal).width('100%').height('100%')
-        .padding(0).borderRadius(0).backgroundColor(Color.Transparent).stateEffect(false)
-        .hitTestBehavior(HitTestMode.Block).onClick(() => this.closeDestinationPicker())
-      if (!this.destinationPickerClosing) {
-        TaskPanel({ title: this.destinationOperation === 'upload' ? '选择上传位置' : '选择目标文件夹',
-          idPrefix: 'destination-picker', safeTop: this.topSafeInset(),
-          hasFooter: true, showAuxiliary: true, auxiliaryLabel: '新建文件夹',
-          auxiliaryEnabled: !this.destinationLoading, closeEnabled: !this.destinationOperationRunning,
-          onClose: (): void => { this.closeDestinationPicker() },
-          onAuxiliary: (): void => { this.openDestinationFolderDialog() },
-          content: (): void => { this.DestinationPickerContent() },
-          footer: (): void => { this.DestinationPickerFooter() } })
-          .id('destinationPickerSurface').transition(this.destinationPickerSurfaceTransition())
-      }
-    }.width('100%').height('100%').hitTestBehavior(HitTestMode.Default)
+    TaskPanel({ title: this.destinationOperation === 'upload' ? '选择上传位置' : '选择目标文件夹',
+      idPrefix: 'destination-picker', floating: true, closing: this.destinationPickerClosing,
+      viewportWidth: this.pageWidthVp, viewportHeight: this.pageHeightVp,
+      safeTop: this.topSafeInset(), safeBottom: this.bottomSafeInset(),
+      hasFooter: true, showAuxiliary: true, auxiliaryLabel: '新建文件夹',
+      auxiliaryEnabled: !this.destinationLoading && !this.destinationContainsSource(this.destinationPath),
+      closeEnabled: !this.destinationOperationRunning,
+      onClose: (): void => { this.closeDestinationPicker() },
+      onAuxiliary: (): void => { this.openDestinationFolderDialog() },
+      content: (): void => { this.DestinationPickerContent() },
+      footer: (): void => { this.DestinationPickerFooter() } })
+      .id('destinationPickerSurface')
   }
 
   @Builder
@@ -8113,6 +8026,7 @@ struct Index {
             ListItem() { this.DestinationFolderRow(entry) }
           }, (entry: FileEntry): string => entry.path)
         }.width('100%').height('100%').cachedCount(2).scrollBar(BarState.Auto)
+          .nestedScroll({ scrollForward: NestedScrollMode.SELF_FIRST, scrollBackward: NestedScrollMode.SELF_FIRST })
         if (this.destinationLoading) {
           LoadingProgress().width(24).height(24).color($r('sys.color.comp_background_emphasize'))
         }
@@ -8127,20 +8041,28 @@ struct Index {
         this.destinationItemCount().toString() + ' 项到此处',
       actionId: 'destination-picker-confirm', busy: this.destinationOperationRunning,
       actionEnabled: !this.destinationLoading && !this.destinationPickerClosing &&
-        this.destinationItemCount() > 0 && this.destinationPath.length > 0,
+        this.destinationItemCount() > 0 && this.destinationPath.length > 0 &&
+        !this.destinationContainsSource(this.destinationPath),
       summaryTitle: this.destinationDisplayName(), summaryValue: this.destinationPath,
-      safeBottom: this.bottomSafeInset(), onAction: (): void => { this.confirmDestinationOperation() } })
+      onAction: (): void => { this.confirmDestinationOperation() } })
+  }
+
+  @Builder
+  DestinationRootLeading(): void {
+    SymbolGlyph(this.destinationPath === this.destinationRootPath ? $r('sys.symbol.house') : $r('sys.symbol.arrow_up'))
+      .fontSize(24).fontColor([$r('sys.color.icon_primary')])
+  }
+
+  @Builder
+  DestinationRowTrailing(): void {
+    SymbolGlyph($r('sys.symbol.chevron_forward')).fontSize(18).fontColor([$r('sys.color.icon_secondary')]).width(24)
   }
 
   @Builder
   DestinationCloudRootRow(): void {
-    Row({ space: FileRowStyle.leadingGap }) {
-      SymbolGlyph(this.destinationPath === this.destinationRootPath ? $r('sys.symbol.house') : $r('sys.symbol.arrow_up'))
-        .fontSize(24).width(FileRowStyle.leadingWidth).height(FileRowStyle.leadingHeight)
-      Text(this.destinationPath === this.destinationRootPath ? this.destinationDisplayName() : '上一级')
-        .fontSize(FileRowStyle.titleSize).fontColor($r('sys.color.font_primary')).layoutWeight(1)
-    }.width('100%').padding({ left: FileRowStyle.horizontalPadding, right: FileRowStyle.horizontalPadding,
-      top: FileRowStyle.verticalPadding, bottom: FileRowStyle.verticalPadding })
+    FileListRow({ title: this.destinationPath === this.destinationRootPath ? this.destinationDisplayName() : '上一级',
+      titleColor: $r('sys.color.font_primary'),
+      leading: (): void => { this.DestinationRootLeading() } })
       .id('destination-picker-root').onClick((): void => {
         if (this.destinationPath !== this.destinationRootPath) { this.goDestinationBack() }
       })
@@ -8148,91 +8070,20 @@ struct Index {
 
   @Builder
   DestinationFolderRow(entry: FileEntry): void {
-    Column() {
-      Row({ space: FileRowStyle.leadingGap }) {
-        Stack() { this.FolderIcon(FileRowStyle.iconSize) }.width(FileRowStyle.leadingWidth).height(FileRowStyle.leadingHeight)
-        Column({ space: FileRowStyle.textGap }) {
-          Text(entry.name).fontSize(FileRowStyle.titleSize).fontColor($r('sys.color.font_primary'))
-            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-          Text(this.destinationEntryInfo(entry)).fontSize(FileRowStyle.infoSize).fontColor($r('sys.color.font_secondary'))
-        }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-        SymbolGlyph($r('sys.symbol.chevron_forward')).fontSize(18).fontColor([$r('sys.color.icon_secondary')]).width(24)
-      }.width('100%').padding({ left: FileRowStyle.horizontalPadding, right: FileRowStyle.horizontalPadding,
-        top: FileRowStyle.verticalPadding, bottom: FileRowStyle.verticalPadding })
-        .onClick((): void => { this.loadDestinationEntries(entry.path) })
-      Divider().strokeWidth(0.5).color($r('app.color.divider')).margin({ left: 56, right: FileRowStyle.horizontalPadding })
-    }.width('100%').id('destination-folder:' + entry.path)
+    FileListRow({ title: entry.name, info: this.destinationEntryInfo(entry), showDivider: true,
+      titleColor: $r('sys.color.font_primary'), infoColor: $r('sys.color.font_secondary'),
+      leading: (): void => { this.FolderIcon(FileRowStyle.iconSize) },
+      trailing: (): void => { this.DestinationRowTrailing() } })
+      .id('destination-folder:' + entry.path).onClick((): void => { this.loadDestinationEntries(entry.path) })
   }
 
   @Builder
   DestinationFolderOverlay(): void {
-    Column() {}
-      .width(0)
-      .height(0)
-      .bindSheet($$this.destinationFolderDialog, this.DestinationFolderOverlayContent, {
-        preferType: SheetType.CENTER,
-        height: SheetSize.FIT_CONTENT,
-        width: '84%',
-        dragBar: false,
-        showClose: false,
-        systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
-        onWillDismiss: () => {
-          if (!this.destinationLoading) {
-            this.closeDestinationFolderDialog()
-          }
-        }
-      })
-  }
-
-  @Builder
-  DestinationFolderOverlayContent(): void {
-    Column({ space: 14 }) {
-      Text('新建文件夹')
-        .fontSize(20)
-        .fontWeight(FontWeight.Bold)
-        .fontColor($r('app.color.text_primary'))
-        .width('100%')
-      Column({ space: 2 }) {
-        TextInput({ placeholder: '输入文件夹名称', text: this.destinationFolderText })
-          .height(40)
-          .fontSize(16)
-          .fontColor($r('app.color.text_primary'))
-          .backgroundColor(Color.Transparent)
-          .border({ width: 0, color: Color.Transparent, radius: 0 })
-          .padding({ left: 14, right: 14 })
-          .onChange((value: string) => this.destinationFolderText = value)
-        Divider()
-          .width('100%')
-          .strokeWidth(0.5)
-          .color($r('app.color.divider'))
-          .margin({ left: 14, right: 14 })
-      }
-      Row({ space: 8 }) {
-        Button('取消')
-          .layoutWeight(1)
-          .height(42)
-          .fontSize(15)
-          .fontColor($r('app.color.text_secondary'))
-          .backgroundColor(Color.Transparent)
-          .stateEffect(false)
-          .onClick(() => this.closeDestinationFolderDialog())
-        Button(this.destinationLoading ? '处理中…' : '确定')
-          .layoutWeight(1)
-          .height(42)
-          .fontSize(15)
-          .fontColor('#2E6BFF')
-          .backgroundColor(Color.Transparent)
-          .stateEffect(false)
-          .enabled(!this.destinationLoading)
-          .onClick(() => this.confirmDestinationFolder())
-      }
-      .width('100%')
-    }
-    .width('100%')
-    .padding({ left: 18, right: 18, top: 18, bottom: 12 })
-    .borderRadius(24)
-    .backgroundColor(Color.Transparent)
-    .onClick(() => {})
+    CreateFolderDialog({ visible: $destinationFolderDialog, name: $destinationFolderText,
+      busy: this.destinationLoading, viewportWidth: this.pageWidthVp,
+      material: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
+      onClose: (): void => { this.closeDestinationFolderDialog() },
+      onConfirm: (): void => { this.confirmDestinationFolder() } })
   }
 
   @Builder
@@ -8298,76 +8149,11 @@ struct Index {
 
   @Builder
   CreateFolderOverlay(): void {
-    Column() {}
-      .width(0)
-      .height(0)
-      .bindSheet($$this.showCreateFolderDialog, this.CreateFolderOverlayContent, {
-        preferType: SheetType.CENTER,
-        height: SheetSize.FIT_CONTENT,
-        width: '84%',
-        dragBar: false,
-        showClose: false,
-        systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
-        onWillDismiss: () => {
-          if (!this.isBusy) {
-            this.closeCreateFolder()
-          }
-        }
-      })
-  }
-
-  @Builder
-  CreateFolderOverlayContent(): void {
-    Column({ space: 14 }) {
-      Text('新建文件夹')
-        .fontSize(20)
-        .fontWeight(FontWeight.Bold)
-        .fontColor($r('app.color.text_primary'))
-        .width('100%')
-      Column({ space: 2 }) {
-        TextInput({ placeholder: '输入文件夹名称', text: this.newFolderText })
-          .height(40)
-          .fontSize(16)
-          .fontColor($r('app.color.text_primary'))
-          // Keep the input as the transparent text area above the divider.
-          // An explicit background/border becomes an unintended rectangular
-          // frame in dark mode and does not match the reference dialog.
-          .backgroundColor(Color.Transparent)
-          .border({ width: 0, color: Color.Transparent, radius: 0 })
-          .padding({ left: 14, right: 14 })
-          .onChange((value: string) => this.newFolderText = value)
-        Divider()
-          .width('100%')
-          .strokeWidth(0.5)
-          .color($r('app.color.divider'))
-          .margin({ left: 14, right: 14 })
-      }
-      Row({ space: 8 }) {
-        Button('取消')
-          .layoutWeight(1)
-          .height(42)
-          .fontSize(15)
-          .fontColor($r('app.color.text_secondary'))
-          .backgroundColor(Color.Transparent)
-          .stateEffect(false)
-          .onClick(() => this.closeCreateFolder())
-        Button(this.isBusy ? '处理中…' : '确定')
-          .layoutWeight(1)
-          .height(42)
-          .fontSize(15)
-          .fontColor('#2E6BFF')
-          .backgroundColor(Color.Transparent)
-          .stateEffect(false)
-          .enabled(!this.isBusy)
-          .onClick(() => this.confirmCreateFolder())
-      }
-      .width('100%')
-    }
-    .width('100%')
-    .padding({ left: 18, right: 18, top: 18, bottom: 12 })
-    .borderRadius(24)
-    .backgroundColor(Color.Transparent)
-    .onClick(() => {})
+    CreateFolderDialog({ visible: $showCreateFolderDialog, name: $newFolderText,
+      busy: this.isBusy, viewportWidth: this.pageWidthVp,
+      material: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
+      onClose: (): void => { this.closeCreateFolder() },
+      onConfirm: (): void => { this.confirmCreateFolder() } })
   }
 
   private copyImageVisualState(source?: ImageVisualState): ImageVisualState {
@@ -10526,7 +10312,7 @@ struct Index {
   ViewerImage(entry: FileEntry): void {
     Image(this.viewerImageSource(entry), {
       types: this.imageAnalyzerTypes,
-      aiController: this.imageAnalyzerController
+      aiController: this.imageAnalyzerController ?? undefined
     })
       .width('100%')
       .height('100%')
@@ -10956,7 +10742,7 @@ struct Index {
             this.showEntryDetails(this.audioEntry)
           }
         },
-        onShare: () => { if (this.audioEntry !== null) { this.shareViewerImage(this.audioEntry) } },
+        onShare: () => { if (this.audioEntry !== null) { this.shareEntry(this.audioEntry) } },
         onSeek: (value: number) => this.seekAudio(value),
         onCoverArea: (area: Area) => this.recordAudioCoverArea(area),
         onCoverVisibility: (ratio: number) => { this.audioCoverVisibleRatio = ratio },
@@ -11424,6 +11210,8 @@ struct Index {
     } catch (_) {
       // The app can still use the default limit if preferences are unavailable.
     }
+    try { await this.folderSharePreparer.initialize(context) }
+    catch (error) { console.warn('[FolderShare] initialization deferred: ' + String(error)) }
     await this.refreshCacheUsage()
     this.scheduleImageVisualNotify()
   }
@@ -14911,6 +14699,7 @@ struct Index {
     this.statusText = '正在清理缓存…'
     try {
       await this.ensureCacheState()
+      await this.folderSharePreparer.sweep()
       StorageBudget.clearDisposable()
       await this.refreshCacheUsage()
       this.statusText = '缓存已清理'
@@ -16482,7 +16271,7 @@ struct Index {
   }
 
   private actionSupportsShare(entry: FileEntry): boolean {
-    return !entry.isDirectory && (this.isImage(entry) || this.isVideo(entry) || this.isAudio(entry) ||
+    return entry.isDirectory || (this.isImage(entry) || this.isVideo(entry) || this.isAudio(entry) ||
       this.fileType(entry).length > 0)
   }
 
@@ -16747,6 +16536,12 @@ struct Index {
     if (this.isBusy || this.destinationOperationRunning) { return }
     this.destinationPickerCloseToken++
     this.destinationOperation = operation; this.destinationSelectedEntries = entries.slice()
+    this.destinationSourceFolders.clear()
+    if (operation !== 'upload') {
+      for (const entry of entries) {
+        if (entry.isDirectory) { this.destinationSourceFolders.add(this.destinationPathKey(entry.path)) }
+      }
+    }
     const roots = this.rootKind === 'personal' ? this.personalRoots : this.sharedRoots
     this.destinationRootPath = roots.filter((entry: FileEntry): boolean => entry.isDirectory &&
       (this.currentPath === entry.path || this.currentPath.startsWith(entry.path + '/')))
@@ -16777,6 +16572,7 @@ struct Index {
       this.destinationPath = ''
       this.destinationDataSource.replace([])
       this.destinationSelectedEntries = []
+      this.destinationSourceFolders.clear()
       this.destinationFolderText = ''
       if (this.destinationOperation === 'upload') {
         IncomingShareManager.shared().dismiss(this.incomingShareId)
@@ -16791,6 +16587,7 @@ struct Index {
 
   private async loadDestinationEntries(path: string = this.destinationPath, forceNetwork: boolean = false): Promise<void> {
     if (this.destinationPickerClosing || this.destinationOperationRunning ||
+      this.destinationContainsSource(path) ||
       (path !== this.destinationRootPath && !path.startsWith(this.destinationRootPath + '/'))) { return }
     const token = ++this.destinationLoadToken
     const identity = this.repository.sessionIdentity()
@@ -16814,8 +16611,26 @@ struct Index {
     // share the repository's coalesced memory/disk index, never list all pages anew.
     const entries = !forceNetwork && path === this.currentPath && !this.currentPageHasMore && this.directoryTimeline.complete
       ? this.entries : (await this.repository.ensureDirectoryIndex(path, path === '' ? this.currentRootType : 3, forceNetwork)).entries
-    return entries.filter((entry: FileEntry): boolean => entry.isDirectory)
+    return entries.filter((entry: FileEntry): boolean => entry.isDirectory && !this.destinationContainsSource(entry.path))
       .sort((a: FileEntry, b: FileEntry): number => a.name.localeCompare(b.name))
+  }
+
+  private destinationPathKey(path: string): string {
+    return path.replace(/\/{2,}/g, '/').replace(/\/+$/, '') || '/'
+  }
+
+  private destinationContainsSource(path: string): boolean {
+    if (this.destinationOperation === 'upload' || this.destinationSourceFolders.size === 0) { return false }
+    // The selected folder set is built once. Check only this path's ancestors,
+    // without scanning selected files for every destination row or loading a tree.
+    let candidate = this.destinationPathKey(path)
+    while (true) {
+      if (this.destinationSourceFolders.has(candidate)) { return true }
+      if (candidate === '/') { return false }
+      const separator = candidate.lastIndexOf('/')
+      if (separator < 0) { return false }
+      candidate = separator === 0 ? '/' : candidate.substring(0, separator)
+    }
   }
 
   private destinationUserRootPath(): string {
@@ -17104,11 +16919,15 @@ struct Index {
     let navigation = this.navigationRequestId
     const operation = this.destinationOperation
     const targetPath = this.destinationPath
+    if (this.destinationContainsSource(targetPath)) {
+      this.presentErrorMessage('不能' + (operation === 'copy' ? '复制' : '移动') + '到源文件夹或其子文件夹',
+        operation === 'copy' ? '复制失败' : '移动失败')
+      return
+    }
     if (this.destinationOperation === 'move') {
       for (const entry of entries) {
         const sourceParent = this.parentPath(entry.path)
-        if (targetPath === sourceParent || targetPath === entry.path ||
-          (entry.isDirectory && targetPath.indexOf(entry.path.replace(/[\\/]$/, '') + '/') === 0)) {
+        if (targetPath === sourceParent || targetPath === entry.path) {
           this.presentErrorMessage('不能移动到当前目录或源目录内部', '移动失败')
           return
         }
@@ -19613,7 +19432,7 @@ struct Index {
   private async shareCommittedViewerImage(): Promise<void> {
     const entry = this.committedViewerActionEntry('share')
     if (entry !== null) {
-      await this.shareViewerImage(entry)
+      await this.shareEntry(entry)
     }
   }
 
@@ -19836,32 +19655,9 @@ struct Index {
     this.showEntryDetails(entry)
   }
 
-  private async shareViewerImage(entry: FileEntry): Promise<void> {
-    if (this.isBusy || entry.isDirectory) {
-      return
-    }
+  private async shareEntry(entry: FileEntry): Promise<void> {
     this.closeImageMoreMenu()
-    if (!await this.confirmMeteredDownload(entry)) {
-      return
-    }
-    this.isBusy = true
-    this.statusText = '正在准备分享…'
-    try {
-      const localPath = await this.ensureCachedFile(entry)
-      const context = getContext(this) as common.UIAbilityContext
-      const sharedData = new systemShare.SharedData(this.shareRecord(entry, localPath))
-      const shareController = new systemShare.ShareController(sharedData)
-      await shareController.show(context, {
-        selectionMode: systemShare.SelectionMode.SINGLE,
-        previewMode: systemShare.SharePreviewMode.DEFAULT
-      })
-      this.statusText = '已打开系统分享'
-    } catch (error) {
-      this.reportError(error as Object, '分享失败')
-      this.statusText = '分享失败'
-    } finally {
-      this.isBusy = false
-    }
+    await this.shareEntries([entry])
   }
 
   private async deleteViewerImage(entry: FileEntry): Promise<void> {
@@ -23280,7 +23076,7 @@ struct Index {
   private selectionCanShare(): boolean {
     const selected = this.selectedEntriesInCurrentDirectory()
     return selected.length > 0 && selected.every((entry: FileEntry): boolean => {
-      return !entry.isDirectory && this.actionSupportsShare(entry)
+      return this.actionSupportsShare(entry)
     })
   }
 
@@ -23369,43 +23165,40 @@ struct Index {
   }
 
   private async shareSelectedEntries(): Promise<void> {
-    const entries = this.selectedEntriesInCurrentDirectory()
-    if (!this.selectionCanShare() || this.isBusy) {
-      return
-    }
+    if (!this.selectionCanShare()) { return }
     this.closeSelectionMoreMenu()
-    if (!await this.confirmMeteredSelection(entries)) {
-      return
-    }
+    await this.shareEntries(this.selectedEntriesInCurrentDirectory(), true)
+  }
+
+  private async shareEntries(candidates: FileEntry[], leaveSelection: boolean = false): Promise<void> {
+    if (this.isBusy || this.gestureSharePreparing || candidates.length === 0) { return }
+    if (candidates.length > 500) { this.showImmersiveToast('一次最多分享 500 项'); return }
+    const entries = candidates.map((entry: FileEntry): FileEntry => entry.clone())
+    const scope = this.repository.sessionIdentity()
+    const contextToken = this.continuationContextToken
+    const valid = (): boolean => scope === this.repository.sessionIdentity() &&
+      contextToken === this.continuationContextToken && this.gestureSharePageVisible && !this.abilityInBackground
+    const pins: string[] = []
     this.isBusy = true
-    this.statusText = '正在准备分享…'
     try {
-      const localPaths: string[] = []
-      for (const entry of entries) {
-        localPaths.push(await this.ensureCachedFile(entry))
-      }
-      if (localPaths.length === 0) {
-        return
-      }
-      const firstEntry = entries[0]
-      const sharedData = new systemShare.SharedData(this.shareRecord(firstEntry, localPaths[0]))
-      for (let index = 1; index < entries.length; index += 1) {
-        const entry = entries[index]
-        sharedData.addRecord(this.shareRecord(entry, localPaths[index]))
-      }
+      if (!await this.confirmMeteredSelection(entries) || !valid()) { return }
+      this.statusText = '正在准备分享…'
+      const prepared = await this.prepareShareEntries(entries, pins, valid, true)
+      if (prepared.entries.length !== entries.length) { throw new Error('部分项目未准备完成，请检查网络后重试') }
       const context = getContext(this) as common.UIAbilityContext
-      const shareController = new systemShare.ShareController(sharedData)
+      const shareController = new systemShare.ShareController(this.preparedShareData(prepared))
       await shareController.show(context, {
         selectionMode: entries.length > 1
           ? systemShare.SelectionMode.BATCH : systemShare.SelectionMode.SINGLE,
         previewMode: systemShare.SharePreviewMode.DEFAULT
       })
-      this.exitSelectionMode()
+      if (leaveSelection) { this.exitSelectionMode() }
       this.statusText = '已打开系统分享'
     } catch (error) {
       this.reportError(error as Object, '分享失败')
       this.statusText = '分享失败'
     } finally {
+      for (const path of pins) { StorageBudget.unpin(path) }
       this.isBusy = false
     }
   }
@@ -25256,21 +25049,22 @@ struct Index {
     return ''
   }
 
-  private shareRecord(entry: FileEntry, localPath: string): systemShare.SharedRecord {
+  private shareRecord(entry: FileEntry, localPath: string, sharedUri: string = ''): systemShare.SharedRecord {
     const record: systemShare.SharedRecord = {
       utd: this.shareUtd(entry),
-      uri: fileUri.getUriFromPath(localPath),
+      uri: sharedUri.length > 0 ? sharedUri : fileUri.getUriFromPath(localPath),
       title: entry.name,
       label: entry.name
     }
     const thumbnailUri = this.gestureShareThumbnailUri(entry)
-    if (thumbnailUri.length > 0) {
+    if (thumbnailUri.length > 0 && sharedUri.length === 0) {
       record.thumbnailUri = thumbnailUri
     }
     return record
   }
 
   private shareUtd(entry: FileEntry): string {
+    if (entry.isDirectory) { return utd.UniformDataType.FOLDER }
     const extension = this.fileExtension(entry.name)
     let belongsTo: string = utd.UniformDataType.FILE
     if (this.isImage(entry)) {
@@ -25320,8 +25114,6 @@ struct Index {
   }
 
   private async logout(): Promise<void> {
-    this.albumConfirmationPending = false
-    this.albumReselectPending = false
     this.showAlbumPicker = false
     this.showAlbumUpload = false
     this.showAlbumDetails = false

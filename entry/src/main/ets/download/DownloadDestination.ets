@@ -17,6 +17,7 @@ export class DownloadDestination {
   private static context: Context | null = null
   private static queue: Promise<void> = Promise.resolve()
   private static grantedRoot: string = ''
+  private static grantedUri: string = ''
   private static granting: Promise<string> | null = null
 
   private static recoveryStarted: boolean = false
@@ -67,12 +68,19 @@ export class DownloadDestination {
     } finally { DownloadDestination.granting = null }
   }
 
+  /** Keep the system URI authority when a user-directory record is shared. */
+  static async directoryUri(): Promise<string> {
+    await DownloadDestination.directory()
+    return DownloadDestination.grantedUri
+  }
+
   private static async obtainDirectory(): Promise<string> {
     if (DownloadDestination.context === null) { throw new Error('下载目录尚未初始化') }
     const options = new picker.DocumentSaveOptions()
     options.pickerMode = picker.DocumentPickerMode.DOWNLOAD
     const result = await new picker.DocumentViewPicker(DownloadDestination.context).save(options)
     if (result.length === 0) { throw new Error('无法获取系统下载目录') }
+    DownloadDestination.grantedUri = result[0].replace(/\/+$/, '')
     return new fileUri.FileUri(result[0]).path.replace(/\/+$/, '')
   }
 

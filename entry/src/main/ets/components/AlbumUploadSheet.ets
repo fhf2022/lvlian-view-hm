@@ -5,55 +5,61 @@ import { LocalImageAlbum } from '../upload/AlbumUploadModel'
 import { TaskPanel, TaskPanelFooter, TaskPanelSection } from './TaskPanel'
 import { TaskPanelStyle } from '../ui/TaskPanelStyle'
 import { FileRowStyle } from '../ui/FileRowStyle'
+import { ContentDivider } from './ContentDivider'
 
 @Component
 export struct AlbumUploadSheet {
   @Link visible: boolean
   @Prop album: LocalImageAlbum = new LocalImageAlbum()
   @Prop destination: string = ''
-  @Prop contentMaxHeight: number = 480
+  @Prop viewportWidth: number = 360
+  @Prop viewportHeight: number = 800
+  @Prop safeTop: number = 0
+  @Prop safeBottom: number = 0
   onReselect: () => void = () => {}
+  onNotice: (message: string) => void = () => {}
   onStart: (album: LocalImageAlbum) => Promise<void> = async () => {}
   @State selected: LocalImageAlbum | null = null
   @State loading: boolean = false
   @Prop starting: boolean = false
   private startPending: boolean = false
-  @State error: string = ''
   private generation: number = 0
   aboutToAppear(): void { this.selected = this.album }
   aboutToDisappear(): void { this.generation++ }
   private async select(uri: string, name: string): Promise<void> {
     if (this.loading || this.starting) { return }
     const generation = ++this.generation
-    this.loading = true; this.error = ''
+    this.loading = true
     try {
       const source = new LocalAlbumSource(getContext(this) as common.UIAbilityContext)
       await source.requestPermission(true)
-      if (generation !== this.generation) { return }
+      if (generation !== this.generation || !this.visible) { return }
       const album = await source.selectedAlbum(uri, name)
-      if (generation === this.generation) { this.selected = album }
+      if (generation === this.generation && this.visible) { this.selected = album }
     } catch (error) {
-      if (generation === this.generation) { this.error = (error as Error).message || '本地图片文件夹读取失败' }
+      if (generation === this.generation && this.visible) {
+        this.onNotice((error as Error).message || '相册读取失败，请稍后重试')
+      }
     } finally { if (generation === this.generation) { this.loading = false } }
   }
   private async start(): Promise<void> {
     const album = this.selected
     if (!album || this.starting || this.startPending) { return }
     const generation = ++this.generation
-    this.startPending = true; this.error = ''
+    this.startPending = true
     try {
       await this.onStart(album)
       if (generation === this.generation && this.visible) { this.visible = false }
     } catch (error) {
       if (generation === this.generation && this.visible) {
-        this.error = (error as Error).message || '创建上传任务失败'
+        this.onNotice((error as Error).message || '创建上传任务失败，请重试')
       }
     } finally { this.startPending = false }
   }
 
   @Builder
   AlbumSummary() {
-    TaskPanelSection() {
+    TaskPanelSection({ paddingSize: 0 }) {
       Column({ space: FileRowStyle.leadingGap }) {
         Row({ space: FileRowStyle.leadingGap }) {
           Column({ space: FileRowStyle.textGap }) {
@@ -79,14 +85,14 @@ export struct AlbumUploadSheet {
             .onClick(() => { if (this.selected) { this.select(this.selected.uri, this.selected.name) } })
             .id('album-upload-refresh')
         }.width('100%')
-        Divider().color($r('app.color.divider')).strokeWidth(0.5).margin({ top: 2, bottom: 2 })
+        ContentDivider({ verticalInset: 2 })
         Column({ space: FileRowStyle.textGap }) {
           Text('NAS 目标').fontSize(FileRowStyle.infoSize).fontColor($r('sys.color.font_secondary'))
           Text(this.destination).fontSize(14).fontColor($r('sys.color.font_primary')).width('100%')
             .maxLines(3).wordBreak(WordBreak.BREAK_ALL).textOverflow({ overflow: TextOverflow.Ellipsis })
             .id('album-upload-destination')
         }.width('100%').alignItems(HorizontalAlign.Start)
-        Text('云端照片先在图库缓存，再刷新数量。')
+        Text('云端照片请先在系统图库下载，再刷新数量。')
           .fontSize(13).fontColor($r('sys.color.font_secondary')).width('100%').margin({ top: 2 })
           .id('album-upload-cache-hint')
         if (this.selected && this.selected.movingCount > 0) {
@@ -105,12 +111,9 @@ export struct AlbumUploadSheet {
         Text('仅 Wi-Fi · 同名同大小跳过，冲突保留两份')
           .fontSize(FileRowStyle.infoSize).fontColor($r('sys.color.font_secondary')).width('100%')
           .id('album-upload-policy')
-        if (this.error) {
-          Text(this.error).fontSize(13).fontColor($r('app.color.album_upload_error'))
-            .width('100%').id('album-upload-error')
-        }
       }.width('100%').alignItems(HorizontalAlign.Start)
-    }.width('100%').constraintSize({ maxHeight: this.contentMaxHeight }).align(Alignment.TopStart)
+    }.width('100%').height('100%').align(Alignment.TopStart)
+      .padding({ left: TaskPanelStyle.inset, right: TaskPanelStyle.inset })
       .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(16) })
       .nestedScroll({ scrollForward: NestedScrollMode.PARENT_FIRST, scrollBackward: NestedScrollMode.SELF_FIRST })
   }
@@ -123,7 +126,9 @@ export struct AlbumUploadSheet {
   }
 
   build() {
-    TaskPanel({ title: '上传相册', idPrefix: 'album-upload', fillHeight: false, hasFooter: true,
+    TaskPanel({ title: '上传相册', idPrefix: 'album-upload', floating: true, compact: true, hasFooter: true,
+      viewportWidth: this.viewportWidth, viewportHeight: this.viewportHeight,
+      safeTop: this.safeTop, safeBottom: this.safeBottom,
       closeEnabled: !this.starting, onClose: (): void => { this.generation++; this.visible = false },
       content: (): void => { this.ConfirmationContent() },
       footer: (): void => { this.ConfirmationFooter() } })

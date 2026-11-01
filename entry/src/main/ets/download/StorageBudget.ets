@@ -8,6 +8,11 @@ interface StorageFile {
   accessedAt: number
 }
 
+interface SharedTemporaryFile {
+  size: number
+  protectedUntil: number
+}
+
 /** One process-wide budget. Admission and writes must have no await between them. */
 export class StorageBudget {
   static readonly PERSISTENT_LIMIT: number = 512 * 1024 * 1024
@@ -20,6 +25,23 @@ export class StorageBudget {
   private static listeners: ((path: string) => void)[] = []
   private static protectedFiles: () => string[] = (): string[] => []
   private static pendingRemoval: Set<string> = new Set<string>()
+  // Explicit owned files only; never register or traverse the public Download root.
+  private static sharedTemporary: Map<string, SharedTemporaryFile> = new Map<string, SharedTemporaryFile>()
+
+  static registerSharedTemporary(path: string, size: number, protectedUntil: number = 0): void {
+    StorageBudget.sharedTemporary.set(path, { size: size, protectedUntil: protectedUntil })
+    StorageBudget.files.set(path, { path: path, size: size, accessedAt: Date.now() })
+  }
+
+  static forgetSharedTemporary(path: string): void {
+    StorageBudget.sharedTemporary.delete(path)
+    StorageBudget.files.delete(path)
+    StorageBudget.pendingRemoval.delete(path)
+  }
+
+  private static sharedLeaseActive(path: string): boolean {
+    return (StorageBudget.sharedTemporary.get(path)?.protectedUntil ?? 0) > Date.now()
+  }
 
   static removeWhenUnused(path: string): void {
     if (!StorageBudget.isTemporary(path)) { return }
@@ -27,7 +49,7 @@ export class StorageBudget {
     StorageBudget.drainRemoval(path)
   }
   private static drainRemoval(path: string): void {
-    if (!StorageBudget.pendingRemoval.has(path) || StorageBudget.pins.has(path) ||
+    if (!StorageBudget.pendingRemoval.has(path) || StorageBudget.pins.has(path) || StorageBudget.sharedLeaseActive(path) ||
       StorageBudget.protectedFiles().indexOf(path) >= 0) { return }
     try { fileIo.unlinkSync(path); StorageBudget.pendingRemoval.delete(path) } catch (_) {}
     StorageBudget.sync(path)
@@ -40,6 +62,7 @@ export class StorageBudget {
     StorageBudget.thumbnailRoot = context.filesDir + '/ugreen-thumbnail-cache'
     StorageBudget.metadataRoots = [context.databaseDir, context.preferencesDir,
       context.filesDir + '/ugreen-thumbnail-index.json']
+    StorageBudget.metadataRoots.push(context.filesDir + '/ugreen-folder-shares')
     StorageBudget.limit = limit
     StorageBudget.scan()
   }
@@ -47,7 +70,8 @@ export class StorageBudget {
   static protect(provider: () => string[]): void { StorageBudget.protectedFiles = provider }
   static onEvicted(listener: (path: string) => void): void { StorageBudget.listeners.push(listener) }
   static isTemporary(path: string): boolean {
-    return StorageBudget.roots.some((root: string): boolean => path.startsWith(root + '/'))
+    return StorageBudget.sharedTemporary.has(path) ||
+      StorageBudget.roots.some((root: string): boolean => path.startsWith(root + '/'))
   }
   static pin(path: string): void {
     StorageBudget.pins.set(path, (StorageBudget.pins.get(path) || 0) + 1)
@@ -62,8 +86,10 @@ export class StorageBudget {
   static touch(path: string): void {
     StorageBudget.sync(path)
     const item = StorageBudget.files.get(path)
-    if (item !== undefined) { item.accessedAt = Date.now() }
-    try { fileIo.utimes(path, Date.now()) } catch (_) {}
+    if (item !== undefined) {
+      item.accessedAt = Date.now()
+      try { fileIo.utimes(path, Date.now()) } catch (_) {}
+    }
   }
   static sync(path: string): void {
     if (!StorageBudget.isTemporary(path)) { return }
@@ -73,8 +99,14 @@ export class StorageBudget {
       if (stat.isFile()) {
         StorageBudget.files.set(path, { path: path, size: stat.size,
           accessedAt: previous === undefined ? stat.mtime * 1000 : previous.accessedAt })
+        const shared = StorageBudget.sharedTemporary.get(path)
+        if (shared !== undefined) { shared.size = stat.size }
       }
-    } catch (_) { StorageBudget.files.delete(path) }
+    } catch (_) {
+      StorageBudget.files.delete(path)
+      const shared = StorageBudget.sharedTemporary.get(path)
+      if (shared !== undefined) { shared.size = 0 }
+    }
   }
   static scan(): number {
     const previous = StorageBudget.files
@@ -86,6 +118,11 @@ export class StorageBudget {
         StorageBudget.files.set(item.path, item)
       }
     }
+    // The owner supplies known sizes, avoiding public directory walks during UI refreshes.
+    StorageBudget.sharedTemporary.forEach((item: SharedTemporaryFile, path: string): void => {
+      StorageBudget.files.set(path, { path: path, size: item.size,
+        accessedAt: previous.get(path)?.accessedAt ?? Date.now() })
+    })
     return StorageBudget.usage()
   }
   static usage(): number {
@@ -108,6 +145,7 @@ export class StorageBudget {
     const old = StorageBudget.files.get(path)
     const growth = Math.max(0, resultingSize - (old === undefined ? 0 : old.size))
     let projected = StorageBudget.usage() + growth
+    if (projected <= StorageBudget.limit) { return }
     const protectedPaths = StorageBudget.protectedFiles()
     const candidates = Array.from(StorageBudget.files.values()).sort(
       (a: StorageFile, b: StorageFile): number => a.accessedAt - b.accessedAt)
@@ -117,7 +155,8 @@ export class StorageBudget {
       const companion = StorageBudget.resumeCompanion(item.path)
       // No companion is an empty sentinel, also used by inactive player paths.
       // It must never make an ordinary cached file look protected.
-      if (item.path === path || StorageBudget.pins.has(item.path) || protectedPaths.indexOf(item.path) >= 0 ||
+      if (item.path === path || StorageBudget.pins.has(item.path) || StorageBudget.sharedLeaseActive(item.path) ||
+        protectedPaths.indexOf(item.path) >= 0 ||
         (companion.length > 0 && (companion === path || StorageBudget.pins.has(companion) ||
           protectedPaths.indexOf(companion) >= 0))) { continue }
       const removed = StorageBudget.evict(item.path)
@@ -134,7 +173,7 @@ export class StorageBudget {
       // Task removal owns resumable partials; automatic pressure may evict them.
       const companion = StorageBudget.resumeCompanion(item.path)
       if (item.path.endsWith('.part') || (companion.endsWith('.part') && StorageBudget.files.has(companion)) ||
-        StorageBudget.pins.has(item.path) || (companion.length > 0 &&
+        StorageBudget.pins.has(item.path) || StorageBudget.sharedLeaseActive(item.path) || (companion.length > 0 &&
           (StorageBudget.pins.has(companion) || protectedPaths.indexOf(companion) >= 0)) ||
         protectedPaths.indexOf(item.path) >= 0) { continue }
       StorageBudget.evict(item.path)
@@ -144,6 +183,7 @@ export class StorageBudget {
     let removed = StorageBudget.files.get(path)?.size ?? 0
     try { fileIo.unlinkSync(path) } catch (_) { return -1 }
     StorageBudget.files.delete(path)
+    StorageBudget.sharedTemporary.delete(path)
     const companion = StorageBudget.resumeCompanion(path)
     let companionRemoved = false
     if (companion.length > 0) {

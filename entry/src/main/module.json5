@@ -4,11 +4,12 @@
     "type": "entry",
     "description": "$string:module_desc",
     "mainElement": "EntryAbility",
-    // 支持三端：手机、平板、2in1
+    // 继续复用同一套页面；TV 使用独立的网格密度预算。
     "deviceTypes": [
       "phone",
       "tablet",
-      "2in1"
+      "2in1",
+      "tv"
     ],
     "deliveryWithInstall": true,
     "installationFree": false,

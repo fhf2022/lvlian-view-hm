@@ -69,6 +69,17 @@ const context={cacheDir:'/cache',tempDir:'/temp',filesDir:'/files',databaseDir:'
  put('/cache/old.jpg',20,1);put(part,8,2);put(meta,2,3);B.scan();B.pin('');B.clearDisposable();
  assert.ok(!files.has('/cache/old.jpg'),'manual clear ignores empty companion and empty protection entries');assert.ok(files.has(part)&&files.has(meta),'manual clear still retains resume pair');assert.ok(files.has('/cache/playing.mp4'));
  B.unpin('');B.protect(()=>[]);
+ files.clear();B.initialize(context,100);
+ const sharedPath='/Download/com.example.ugreenlink/temp/owned-share/file.txt';
+ put(sharedPath,70);put('/Download/com.example.ugreenlink/ordinary-user.txt',900);
+ B.registerSharedTemporary(sharedPath,70,Date.now()+60000);B.scan();assert.equal(B.usage(),70);
+ B.clearDisposable();assert.ok(files.has(sharedPath),'system handover must not release a transmission lease');
+ assert.throws(()=>B.admit('/cache/incoming',31),'leased public copies count toward the same quota');
+ B.registerSharedTemporary(sharedPath,70,Date.now()-1);B.admit('/cache/incoming',31);
+ assert.ok(!files.has(sharedPath),'expired registered copies can be evicted');
+ assert.ok(files.has('/Download/com.example.ugreenlink/ordinary-user.txt'),'ordinary downloads never enter the cache inventory');
+ assert.equal(await D.directoryUri(),'/Download/com.example.ugreenlink','sharing reuses the exact system directory grant');
+ console.log('PASS: registered public staging shares quota, retains transfer leases, expires safely and excludes ordinary downloads');
  console.log('PASS: paired partial metadata, manual clear, orphan cleanup, quota accounting and pin protection');
  console.log('PASS: cached public directory grant works in background; a fresh process cannot invoke background picker');
  console.log('PASS: restart recovers interrupted public copy');console.log('PASS: shared quota, LRU, partial eviction, pins, limit rollback, public isolation, copy rollback/retry, deferred cleanup, collision and traversal');

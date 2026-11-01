@@ -24,4 +24,8 @@ for(const [w,h] of [[400,800],[960,1440],[1440,960],[700,700],[400,500]]){
 }
 const bounded=page(400,800,5000);const unreadable=new Proxy([],{get(){throw new Error('eligibility must not scan or inspect directory/visible image arrays')}});bounded.entries=bounded.waterfallEntries=unreadable;bounded.isImage=()=>assert.fail('no per-entry type checks');for(const mode of ['grid','list','waterfall']){bounded.fileViewMode=mode;assert.equal(bounded.shouldShowTimeline(),true)}
 for(const value of [0,-1,NaN,Infinity]){const p=page(value,800,5000);assert.equal(p.shouldShowTimeline(),false,'invalid layout cannot transiently enable a timeline')}
+const tv=page(1920,1080,5000);tv.isTvDevice=true;
+assert.equal(tv.fileGridColumnCount(),10);
+assert.equal(tv.timelineViewportImageCapacity(),60,'TV timeline threshold follows the same denser grid geometry');
+for(const mode of ['grid','list','waterfall']){tv.fileViewMode=mode;tv.directoryTimeline.directImageCount=359;assert.equal(tv.shouldShowTimeline(),false);tv.directoryTimeline.directImageCount=360;assert.equal(tv.shouldShowTimeline(),true)}
 console.log('PASS timeline visibility: same directory/window across all modes, batch/scroll invariance, count/span/completeness/sort/window and directory guards');
