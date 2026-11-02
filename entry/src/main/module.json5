@@ -4,12 +4,11 @@
     "type": "entry",
     "description": "$string:module_desc",
     "mainElement": "EntryAbility",
-    // 继续复用同一套页面；TV 使用独立的网格密度预算。
+    // 当前仅发布手机、平板与 2in1；TV 布局留待后续真机验证。
     "deviceTypes": [
       "phone",
       "tablet",
-      "2in1",
-      "tv"
+      "2in1"
     ],
     "deliveryWithInstall": true,
     "installationFree": false,

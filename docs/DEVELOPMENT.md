@@ -9,15 +9,15 @@
 | 语言与 UI | ArkTS / ArkUI，Stage 模型 |
 | SDK | HarmonyOS API 26；最低兼容与目标均为 `26.0.0` |
 | 工程模型 | Hvigor / OHPM，`modelVersion: 26.0.0` |
-| 设备类型 | `phone`、`tablet`、`2in1`、`tv`（TV 基础适配，暂无真机验收） |
+| 设备类型 | `phone`、`tablet`、`2in1`；当前发布不声明 `tv` |
 | 应用版本 | 以 [`AppScope/app.json5`](../AppScope/app.json5) 的 `versionName`、`versionCode` 为准 |
 | 主模块 | `entry` |
 
 使用能够安装 API 26 SDK 的 DevEco Studio。建议采用与工程对应的 26.0.0 Release 工具链；提交应用市场的包还需检查 SDK 的 `releaseType` 为 `Release`。API 23、24 尚未做兼容适配，不能仅下调 `compatibleSdkVersion` 就视为支持。
 
-TV 基础适配已声明 `tv`，仍要求 API 26。页面创建时只读取一次系统 `deviceInfo.deviceType`，TV 在共用 `FileGridLayout` 中使用约 60 张可见图片、最多 12 列的预算；标准 16:9 窗口为 10 列。其他设备保留原有 36 张、最多 7 列的预算。实际网格、目录快照、返回定位、多选几何和时间轴门槛共用同一列数入口；没有另外实现电视图库或提高下载、解码并发。
+1.0.17 起暂停声明 `tv`，正式包与测试模块均只声明 phone、tablet、2in1。保留 TV 基础布局供后续验证：页面创建时只读取一次系统 `deviceInfo.deviceType`，TV 在共用 `FileGridLayout` 中使用约 60 张可见图片、最多 12 列的预算；标准 16:9 窗口为 10 列。其他设备保留原有 36 张、最多 7 列的预算。实际网格、目录快照、返回定位、多选几何和时间轴门槛共用同一列数入口；没有另外实现电视图库或提高下载、解码并发。
 
-AI 识图先通过 `canIUse('SystemCapability.AI.VisionImageAnalyzer')` 检查，再按需创建控制器；不支持的设备不会在页面初始化时构造该原生服务。隔空传送继续沿用已有系统能力检查。遥控器走焦及系统相册、分享、接续等能力尚无 TV 真机验证，构建通过不代表这些能力在电视上全部可用。AGC 上架时需将支持设备与包含 `tv` 的新包保持一致，不能复用旧三端包的设备声明。
+AI 识图先通过 `canIUse('SystemCapability.AI.VisionImageAnalyzer')` 检查，再按需创建控制器；不支持的设备不会在页面初始化时构造该原生服务。隔空传送继续沿用已有系统能力检查。遥控器走焦及系统相册、分享、接续等能力尚无 TV 真机验证，构建通过不代表这些能力在电视上全部可用。当前 AGC 上架设备选择手机、平板、2in1，不勾选智慧屏；后续启用 TV 前再进行专门验证。
 
 宿主机回归使用 Node.js 与 TypeScript；相册回归依赖 `node:sqlite`，建议使用 **Node.js 24 LTS**。ArkTS 应用本身仍由 DevEco 工具链编译。
 
