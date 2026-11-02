@@ -1,6 +1,6 @@
 import { DownloadDestination } from '../download/DownloadDestination'
 import { StorageBudget } from '../download/StorageBudget'
-import { DownloadTaskRecord, DownloadTaskStatus } from '../model/FileEntry'
+import { DownloadTaskRecord, DownloadTaskStatus, TransferBatchFields } from '../model/FileEntry'
 import { NetworkPolicy } from '../core/network/NetworkPolicy'
 import { RemoteFileVersion } from '../core/network/RemoteFileVersion'
 import { TransferBackgroundManager } from '../transfer/TransferBackgroundManager'
@@ -53,7 +53,7 @@ export class VideoSourceHandle {
 
 export type VideoTransferListener = (states: VideoTransferState[], tasks: DownloadTaskRecord[]) => void
 
-class VideoTransferSession {
+class VideoTransferSession implements TransferBatchFields {
   entry: FileEntry = new FileEntry()
   signature: RemoteFileSignature = new RemoteFileSignature()
   descriptor: DownloadDescriptor = new DownloadDescriptor()
@@ -79,6 +79,10 @@ class VideoTransferSession {
   durablePath: string = ''
   destinationRoot: string = ''
   relativePath: string = ''
+  batchId: string = ''
+  batchName: string = ''
+  batchKind: string = 'files'
+  batchState: string = 'ready'
   lastPersistAt: number = 0
 }
 
@@ -461,7 +465,7 @@ export class VideoTransferManager {
   /** Resolve after admission, not completion. Save/share callers that need
    * complete bytes must use requestCachedFile instead of blocking the page. */
   async requestDownload(entry: FileEntry, destinationRoot: string = '',
-    relativePath: string = ''): Promise<void> {
+    relativePath: string = '', batch: TransferBatchFields | null = null): Promise<void> {
     await this.requireInitialized()
     const signature = this.signature(entry)
     await DownloadDestination.directory()
@@ -486,6 +490,9 @@ export class VideoTransferManager {
         activeSession.partPath = existing
         activeSession.destinationRoot = destinationRoot
         activeSession.relativePath = relativePath
+        if (batch !== null && activeSession.batchId.length === 0 && !activeSession.downloadRequested) {
+          DownloadTaskRecord.copyBatchInto(batch, activeSession)
+        }
         activeSession.totalBytes = signature.size > 0 ? signature.size : this.fileSize(existing)
         activeSession.manualMobileResume = this.networkPolicy?.isMetered() ?? true
         activeSession.ranges.clear()
@@ -493,12 +500,15 @@ export class VideoTransferManager {
         this.startDownload(activeSession).catch((): void => {})
         return
       }
-      await this.promoteCachedFile(entry, signature, existing, destinationRoot, relativePath)
+      await this.promoteCachedFile(entry, signature, existing, destinationRoot, relativePath, batch)
       return
     }
     const session = await this.getSession(entry, signature, false)
     session.destinationRoot = destinationRoot
     session.relativePath = relativePath
+    if (batch !== null && session.batchId.length === 0 && !session.downloadRequested) {
+      DownloadTaskRecord.copyBatchInto(batch, session)
+    }
     session.paused = false
     session.temporaryOnly = false
     session.manualMobileResume = this.networkPolicy?.isMetered() ?? true
@@ -526,6 +536,7 @@ export class VideoTransferManager {
       task.finalPath = record.durablePath
       task.stagingPath = record.partPath
       task.receivedBytes = record.receivedBytes
+      DownloadTaskRecord.copyBatchInto(record, task)
       const state = this.states[record.sourceKey]
       const session = this.sessions.get(record.sourceKey)
       task.status = 'paused'
@@ -542,18 +553,22 @@ export class VideoTransferManager {
       tasks.push(task)
     }
     const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000
-    let completed = 0
-    const visible = tasks.sort((a: DownloadTaskRecord, b: DownloadTaskRecord): number => b.updatedAt - a.updatedAt)
-      .filter((task: DownloadTaskRecord): boolean => {
-        if (task.status !== 'completed') { return true }
-        completed += 1
-        return completed <= 200 && task.updatedAt >= cutoff
-      })
+    const visible = DownloadTaskRecord.retainHistory(tasks.sort(
+      (a: DownloadTaskRecord, b: DownloadTaskRecord): number => b.updatedAt - a.updatedAt), cutoff)
     const retained = new Set<string>(visible.map((task: DownloadTaskRecord): string => task.sourceKey))
     for (const key of Array.from(this.taskRows.keys())) {
       if (!retained.has(key)) { this.taskRows.delete(key) }
     }
     return visible
+  }
+
+  async finishBatch(batchId: string, complete: boolean): Promise<void> {
+    for (const session of this.sessions.values()) {
+      if (session.batchId === batchId) { session.batchState = complete ? 'ready' : 'incomplete' }
+    }
+    if (this.store.finishBatch(batchId, complete)) {
+      await this.store.flush(); this.notify()
+    }
   }
 
   async toggleTask(id: string): Promise<void> {
@@ -783,6 +798,7 @@ export class VideoTransferManager {
       ? this.stagingPath(session.sourceKey) : session.cachePath + '.part'
     const stored = this.store.find(session.sourceKey)
     if (stored !== null) {
+      DownloadTaskRecord.copyBatchInto(stored, session)
       if (session.descriptor.etag.length === 0) { session.descriptor.etag = stored.transferEtag || stored.etag }
       if (session.descriptor.checksum.length === 0) { session.descriptor.checksum = stored.transferChecksum || stored.checksum }
       session.resumeValidator = stored.transferValidator || RemoteFileVersion.strongEtag(session.descriptor.etag)
@@ -838,7 +854,8 @@ export class VideoTransferManager {
   }
 
   private async promoteCachedFile(entry: FileEntry, signature: RemoteFileSignature,
-    cachedPath: string, destinationRoot: string = '', relativePath: string = ''): Promise<void> {
+    cachedPath: string, destinationRoot: string = '', relativePath: string = '',
+    batch: TransferBatchFields | null = null): Promise<void> {
     const totalBytes = signature.size > 0 ? signature.size : this.fileSize(cachedPath)
     if (totalBytes <= 0 || this.fileSize(cachedPath) !== totalBytes) {
       throw new Error('视频缓存文件不完整')
@@ -855,6 +872,7 @@ export class VideoTransferManager {
     session.closed = false
     session.destinationRoot = destinationRoot
     session.relativePath = relativePath
+    if (batch !== null) { DownloadTaskRecord.copyBatchInto(batch, session) }
     this.sessions.set(session.sourceKey, session)
     const state = this.ensureState(session.sourceKey)
     state.status = 'queued'
@@ -1209,6 +1227,7 @@ export class VideoTransferManager {
     record.partPath = cacheComplete ? '' : session.partPath
     record.userDownload = record.userDownload || (session.downloadRequested && !session.temporaryOnly)
     record.relativePath = session.relativePath
+    DownloadTaskRecord.copyBatchInto(session, record)
     record.ranges = session.ranges.serialize()
     record.receivedBytes = session.ranges.coveredBytes()
     record.totalBytes = session.totalBytes

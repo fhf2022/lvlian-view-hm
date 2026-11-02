@@ -43,6 +43,8 @@ Copy-Item build-profile.example.json5 build-profile.json5
 
 当前后续开发中的开屏流程使用 AGC 托管隐私声明。自行构建时，应为自己的应用标识配置对应的 AGC 协议与完整模式隐私管理；只在项目中保存一份 Markdown 政策草稿，不能代替系统托管配置。如果停在开屏授权提示，先核对对应应用和 Profile 的隐私配置。
 
+1.0.16 起开屏不申请图库权限；系统相册列表本身无需授权。只有点选具体相册、刷新数量或继续相册上传时才调用图库权限入口，普通文件选择、系统分享和拖入沿用系统授予的 URI 访问能力。
+
 保留原应用安装数据的覆盖升级，需要沿用原有签名身份。自行签名的包通常不能覆盖其他证书签名的安装包，不要通过卸载用户现有应用来验证普通 UI 改动。
 
 ## 构建调试 HAP
@@ -92,6 +94,8 @@ $typescriptRuntime = 'C:/Program Files/Huawei/DevEco Studio/tools/ohpm/node_modu
 - `DownloadDestination.directoryUri()` 复用普通下载已有的官方 DOWNLOAD 模式授权；公开文件只登记具体拥有的路径，由 `StorageBudget` 计入限额，不扫描整个公共下载目录。分享回调表示系统已接手，不表示传输完成，因此保留 24 小时读取期，通过私有日志在重启后恢复和精确清理。
 
 实现与实际验证边界见[文件夹分享](FOLDER_SHARING.md)。没有新增权限、ZIP 打包或另一套下载器。
+
+后续传输聚合使用 `TransferBatch` 标记一次选择，批次身份、名称、种类和加入状态随原任务记录持久化；视频沿用 `MediaLocalStore`。`TransferTaskGroups` 仅在传输页接收队列更新时汇总，稳定复用行对象和成员引用；不改变下载／上传调度、并发、续传及后台保护。`TransferGroupTaskRow` 和单文件行共用 `TransferTaskListRow`，只给集合增加展开按钮，子文件缩进 24 vp、每页最多 100 项。原图与缩略图加载不参与分组。
 
 传输与图库验证优先使用合成文件和独立测试目录。验证缩略图或 UI 时，不应顺带上传整个个人相册。
 

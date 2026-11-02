@@ -18,7 +18,9 @@ import { FloatingImportControl } from '../components/FloatingImportControl'
 import { AlbumUploadPicker } from '../components/AlbumUploadPicker'
 import { AlbumUploadSheet } from '../components/AlbumUploadSheet'
 import { AlbumUploadDetails } from '../components/AlbumUploadDetails'
-import { TransferTaskListRow, TransferQueueTaskRow } from '../components/TransferTaskListRow'
+import { TransferTaskListRow } from '../components/TransferTaskListRow'
+import { TransferGroupTaskRow } from '../components/TransferGroupTaskRow'
+import { TransferBatch, TransferTaskGroup, TransferTaskGroups } from '../transfer/TransferTaskGroup'
 import { HeaderStyle } from '../ui/HeaderStyle'
 import { GlassControlGeometry as Glass } from '../ui/GlassControlGeometry'
 import { GlassMaterial } from '../ui/GlassMaterial'
@@ -963,6 +965,8 @@ struct Index {
   @State meteredBackgroundRefresh: boolean = false
   @State meteredDownloadContinue: boolean = false
   @State downloadTasks: DownloadTaskRecord[] = []
+  private downloadGroups: TransferTaskGroups = new TransferTaskGroups()
+  private uploadGroups: TransferTaskGroups = new TransferTaskGroups()
   @State downloadSpeedBytesPerSecond: number = 0
   @State @Watch('onContinuationSceneChanged') contextMenuVisible: boolean = false
   @State contextMenuEntry: FileEntry | null = null
@@ -1803,6 +1807,7 @@ struct Index {
   }
   private downloadStateListener = (tasks: DownloadTaskRecord[], speed: number): void => {
     this.downloadTasks = tasks.concat(this.videoTransferManager.snapshotTasks())
+    this.refreshTransferGroups()
     this.downloadSpeedBytesPerSecond = speed
   }
   @State private nasState: NasConnectionState = 'unknown'
@@ -1832,6 +1837,7 @@ struct Index {
     }
     this.videoTransferStates = next
     this.downloadTasks = this.downloadQueue.snapshot().concat(tasks)
+    this.refreshTransferGroups()
   }
   private gestureShareRegistered: boolean = false
   private gestureSharePageVisible: boolean = true
@@ -5048,21 +5054,19 @@ struct Index {
           }
           .width('100%')
         } else {
-          ForEach(this.visibleTransferTasks(), (task: DownloadTaskRecord) => {
+          ForEach(this.visibleTransferRows(), (group: TransferTaskGroup) => {
             ListItem() {
-              TransferQueueTaskRow({ task: task,
+              TransferGroupTaskRow({ group: group,
+                leading: this.TransferFileLeading.bind(this),
+                folderLeading: this.TransferFolderLeading.bind(this),
+                onActivate: (task: DownloadTaskRecord): void => { this.toggleDownloadTask(task) },
+                onRemove: (task: DownloadTaskRecord): void => { this.confirmRemoveDownloadTask(task) },
                 infoForTask: (value: DownloadTaskRecord): string => this.downloadTaskInfo(value),
-                progressForTask: (value: DownloadTaskRecord): number => this.downloadTaskProgress(value) }) {
-                this.FileLeadingVisual(this.downloadTaskEntry(task))
-              }
+                progressForTask: (value: DownloadTaskRecord): number => this.downloadTaskProgress(value) })
             }
             .width('100%')
-            .onClick(() => this.toggleDownloadTask(task))
-            .priorityGesture(
-              LongPressGesture({ repeat: false })
-                .onAction(() => this.confirmRemoveDownloadTask(task))
-            )
-          }, (task: DownloadTaskRecord): string => task.id)
+            .id('transfer-row:' + group.id)
+          }, (group: TransferTaskGroup): string => group.id)
 
         }
       }
@@ -5087,6 +5091,28 @@ struct Index {
 
   private visibleTransferTasks(): DownloadTaskRecord[] {
     return this.transferDirection === 'upload' ? this.uploadTasks : this.downloadTasks
+  }
+
+  private refreshTransferGroups(): void {
+    if (this.screen !== 'downloads') { return }
+    this.downloadGroups.update(this.downloadTasks, false)
+    this.uploadGroups.update(this.uploadTasks, true)
+  }
+
+  private visibleTransferRows(): TransferTaskGroup[] {
+    // Read the published state for ArkUI dependency tracking; projections are updated outside build.
+    const tasks = this.visibleTransferTasks()
+    return tasks.length === 0 ? [] : (this.transferDirection === 'upload' ? this.uploadGroups.rows : this.downloadGroups.rows)
+  }
+
+  @Builder
+  TransferFolderLeading(): void {
+    this.FolderIcon(FileRowStyle.iconSize)
+  }
+
+  @Builder
+  TransferFileLeading(task: DownloadTaskRecord): void {
+    this.FileLeadingVisual(this.downloadTaskEntry(task))
   }
 
   private albumUploadStatus(job: AlbumUploadJob): string {
@@ -11254,6 +11280,7 @@ struct Index {
       await this.uploadQueue.initialize(context, this.repository, this.networkPolicy,
         (tasks: UploadTaskRecord[]): void => {
           this.uploadTasks = tasks.slice()
+          this.refreshTransferGroups()
           this.syncImportedUploads(tasks)
         })
       await this.albumUpload.initialize(context as common.UIAbilityContext, this.repository, this.networkPolicy,
@@ -11262,6 +11289,7 @@ struct Index {
       this.albumUpload.setForeground(this.gestureSharePageVisible && !this.abilityInBackground)
       this.downloadQueue.onChange(this.downloadStateListener)
       this.downloadTasks = this.downloadQueue.snapshot().concat(this.videoTransferManager.snapshotTasks())
+      this.refreshTransferGroups()
       this.downloadSpeedBytesPerSecond = this.downloadQueue.speed()
       await this.downloadQueue.setMeteredDownloadContinue(this.meteredDownloadContinue)
     } catch (error) {
@@ -14655,6 +14683,7 @@ struct Index {
     this.setSelectedPaths([])
     this.selectedBottomTab = 'downloads'
     this.screen = 'downloads'
+    this.refreshTransferGroups()
     this.importExpanded = false
     this.updateTopTitle('传输')
     this.updateBottomBarVisibility(true)
@@ -16315,10 +16344,13 @@ struct Index {
     this.closeActionMenu()
     this.isBusy = true
     this.statusText = '正在准备文件夹下载…'
+    const batch = new TransferBatch(entry.name, this.repository.cacheScopeHash())
+    let complete = false
     try {
       await this.ensureDownloadState()
       const destinationRoot = await DownloadDestination.directory()
-      const count = await this.enqueueRemoteTree(entry, destinationRoot, entry.name)
+      const count = await this.enqueueRemoteTree(entry, destinationRoot, entry.name, batch)
+      complete = true
       this.statusText = count > 0 ? '已加入下载队列' : '文件夹为空'
       if (count > 0) {
         this.showImmersiveToast('已加入下载：' + entry.name)
@@ -16327,21 +16359,24 @@ struct Index {
       this.reportError(error as Object, '加入下载失败')
       this.statusText = '加入下载失败'
     } finally {
-      this.isBusy = false
+      try { await this.finishDownloadBatch(batch, complete) } finally { this.isBusy = false }
     }
   }
 
   private async enqueueRemoteTree(entry: FileEntry, destinationRoot: string,
-    relativePath: string): Promise<number> {
+    relativePath: string, batch: TransferBatch | null = null): Promise<number> {
+    if (batch !== null && batch.ownerScope !== this.repository.cacheScopeHash()) {
+      throw new Error('账号已变化，已停止加入下载')
+    }
     if (!entry.isDirectory) {
       if (this.isVideo(entry)) {
         // Video transfers use the MediaKit range/cache coordinator so an
         // earlier stream is promoted instead of starting a second full-file
         // download. The route remains the same system download directory.
         await this.refreshVideoManager()
-        this.videoTransferManager.requestDownload(entry, destinationRoot, relativePath).catch((): void => {})
+        await this.videoTransferManager.requestDownload(entry, destinationRoot, relativePath, batch)
       } else {
-        await this.downloadQueue.enqueue(entry, destinationRoot, relativePath)
+        await this.downloadQueue.enqueue(entry, destinationRoot, relativePath, batch)
       }
       return 1
     }
@@ -16351,9 +16386,16 @@ struct Index {
     let count = 0
     for (const child of children) {
       const childRelativePath = relativePath + '/' + child.name
-      count += await this.enqueueRemoteTree(child, destinationRoot, childRelativePath)
+      count += await this.enqueueRemoteTree(child, destinationRoot, childRelativePath, batch)
     }
     return count
+  }
+
+  private async finishDownloadBatch(batch: TransferBatch, complete: boolean): Promise<void> {
+    try {
+      await Promise.all([this.downloadQueue.finishBatch(batch.batchId, complete),
+        this.videoTransferManager.finishBatch(batch.batchId, complete)])
+    } catch (error) { this.reportError(error as Object, '保存传输批次失败') }
   }
 
   private ensureLocalDirectory(path: string): void {
@@ -23291,22 +23333,30 @@ struct Index {
     this.closeSelectionMoreMenu()
     this.isBusy = true
     this.statusText = '正在加入下载队列…'
+    const batch = entries.length > 1 || entries[0].isDirectory
+      ? new TransferBatch(entries.length === 1 && entries[0].isDirectory ? entries[0].name : '',
+        this.repository.cacheScopeHash()) : null
+    let complete = false
     try {
       await this.ensureDownloadState()
       await this.refreshVideoManager()
       const destinationRoot = await DownloadDestination.directory()
       let count = 0
       for (const entry of entries) {
+        if (batch !== null && batch.ownerScope !== this.repository.cacheScopeHash()) {
+          throw new Error('账号已变化，已停止加入下载')
+        }
         if (entry.isDirectory) {
-          count += await this.enqueueRemoteTree(entry, destinationRoot, entry.name)
+          count += await this.enqueueRemoteTree(entry, destinationRoot, entry.name, batch)
         } else if (this.isVideo(entry)) {
-          this.videoTransferManager.requestDownload(entry).catch((): void => {})
+          await this.videoTransferManager.requestDownload(entry, '', '', batch)
           count += 1
         } else {
-          await this.downloadQueue.enqueue(entry)
+          await this.downloadQueue.enqueue(entry, '', '', batch)
           count += 1
         }
       }
+      complete = true
       this.exitSelectionMode()
       this.statusText = count > 0 ? '已加入下载队列' : '没有可下载文件'
       if (count > 0) {
@@ -23316,7 +23366,9 @@ struct Index {
       this.reportError(error as Object, '加入下载失败')
       this.statusText = '加入下载失败'
     } finally {
-      this.isBusy = false
+      try {
+        if (batch !== null) { await this.finishDownloadBatch(batch, complete) }
+      } finally { this.isBusy = false }
     }
   }
 

@@ -1,10 +1,8 @@
 import { common } from '@kit.AbilityKit'
 import { privacyManager } from '@kit.AppGalleryKit'
-import { preferences } from '@kit.ArkData'
-import { LocalAlbumSource } from '../../upload/LocalAlbumSource'
 import { TransferBackgroundManager } from '../../transfer/TransferBackgroundManager'
 
-/** Platform consent is authoritative; a local flag records only the optional gallery prompt. */
+/** Startup gates only platform privacy consent; album access is requested by album actions. */
 export class StartupAuthorization {
   private static instance: StartupAuthorization = new StartupAuthorization()
   static shared(): StartupAuthorization { return StartupAuthorization.instance }
@@ -63,19 +61,6 @@ export class StartupAuthorization {
       return false
     }
 
-    // This optional permission follows consent once, and never gates NAS browsing.
-    // A denied permission can be requested again by an explicit album action.
-    try {
-      const store = await preferences.getPreferences(context, 'linkfiles-startup-authorization')
-      if (await store.get('gallery_prompted', false) !== true) {
-        try { await new LocalAlbumSource(context).requestPermission() }
-        catch (_) { console.info('[StartupAuthorization] gallery access not granted') }
-        await store.put('gallery_prompted', true)
-        await store.flush()
-      }
-    } catch (error) {
-      console.warn('[StartupAuthorization] gallery prompt state unavailable: ' + JSON.stringify(error))
-    }
     const background = TransferBackgroundManager.shared()
     background.initialize(context)
     try { await background.requestNotificationPermission() } catch (_) {}

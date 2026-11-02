@@ -2,7 +2,7 @@ import { Context } from '@kit.AbilityKit'
 import { fileIo, fileUri } from '@kit.CoreFileKit'
 import { preferences } from '@kit.ArkData'
 import { util } from '@kit.ArkTS'
-import { DownloadTaskRecord } from '../model/FileEntry'
+import { DownloadTaskRecord, TransferBatchFields } from '../model/FileEntry'
 import { StorageBudget } from '../download/StorageBudget'
 import { UgreenRemoteRepository } from '../repository/UgreenRemoteRepository'
 import { NetworkPolicy } from '../core/network/NetworkPolicy'
@@ -46,6 +46,7 @@ export class UploadQueueManager {
     this.tasks = restored.map((task: UploadTaskRecord): UploadTaskRecord => {
       const result = new UploadTaskRecord()
       DownloadTaskRecord.copyInto(task, result)
+      if (result.batchState === 'adding') { result.batchState = 'incomplete' }
       result.uuid = task.uuid; result.scope = task.scope; result.prepared = task.prepared
       result.importing = task.importing; result.skipped = task.skipped
       return result
@@ -128,7 +129,8 @@ export class UploadQueueManager {
     this.pump()
   }
 
-  async enqueue(uri: string, dir: string, scope: string): Promise<UploadTaskRecord> {
+  async enqueue(uri: string, dir: string, scope: string,
+    batch: TransferBatchFields | null = null): Promise<UploadTaskRecord> {
     await TransferBackgroundManager.shared().requestResume()
     if (this.repository === null || !this.ready || scope !== this.repository.cacheScopeHash()) {
       throw new Error('登录状态已改变，请重新选择上传文件')
@@ -137,6 +139,8 @@ export class UploadQueueManager {
     task.uuid = util.generateRandomUUID(false)
     task.id = 'upload:' + task.uuid
     task.scope = scope
+    task.sourceScope = scope
+    if (batch !== null) { DownloadTaskRecord.copyBatchInto(batch, task) }
     task.name = new fileUri.FileUri(uri).name
     if (!task.name || /[\r\n\/\\]/.test(task.name)) { throw new Error('文件名无效') }
     task.destinationRoot = dir
@@ -213,6 +217,14 @@ export class UploadQueueManager {
     await this.persist()
     this.publish()
     this.pump()
+  }
+
+  async finishBatch(batchId: string, complete: boolean): Promise<void> {
+    if (!batchId || !this.tasks.some((task: UploadTaskRecord): boolean => task.batchId === batchId)) { return }
+    for (const task of this.tasks) {
+      if (task.batchId === batchId) { task.batchState = complete ? 'ready' : 'incomplete' }
+    }
+    await this.persist(); this.publish()
   }
 
   async remove(id: string): Promise<void> {

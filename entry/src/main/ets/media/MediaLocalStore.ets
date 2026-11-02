@@ -1,5 +1,6 @@
 import { Context } from '@kit.AbilityKit'
 import { preferences } from '@kit.ArkData'
+import { DownloadTaskRecord, TransferBatchFields } from '../model/FileEntry'
 
 /**
  * The remote signature is intentionally small and serialisable. Path, size
@@ -32,7 +33,7 @@ export class RemoteFileSignature {
 
 export type MediaLocalStatus = 'partial' | 'cached' | 'downloaded' | 'failed'
 
-export class MediaLocalRecord {
+export class MediaLocalRecord implements TransferBatchFields {
   sourceKey: string = ''
   scopeKey: string = ''
   remotePath: string = ''
@@ -55,6 +56,10 @@ export class MediaLocalRecord {
   status: MediaLocalStatus = 'partial'
   userDownload: boolean = false
   relativePath: string = ''
+  batchId: string = ''
+  batchName: string = ''
+  batchKind: string = 'files'
+  batchState: string = 'ready'
   playbackPositionMs: number = 0
   updatedAt: number = 0
 }
@@ -117,6 +122,19 @@ export class MediaLocalStore {
     this.notify()
   }
 
+  finishBatch(batchId: string, complete: boolean): boolean {
+    let changed = false
+    for (const key of Object.keys(this.records)) {
+      const record = this.records[key]
+      if (record.batchId === batchId && record.batchState !== (complete ? 'ready' : 'incomplete')) {
+        record.batchState = complete ? 'ready' : 'incomplete'
+        changed = true
+      }
+    }
+    if (changed) { this.schedulePersist(); this.notify() }
+    return changed
+  }
+
   remove(sourceKey: string): void {
     if (sourceKey.length === 0 || this.records[sourceKey] === undefined) {
       return
@@ -163,6 +181,10 @@ export class MediaLocalStore {
         record.userDownload = typeof value['userDownload'] === 'boolean' ? value['userDownload'] === true :
           record.durablePath.length > 0 || record.partPath.length > 0
         record.relativePath = this.stringValue(value['relativePath'])
+        record.batchId = this.stringValue(value['batchId'])
+        record.batchName = this.stringValue(value['batchName'])
+        record.batchKind = this.stringValue(value['batchKind']) === 'folder' ? 'folder' : 'files'
+        record.batchState = this.stringValue(value['batchState']) === 'ready' ? 'ready' : 'incomplete'
         const ranges = value['ranges']
         record.ranges = ranges instanceof Array
           ? ranges.filter((item: Object): boolean => typeof item === 'string') as string[] : []
@@ -233,6 +255,7 @@ export class MediaLocalStore {
     result.status = source.status
     result.userDownload = source.userDownload
     result.relativePath = source.relativePath
+    DownloadTaskRecord.copyBatchInto(source, result)
     result.playbackPositionMs = source.playbackPositionMs
     result.updatedAt = source.updatedAt
     return result

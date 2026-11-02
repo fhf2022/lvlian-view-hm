@@ -26,6 +26,9 @@ export struct TransferTaskListRow {
   @Prop progress: number = 0
   @Prop loading: boolean = false
   @Prop infoColor: ResourceColor = $r('app.color.text_muted')
+  @Prop expandable: boolean = false
+  @Prop expanded: boolean = false
+  onExpand: () => void = () => {}
   @BuilderParam leading: () => void = this.ImageIcon
 
   @Builder
@@ -44,11 +47,21 @@ export struct TransferTaskListRow {
 
   @Builder
   ProgressContent(): void {
-    Progress({ value: this.progress, total: 100, type: ProgressType.Ring })
-      .width(30).height(30).backgroundColor('#AAB3C1').color('#2E6BFF')
-      .style({ strokeWidth: 3, enableSmoothEffect: false,
-        status: this.loading ? ProgressStatus.LOADING : ProgressStatus.PROGRESSING })
-      .margin({ left: 10, right: 8 })
+    Row({ space: 0 }) {
+      if (this.expandable) {
+        Button({ type: ButtonType.Circle }) {
+          SymbolGlyph($r('sys.symbol.chevron_right')).fontSize(14)
+            .fontColor([$r('app.color.text_muted')])
+            .rotate({ angle: this.expanded ? 90 : 0 })
+        }.width(32).height(32).padding(0).backgroundColor(Color.Transparent).stateEffect(false)
+          .accessibilityText(this.expanded ? '收起明细' : '展开明细').onClick((): void => this.onExpand())
+      }
+      Progress({ value: this.progress, total: 100, type: ProgressType.Ring })
+        .width(30).height(30).backgroundColor('#AAB3C1').color('#2E6BFF')
+        .style({ strokeWidth: 3, enableSmoothEffect: false,
+          status: this.loading ? ProgressStatus.LOADING : ProgressStatus.PROGRESSING })
+        .margin({ left: 10, right: 8 })
+    }
   }
 
   build() {

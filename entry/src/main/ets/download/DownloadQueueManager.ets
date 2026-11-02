@@ -3,7 +3,7 @@ import { fileIo } from '@kit.CoreFileKit'
 import { preferences } from '@kit.ArkData'
 import { DownloadDestination } from './DownloadDestination'
 import { StorageBudget } from './StorageBudget'
-import { DownloadDescriptor, DownloadTaskRecord, DownloadTaskStatus, FileEntry } from '../model/FileEntry'
+import { DownloadDescriptor, DownloadTaskRecord, DownloadTaskStatus, FileEntry, TransferBatchFields } from '../model/FileEntry'
 import { BinaryDownloadProgress, HttpTransport, StreamDownloadResult } from '../core/network/HttpTransport'
 import { NetworkClass, NetworkPolicy } from '../core/network/NetworkPolicy'
 import { NasConnection, NasConnectionState } from '../core/network/NasConnection'
@@ -173,7 +173,8 @@ export class DownloadQueueManager {
     this.schedule()
   }
 
-  async enqueue(entry: FileEntry, destinationRoot: string = '', relativePath: string = ''): Promise<string> {
+  async enqueue(entry: FileEntry, destinationRoot: string = '', relativePath: string = '',
+    batch: TransferBatchFields | null = null): Promise<string> {
     if (!this.initialized || this.context === null) {
       throw new Error('下载服务尚未初始化')
     }
@@ -214,6 +215,7 @@ export class DownloadQueueManager {
     task.destinationRoot = normalizedRoot
     task.relativePath = normalizedRelative
     task.manualMobileResume = this.isMeteredNetwork()
+    if (batch !== null) { DownloadTaskRecord.copyBatchInto(batch, task) }
     task.sourceScope = scope
     // Keep the queue record tied to the same remote version used by the
     // video/cache resolver. Older callers may not supply validators.
@@ -228,6 +230,14 @@ export class DownloadQueueManager {
     this.notify()
     this.schedule()
     return task.id
+  }
+
+  async finishBatch(batchId: string, complete: boolean): Promise<void> {
+    if (!batchId || !this.tasks.some((task: DownloadTaskRecord): boolean => task.batchId === batchId)) { return }
+    for (const task of this.tasks) {
+      if (task.batchId === batchId) { task.batchState = complete ? 'ready' : 'incomplete' }
+    }
+    await this.persist(); this.notify()
   }
 
   async toggleTask(id: string): Promise<boolean> {
@@ -336,6 +346,8 @@ export class DownloadQueueManager {
         task.sourceChecksum = typeof source.sourceChecksum === 'string' ? source.sourceChecksum : ''
         task.resumeValidator = typeof source.resumeValidator === 'string' ? source.resumeValidator :
           RemoteFileVersion.strongEtag(task.sourceEtag)
+        DownloadTaskRecord.copyBatchInto(source, task)
+        if (task.batchState === 'adding') { task.batchState = 'incomplete' }
         if (task.status === 'downloading') {
           task.status = 'queued'
         }
@@ -349,11 +361,7 @@ export class DownloadQueueManager {
 
   private pruneHistory(): void {
     const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000
-    const completed = this.tasks.filter((task: DownloadTaskRecord): boolean => task.status === 'completed')
-      .sort((a: DownloadTaskRecord, b: DownloadTaskRecord): number => b.updatedAt - a.updatedAt)
-      .filter((task: DownloadTaskRecord): boolean => task.updatedAt >= cutoff).slice(0, 200)
-    this.tasks = this.tasks.filter((task: DownloadTaskRecord): boolean =>
-      task.status !== 'completed' || completed.indexOf(task) >= 0)
+    this.tasks = DownloadTaskRecord.retainHistory(this.tasks, cutoff)
     this.requestPersist()
   }
 

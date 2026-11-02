@@ -3,11 +3,13 @@ const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('nod
 const ts=require(process.argv[2]);
 const types={FILE_URI:'general.file-uri',FILE:'general.file',IMAGE:'general.image',VIDEO:'general.video',AUDIO:'general.audio',FOLDER:'general.folder'};
 const channel={ProgressIndicator:{DEFAULT:1},ListenerStatus:{FINISHED:0,PROCESSING:1,CANCELED:2,INNER_ERROR:200}};
-const native={'@kit.ArkData':{uniformTypeDescriptor:{UniformDataType:types},unifiedDataChannel:channel}};
+const native={'@kit.ArkTS':{util:{generateRandomUUID:()=>require('node:crypto').randomUUID()}},'@kit.ArkData':{uniformTypeDescriptor:{UniformDataType:types},unifiedDataChannel:channel}};
 function compile(source,globals={}){
  const exports={};vm.runInNewContext(ts.transpileModule(source,{compilerOptions:{target:ts.ScriptTarget.ES2021,module:ts.ModuleKind.CommonJS}}).outputText,
- {exports,require:name=>native[name]||{},console,Math,Set,Error,Promise,...globals});return exports;
+ {exports,require:name=>native[name]||{},console,Math,Set,Error,Promise,Observed:value=>value,...globals});return exports;
 }
+native['../model/FileEntry']=compile(fs.readFileSync('entry/src/main/ets/model/FileEntry.ets','utf8'));
+native['../transfer/TransferTaskGroup']=compile(fs.readFileSync('entry/src/main/ets/transfer/TransferTaskGroup.ets','utf8'));
 const {FileImport}=compile(fs.readFileSync('entry/src/main/ets/upload/FileImport.ets','utf8'));
 const record=(uri,type=types.FILE_URI)=>({getTypes:()=>[type],getType:()=>type,getEntry:()=>({oriUri:uri,fileType:types.IMAGE}),uri});
 const data=(...records)=>({getRecords:()=>records});
@@ -38,7 +40,7 @@ function make(){
  showPageTransition:false,showSearch:false,selectionMode:false,importSelecting:false,continuationPending:false,continuationSending:false,
  continuationDialogCount:0,dropImportHover:false,dropImportActive:false,dropImportKey:'',dropImportGeneration:0,scope:'account-a',
  parentOverlayOwnsInteraction:()=>false,repository:{cacheScopeHash:()=>h.scope},ensureDownloadState:async()=>{},
- uploadQueue:{enqueue:async(uri,target,scope)=>{calls.push({uri,target,scope});return {status:'queued'};}},
+ uploadQueue:{finishBatch:async()=>{},enqueue:async(uri,target,scope)=>{calls.push({uri,target,scope});return {status:'queued'};}},
  showImmersiveToast:text=>messages.push(text),reportError:error=>errors.push(error.message),
  getUIContext:()=>({getDragController:()=>({cancelDataLoading:key=>cancellations.push(key)})})});
  return {h,calls,messages,errors,cancellations};
@@ -51,11 +53,11 @@ function event(source='com.huawei.files',synchronous=false){
 const tick=()=>new Promise(resolve=>setImmediate(resolve));
 (async()=>{
  const batchCalls=[];
- const batch=await FileImport.enqueue({enqueue:async(uri,target,scope)=>{batchCalls.push([uri,target,scope]);if(uri==='b')throw Error('denied');return{status:uri==='c'?'failed':'queued'};}},
+ const batch=await FileImport.enqueue({finishBatch:async()=>{},enqueue:async(uri,target,scope)=>{batchCalls.push([uri,target,scope]);if(uri==='b')throw Error('denied');return{status:uri==='c'?'failed':'queued'};}},
  ['a','b','c','d'],'/target','account',()=>true);
  assert.equal(batch.added,2);assert.equal(batch.failed,2);assert.equal(batchCalls.length,4);
  let current=true;
- const changed=await FileImport.enqueue({enqueue:async()=>{current=false;return{status:'queued'};}},['a','b','c'],'/target','account',()=>current);
+ const changed=await FileImport.enqueue({finishBatch:async()=>{},enqueue:async()=>{current=false;return{status:'queued'};}},['a','b','c'],'/target','account',()=>current);
  assert.equal(changed.added,1);assert.equal(changed.failed,2,'stop remaining imports after account change');
 
  let t=make(),e=event();t.h.updateFileDropHover(e);assert.equal(t.h.dropImportHover,true);

@@ -1,5 +1,6 @@
 import { unifiedDataChannel, uniformDataStruct, uniformTypeDescriptor as utd } from '@kit.ArkData'
 import { UploadQueueManager } from './UploadQueueManager'
+import { TransferBatch } from '../transfer/TransferTaskGroup'
 
 export class DroppedFiles {
   uris: string[] = []
@@ -51,12 +52,19 @@ export class FileImport {
     if (uris.length > FileImport.maxFiles) { throw new Error('一次最多导入 500 个文件') }
     if (target === '' || scope === '' || !valid()) { throw new Error('登录状态已改变，请重新选择上传位置') }
     const result = new FileImportResult()
-    for (let index = 0; index < uris.length; index++) {
-      if (!valid()) { result.failed += uris.length - index; break }
-      try {
-        const task = await queue.enqueue(uris[index], target, scope)
-        if (task.status === 'failed') { result.failed++ } else { result.added++ }
-      } catch (_) { result.failed++ }
+    const batch = uris.length > 1 ? new TransferBatch() : null
+    let admitted = 0
+    try {
+      for (let index = 0; index < uris.length; index++) {
+        if (!valid()) { result.failed += uris.length - index; break }
+        try {
+          const task = await queue.enqueue(uris[index], target, scope, batch)
+          admitted++
+          if (task.status === 'failed') { result.failed++ } else { result.added++ }
+        } catch (_) { result.failed++ }
+      }
+    } finally {
+      if (batch !== null) { await queue.finishBatch(batch.batchId, admitted === uris.length) }
     }
     return result
   }

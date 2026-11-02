@@ -140,8 +140,57 @@ export type DownloadTaskStatus = 'queued' | 'downloading' | 'paused' | 'waiting_
  * A user-visible download is deliberately not a CacheManager entry.  The
  * staging file lives in filesDir and survives cache cleanup/system reclaim.
  */
+export interface TransferBatchFields {
+  batchId: string
+  batchName: string
+  batchKind: string
+  batchState: string
+}
+
 @Observed
-export class DownloadTaskRecord {
+export class DownloadTaskRecord implements TransferBatchFields {
+  /** Reclaim completed history by whole batch, so a folder never loses random detail rows. */
+  static retainHistory(tasks: DownloadTaskRecord[], cutoff: number, limit: number = 200): DownloadTaskRecord[] {
+    const units = new Map<string, DownloadTaskRecord[]>()
+    for (const task of tasks) {
+      const key = task.sourceScope + ':' + (task.batchId ? 'batch:' + task.batchId : 'task:' + task.id)
+      const unit = units.get(key)
+      if (unit === undefined) { units.set(key, [task]) } else { unit.push(task) }
+    }
+    const completed: DownloadTaskRecord[][] = []
+    const retained = new Set<string>()
+    const newest = new Map<string, number>()
+    units.forEach((unit: DownloadTaskRecord[]): void => {
+      let updatedAt = 0
+      for (const task of unit) { updatedAt = Math.max(updatedAt, task.updatedAt) }
+      newest.set(unit[0].id, updatedAt)
+      if (unit.some((task: DownloadTaskRecord): boolean => task.status !== 'completed' ||
+        (task.batchId.length > 0 && task.batchState !== 'ready'))) {
+        unit.forEach((task: DownloadTaskRecord): void => { retained.add(task.id) })
+      } else { completed.push(unit) }
+    })
+    completed.sort((a: DownloadTaskRecord[], b: DownloadTaskRecord[]): number =>
+      (newest.get(b[0].id) ?? 0) - (newest.get(a[0].id) ?? 0))
+    let count = 0
+    for (const unit of completed) {
+      if (!unit.some((task: DownloadTaskRecord): boolean => task.updatedAt >= cutoff)) { continue }
+      // One recent large batch may exceed the record budget; retain it whole, then stop.
+      if (count > 0 && count + unit.length > limit) { continue }
+      unit.forEach((task: DownloadTaskRecord): void => { retained.add(task.id) })
+      count += unit.length
+      if (count >= limit) { break }
+    }
+    return tasks.filter((task: DownloadTaskRecord): boolean => retained.has(task.id))
+  }
+
+  static copyBatchInto(source: TransferBatchFields, target: TransferBatchFields): void {
+    target.batchId = typeof source.batchId === 'string' ? source.batchId : ''
+    target.batchName = typeof source.batchName === 'string' ? source.batchName : ''
+    target.batchKind = source.batchKind === 'folder' ? 'folder' : 'files'
+    target.batchState = source.batchState === 'adding' || source.batchState === 'incomplete'
+      ? source.batchState : 'ready'
+  }
+
   static copyInto(source: DownloadTaskRecord, result: DownloadTaskRecord): void {
     result.id = source.id
     result.remotePath = source.remotePath
@@ -164,6 +213,7 @@ export class DownloadTaskRecord {
     result.sourceEtag = source.sourceEtag
     result.sourceChecksum = source.sourceChecksum
     result.resumeValidator = source.resumeValidator
+    DownloadTaskRecord.copyBatchInto(source, result)
   }
 
   id: string = ''
@@ -192,4 +242,9 @@ export class DownloadTaskRecord {
   sourceEtag: string = ''
   sourceChecksum: string = ''
   resumeValidator: string = ''
+  // Presentation membership only; the underlying transfer remains an individual task.
+  batchId: string = ''
+  batchName: string = ''
+  batchKind: string = 'files'
+  batchState: string = 'ready'
 }
