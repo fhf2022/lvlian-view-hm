@@ -9,6 +9,7 @@ import { NasConnection } from '../core/network/NasConnection'
 import { HttpResult, JsonObject } from '../core/network/HttpTypes'
 import { UGREENLINK_RESOLVE_URL, UgreenEndpoints } from './UgreenEndpoints'
 import { UgreenError, UgreenErrorKind } from './UgreenErrors'
+import { ThumbnailNotifications } from './ThumbnailNotifications'
 
 interface PendingLogin {
   username: string
@@ -23,6 +24,7 @@ export interface UgreenDirectoryPage {
 }
 
 export class UgreenRemoteClient {
+  private thumbnailNotifications: ThumbnailNotifications = new ThumbnailNotifications()
   private static readonly DIRECTORY_PAGE_SIZE: number = 200
   // Metadata-only indexing must cover large photo directories. The guard is
   // still finite so a broken endpoint cannot create an endless page loop.
@@ -55,6 +57,7 @@ export class UgreenRemoteClient {
   }
 
   clearSession(): void {
+    this.thumbnailNotifications.reset()
     this.sessionGeneration += 1
     this.sessionStore.clear()
     this.pendingLogin = null
@@ -138,6 +141,7 @@ export class UgreenRemoteClient {
   }
 
   async login(username: string, password: string): Promise<LoginResult> {
+    this.thumbnailNotifications.reset()
     const generation = this.sessionGeneration
     const cleanUsername = username.trim()
     if (cleanUsername.length === 0 || password.length === 0) {
@@ -586,7 +590,10 @@ export class UgreenRemoteClient {
   private async thumbnailCandidatesOnce(entry: FileEntry): Promise<DownloadDescriptor[]> {
     const urls = this.requireEndpoints()
     const headers = await this.authHeaders()
+    await this.thumbnailNotifications.ensure(urls.baseUrl, headers)
     const thumbnailHeaders = this.withHeaders(headers, 'accept', 'image/*')
+    const notificationHeaders = this.thumbnailNotifications.requestHeaders(entry.path)
+    for (const name of Object.keys(notificationHeaders)) { thumbnailHeaders[name] = notificationHeaders[name] }
     // The web file manager sends this referer for preview requests. Keep the
     // binary request in the same authenticated context instead of accepting
     // a successful HTML/JSON error body as an image.
@@ -604,6 +611,15 @@ export class UgreenRemoteClient {
     }
     return result
   }
+
+  setThumbnailReadyListener(listener: ((path: string) => void) | null): void {
+    this.thumbnailNotifications.setListener(listener)
+  }
+
+  setThumbnailForeground(value: boolean): void { this.thumbnailNotifications.setForeground(value) }
+  cancelThumbnailNotifications(): void { this.thumbnailNotifications.forgetPending() }
+  thumbnailNotificationsConnected(): boolean { return this.thumbnailNotifications.isConnected() }
+  completeThumbnail(path: string, id: string): void { this.thumbnailNotifications.complete(path, id) }
 
   async rename(path: string, newName: string): Promise<void> {
     await this.withReconnect(async (): Promise<void> => {

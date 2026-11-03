@@ -1850,6 +1850,11 @@ struct Index {
   private timelineRailMaterial: uiMaterial.ImmersiveMaterial = GlassMaterial.timeline()
   private floatingPanelMaterial: uiMaterial.ImmersiveMaterial = GlassMaterial.overlay()
   aboutToAppear(): void {
+    this.repository.setThumbnailReadyListener((path: string): void => {
+      if (this.screen !== 'files' || this.fileContentScrolling || this.showImageViewer ||
+        this.showPageTransition || this.locateProgrammaticScrolling || this.timelineScrubActive) { return }
+      this.previewQueue.retryNow(path + '#preview:' + this.previewGeneration.toString())
+    })
     this.observeGridLayoutSize()
     CacheManager.onRemoved(this.cacheRemovalListener)
     ContinuationManager.shared().attach(this.continuationPage)
@@ -2434,6 +2439,9 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    this.cancelPendingPreviewLoads()
+    this.repository.setThumbnailReadyListener(null)
+    this.repository.setThumbnailForeground(false)
     this.storageUsageRefreshToken++
     this.stopWaterfallPipeline()
     this.gridLayoutWatching = false
@@ -2610,6 +2618,9 @@ struct Index {
 
   onPageHide(): void {
     if (!this.startupAuthorized) { return }
+    this.fileContentScrolling = false
+    this.cancelPendingPreviewLoads()
+    this.repository.setThumbnailForeground(false)
     this.albumUpload.setForeground(false)
     this.gestureSharePageVisible = false
     NasConnection.shared().setForeground(false)
@@ -2620,6 +2631,7 @@ struct Index {
   }
 
   onPageShow(): void {
+    this.repository.setThumbnailForeground(!this.abilityInBackground)
     if (!this.startupAuthorized) { return }
     this.albumUpload.setForeground(!this.abilityInBackground)
     this.gestureSharePageVisible = true
@@ -2628,6 +2640,7 @@ struct Index {
     this.onIncomingShareRequested()
     NasConnection.shared().setForeground(!this.abilityInBackground)
     this.scheduleNasRecovery()
+    this.schedulePreviewWarmup(this.previewGeneration)
     this.syncGestureShareRegistration()
     this.handlePlaybackBackgroundState(false)
     this.scheduleVideoPipRestore()
@@ -2640,12 +2653,18 @@ struct Index {
 
   onAbilityBackgroundChanged(): void {
     if (!this.startupAuthorized) { return }
+    this.repository.setThumbnailForeground(this.gestureSharePageVisible && !this.abilityInBackground)
+    if (this.abilityInBackground) {
+      this.fileContentScrolling = false
+      this.cancelPendingPreviewLoads()
+    }
     this.albumUpload.setForeground(this.gestureSharePageVisible && !this.abilityInBackground)
     NasConnection.shared().setForeground(this.gestureSharePageVisible && !this.abilityInBackground)
     if (!this.abilityInBackground) { this.scheduleNasRecovery() }
     this.syncGestureShareRegistration()
     this.handlePlaybackBackgroundState(this.abilityInBackground)
     if (!this.abilityInBackground) {
+      this.schedulePreviewWarmup(this.previewGeneration)
       this.onContinuationNoticeChanged()
       this.onContinuationMessage()
       this.onIncomingShareRequested()
@@ -3514,6 +3533,7 @@ struct Index {
     this.postRenderFrame((): void => this.rememberGridViewportAnchor())
     if (this.resetPreviewAfterPageTransition) {
       this.resetPreviewAfterPageTransition = false
+      this.fileContentScrolling = false
       this.resetPreviewState(false)
     }
   }
@@ -3696,6 +3716,7 @@ struct Index {
     this.transitionSnapshotMode = 'list'
     this.traceStateWrite('StateWrite:cbf.outgoingEntries')
     this.outgoingEntries = []
+    this.fileContentScrolling = false
     this.resetPreviewState(false)
     this.pageTransitionFinishing = false
     this.traceStateWrite('StateWrite:cbf.isBusy')
@@ -4341,9 +4362,11 @@ struct Index {
   LoginContent(): void {
     Column({ space: 26 }) {
       Column({ space: 12 }) {
-        Image($r('app.media.private_cloud'))
+        Image($r('app.media.icon'))
           .width(76)
           .height(76)
+          .objectFit(ImageFit.Contain).borderRadius(18).clip(true)
+          .accessibilityText('联文件应用图标')
         Text('联文件')
           .fontSize(26)
           .fontWeight(FontWeight.Bold)
@@ -15135,6 +15158,7 @@ struct Index {
   }
 
   private cancelPendingPreviewLoads(): void {
+    this.repository.cancelThumbnailNotifications()
     const cancelled = this.previewQueue.cancelPending()
     for (const key of cancelled) {
       const separator = key.indexOf('#preview:')
@@ -15512,7 +15536,8 @@ struct Index {
     const endScan = visibleEnd > 0 ? visibleEnd : Math.min(items.length - 1, 24)
     for (let i = visibleStart; i <= endScan; i++) {
       const entry = items[i]
-      if (!entry || processedPaths.has(entry.path) || entry.isDirectory || !this.isImage(entry)) {
+      if (!entry || processedPaths.has(entry.path) || entry.isDirectory ||
+        (!this.isImage(entry) && !this.isVideo(entry) && !this.isAudio(entry))) {
         continue
       }
       const uri = this.previewUri(entry)
@@ -17091,6 +17116,7 @@ struct Index {
     }
     this.closeActionMenu()
     this.viewerBlocksFileContent = true
+    this.cancelPendingPreviewLoads()
     this.viewerClosing = false
     this.viewerInteractionUnlocked = false
     this.isBusy = true
@@ -24616,6 +24642,11 @@ struct Index {
   }
 
   private resetPreviewState(resetScroll: boolean = true): void {
+    // Incoming cells can become visible during the directory animation. Keep
+    // their observations when settling the same mounted surface, not old paths.
+    const visible: FileEntry[] = !resetScroll && this.fileViewMode !== 'waterfall'
+      ? Array.from(this.pendingVisibleLoads.values()).filter((entry: FileEntry): boolean =>
+        this.fileEntryDataSource.indexOfPath(entry.path) >= 0) : []
     this.previewRecoveryAttempts.clear()
     this.previewReloadPaths.clear()
     this.previewGeneration += 1
@@ -24626,13 +24657,25 @@ struct Index {
     // thumbnail immediately.
     this.previewRequests = {}
     this.pendingVisibleLoads.clear()
-    // R3.2：rendered preview key 是 per-条目状态，换目录即作废。
-    // 不做 LRU，目录切换清空即可（避免长期浏览大量目录后无限增长）。
-    this.gridRenderedPreviewKey = {}
+    for (const entry of visible) { this.pendingVisibleLoads.set(entry.path, entry) }
+    // Keep committed cells for the current directory; discard old-directory
+    // render keys so settling a transition neither loses readiness nor grows history.
+    if (resetScroll || this.fileViewMode === 'waterfall') {
+      this.gridRenderedPreviewKey = {}
+    } else {
+      const rendered: Record<string, string> = {}
+      for (const path of Object.keys(this.gridRenderedPreviewKey)) {
+        if (this.fileEntryDataSource.indexOfPath(path) >= 0) { rendered[path] = this.gridRenderedPreviewKey[path] }
+      }
+      this.gridRenderedPreviewKey = rendered
+    }
     this.waterfallRenderedPreviewKey = {}
+    this.repository.cancelThumbnailNotifications()
     this.previewQueue.cancelPending()
-    this.fileVisibleStartIndex = 0
-    this.fileVisibleEndIndex = 0
+    if (resetScroll || this.fileViewMode === 'waterfall') {
+      this.fileVisibleStartIndex = 0
+      this.fileVisibleEndIndex = 0
+    }
     this.waterfallVisibleStartIndex = 0
     this.waterfallVisibleEndIndex = 0
     this.directoryCountRequests = {}
@@ -24644,17 +24687,22 @@ struct Index {
       this.postRenderFrame((): void => this.ensureWaterfallStarted())
     }
     if (resetScroll) {
+      this.fileContentScrolling = false
       this.resetFileListScroll()
     }
     this.schedulePreviewWarmup(this.previewGeneration)
   }
 
   private schedulePreviewWarmup(generation: number): void {
-    setTimeout((): void => {
+    this.postRenderFrame((): void => {
       if (generation !== this.previewGeneration || this.screen !== 'files' || this.showSearch ||
-        this.fileViewMode === 'waterfall') {
+        this.showImageViewer || this.showPageTransition || this.fileContentScrolling ||
+        this.locateProgrammaticScrolling || this.timelineScrubActive || this.fileViewMode === 'waterfall') {
         return
       }
+      // Reconcile the committed visible set first, including cached cells that
+      // mounted as placeholders. Preload budgets must not limit the actual screen.
+      this.flushPendingVisibleLoads()
       const limit = this.networkPolicy.isMetered()
         ? (this.fileViewMode === 'grid' ? 8 : 6)
         : (this.fileViewMode === 'grid' ? 16 : 12)
@@ -24679,11 +24727,12 @@ struct Index {
         if (entry.isDirectory || (!this.isImage(entry) && !this.isVideo(entry) && !this.isAudio(entry))) {
           continue
         }
+        if (this.previewUri(entry).length > 0 || this.isPreviewRequestActive(entry.path)) { continue }
         this.resolveFileListImageRotation(entry)
         this.loadEntryPreview(entry, this.previewPriority(index, this.fileViewMode))
         scheduled += 1
       }
-    }, 0)
+    })
   }
 
   private previewPriority(index: number, surface: ThumbnailSurfaceKind): number {
@@ -24782,6 +24831,10 @@ struct Index {
     if (this.fileContentScrolling && this.screen === 'files' && !this.showImageViewer) {
       return
     }
+    const queueKey = entry.path + '#preview:' + this.previewGeneration.toString()
+    // A deferred lock is still owned by this queue. Do not replace its path
+    // generation or retry budget when a native visibility callback repeats.
+    if (this.previewQueue.promote(queueKey, priority)) { return }
     const generation = this.previewGeneration
     const pathToken = this.acquirePathGeneration(entry.path)
     // R3.1：本请求的 owner token。只有它仍然拥有这个 path 时才有权在结束时清除标志。
@@ -24790,10 +24843,19 @@ struct Index {
     this.previewRequests[entry.path] = requestToken
     // A running task from an old directory generation must not reject a new
     // task for the same path after the user returns to that directory.
-    const queueKey = entry.path + '#preview:' + generation.toString()
+    const valid = (): boolean => generation === this.previewGeneration && this.isPathGenerationValid(entry.path, pathToken) &&
+      this.screen === 'files' && this.gestureSharePageVisible && !this.abilityInBackground &&
+      !this.showPageTransition && !this.showImageViewer && !this.viewerBlocksFileContent &&
+      !this.fileContentScrolling && !this.locateProgrammaticScrolling && !this.timelineScrubActive
     const accepted = this.previewQueue.enqueue(queueKey, priority, async (): Promise<void> => {
+      if (!valid()) {
+        if (this.previewRequests[entry.path] === requestToken) { this.previewRequests[entry.path] = 0 }
+        return
+      }
+      this.previewRequests[entry.path] = requestToken
       await this.loadEntryPreviewNow(entry, generation, pathToken, requestToken)
-    })
+    }, (error: Object): boolean => error instanceof UgreenError && error.status === 423,
+      valid, (): number => this.repository.thumbnailNotificationsConnected() ? 15000 : 0)
     if (!accepted) {
       if (this.previewRequests[entry.path] === requestToken) {
         this.previewRequests[entry.path] = 0
@@ -24850,6 +24912,7 @@ struct Index {
         thumbnailPath = await this.repository.prepareThumbnail(entry, this.thumbnailDirectory,
           this.thumbnailCacheLimitBytes, 'list')
       } catch (error) {
+        if (error instanceof UgreenError && error.status === 423) { throw error }
         console.warn('[UgreenPreview] server thumbnail failed: ' + entry.path + ': ' +
           JSON.stringify(error))
       }
@@ -24873,6 +24936,7 @@ struct Index {
       }
 
     } catch (error) {
+      if (error instanceof UgreenError && error.status === 423) { throw error }
       // A failed thumbnail must never make the directory itself fail to
       // render, but retain evidence for diagnosing transient NAS/decoder
       // failures and for a later retry triggered by a new appearance.

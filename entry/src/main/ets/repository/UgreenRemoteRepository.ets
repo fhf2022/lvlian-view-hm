@@ -112,6 +112,11 @@ export class UgreenRemoteRepository {
     return this.thumbnailCacheStore.directoryPath()
   }
 
+  setThumbnailReadyListener(listener: ((path: string) => void) | null): void { this.client.setThumbnailReadyListener(listener) }
+  setThumbnailForeground(value: boolean): void { this.client.setThumbnailForeground(value) }
+  cancelThumbnailNotifications(): void { this.client.cancelThumbnailNotifications() }
+  thumbnailNotificationsConnected(): boolean { return this.client.thumbnailNotificationsConnected() }
+
   async thumbnailCacheUsage(): Promise<number> {
     return await this.thumbnailCacheStore.usage()
   }
@@ -1050,6 +1055,7 @@ export class UgreenRemoteRepository {
     // Resolve every persistent candidate before starting any network request.
     // The thumbnail cache is deliberately isolated from the disposable
     // original-file cache and never reads legacy cacheDir previews.
+    let locked: UgreenError | null = null
     for (const descriptor of descriptors) {
       if (scope !== this.cacheScopeHash()) { return '' }
       if (descriptor.url.length === 0) {
@@ -1085,7 +1091,8 @@ export class UgreenRemoteRepository {
           if (pendingPath.length > 0) {
             return pendingPath
           }
-        } catch (_) {
+        } catch (error) {
+          if (error instanceof UgreenError && error.status === 423) { locked = error }
           // Try the next candidate route below.
         }
         continue
@@ -1098,18 +1105,22 @@ export class UgreenRemoteRepository {
         if (preparedPath.length > 0) {
           await this.thumbnailCacheStore.register(cacheKey, preparedPath)
           await this.thumbnailCacheStore.register(identityKey, preparedPath)
+          this.client.completeThumbnail(entry.path, descriptor.headers['Thumb-ID'] || '')
           return preparedPath
         }
       } catch (error) {
         if (error instanceof UgreenError && error.kind === UgreenErrorKind.NAS_UNAVAILABLE) { return '' }
         console.warn('[UgreenThumbnail] route failed kind=' +
-          (error instanceof UgreenError ? error.kind : 'UNKNOWN'))
+          (error instanceof UgreenError ? error.kind : 'UNKNOWN') +
+          ' status=' + (error instanceof UgreenError ? error.status.toString() : '0'))
+        if (error instanceof UgreenError && error.status === 423) { locked = error }
       } finally {
         if (this.thumbnailRequests.get(cacheKey) === request) {
           this.thumbnailRequests.delete(cacheKey)
         }
       }
     }
+    if (locked !== null) { throw locked }
     return ''
   }
 
