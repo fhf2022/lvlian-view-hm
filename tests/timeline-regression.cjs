@@ -4,6 +4,8 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const ts = require(process.argv[2] || 'typescript');
 
+const mediaExports = {};
+vm.runInNewContext(ts.transpileModule(fs.readFileSync('entry/src/main/ets/model/MediaType.ets', 'utf8'), { compilerOptions: {module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020} }).outputText, {exports: mediaExports});
 const exportsObject = {};
 const source = fs.readFileSync('entry/src/main/ets/model/DirectoryTimeline.ets', 'utf8');
 const compiled = ts.transpileModule(source, {
@@ -30,6 +32,7 @@ class FileEntry {
 vm.runInNewContext(compiled, {
   exports: exportsObject,
   require: key => {
+    if (key === './MediaType') return mediaExports;
     assert.equal(key, './FileEntry');
     return { FileEntry };
   },

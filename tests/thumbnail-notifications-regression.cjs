@@ -47,6 +47,17 @@ const ready=(socket,id)=>socket.emit('message',JSON.stringify({type:'filemgr',ap
  let reject;calls=0;queue.enqueue('early',0,()=>{calls++;return calls===1?new Promise((_,fail)=>reject=fail):Promise.resolve()},()=>true,()=>true,()=>15000);
  queue.retryNow('early');queue.retryNow('early');reject(Error('423'));await tick();assert.equal(calls,2,'early and duplicate events coalesce into one follow-up');
  calls=0;queue.enqueue('cancelled',0,async()=>{calls++;throw Error('423')},()=>true,()=>true,()=>15000);await tick();queue.cancelPending();queue.retryNow('cancelled');await tick();assert.equal(calls,1);assert.equal(timers.size,0);
+
+ // Use the production notification channel and queue together across a scroll.
+ const scrollChannel=new Notifications(),scrollQueue=new Queue(4,256);let rejectScroll,scrollCalls=0;
+ const scrollConnect=scrollChannel.ensure('https://nas.invalid',{}),scrollSocket=sockets.at(-1);scrollSocket.emit('open');await scrollConnect;
+ scrollChannel.setListener(path=>scrollQueue.retryNow(path));
+ const scrollHeaders=scrollChannel.requestHeaders('/scroll/one');
+ scrollQueue.enqueue('/scroll/one',0,()=>++scrollCalls===1?new Promise((_,fail)=>rejectScroll=fail):Promise.resolve(),()=>true,()=>true,()=>15000);
+ scrollQueue.pause();rejectScroll(Error('423'));await tick();ready(scrollSocket,scrollHeaders['Thumb-ID']);await tick();
+ assert.equal(scrollCalls,1);assert.equal([...timers.values()].filter(t=>!t.interval).length,0,'scroll leaves only the existing socket heartbeat');
+ scrollQueue.reconcile(new Map([['/scroll/one',0]]));scrollQueue.resume();await tick();assert.equal(scrollCalls,2,'a real matching server notification survives scroll without rebinding');
+ scrollChannel.stop();assert.equal(timers.size,0);
  // Background cancellation must not leave an old scrolling flag blocking resume.
  const source=fs.readFileSync('entry/src/main/ets/pages/Index.ets','utf8');
  const start=source.indexOf('  onAbilityBackgroundChanged(): void {'),end=source.indexOf('\n  onTransferNavigationRequested()',start);
@@ -54,7 +65,7 @@ const ready=(socket,id)=>socket.emit('message',JSON.stringify({type:'filemgr',ap
   {exports:exported,NasConnection:{shared:()=>({setForeground(){}})}});
  const page=new exported.Page(),foreground=[];let cancelled=0,warmed=0;
  Object.assign(page,{startupAuthorized:true,gestureSharePageVisible:true,abilityInBackground:true,fileContentScrolling:true,previewGeneration:9,
-  repository:{setThumbnailForeground:value=>foreground.push(value)},albumUpload:{setForeground(){}},cancelPendingPreviewLoads(){cancelled++},
+  repository:{setForeground:value=>foreground.push(value)},albumUpload:{setForeground(){}},cancelPendingPreviewLoads(){cancelled++},
   scheduleNasRecovery(){},syncGestureShareRegistration(){},handlePlaybackBackgroundState(){},schedulePreviewWarmup(generation){assert.equal(generation,9);warmed++},
   onContinuationNoticeChanged(){},onContinuationMessage(){},onIncomingShareRequested(){},scheduleVideoPipRestore(){}});
  page.onAbilityBackgroundChanged();assert.equal(cancelled,1);assert.equal(page.fileContentScrolling,false);assert.equal(warmed,0);

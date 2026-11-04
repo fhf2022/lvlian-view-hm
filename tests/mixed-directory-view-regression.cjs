@@ -1,13 +1,14 @@
 // node tests/mixed-directory-view-regression.cjs <SDK typescript.js>
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
 const ts = require(process.argv[2]);
-function compile(source) {
+function compile(source, globals = {}) {
   const exports = {};
   vm.runInNewContext(ts.transpileModule(source, { compilerOptions: {
     target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS
-  } }).outputText, { exports });
+  } }).outputText, { exports, ...globals });
   return exports;
 }
+const { MediaType } = compile(fs.readFileSync('entry/src/main/ets/model/MediaType.ets', 'utf8').replace(/^import .*$/gm, ''));
 const source = fs.readFileSync('entry/src/main/ets/pages/Index.ets', 'utf8');
 function method(name) {
   const start = source.search(new RegExp('^  private (?:async )?' + name + '\\(', 'm'));
@@ -19,7 +20,7 @@ const names = ['syncDirectoryMediaEntries', 'sameWaterfallEntry', 'preferredView
   'applyPreferredViewMode', 'prepareWaterfallPipeline', 'selectionEntries', 'allEntriesSelected',
   'toggleSelectAll', 'selectedEntriesInCurrentDirectory', 'setSelectedPaths', 'publishFileSelection',
   'isSelected', 'isImage', 'isVideo', 'isAudio', 'fileExtension'];
-const { Page } = compile('export class Page {\n' + names.map(method).join('\n') + '\n}');
+const { Page } = compile('export class Page {\n' + names.map(method).join('\n') + '\n}', { MediaType });
 let serial = 0;
 function entry(ext, size = 2 * 1024 * 1024, directory = false) {
   const name = `${serial++}.${ext}`;

@@ -10,6 +10,8 @@ import { HttpResult, JsonObject } from '../core/network/HttpTypes'
 import { UGREENLINK_RESOLVE_URL, UgreenEndpoints } from './UgreenEndpoints'
 import { UgreenError, UgreenErrorKind } from './UgreenErrors'
 import { ThumbnailNotifications } from './ThumbnailNotifications'
+import { DirectorySizeQuery } from './DirectorySizeQuery'
+import { FileOperationState } from '../model/FileOperation'
 
 interface PendingLogin {
   username: string
@@ -276,6 +278,26 @@ export class UgreenRemoteClient {
   async listPage(path: string, rootType: number, pageIndex: number,
     limit: number = 0): Promise<UgreenDirectoryPage> {
     return await this.withReconnect(() => this.listPageOnce(path, rootType, pageIndex, limit))
+  }
+
+  createDirectorySizeQuery(entry: FileEntry): DirectorySizeQuery {
+    const urls = this.requireEndpoints()
+    const session = this.sessionStore.get()
+    const headers = this.authHeaders()
+    const url = urls.directorySize(entry.path, entry.intranetShareId)
+    const valid = (): boolean => session !== null && this.sessionStore.get() === session && this.endpoints === urls
+    return new DirectorySizeQuery(async (): Promise<JsonObject> => {
+      const auth = await headers
+      if (!valid()) { throw new Error('Directory size session changed') }
+      const response = await this.transport.requestJson(url, http.RequestMethod.GET, undefined, auth)
+      return this.successData(response.body, '获取文件夹大小失败')
+    }, async (id: string | number): Promise<void> => {
+      // The captured endpoint and headers belong to the original account,
+      // including cleanup after a switch while a request was still in flight.
+      const auth = this.withHeaders(await headers, 'content-type', 'application/json')
+      await this.transport.requestJson(urls.cancelDirectorySize(), http.RequestMethod.POST,
+        { 'calculate_id': id }, auth)
+    }, valid)
   }
 
   private async listPageOnce(path: string, rootType: number, pageIndex: number,
@@ -617,7 +639,10 @@ export class UgreenRemoteClient {
   }
 
   setThumbnailForeground(value: boolean): void { this.thumbnailNotifications.setForeground(value) }
-  cancelThumbnailNotifications(): void { this.thumbnailNotifications.forgetPending() }
+  cancelThumbnailNotifications(path: string = ''): void {
+    if (path.length > 0) { this.thumbnailNotifications.complete(path) }
+    else { this.thumbnailNotifications.forgetPending() }
+  }
   thumbnailNotificationsConnected(): boolean { return this.thumbnailNotifications.isConnected() }
   completeThumbnail(path: string, id: string): void { this.thumbnailNotifications.complete(path, id) }
 
@@ -633,18 +658,20 @@ export class UgreenRemoteClient {
     })
   }
 
-  async copy(paths: string[], targetPath: string): Promise<void> {
-    await this.copyOrMove(paths, targetPath, false)
+  async copy(paths: string[], targetPath: string): Promise<string> {
+    return await this.copyOrMove(paths, targetPath, false)
   }
 
-  async move(paths: string[], targetPath: string): Promise<void> {
-    await this.copyOrMove(paths, targetPath, true)
+  async move(paths: string[], targetPath: string): Promise<string> {
+    return await this.copyOrMove(paths, targetPath, true)
   }
 
-  private async copyOrMove(paths: string[], targetPath: string, move: boolean): Promise<void> {
-    await this.withReconnect(async (): Promise<void> => {
+  private async copyOrMove(paths: string[], targetPath: string, move: boolean): Promise<string> {
+    const identity = this.sessionIdentity()
+    return await this.withReconnect(async (): Promise<string> => {
       const urls = this.requireEndpoints()
       const headers = this.withHeaders(await this.authHeaders(), 'content-type', 'application/json')
+      if (identity !== this.sessionIdentity()) { throw new Error('账号已改变') }
       const body: JsonObject = {}
       body['src'] = paths
       body['dst'] = targetPath
@@ -652,7 +679,42 @@ export class UgreenRemoteClient {
       body['action_type'] = 0
       body['intranet_share_id'] = 0
       const response = await this.transport.requestJson(urls.copyOrMovePaths(), http.RequestMethod.POST, body, headers, false, 60000)
-      this.successData(response.body, move ? '文件移动失败' : '文件复制失败')
+      const data = this.successData(response.body, move ? '文件移动失败' : '文件复制失败')
+      if (this.stringValue(data['path']).length > 0) { throw new Error('目标位置没有写入权限') }
+      const id = this.stringValue(data['task_id'])
+      if (id.length === 0) { throw new Error('NAS 未返回文件任务标识，请刷新目录确认结果') }
+      return id
+    })
+  }
+
+  async fileOperationStates(): Promise<FileOperationState[]> {
+    return await this.withReconnect(async (): Promise<FileOperationState[]> => {
+      const response = await this.transport.requestJson(this.requireEndpoints().fileTasks(),
+        http.RequestMethod.GET, undefined, await this.authHeaders())
+      const data = this.successData(response.body, '文件任务查询失败')
+      const rows = data['result']
+      if (!(rows instanceof Array)) { throw new Error('NAS 文件任务结果无效') }
+      const states: FileOperationState[] = []
+      for (const value of rows as Object[]) {
+        const row = this.asRecord(value)
+        const state: FileOperationState = { id: this.stringValue(row['id']), complete: row['is_completed'] === true,
+          failed: this.numberValue(row['status']) !== 3 || this.numberValue(row['err_item_count']) > 0 }
+        states.push(state)
+      }
+      return states
+    })
+  }
+
+  async pathExists(path: string): Promise<boolean> {
+    return await this.withReconnect(async (): Promise<boolean> => {
+      const headers = this.withHeaders(await this.authHeaders(), 'content-type', 'application/json')
+      const body: JsonObject = {}
+      body['path'] = path
+      const response = await this.transport.requestJson(this.requireEndpoints().pathExists(),
+        http.RequestMethod.POST, body, headers)
+      const data = this.successData(response.body, '文件路径核对失败')
+      if (typeof data['result'] !== 'boolean') { throw new Error('NAS 文件路径结果无效') }
+      return data['result'] as boolean
     })
   }
 

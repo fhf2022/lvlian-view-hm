@@ -15,7 +15,7 @@ vm.runInNewContext(ts.transpileModule('export class H {' + source.slice(a, b) +
   ['recordFilePageSize', 'observeGridLayoutSize'].map(method).join('\n') + '}', {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2021 }
 }).outputText, { exports: exp, window: { getLastWindow: () => getWindow() }, getContext: () => ({}),
-  EXPERIMENT_GRID_CACHED_COUNT: 4, THUMB_PROBE: false, ImageRotateOrientation: { UP: 0 } });
+  GRID_CACHED_ROW_COUNT: 4, THUMB_PROBE: false, ImageRotateOrientation: { UP: 0 } });
 (async () => {
   for (const density of [1, 2, 3]) {
     const h = new exp.H(), changes = [], events = new Map();

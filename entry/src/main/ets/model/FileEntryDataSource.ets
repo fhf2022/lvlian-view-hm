@@ -167,17 +167,48 @@ export class FileEntryDataSource implements IDataSource {
     }
   }
 
-  /**
-   * 在指定位置插入一条，并且【只通知这一个索引】（onDataAdd）。
-   * 不要用 replace() 来做插入：新文件会改变 path 顺序 → replace 会退化成
-   * onDataReloaded() 全量重载 → 所有已挂载行被销毁重建（闪烁 + 上下位移）。
-   */
-  insertAt(index: number, item: FileEntry): void {
-    const target = Math.max(0, Math.min(index, this.items.length))
-    this.items.splice(target, 0, item)
-    this.rebuildPathIndexes()
+  /** Apply a sorted add/remove batch without reloading unchanged lazy items. */
+  reconcile(next: FileEntry[]): void {
+    const indexes = new Map<string, number>()
+    const additions: number[] = []
+    const changed: number[] = []
+    let previousIndex = -1
+    for (let index = 0; index < next.length; index++) {
+      const item = next[index]
+      const oldIndex = this.pathIndexes.get(item.path)
+      // A true reorder uses the existing reload path. Add/remove batches keep
+      // the relative order of retained items, regardless of their new indexes.
+      if (indexes.has(item.path) || (oldIndex !== undefined && oldIndex <= previousIndex)) {
+        this.replace(next)
+        return
+      }
+      indexes.set(item.path, index)
+      if (oldIndex === undefined) { additions.push(index) }
+      else {
+        previousIndex = oldIndex
+        if (!this.sameRenderedEntry(this.items[oldIndex], item)) { changed.push(index) }
+      }
+    }
+    const removed: number[] = []
+    for (let index = this.items.length - 1; index >= 0; index--) {
+      if (!indexes.has(this.items[index].path)) { removed.push(index) }
+    }
+    const committed = next.slice()
+    if (this.bumpInPlace) {
+      for (let index = 0; index < committed.length; index++) {
+        const oldIndex = this.pathIndexes.get(committed[index].path)
+        if (oldIndex === undefined) { continue }
+        const retained = this.items[oldIndex]
+        retained.updateFrom(committed[index])
+        committed[index] = retained
+      }
+    }
+    this.items = committed
+    this.pathIndexes = indexes
     for (const listener of this.listeners.slice()) {
-      listener.onDataAdd(target)
+      for (const index of removed) { listener.onDataDelete(index) }
+      for (const index of additions) { listener.onDataAdd(index) }
+      for (const index of changed) { listener.onDataChange(index) }
     }
   }
 

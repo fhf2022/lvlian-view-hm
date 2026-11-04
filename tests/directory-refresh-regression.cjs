@@ -50,12 +50,14 @@ function make(root = false) {
 
   state = make(); job = state.page.confirmDestinationOperation();
   await tick(); state.finish(); await job;
-  assert.equal(state.published.length, 1);
-  assert.equal(state.page.closed, true, 'the refresh increment must not suppress normal copy completion');
+  assert.equal(state.published.length, 0, 'submission alone must not refresh an unfinished NAS task');
+  assert.equal(state.page.closed, true, 'submitted copy closes picker; completed task publishes its own incremental delta');
   assert.equal(state.page.toast, true);
 
-  state = make(); job = state.page.confirmDestinationOperation();
-  await tick(); state.page.navigationRequestId++; state.page.currentPath = '/home/user/Incoming';
+  // Start a separate asynchronous submission so navigation races the NAS reply.
+  state = make(); let resolveCopy; state.page.repository.copy = () => new Promise(resolve => { resolveCopy = resolve; });
+  job = state.page.confirmDestinationOperation(); await tick();
+  state.page.navigationRequestId++; state.page.currentPath = '/home/user/Incoming'; resolveCopy();
   state.finish(); await job;
   assert.equal(state.published.length, 0);
   assert.equal(state.page.closed, undefined, 'old completion cannot close the replacement picker');

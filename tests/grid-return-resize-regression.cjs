@@ -4,7 +4,8 @@ const ts = require(process.argv[2]);
 const source = fs.readFileSync('entry/src/main/ets/pages/Index.ets', 'utf8');
 const names = ['recordFilePageSize', 'updateFilePageSize', 'mediaReturnBandTop', 'mediaReturnBandBottom',
   'gridViewerReturnTargetVisible', 'waitForFileViewport', 'scrollMediaReturnSourceIntoView',
-  'scrollItemIntoContentBand', 'prepareMediaReturnSource', 'closeGridViewerWithReturnOverlay'];
+  'scrollItemIntoContentBand', 'prepareMediaReturnSource', 'beginViewerCloseSession',
+  'closeGridViewerWithReturnOverlay'];
 function method(name) {
   const start = source.search(new RegExp('^  private (?:async )?' + name + '\\(', 'm'));
   assert.ok(start >= 0, name);

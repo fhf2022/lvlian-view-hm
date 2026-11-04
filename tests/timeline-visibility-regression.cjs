@@ -1,7 +1,8 @@
 const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict'),ts=require(process.argv[2]);
 function load(source,bindings={}){const exports={};vm.runInNewContext(ts.transpileModule(source,{compilerOptions:{target:ts.ScriptTarget.ES2021,module:ts.ModuleKind.CommonJS}}).outputText,{exports,...bindings});return exports}
 const {FileGridLayout}=load(fs.readFileSync('entry/src/main/ets/ui/FileGridLayout.ets','utf8'));
-const {DirectoryTimeline,DirectoryTimelinePolicy}=load(fs.readFileSync('entry/src/main/ets/model/DirectoryTimeline.ets','utf8'),{require:()=>({FileEntry:class{}})});
+const {MediaType}=load(fs.readFileSync('entry/src/main/ets/model/MediaType.ets','utf8'));
+const {DirectoryTimeline,DirectoryTimelinePolicy}=load(fs.readFileSync('entry/src/main/ets/model/DirectoryTimeline.ets','utf8'),{require:key=>key==='./MediaType'?{MediaType}:{FileEntry:class{}}});
 const source=fs.readFileSync('entry/src/main/ets/pages/Index.ets','utf8');
 function method(name){const a=source.search(new RegExp('^  private '+name+'\\(','m'));assert.ok(a>=0,name);const b=source.slice(a+1).search(/^  (?:private |@Builder)/m);return source.slice(a,a+b+1)}
 const {Page}=load('export class Page {\n'+['shouldShowTimeline','timelineViewportImageCapacity','fileGridColumnCount'].map(method).join('\n')+'\n}',{FileGridLayout,DirectoryTimelinePolicy});

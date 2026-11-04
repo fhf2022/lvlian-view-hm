@@ -20,7 +20,7 @@ vm.runInNewContext(ts.transpileModule('export class H {' +
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2021 }
 }).outputText, { exports: exportsObject, FileGridLayout: layoutExports.FileGridLayout,
   ContinuationSnapshot: class { constructor() { this.state = { scene: 'directory' }; this.entries = []; } },
-  IMAGE_RETURN_MOUNT_FRAME_LIMIT: 8, EXPERIMENT_GRID_CACHED_COUNT: 4,
+  IMAGE_RETURN_MOUNT_FRAME_LIMIT: 8, GRID_CACHED_ROW_COUNT: 4,
   ScrollAlign: { START: 0 }, LengthMetrics: { vp: n => n }, console });
 
 function make() {

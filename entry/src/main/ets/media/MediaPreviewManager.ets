@@ -1,3 +1,4 @@
+import { MediaType } from '../model/MediaType'
 import { fileIo } from '@kit.CoreFileKit'
 import { image } from '@kit.ImageKit'
 import { media } from '@kit.MediaKit'
@@ -156,25 +157,14 @@ export class MediaPreviewManager {
   }
 
   private kind(entry: FileEntry): PreviewKind {
-    const extension = this.extension(entry.name)
-    if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'heif', 'bmp', 'tif', 'tiff'].indexOf(extension) >= 0) {
-      return 'image'
-    }
-    if (['mp4', 'mov', 'm4v', 'avi', 'mkv', 'webm', '3gp', 'ts'].indexOf(extension) >= 0) {
-      return 'video'
-    }
-    if (['mp3', 'wav', 'm4a', 'flac', 'aac', 'ogg', 'amr'].indexOf(extension) >= 0) {
-      return 'audio'
-    }
-    return ''
-  }
-
-  private extension(name: string): string {
-    const dot = name.lastIndexOf('.')
-    if (dot <= 0 || dot === name.length - 1) {
-      return ''
-    }
-    return name.substring(dot + 1).toLowerCase()
+    if (entry.isDirectory) { return '' }
+    // This fallback decodes an already cached file. Keep its tested container
+    // support separate from the broader UI/MIME classification and NAS previews.
+    const extension = MediaType.extension(entry.name)
+    const kind = MediaType.kindForExtension(extension)
+    if (kind === 'video' &&
+      ['mp4', 'mov', 'm4v', 'avi', 'mkv', 'webm', '3gp', 'ts'].indexOf(extension) < 0) { return '' }
+    return kind
   }
 
   private shouldPreserveAlpha(name: string): boolean {

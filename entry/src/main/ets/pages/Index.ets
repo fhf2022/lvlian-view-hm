@@ -1,3 +1,8 @@
+import { ImageLoadCompleteEvent as ViewerImageCompleteEvent } from '../media/ImageLoadEvent'
+import { GridThumbnailCell, GridThumbnailBridge, GridImageState } from '../components/GridThumbnailCell'
+import { WaterfallThumbnailCell, WaterfallThumbnailBridge, WaterfallImageState } from '../components/WaterfallThumbnailCell'
+import { MediaType } from '../model/MediaType'
+import { DirectoryChange } from '../model/DirectoryChange'
 import { DEBUG } from 'BuildProfile'
 import { rekeyRecord } from '../model/RecordUtils'
 import { StartupAuthorization } from '../core/authorization/StartupAuthorization'
@@ -29,13 +34,14 @@ import { GlassMenuSurface } from '../components/GlassMenuSurface'
 import { GlassMenuRow } from '../components/GlassMenuRow'
 import { ContentDivider } from '../components/ContentDivider'
 import { FileListRow } from '../components/FileListRow'
-import { EntryDetailsContent } from '../components/EntryDetailsContent'
+import { EntryDetailsContent, EntryDetailsData } from '../components/EntryDetailsContent'
+import { DirectorySizeQuery } from '../ugreen/DirectorySizeQuery'
 import { AlertDialog as SystemAlertDialog, CustomContentDialog, ButtonOptions } from '@ohos.arkui.advanced.Dialog'
 import { FileRowStyle } from '../ui/FileRowStyle'
 import { FileGridLayout } from '../ui/FileGridLayout'
 import { FileGridCell, FileGridCellEvents } from '../components/FileGridCell'
 import { TaskPanel, TaskPanelFooter, TaskPanelSection } from '../components/TaskPanel'
-import { CreateFolderDialog } from '../components/CreateFolderDialog'
+import { NameInputDialog } from '../components/NameInputDialog'
 import { DirectoryHeaderState } from '../ui/DirectoryHeaderState'
 import { AlbumUploadManager } from '../upload/AlbumUploadManager'
 import { AlbumUploadJob, LocalImageAlbum } from '../upload/AlbumUploadModel'
@@ -185,47 +191,15 @@ const STATE_TRACE_TASK_ID: number = 1001
 //   true  = Baseline（原行为：修改根级 @State viewerBitmapEpoch，整页重跑 build）
 //   false = 实验 H0（单条目精准通知 onDataChange(index)，解耦全局 epoch）
 const USE_GLOBAL_BITMAP_EPOCH: boolean = false
-// ── R2 原型：把网格缩略图那块抽成独立 @Component（@Observed + @ObjectLink） ──
-//
-// 背景（R1 实测结论，见 2026-09-30 记忆 / r1_continuous.ftrace）：
-//   · R0（false）下 `notifyItemChanged` → `onDataChange(index)` 只换了数据对象，
-//     因为 keyGenerator 仍是 entry.path（key 未变），LazyForEach 认为还是同一个
-//     item，**不会重跑 item 生成器** → `[5]/[6]` 从不出现 → 缩略图永久滞留占位。
-//   · R1（true）靠"根组件整树重跑"顺带把已挂载 cell 全部重跑，图是出来了，
-//     代价是 43 次 CNU(Index)，其中 14 次 >16.67ms（P90 56.5ms，self 896ms，
-//     占坏帧 ~78%）—— 这就是肉眼看到的"滑动时偶尔闪一下"。
-//
-// 本开关的目标：让"某条目的缩略图版本号变了"只通知【那一个 cell】重算，
-//   既不经过根组件整树 build，也不改 keyGenerator（保住 GridItem identity）。
-//
-//   true  = R2（网格 cell 走 GridThumbCell 子组件 + @ObjectLink entry）
-//   false = 基线（保持内联写法，与 R1 前一致）
-const EXPERIMENT_R2_THUMB_CELL: boolean = true
-// ── R2 推广（瀑布流）：同机制、独立开关，便于单独验证与回滚 ──────────────
-//
-// 瀑布流与 Grid 不同构，必须单独做：
-//   · 图片在独立 @Builder `WaterfallPreviewImage` 里，且与 `LoadingProgress` 是
-//     兄弟节点 → 子组件要连 `Stack({alignContent: Center})` 一起包（节点身份不变）。
-//   · 多一个「宽高比已就绪」状态：就绪前不传 sourceSize 且 opacity(0)（避免
-//     ArkUI 用临时 FlowItem 的 1:1 方框播种解码目标）。
-//   · 失效走的是两个【全局 epoch】：`waterfallSourceEpoch`（只在 waterfallUri() 里读）
-//     与 `waterfallAspectEpoch`（只在 resolvedWaterfallAspectRatio() 里读），
-//     两者都在 item builder 路径上 → 每次 bump 都会重跑整棵树。
-//     包成子组件后，这两处读取改在子组件 build 期间发生，依赖落到 cell 上，
-//     不再整树重跑；再加上 previewRevision 的就地自增做单条精准刷新。
-//
-//   true  = R2W（瀑布流走 WaterfallThumbCell 子组件）
-//   false = 基线（保持内联 + @Builder 写法）
-const EXPERIMENT_R2_WATERFALL_CELL: boolean = true
 // ── 🔬 临时探针（Q3 清理时删除）：首次打开共享元素动画的真实绑定状态 ──────────
 //
 // 已知：`entry-source-bound` 只证明 Index 层"决定启用 geometry transition"，
-//      它证明不了 GridThumbCell 里的真实 Image 节点在 L15550 那一静默帧
+//      它证明不了 GridThumbnailCell 里的真实 Image 节点在 L15550 那一静默帧
 //      重新 build 并挂上了 transitionId。
 // 本探针只补 4 个时间点（+2 个既有 tapTrace），全部只读、无延时、不改结构：
 //   1) startViewerEntryTransition：expected transitionId + 闸门结果
 //   2) resolveGridImageStateInto（= cell 真正 build 时）：rev + 实际 transitionId
-//   3) GridThumbCell 内 Image onAppear：节点出现时刻的 transitionId
+//   3) GridThumbnailCell 内 Image onAppear：节点出现时刻的 transitionId
 //   4) viewer target Image onAppear：目标节点出现时刻的 transitionId
 //   附：shouldReplaceViewerTransitionSource（parent build 期）→ source 是保留还是被 Blank 顶掉
 // 只在 startViewerEntryTransition 后 800ms 窗口内输出，避免热路径刷屏。
@@ -247,18 +221,6 @@ const THUMB_BATCH_EPOCH: boolean = true
 // 诊断开关：汇总统计缩略图完成路径。⚠️ 只在窗口结束时输出一条 hilog，
 // 绝不逐张打印（日志本身会干扰性能测量）。
 const THUMB_DIAG: boolean = DEBUG
-// ── 实验 A：网格项把 Image 换成同尺寸 Blank（**分界实验**）────────────────
-//
-// 目的：判断"Grid measure 被拖慢"到底是【Grid 布局算法本身】还是【Image 子树/图片处理】。
-// 做法：保持 Grid / GridItem / 列数 / Cell 尺寸 / 文字 / 滚动 / FisheyeTimeline /
-//      所有布局参数【完全不变】，只把 `Image(...)` 换成同尺寸 `Blank()`。
-// 判读：若 CreateTaskMeasure[Grid] 从 ~85ms 降到几毫秒、长帧基本消失
-//      → 不是 Grid 布局算法，而是 Image 子树/图片资源处理把 measure 拖慢。
-//
-// ⚠️ 注意：本开关仍保留 fileImageSourceAvailable 判断（即仍会解析 1 次图片源），
-//   所以它去掉的是「Image 子树 + 另外 2 次源解析 + 实际解码」。
-//   若要进一步区分"解码重(M2)"还是"重复解析(R2)"，需要再做 A2（保留 Image、只换常量 source）。
-const EXPERIMENT_GRID_BLANK: boolean = false
 // ── 实验 C：关闭「从图片查看器返回后的预热」──────────────────────────────
 //
 // 剩余现象很特定：整体已可接受，但"刚返回开始滑"那一下明显卡。
@@ -270,48 +232,8 @@ const EXPERIMENT_GRID_BLANK: boolean = false
 // true  = 关闭返回后的预热（实验组）
 // false = 保持现状（对照组）
 const DISABLE_RETURN_WARMUP: boolean = true
-// ── 实验 D：固定 source 的 Image（比 Blank 更精确的一刀）────────────────────
-//
-// Blank 实验一次去掉了太多东西（Image 节点 / ImageSource / URI / decode / PixelMap）。
-// 本实验【保持 Image 组件与节点结构完全不变】，只把 source 换成"同一个、已缓存
-// 的本地小图"，从而只消除：真实 URI / previewUri / getUriFromPath / 每文件不同
-// source / thumbnail 解码。
-//
-// 判读：
-//   · 若 CreateImageObj 的耗时从 ~41ms 掉到个位数
-//     → 贵的是「创建 Image 时处理真实 source」→ R2（source 解析/复用）是核心
-//   · 若固定资源仍要 30~40ms
-//     → 贵的是「大量 Image 节点本身创建/绑定进入 Grid 热路径」
-//       → 去优化节点复用 / prebuild / cachedCount / 减少同帧创建量
-const EXPERIMENT_GRID_FIXED_SOURCE: boolean = false
-// ── 实验 B′：网格图片的**解码尺寸**（唯一变量：source resolution）─────────────
-//
-// 目的：M2 —— 判断"图片太重"里有多少来自"源图太大"。
-// 做法：Grid Cell 320×320 / 列数 / 组件树 / fit / orientation / 排序 / 目录
-//      **全部不变**，只改 Image 的解码目标尺寸。
-//   · 0   = 不限制（= 现状基线：ArkUI 按组件尺寸自动解码）
-//   · 128 / 256 / 512 = 指定解码尺寸（SDK 注明 number 单位是 vp）
-//
-// ⚠️ 相比"生成三套 128/256/512 的缩略图文件"，用 sourceSize 更干净：
-//    source 文件完全相同 → disk cache 天然全命中、无额外 NAS 请求 →
-//    真正只有"解码目标尺寸"这一个变量在变（不必预热三套缓存）。
-//
-// 判读：
-//   · 若 GetImageData / PixelMap / Grid Measure 的 P95·P99 随分辨率明显下降 → M2 坐实
-//   · 若分辨率降了但上述指标变化不明显 → 问题偏向"重复解析/source 创建次数"(R2)
-//     下一刀就该做 resolveFileImageState，而不是继续降分辨率
-const EXPERIMENT_GRID_SOURCE_SIZE: number = 0
-// 生产方案：当前图独占高清 original。邻图仅保留/常驻轻量 preview（~786KB），
-// 禁止邻图预加载 33.5MB original，将 Viewer 峰值从 ~103MB 裁减至 ~35MB。
-const EXPERIMENT_A3_SINGLE_ORIGINAL_VIEWER: boolean = true
-// 生产基线：Grid 缓存窗口固定为 4（兼顾准入削峰与视口抗扰动）
-const EXPERIMENT_GRID_CACHED_COUNT: number = 4
-// ⚠️ 实验用：取"不超过源尺寸"的解码目标。
-//   `sourceSize` 传大于源尺寸的值会导致硬件解码失败
-//   （`JPEGHWDECODER failed to do decode, err=-1` → 白屏），所以必须夹住。
-//   源尺寸优先取状态里已知的解码后尺寸（渲染路径上零 IO）；未知时退回目标值
-//   —— 实测 NAS 缩略图多为 512×384，256 在其之下，安全。
-const EXPERIMENT_GRID_SOURCE_SAFE: boolean = true
+// Grid caches four rows; resizing and scrolling share this production setting.
+const GRID_CACHED_ROW_COUNT: number = 4
 const IMAGE_VIEWER_HILOG_DOMAIN: number = 0xD003
 const IMAGE_VIEWER_HILOG_TAG: string = 'ImageViewerDiag'
 // Pull-to-dismiss is deliberately a short, proportional gesture. The
@@ -346,37 +268,10 @@ interface PopupStateChange {
   isVisible: boolean
 }
 
-interface ViewerImageCompleteEvent {
-  width: number
-  height: number
-  componentWidth: number
-  componentHeight: number
-  loadingStatus: number
-  contentWidth: number
-  contentHeight: number
-  contentOffsetX: number
-  contentOffsetY: number
-}
-
 type ViewerImageLayer = 'thumbnail' | 'original'
 type ViewerDecodeState = 'idle' | 'loading' | 'decoded' | 'displayed' | 'failed'
 type ViewerTransitionKind = 'none' | 'entry' | 'exit'
 type ThumbnailSurfaceKind = 'none' | 'list' | 'grid' | 'waterfall' | 'search'
-
-/**
- * R2 修复：网格项在一次 build 中需要的全部图片显示信息。
- * 由 `resolveGridImageState()` 一次性解析，避免同一轮构建里重复求值。
- */
-class GridImageState {
-  available: boolean = false
-  hidden: boolean = false
-  source: image.PixelMap | string = ''
-  orientation: ImageRotateOrientation = ImageRotateOrientation.UP
-  transitionId: string = ''
-  syncLoad: boolean = false
-  sourceWidth: number = 0
-  sourceHeight: number = 0
-}
 
 class ViewerReturnRect {
   x: number = 0
@@ -398,133 +293,6 @@ class ViewerReturnSnapshot {
   hasTarget: boolean = false
 }
 
-/**
- * R2 原型：网格缩略图 cell 与 Index 之间的桥。
- *
- * 🔴 纪律：桥上的方法会在【子组件 build 期间】被调用，因此只允许读非 @State 的
- *    存储（位图/URI Map、entry 自身字段）。一旦在子组件里读到 Index 的 @State，
- *    依赖会重新注册回根组件，R2 就失去意义。
- *    `resolveGridImageStateInto()` 满足这一点：它只走 previewUri()（结果缓存 Map）、
- *    imageVisualState()（Map）与 entry 字段，不碰任何 epoch。
- */
-class GridThumbBridge {
-  resolveInto: (entry: FileEntry, state: GridImageState) => GridImageState =
-    (entry: FileEntry, state: GridImageState): GridImageState => state
-  icon: (entry: FileEntry) => Resource =
-    (entry: FileEntry): Resource => $r('app.media.startIcon')
-  onComplete: (entry: FileEntry, index: number, event?: ViewerImageCompleteEvent) => void =
-    (entry: FileEntry, index: number, event?: ViewerImageCompleteEvent): void => {}
-  onError: (entry: FileEntry) => void = (entry: FileEntry): void => {}
-  // 🔬 OpenAnimProbe：cell 内 Image 节点出现（Q3 清理时删除）
-  probeAppear: (entry: FileEntry, index: number) => void =
-    (entry: FileEntry, index: number): void => {}
-}
-
-/**
- * R2 推广（瀑布流）：cell 与 Index 之间的桥。
- * 🔴 与 GridThumbBridge 同纪律：方法在【子组件 build 期间】被调用，
- *    只允许读非 @State 的存储（位图/URI Map、entry 字段）；两个 waterfall epoch
- *    是刻意保留的（它们现在只被 cell 读到，依赖落在 cell 上，不再整树重跑）。
- */
-class WaterfallThumbBridge {
-  resolveInto: (entry: FileEntry, state: WaterfallImageState) => WaterfallImageState =
-    (entry: FileEntry, state: WaterfallImageState): WaterfallImageState => state
-  onComplete: (entry: FileEntry, index: number, event?: ViewerImageCompleteEvent) => void =
-    (entry: FileEntry, index: number, event?: ViewerImageCompleteEvent): void => {}
-  onError: (entry: FileEntry) => void = (entry: FileEntry): void => {}
-}
-
-/** 瀑布流一次 build 需要的图片信息（含「宽高比是否就绪」这条瀑布流专属状态）。 */
-class WaterfallImageState {
-  available: boolean = false
-  aspectReady: boolean = false
-  failed: boolean = false
-  source: image.PixelMap | string = ''
-  orientation: ImageRotateOrientation = ImageRotateOrientation.UP
-  transitionId: string = ''
-  syncLoad: boolean = false
-}
-
-/**
- * R2 推广（瀑布流）：把「图片 + LoadingProgress」这一整块包成独立子组件。
- * ⚠️ 根节点就是原来那个 `Stack({alignContent: Center})`（含 borderRadius/clip），
- *    自定义组件不产生节点，所以外层 FlowItem 看到的子树形状与改前一致。
- * ⚠️ 带 geometryTransition 的 Image 必须【内联】在本组件 build 里。
- */
-@Component
-struct WaterfallThumbCell {
-  @ObjectLink entry: FileEntry
-  bridge: WaterfallThumbBridge = new WaterfallThumbBridge()
-  index: number = 0
-  private state: WaterfallImageState = new WaterfallImageState()
-
-  private st(): WaterfallImageState {
-    return this.bridge.resolveInto(this.entry, this.state)
-  }
-
-  build() {
-    Stack({ alignContent: Alignment.Center }) {
-      if (this.st().available) {
-        if (this.st().aspectReady) {
-          Image(this.st().source)
-            .width('100%')
-            .height('100%')
-            .orientation(this.st().orientation)
-            .objectFit(ImageFit.Contain)
-            .geometryTransition(this.st().transitionId)
-            .syncLoad(this.st().syncLoad)
-            .opacity(1)
-            .onComplete((event?: ViewerImageCompleteEvent): void => {
-              this.bridge.onComplete(this.entry, this.index, event)
-            })
-            .onError((): void => {
-              this.bridge.onError(this.entry)
-            })
-        } else {
-          // 不传临时的 1:1 sourceSize：WaterFlow 回收 item 时 ArkUI 可能复用已解码的
-          // raster，首次解码必须等 Image Kit 的真实几何，否则会把临时方框的目标尺寸固化。
-          Image(this.st().source)
-            .width('100%')
-            .height('100%')
-            .orientation(this.st().orientation)
-            .objectFit(ImageFit.Contain)
-            .geometryTransition(this.st().transitionId)
-            .syncLoad(this.st().syncLoad)
-            .opacity(0)
-            .onComplete((event?: ViewerImageCompleteEvent): void => {
-              this.bridge.onComplete(this.entry, this.index, event)
-            })
-            .onError((): void => {
-              this.bridge.onError(this.entry)
-            })
-        }
-      }
-      if (this.st().failed) {
-        Text('!').fontSize(22).fontColor('#888888')
-      } else if (!this.st().available || !this.st().aspectReady) {
-        LoadingProgress()
-          .width(24)
-          .height(24)
-          .color('#2E6BFF')
-      }
-    }
-    .width('100%')
-    .height('100%')
-    .borderRadius(10)
-    .clip(true)
-  }
-}
-
-/**
- * R2 原型：只包「缩略图 / 占位图」这一小块。
- *
- * ⚠️ 刻意【不】包外层那个 Stack —— 外层带 aspectRatio / onAreaChange /
- *    onVisibleAreaChange，节点位置与 identity 原样不动，转场最安全。
- *    自定义组件不产生节点，所以在父层 Stack 看来子树形状与改前一致。
- * ⚠️ 带 geometryTransition 的 Image 必须【内联】在本组件 build 里，
- *    不能再提一层 @Builder（历史上提取 @Builder 导致过场动画消失）。
- * ⚠️ 结果对象复用同一个实例（build 内会问 3~4 次，不能每次分配）。
- */
 @Component
 struct AudioFileLeadingCell {
   @ObjectLink entry: FileEntry
@@ -546,72 +314,6 @@ struct AudioFileLeadingCell {
       Image($r('sys.media.ohos_ic_normal_white_grid_audio'))
         .width(FileRowStyle.iconSize)
         .height(FileRowStyle.iconSize)
-        .objectFit(ImageFit.Contain)
-    }
-  }
-}
-
-@Component
-struct GridThumbCell {
-  @ObjectLink entry: FileEntry
-  bridge: GridThumbBridge = new GridThumbBridge()
-  index: number = 0
-  private state: GridImageState = new GridImageState()
-
-  private thumbState(): GridImageState {
-    return this.bridge.resolveInto(this.entry, this.state)
-  }
-
-  build() {
-    if (this.thumbState().available) {
-      if (this.thumbState().sourceWidth > 0) {
-        // Image(source) resolves the complete state at the start of this
-        // native Image update. The following attributes use that same
-        // result instead of repeating source/URI/transition resolution.
-        Image(this.thumbState().source)
-          .width('100%')
-          .height('100%')
-          .sourceSize({
-            width: this.state.sourceWidth,
-            height: this.state.sourceHeight
-          })
-          .orientation(this.state.orientation)
-          .objectFit(ImageFit.Cover)
-          .geometryTransition(this.state.transitionId)
-          .syncLoad(this.state.syncLoad)
-          .visibility(this.state.hidden ? Visibility.Hidden : Visibility.Visible)
-          .onAppear((): void => {
-            this.bridge.probeAppear(this.entry, this.index)
-          })
-          .onComplete((event?: ViewerImageCompleteEvent): void => {
-            this.bridge.onComplete(this.entry, this.index, event)
-          })
-          .onError((): void => {
-            this.bridge.onError(this.entry)
-          })
-      } else {
-        Image(this.thumbState().source)
-          .width('100%')
-          .height('100%')
-          .orientation(this.state.orientation)
-          .objectFit(ImageFit.Cover)
-          .geometryTransition(this.state.transitionId)
-          .syncLoad(this.state.syncLoad)
-          .visibility(this.state.hidden ? Visibility.Hidden : Visibility.Visible)
-          .onAppear((): void => {
-            this.bridge.probeAppear(this.entry, this.index)
-          })
-          .onComplete((event?: ViewerImageCompleteEvent): void => {
-            this.bridge.onComplete(this.entry, this.index, event)
-          })
-          .onError((): void => {
-            this.bridge.onError(this.entry)
-          })
-      }
-    } else {
-      Image(this.bridge.icon(this.entry))
-        .width(48)
-        .height(48)
         .objectFit(ImageFit.Contain)
     }
   }
@@ -1498,11 +1200,11 @@ struct Index {
   private transitionFileEntryDataSource: FileEntryDataSource = new FileEntryDataSource()
   private fileListScroller: Scroller = new Scroller()
   private fileGridOptions: GridLayoutOptions = { regularSize: [1, 1] }
-  // R2 原型：网格 cell 子组件与 Index 之间的桥（在 aboutToAppear 里接线）
-  private gridThumbBridge: GridThumbBridge = new GridThumbBridge()
+  // 只读桥在 aboutToAppear 接线，图片状态依赖留在各缩略图组件内。
+  private gridThumbBridge: GridThumbnailBridge = new GridThumbnailBridge()
   private fileGridCellEvents: FileGridCellEvents = new FileGridCellEvents()
-  // R2 推广：瀑布流 cell 的桥
-  private waterfallThumbBridge: WaterfallThumbBridge = new WaterfallThumbBridge()
+  // 瀑布流保持独立的宽高比和加载占位状态。
+  private waterfallThumbBridge: WaterfallThumbnailBridge = new WaterfallThumbnailBridge()
   private waterfallScroller: Scroller = new Scroller()
   // Keep the exact offset of the file surface below ImageViewer so returning
   // from a preview does not recreate list/grid/waterfall at position zero.
@@ -1558,7 +1260,8 @@ struct Index {
   private previewLocalPaths: Record<string, string> = {}
   private previewLocalSignatures: Record<string, string> = {}
   private previewQueue: PreviewLoadQueue = new PreviewLoadQueue(
-    ThumbnailPolicy.LIST_MAX_CONCURRENT, ThumbnailPolicy.MAX_PENDING_TASKS)
+    ThumbnailPolicy.LIST_MAX_CONCURRENT, ThumbnailPolicy.MAX_PENDING_TASKS,
+    (): boolean => this.canDispatchPreviewLoads())
   private imageTelemetry: ImagePipelineTelemetry = new ImagePipelineTelemetry()
   private returnPerfSession: ReturnPerfSession = new ReturnPerfSession()
   private entryPathGenerations: Record<string, number> = {}
@@ -1850,9 +1553,13 @@ struct Index {
   private timelineRailMaterial: uiMaterial.ImmersiveMaterial = GlassMaterial.timeline()
   private floatingPanelMaterial: uiMaterial.ImmersiveMaterial = GlassMaterial.overlay()
   aboutToAppear(): void {
+    this.repository.setFileOperationListener((changes: DirectoryChange[], uncertain: boolean): void => {
+      for (const change of changes) { this.applyDirectoryChange(change) }
+      if (uncertain) { this.showImmersiveToast('部分文件任务未能确认完成，请刷新目录核对') }
+    })
     this.repository.setThumbnailReadyListener((path: string): void => {
-      if (this.screen !== 'files' || this.fileContentScrolling || this.showImageViewer ||
-        this.showPageTransition || this.locateProgrammaticScrolling || this.timelineScrubActive) { return }
+      if (this.screen !== 'files' || !this.gestureSharePageVisible || this.abilityInBackground ||
+        this.showImageViewer || this.viewerBlocksFileContent) { return }
       this.previewQueue.retryNow(path + '#preview:' + this.previewGeneration.toString())
     })
     this.observeGridLayoutSize()
@@ -2284,9 +1991,9 @@ struct Index {
     this.fileEntryDataSource.onItemRequested = (index: number, entry: FileEntry): void => {
       this.noteLocateItemBuild(entry, index)
     }
-    // ── R2 原型接线 ────────────────────────────────────────────────────────
+    // Grid thumbnail cells retain the exact observed FileEntry instance.
     // 1) datasource 就地自增 previewRevision（不换实例，否则 @ObjectLink 断链）
-    this.fileEntryDataSource.bumpInPlace = EXPERIMENT_R2_THUMB_CELL
+    this.fileEntryDataSource.bumpInPlace = true
     // 2) 桥上的方法只在子组件 build 期间被调用，绝不能读 Index 的 @State
     this.gridThumbBridge.resolveInto = (entry: FileEntry, state: GridImageState): GridImageState =>
       this.resolveGridImageStateInto(entry, state)
@@ -2330,10 +2037,10 @@ struct Index {
     }
     this.fileGridCellEvents.dragCancel = (): void => this.cancelDragSelectionGesture()
     this.fileGridCellEvents.isVideo = (entry: FileEntry): boolean => !entry.isDirectory && this.isVideo(entry)
-    // ── R2 推广：瀑布流接线 ────────────────────────────────────────────────
+    // WaterFlow cells use the same observed-entry ownership contract.
     // 就地自增同样必须开，否则 waterfallDataSource.notifyItemChanged 仍走 clone
     // 路径 → 换实例 → @ObjectLink 断链。
-    this.waterfallDataSource.bumpInPlace = EXPERIMENT_R2_WATERFALL_CELL
+    this.waterfallDataSource.bumpInPlace = true
     this.waterfallThumbBridge.resolveInto = (entry: FileEntry,
       state: WaterfallImageState): WaterfallImageState =>
       this.resolveWaterfallImageStateInto(entry, state)
@@ -2441,7 +2148,8 @@ struct Index {
   aboutToDisappear(): void {
     this.cancelPendingPreviewLoads()
     this.repository.setThumbnailReadyListener(null)
-    this.repository.setThumbnailForeground(false)
+    this.repository.setFileOperationListener(null)
+    this.repository.setForeground(false)
     this.storageUsageRefreshToken++
     this.stopWaterfallPipeline()
     this.gridLayoutWatching = false
@@ -2620,7 +2328,7 @@ struct Index {
     if (!this.startupAuthorized) { return }
     this.fileContentScrolling = false
     this.cancelPendingPreviewLoads()
-    this.repository.setThumbnailForeground(false)
+    this.repository.setForeground(false)
     this.albumUpload.setForeground(false)
     this.gestureSharePageVisible = false
     NasConnection.shared().setForeground(false)
@@ -2631,7 +2339,7 @@ struct Index {
   }
 
   onPageShow(): void {
-    this.repository.setThumbnailForeground(!this.abilityInBackground)
+    this.repository.setForeground(!this.abilityInBackground)
     if (!this.startupAuthorized) { return }
     this.albumUpload.setForeground(!this.abilityInBackground)
     this.gestureSharePageVisible = true
@@ -2653,7 +2361,7 @@ struct Index {
 
   onAbilityBackgroundChanged(): void {
     if (!this.startupAuthorized) { return }
-    this.repository.setThumbnailForeground(this.gestureSharePageVisible && !this.abilityInBackground)
+    this.repository.setForeground(this.gestureSharePageVisible && !this.abilityInBackground)
     if (this.abilityInBackground) {
       this.fileContentScrolling = false
       this.cancelPendingPreviewLoads()
@@ -5585,76 +5293,29 @@ struct Index {
   @Builder
   private FileGridThumbnail(entry: FileEntry, index: number): void {
     if (this.shouldReplaceViewerTransitionSource(entry)) {
-      Blank()
+      Blank().width('100%').height('100%')
+    } else if (!entry.isDirectory) {
+      GridThumbnailCell({ entry: entry, bridge: this.gridThumbBridge, index: index })
+    } else if (this.fileImageSourceAvailable(entry, 'grid')) {
+      Image(this.fileImageSource(entry, 'grid'))
         .width('100%')
         .height('100%')
-    } else if (EXPERIMENT_GRID_FIXED_SOURCE && !entry.isDirectory) {
-      // 实验 D：Image 组件与节点结构完全不变，只把 source 换成
-      // 「同一个、已缓存的本地小图」。这样只消除真实 URI / previewUri /
-      // getUriFromPath / 每文件不同 source / thumbnail 解码，
-      // 用来区分「Image 节点本身贵」还是「处理真实 source 贵」。
-      Image($r('app.media.startIcon'))
-        .width('100%')
-        .height('100%')
-        .orientation(ImageRotateOrientation.UP)
+        .orientation(this.fileImageSourceOrientation(entry, 'grid'))
         .objectFit(ImageFit.Cover)
         .geometryTransition(this.fileImageTransitionId(entry, 'grid'))
-    } else if (EXPERIMENT_R2_THUMB_CELL && !entry.isDirectory) {
-      // R2 原型：文件类缩略图交给独立子组件。
-      // 依赖 entry.previewRevision（@ObjectLink）驱动局部重算，
-      // 不再需要"整树重跑"来顺带刷新这一格。
-      GridThumbCell({ entry: entry, bridge: this.gridThumbBridge, index: index })
-    } else if (this.fileImageSourceAvailable(entry, 'grid')) {
-      if (this.gridSourceWidth(entry) > 0) {
-        // 实验 B′/F：指定解码尺寸。
-        // ⚠️ 宽高严格按源图比例（gridSourceSizeFor 负责），
-        //    绝不传正方形（会改比例），也绝不超过源尺寸（会解码失败）。
-        Image(this.fileImageSource(entry, 'grid'))
-          .width('100%')
-          .height('100%')
-          .sourceSize({
-            width: this.gridSourceWidth(entry),
-            height: this.gridSourceHeight(entry)
-          })
-          .orientation(this.fileImageSourceOrientation(entry, 'grid'))
-          .objectFit(ImageFit.Cover)
-          .geometryTransition(this.fileImageTransitionId(entry, 'grid'))
-          .syncLoad(this.fileImageShouldSyncLoad(entry))
-          .onComplete((event?: ViewerImageCompleteEvent): void => {
-            this.imageTelemetry.recordPipelineComplete(entry.path, 'grid')
-            this.recordThumbnailComplete(entry, this.previewUri(entry), index,
-              'grid', event)
-          })
-          .onError((): void => {
-            this.imageTelemetry.recordPipelineError(entry.path, 'grid')
-            this.recoverEntryPreview(entry)
-          })
-      } else {
-        Image(this.fileImageSource(entry, 'grid'))
-          .width('100%')
-          .height('100%')
-          .orientation(this.fileImageSourceOrientation(entry, 'grid'))
-          .objectFit(ImageFit.Cover)
-          .geometryTransition(this.fileImageTransitionId(entry, 'grid'))
-          .syncLoad(this.fileImageShouldSyncLoad(entry))
-          .onComplete((event?: ViewerImageCompleteEvent): void => {
-            this.imageTelemetry.recordPipelineComplete(entry.path, 'grid')
-            this.recordThumbnailComplete(entry, this.previewUri(entry), index,
-              'grid', event)
-          })
-          .onError((): void => {
-            this.imageTelemetry.recordPipelineError(entry.path, 'grid')
-            this.recoverEntryPreview(entry)
-          })
-      }
-    } else if (entry.isDirectory) {
+        .syncLoad(this.fileImageShouldSyncLoad(entry))
+        .onComplete((event?: ViewerImageCompleteEvent): void => {
+          this.imageTelemetry.recordPipelineComplete(entry.path, 'grid')
+          this.recordThumbnailComplete(entry, this.previewUri(entry), index,
+            'grid', event)
+        })
+        .onError((): void => {
+          this.imageTelemetry.recordPipelineError(entry.path, 'grid')
+          this.recoverEntryPreview(entry)
+        })
+    } else {
       this.FolderIcon(FileGridLayout.fileIconSize(
         FileGridLayout.cellWidth(this.pageWidthVp, this.fileGridColumnCount())))
-    } else {
-      Image(this.fileIcon(entry))
-        .width(48)
-        .height(48)
-        .objectFit(ImageFit.Contain)
     }
   }
 
@@ -5672,7 +5333,7 @@ struct Index {
     .rowsGap(FileGridLayout.gap)
     // Native grid keeps file identities through column changes. Cache at
     // most four rows on either side; no regroup/reload on window resize.
-    .cachedCount(EXPERIMENT_GRID_CACHED_COUNT)
+    .cachedCount(GRID_CACHED_ROW_COUNT)
     .onScrollIndex((first: number, last: number): void => {
       this.fileVisibleStartIndex = Math.max(0, first)
       this.fileVisibleEndIndex = Math.max(this.fileVisibleStartIndex, last)
@@ -5724,45 +5385,6 @@ struct Index {
   }
 
   @Builder
-  WaterfallPreviewImage(entry: FileEntry, index: number): void {
-    if (this.waterfallAspectRatioReady(entry)) {
-      Image(this.fileImageSource(entry, 'waterfall'))
-        .width('100%')
-        .height('100%')
-        .orientation(this.fileImageSourceOrientation(entry, 'waterfall'))
-        .objectFit(ImageFit.Contain)
-        .geometryTransition(this.fileImageTransitionId(entry, 'waterfall'))
-        .syncLoad(this.fileImageShouldSyncLoad(entry))
-        .opacity(1)
-        .onComplete((event?: ViewerImageCompleteEvent): void => {
-          this.recordThumbnailComplete(entry, this.thumbnailSurfaceUri(entry, 'waterfall'), index,
-            'waterfall', event)
-          this.completeWaterfallDecode(entry)
-        })
-        .onError(() => this.failWaterfallDecode(entry))
-    } else {
-      // Do not pass a provisional square sourceSize. ArkUI can reuse the
-      // decoded raster while WaterFlow is recycling the item, so the first
-      // decode must wait for Image Kit geometry instead of seeding a 1:1
-      // target that belongs to the temporary FlowItem.
-      Image(this.fileImageSource(entry, 'waterfall'))
-        .width('100%')
-        .height('100%')
-        .orientation(this.fileImageSourceOrientation(entry, 'waterfall'))
-        .objectFit(ImageFit.Contain)
-        .geometryTransition(this.fileImageTransitionId(entry, 'waterfall'))
-        .syncLoad(this.fileImageShouldSyncLoad(entry))
-        .opacity(0)
-        .onComplete((event?: ViewerImageCompleteEvent): void => {
-          this.recordThumbnailComplete(entry, this.thumbnailSurfaceUri(entry, 'waterfall'), index,
-            'waterfall', event)
-          this.completeWaterfallDecode(entry)
-        })
-        .onError(() => this.failWaterfallDecode(entry))
-    }
-  }
-
-  @Builder
   FileContentEndSpace(): void {
     Row().width('100%').height(this.floatingBarContentInset())
       .hitTestBehavior(HitTestMode.None).accessibilityLevel('no')
@@ -5785,28 +5407,8 @@ struct Index {
                 .height('100%')
             } else {
               Stack() {
-                if (EXPERIMENT_R2_WATERFALL_CELL) {
-                  // R2 推广：图片 + LoadingProgress 整块交给独立子组件，
-                  // 依赖 entry.previewRevision（@ObjectLink）做单条精准刷新。
-                  WaterfallThumbCell({ entry: entry, bridge: this.waterfallThumbBridge, index: this.waterfallEntryIndex(entry) })
-                } else {
-                  Stack({ alignContent: Alignment.Center }) {
-                    if (this.fileImageSourceAvailable(entry, 'waterfall')) {
-                      this.WaterfallPreviewImage(entry, this.waterfallEntryIndex(entry))
-                    }
-                    if (!this.fileImageSourceAvailable(entry, 'waterfall') ||
-                      !this.waterfallAspectRatioReady(entry)) {
-                      LoadingProgress()
-                        .width(24)
-                        .height(24)
-                        .color('#2E6BFF')
-                    }
-                  }
-                  .width('100%')
-                  .height('100%')
-                  .borderRadius(10)
-                  .clip(true)
-                }
+                // One observed cell owns the image and loading indicator.
+                WaterfallThumbnailCell({ entry: entry, bridge: this.waterfallThumbBridge, index: this.waterfallEntryIndex(entry) })
               }
               .width('100%')
               .height('100%')
@@ -7349,12 +6951,14 @@ struct Index {
           if (this.selectedSingleEntry() !== null &&
             this.actionSupportsOpenWith(this.selectedSingleEntry() as FileEntry)) {
             this.SelectionMoreRow($r('sys.symbol.rectangle_and_arrowshape_turn_up_right'), '其他应用打开',
-              () => this.openWithSelectedEntry(this.selectedSingleEntry() as FileEntry))
+              () => this.withSelectionExit(
+                (entry: FileEntry): Promise<void> => this.openWithOtherApp(entry)))
           }
           if (this.selectedSingleEntry() !== null &&
             this.actionSupportsQuickView(this.selectedSingleEntry() as FileEntry)) {
             this.SelectionMoreRow($r('sys.symbol.play'), '快速查看',
-              () => this.quickViewSelectedEntry(this.selectedSingleEntry() as FileEntry))
+              () => this.withSelectionExit(
+                (entry: FileEntry): Promise<void> => this.quickView(entry)))
           }
           if (this.selectedSingleEntry() !== null &&
             !(this.selectedSingleEntry() as FileEntry).isDirectory &&
@@ -7369,9 +6973,10 @@ struct Index {
           }
           if (this.selectedSingleEntry() !== null) {
             this.SelectionMoreRow($r('sys.symbol.rename'), '重命名',
-              () => this.renameSelectedEntry(this.selectedSingleEntry() as FileEntry))
+              () => this.withSelectionExit((entry: FileEntry): void => this.openRename(entry)))
             this.SelectionMoreRow($r('sys.symbol.info_circle'), '详情',
-              () => this.showEntryDetailsSelected(this.selectedSingleEntry() as FileEntry), false)
+              () => this.withSelectionExit(
+                (entry: FileEntry): Promise<void> => this.showEntryDetails(entry)), false)
           }
         } else if (this.selectedCachedEntries().length > 0) {
           this.SelectionMoreRow($r('sys.symbol.arrow_down'), '释放缓存',
@@ -8021,32 +7626,16 @@ struct Index {
   @Builder
   ActionMenuRow(icon: Resource, title: string, action: () => void, danger: boolean = false,
     last: boolean = false): void {
-    Column() {
-      Row() {
-        Text(title)
-          .fontSize(16)
-          .fontColor(danger ? $r('sys.color.warning') : $r('sys.color.font_primary'))
-          .layoutWeight(1)
-        SymbolGlyph(icon)
-          .fontSize(21)
-          .fontColor([danger ? $r('sys.color.warning') : $r('sys.color.icon_primary')])
-          .width(30)
-      }
-      .width('100%')
-      .height(50)
-      .padding({ left: 16, right: 10 })
-      if (!last) {
-        ContentDivider({ startInset: 16, endInset: 10 })
-      }
-    }
-    .width('100%')
-    .backgroundColor(Color.Transparent)
-    // 菜单里也要「按下 A、滑到 B 松手 → 执行 B」。菜单虽然挂在原生
+    // 与玻璃菜单共用一份行实现；variant='menu' 保留 50 高、16/10 内边距、
+    // 无按压高亮与各自的警示色，避免两套行各自演进。
+    // 菜单里也要「按下 A、滑到 B 松手 → 执行 B」：菜单虽然挂在原生
     // bindContextMenu 上，但条目是自绘的，所以能收到触摸事件。
-    .onAreaChange((_, area) =>
-      this.registerSlideItem('ctxmenu', title, area, () => this.runContextAction(action)))
-    .onTouch((event: TouchEvent) => this.slideItemTouch('ctxmenu', title, event))
-    .onClick(() => this.runContextAction(action))
+    GlassMenuRow({ icon: icon, title: title, showDivider: !last, danger: danger,
+      variant: 'menu', rowId: 'context-menu-row-' + title,
+      onActivate: () => this.runContextAction(action),
+      onRowArea: (area: Area) => this.registerSlideItem('ctxmenu', title, area,
+        () => this.runContextAction(action)),
+      onRowTouch: (event: TouchEvent) => this.slideItemTouch('ctxmenu', title, event) })
   }
 
   @Builder
@@ -8128,7 +7717,8 @@ struct Index {
 
   @Builder
   DestinationFolderOverlay(): void {
-    CreateFolderDialog({ visible: $destinationFolderDialog, name: $destinationFolderText,
+    NameInputDialog({ visible: $destinationFolderDialog, name: $destinationFolderText,
+      title: '新建文件夹', placeholder: '输入文件夹名称', idPrefix: 'destination-folder',
       busy: this.destinationLoading, viewportWidth: this.pageWidthVp,
       material: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
       onClose: (): void => { this.closeDestinationFolderDialog() },
@@ -8137,68 +7727,18 @@ struct Index {
 
   @Builder
   RenameOverlay(): void {
-    Column() {}
-      .width(0)
-      .height(0)
-      .bindSheet($$this.showRenameDialog, this.RenameOverlayContent, {
-        preferType: SheetType.CENTER,
-        height: SheetSize.FIT_CONTENT,
-        width: '88%',
-        dragBar: false,
-        showClose: false,
-        systemMaterial: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
-        onWillDismiss: () => {
-          if (!this.isBusy) {
-            this.closeRename()
-          }
-        }
-      })
-  }
-
-  @Builder
-  RenameOverlayContent(): void {
-    Column({ space: 16 }) {
-      Text('重命名')
-        .fontSize(20)
-        .fontWeight(FontWeight.Bold)
-        .fontColor($r('app.color.text_primary'))
-        .width('100%')
-      TextInput({ placeholder: '输入新名称', text: this.renameText })
-        .height(50)
-        .fontSize(16)
-        .fontColor($r('app.color.text_primary'))
-        .backgroundColor(Color.Transparent)
-        .borderRadius(12)
-        .padding({ left: 14, right: 14 })
-        .onChange((value: string) => this.renameText = value)
-      Row({ space: 10 }) {
-        Button('取消')
-          .layoutWeight(1)
-          .height(46)
-          .fontSize(15)
-          .fontColor($r('app.color.text_secondary'))
-          .backgroundColor(Color.Transparent)
-          .onClick(() => this.closeRename())
-        Button(this.isBusy ? '处理中…' : '确定')
-          .layoutWeight(1)
-          .height(46)
-          .fontSize(15)
-          .fontColor('#2E6BFF')
-          .backgroundColor(Color.Transparent)
-          .enabled(!this.isBusy)
-          .onClick(() => this.confirmRename())
-      }
-      .width('100%')
-    }
-    .width('100%')
-    .borderRadius(20)
-    .padding(20)
-    .onClick(() => {})
+    NameInputDialog({ visible: $showRenameDialog, name: $renameText,
+      title: '重命名', placeholder: '输入新名称', idPrefix: 'rename',
+      busy: this.isBusy, viewportWidth: this.pageWidthVp,
+      material: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
+      onClose: (): void => { this.closeRename() },
+      onConfirm: (): void => { this.confirmRename() } })
   }
 
   @Builder
   CreateFolderOverlay(): void {
-    CreateFolderDialog({ visible: $showCreateFolderDialog, name: $newFolderText,
+    NameInputDialog({ visible: $showCreateFolderDialog, name: $newFolderText,
+      title: '新建文件夹', placeholder: '输入文件夹名称', idPrefix: 'create-folder',
       busy: this.isBusy, viewportWidth: this.pageWidthVp,
       material: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
       onClose: (): void => { this.closeCreateFolder() },
@@ -9220,9 +8760,7 @@ struct Index {
     hiTraceMeter.finishTrace(name, STATE_TRACE_TASK_ID)
   }
 
-  /**
-   * 实验 H0：条目级局部刷新，仅通知对应索引的 LazyForEach Item 重新求值。
-   */
+  /** 仅通知对应索引的 LazyForEach Item，保留条目身份和局部刷新。 */
   private notifyEntryChanged(path: string, surfaceHint?: string): void {
     if (STATE_TRACE) {
       this.traceStateWrite('StateWrite:thumbNotify')
@@ -9234,12 +8772,7 @@ struct Index {
       }
       if (listIdx >= 0) {
         this.fileEntryDataSource.notifyItemChanged(listIdx)
-        // R2：子组件已由 @ObjectLink 局部刷新，这里不能再写 @State 数组
-        //（那会重新把根组件标脏，白费 R2）。
-        if (!EXPERIMENT_R2_THUMB_CELL &&
-          listIdx < this.entries.length && this.entries[listIdx].path === path) {
-          this.entries[listIdx] = this.fileEntryDataSource.getData(listIdx)
-        }
+        // @ObjectLink 在条目内刷新，不再写根级 @State 数组。
       }
     }
     if (surfaceHint === undefined || surfaceHint === 'waterfall') {
@@ -9249,11 +8782,7 @@ struct Index {
       }
       if (wfIdx >= 0) {
         this.waterfallDataSource.notifyItemChanged(wfIdx)
-        // R2W：瀑布流子组件已由 @ObjectLink 局部刷新，这里不能再写 @State 数组。
-        if (!EXPERIMENT_R2_WATERFALL_CELL &&
-          this.waterfallAbsoluteIndex(wfIdx) < this.waterfallEntries.length && this.waterfallEntries[this.waterfallAbsoluteIndex(wfIdx)].path === path) {
-          this.waterfallEntries[this.waterfallAbsoluteIndex(wfIdx)] = this.waterfallDataSource.getData(wfIdx)
-        }
+        // 与网格相同，只刷新对应条目。
       }
     }
   }
@@ -10243,10 +9772,7 @@ struct Index {
       .duration(180)
       .curve(Curve.FastOutSlowIn)
       .effectMode(EdgeEffect.Spring)
-      .disableSwipe(this.imageScale > 1.001 || this.viewerTransitionActive ||
-        this.viewerEntryTransitionActive || this.imageDismissDragging ||
-        this.isBusy || this.showImageMoreMenu ||
-        this.continuationDialogCount > 0 || this.showRenameDialog)
+      .disableSwipe(this.viewerGestureBlocked() || this.imageScale > 1.001 || this.imageDismissDragging)
       .width('100%')
       .height('100%')
       .onAreaChange((_, area) => this.handleImageViewportArea(area))
@@ -10545,20 +10071,7 @@ struct Index {
         .hitTestBehavior(HitTestMode.None)
 
       Row({ space: HeaderStyle.gap }) {
-        Button() {
-          SymbolGlyph($r('sys.symbol.chevron_backward'))
-            .fontSize(HeaderStyle.iconSize)
-            .fontColor([$r('sys.color.icon_primary')])
-        }
-          .type(ButtonType.Normal)
-          .width(HeaderStyle.controlHeight)
-          .height(HeaderStyle.controlHeight)
-          .borderRadius(HeaderStyle.controlHeight / 2)
-          .backgroundColor(Color.Transparent)
-          .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN))
-          .hitTestBehavior(HitTestMode.Default)
-          .monopolizeEvents(true)
-          .onClick(() => this.closeImageViewer())
+        this.OfficialBackButton(() => this.closeImageViewer())
         Text(this.viewerHeaderTitle)
           .fontSize(HeaderStyle.titleSize)
           .fontWeight(FontWeight.Bold)
@@ -10630,9 +10143,11 @@ struct Index {
   ImageViewerBarContent(): void {
     Row() {
       this.ImageViewerActionItem($r('sys.symbol.picture_badge_arrow_down'), '保存',
-        () => this.saveCommittedViewerImage())
+        () => this.runCommittedViewerAction('save',
+          (entry: FileEntry): Promise<void> => this.saveToGallery(entry)))
       this.ImageViewerActionItem($r('sys.symbol.share'), '分享',
-        () => this.shareCommittedViewerImage())
+        () => this.runCommittedViewerAction('share',
+          (entry: FileEntry): Promise<void> => this.shareEntry(entry)))
       // 进度环保持原尺寸，只在槽位内绝对居中。
       Stack() {
         Progress({ value: this.viewerProgress(), total: 100, type: ProgressType.Ring })
@@ -10657,11 +10172,14 @@ struct Index {
       .hitTestBehavior(HitTestMode.Default)
       .monopolizeEvents(true)
       .onAreaChange((_, area) => this.registerSlideItem('viewer', '进度', area,
-        () => this.loadCommittedViewerOriginalManually()))
+        () => this.runCommittedViewerAction('load-original',
+          (entry: FileEntry): Promise<void> => this.loadViewerOriginalManually(entry))))
       .onTouch((event: TouchEvent) => this.slideItemTouch('viewer', '进度', event))
-      .onClick(() => this.loadCommittedViewerOriginalManually())
+      .onClick(() => this.runCommittedViewerAction('load-original',
+        (entry: FileEntry): Promise<void> => this.loadViewerOriginalManually(entry)))
       this.ImageViewerActionItem($r('sys.symbol.trash'), '删除',
-        () => this.deleteCommittedViewerImage())
+        () => this.runCommittedViewerAction('delete',
+          (entry: FileEntry): Promise<void> => this.deleteViewerImage(entry)))
       this.ImageViewerMoreButton()
     }
     .width('100%')
@@ -10785,7 +10303,7 @@ struct Index {
         onBack: () => this.closeAudioPlayer(), onToggle: () => this.toggleAudio(),
         onPrevious: () => this.skipAudio(-1), onNext: () => this.skipAudio(1),
         onMode: () => this.cycleAudioMode(), onQueue: () => this.openAudioQueue(),
-        onDownload: () => { if (this.audioEntry !== null) { this.cacheToLocal(this.audioEntry) } },
+        onDownload: () => { if (this.audioEntry !== null) { this.downloadFileFromAction(this.audioEntry) } },
         onDetails: () => {
           if (this.audioEntry !== null && !this.audioPageBusy() && this.continuationDialogCount === 0) {
             this.showEntryDetails(this.audioEntry)
@@ -11905,6 +11423,26 @@ struct Index {
     }
   }
 
+  /**
+   * 从搜索结果打开图片/音频/视频/目录前的共同前置：确保会话存在、把「当前
+   * 真实滚动位置」写回会话、记录返回模式。四处原先各写一份，音频/视频两条
+   * 漏了读取实时位置（只写回上一次记住的值），返回时会跳回旧位置。
+   */
+  private prepareSearchReturn(mode: SearchReturnMode): void {
+    if (this.searchSession === null) {
+      this.searchSession = this.createSearchSession()
+    }
+    this.captureSearchSession()
+    try {
+      const offset = this.searchResultScroller.currentOffset()
+      if (offset !== undefined && typeof offset.yOffset === 'number') {
+        this.searchScrollOffset = Math.max(0, offset.yOffset)
+      }
+    } catch (_) {}
+    this.searchSession.scrollOffset = Math.max(0, this.searchScrollOffset)
+    this.searchSession.returnMode = mode
+  }
+
   private beginSearchResultReturn(entry: FileEntry, targetParent: string): SearchReturnMode {
     if (this.searchSession === null) {
       this.searchSession = this.createSearchSession()
@@ -12950,82 +12488,9 @@ struct Index {
   }
 
   /**
-   * 实验 B′ 专用：网格图片的解码目标尺寸（**严格保持源图比例**）。
-   *
-   * · 返回 null → 不设置 sourceSize（基线）
-   * · 否则返回 {width, height}，宽高严格等于源图比例，且两轴都 ≤ 源尺寸
-   *
-   * ⚠️ 两条硬约束（都踩过坑）：
-   *   1. 绝不能传正方形：源是 512×384 时按正方形缩放会【改变显示比例】。
-   *   2. 绝不能超过源尺寸：会触发 `JPEGHWDECODER failed to do decode` → 白屏。
-   * 源尺寸取状态里已知的解码尺寸（渲染路径零 IO）；两者未知时不设置，宁可走基线。
-   */
-  private gridSourceSizeFor(entry: FileEntry): ThumbnailSize | null {
-    const target = EXPERIMENT_GRID_SOURCE_SIZE
-    if (target <= 0) {
-      return null
-    }
-    const state = this.imageVisualState(entry.path)
-    let srcW = state.thumbnailDisplayWidth
-    let srcH = state.thumbnailDisplayHeight
-    if (!(srcW > 0) || !(srcH > 0)) {
-      // 退到物理尺寸；仍未知则本次不设置（不做任何猜测，避免变形或解码失败）。
-      srcW = state.physicalWidth
-      srcH = state.physicalHeight
-      if (!(srcW > 0) || !(srcH > 0)) {
-        return null
-      }
-    }
-    // 方案 A：针对 Grid 1:1 正方形单元格以 Cover 渲染的特性，
-    // 统一以短边限制在 target（320px），且绝不反向放大（限制最大 decode size）。
-    // 比例始终严格不变，Cover 裁剪保证点对点清晰，避免大缩略图（如 960x648）显存浪费。
-    const minDim = Math.min(srcW, srcH)
-    const scale = Math.min(target / minDim, 1)
-    const width = Math.max(1, Math.round(srcW * scale))
-    const height = Math.max(1, Math.round(srcH * scale))
-    const result: ThumbnailSize = { width: width, height: height }
-    return result
-  }
-
-  /**
-   * 实验 B′/F：解码目标宽度（0 = 本次不设置 sourceSize）。 */
-  private gridSourceWidth(entry: FileEntry): number {
-    const size = this.gridSourceSizeFor(entry)
-    return size === null ? 0 : size.width
-  }
-
-  /**
-   * 实验 B′/F：解码目标高度（0 = 本次不设置 sourceSize）。 */
-  private gridSourceHeight(entry: FileEntry): number {
-    const size = this.gridSourceSizeFor(entry)
-    return size === null ? 0 : size.height
-  }
-
-  /**
-   * R2 修复：网格项"一次算完"的图片显示状态。
-   *
-   * 背景：改造前，一个 GridItem 的单次 build 会通过三个 helper 重复求值
-   *      —— `fileImageSourceAvailable()`、`Image(fileImageSource())`、
-   *      `fileImageSourceOrientation()` 各自走一遍 `fileImageSource()`，
-   *      而它内部在 grid 路径下恒为 `previewUri()`（含 NAPI `fileUri.getUriFromPath`
-   *      + 多层查表）。即"同一轮构建里把同一个事实查了 3 遍"。
-   * 现在：只解析一次，后续全部读这个对象。
-   */
-  private resolveGridImageState(entry: FileEntry): GridImageState {
-    return this.resolveGridImageStateInto(entry, new GridImageState())
-  }
-
-  /**
-   * 同上，但把结果写进调用方给的实例（R2 子组件复用同一个 state，
-   * 避免 build 内 3~4 次问询各分配一个对象）。
-   * ⚠️ 被复用的实例必须显式复位每个字段，不能依赖默认值。
-   *
-   * R3.2：这里同时登记「这一格实际画的是哪个 preview」——
-   * 这是唯一权威写入点：只被 GridThumbCell 的桥在 cell build 期间调用，
-   * 不会被 onVisibleAreaChange 之类的旁路调用污染。
-   * 记录的是 preview identity（previewUri），不是 Image() 参数的 typeof：
-   * source 可能是 PixelMap（例如 viewer 转场期间），按类型判会错记成 ''，
-   * 下一轮就会把"已经画对的格子"再批量 notify 一次。
+   * Resolve once into the cell-owned reusable object. Keep geometryTransition
+   * on the native Image and record only previews actually rendered by a cell.
+   * This path does no IO and never publishes a root epoch per image.
    */
   private resolveGridImageStateInto(entry: FileEntry, state: GridImageState): GridImageState {
     state.hidden = this.viewerReturnHiddenPath === entry.path || this.audioReturnHiddenPath === entry.path
@@ -13039,8 +12504,6 @@ struct Index {
       state.orientation = ImageRotateOrientation.UP
       state.transitionId = ''
       state.syncLoad = false
-      state.sourceWidth = 0
-      state.sourceHeight = 0
       return state
     }
     state.orientation = isUri
@@ -13049,9 +12512,6 @@ struct Index {
     state.syncLoad = this.fileImageShouldSyncLoad(entry) ||
       (this.gridViewportRestore !== null && isUri &&
         ((source as string).startsWith('file://') || (source as string).startsWith('/')))
-    const size = this.gridSourceSizeFor(entry)
-    state.sourceWidth = size === null ? 0 : size.width
-    state.sourceHeight = size === null ? 0 : size.height
     this.gridRenderedPreviewKey[entry.path] = this.previewUri(entry)
     if (!state.hidden && this.viewerReturnRestoringPath === entry.path) {
       this.viewerReturnRestoringPath = ''
@@ -13076,8 +12536,8 @@ struct Index {
   }
 
   /**
-   * R2 推广（瀑布流）：同 resolveGridImageStateInto 的契约。
-   * 唯一权威写入点 —— 只被 WaterfallThumbCell 的桥在 cell build 期间调用。
+   * 与网格相同，构建时只解析本条目的图片状态。
+   * 唯一权威写入点 —— 只被 WaterfallThumbnailCell 的桥在 cell build 期间调用。
    * 原 item builder 里 `fileImageSourceAvailable()` 被调了两次、`fileImageSource()`
    * 又被 @Builder 里再调两次；这里一次算完，次数与原来相当或更少。
    */
@@ -13976,54 +13436,17 @@ struct Index {
       await this.openSearchResultFolder(entry)
       return
     }
-    if (this.isImage(entry)) {
-      await this.openSearchResultImage(entry)
-      return
-    }
-    if (this.isAudio(entry)) {
-      await this.openSearchResultAudio(entry)
-      return
-    }
-    if (this.isVideo(entry)) {
-      await this.openSearchResultVideo(entry)
-      return
-    }
-    await this.downloadEntry(entry)
-  }
-
-  private async openSearchResultImage(entry: FileEntry): Promise<void> {
-    if (this.searchSession === null) {
-      this.searchSession = this.createSearchSession()
-    }
-    this.captureSearchSession()
-    this.searchSession.returnMode = 'image'
-    try {
-      const offset = this.searchResultScroller.currentOffset()
-      if (offset !== undefined && typeof offset.yOffset === 'number') {
-        this.searchScrollOffset = Math.max(0, offset.yOffset)
-      }
-    } catch (_) {}
-    this.searchSession.scrollOffset = this.searchScrollOffset
-
-    const searchImages = this.searchResults.filter((item: FileEntry) => !item.isDirectory && this.isImage(item))
-    await this.openImageViewer(entry, searchImages)
+    if (!await this.openMediaEntry(entry, true)) { await this.downloadEntry(entry) }
   }
 
   private async openSearchResultFolder(entry: FileEntry): Promise<void> {
-    if (this.searchSession === null) {
-      this.searchSession = this.createSearchSession()
+    this.prepareSearchReturn('directory')
+    const session = this.searchSession
+    if (session === null) {
+      return
     }
-    this.captureSearchSession()
-    try {
-      const offset = this.searchResultScroller.currentOffset()
-      if (offset !== undefined && typeof offset.yOffset === 'number') {
-        this.searchScrollOffset = Math.max(0, offset.yOffset)
-      }
-    } catch (_) {}
-    this.searchSession.scrollOffset = this.searchScrollOffset
-    this.searchSession.returnMode = 'directory'
-    this.searchSession.targetParentPath = entry.path
-    this.searchSession.targetNavigationDepth = this.navigationStack.length
+    session.targetParentPath = entry.path
+    session.targetNavigationDepth = this.navigationStack.length
 
     const requestId = ++this.navigationRequestId
     this.isNavigating = true
@@ -14068,24 +13491,6 @@ struct Index {
         this.isBusy = false
       }
     }
-  }
-
-  private async openSearchResultAudio(entry: FileEntry): Promise<void> {
-    if (this.searchSession === null) {
-      this.searchSession = this.createSearchSession()
-    }
-    this.captureSearchSession()
-    this.searchSession.returnMode = 'audio'
-    await this.openAudioPlayer(entry)
-  }
-
-  private async openSearchResultVideo(entry: FileEntry): Promise<void> {
-    if (this.searchSession === null) {
-      this.searchSession = this.createSearchSession()
-    }
-    this.captureSearchSession()
-    this.searchSession.returnMode = 'video'
-    await this.openVideoPlayer(entry)
   }
 
   private async toggleAutoLogin(): Promise<void> {
@@ -15032,15 +14437,7 @@ struct Index {
       this.updateDirectoryCount(this.currentPath,
         snapshot.totalCount >= 0
           ? Math.max(0, snapshot.totalCount - suppressedCount) : effectiveEntries.length)
-      if (effectiveTimeline.eligible()) {
-        const earliest = DirectoryTimelinePolicy.localDayStart(effectiveTimeline.earliestTime)
-        const latest = DirectoryTimelinePolicy.localDayStart(effectiveTimeline.latestTime)
-        if (this.timelineFocusTime < earliest || this.timelineFocusTime > latest) {
-          this.timelineFocusTime = this.fileSortAscending ? earliest : latest
-        }
-      } else {
-        this.timelineFocusTime = 0
-      }
+      this.alignTimelineFocus(effectiveTimeline)
       if (Date.now() - snapshot.fetchedAt > DIRECTORY_INDEX_STALE_MS &&
         effectiveEntries.length <= DIRECTORY_AUTO_REFRESH_MAX_ITEMS) {
         setTimeout((): void => {
@@ -15062,15 +14459,7 @@ struct Index {
     this.updateDirectoryCount(this.currentPath,
       snapshot.totalCount >= 0
         ? Math.max(0, snapshot.totalCount - suppressedCount) : sorted.length)
-    if (effectiveTimeline.eligible()) {
-      const earliest = DirectoryTimelinePolicy.localDayStart(effectiveTimeline.earliestTime)
-      const latest = DirectoryTimelinePolicy.localDayStart(effectiveTimeline.latestTime)
-      if (this.timelineFocusTime < earliest || this.timelineFocusTime > latest) {
-        this.timelineFocusTime = this.fileSortAscending ? earliest : latest
-      }
-    } else {
-      this.timelineFocusTime = 0
-    }
+    this.alignTimelineFocus(effectiveTimeline)
     if (Date.now() - snapshot.fetchedAt > DIRECTORY_INDEX_STALE_MS &&
       effectiveEntries.length <= DIRECTORY_AUTO_REFRESH_MAX_ITEMS) {
       setTimeout((): void => {
@@ -15078,6 +14467,23 @@ struct Index {
           this.scheduleCurrentDirectoryIndex(true)
         }
       }, 0)
+    }
+  }
+
+  /**
+   * 目录索引刷新后对齐时间轴焦点。合格但焦点越界就夹到最近一天，不合格归零。
+   * 「内容未变」与「需要重排」两条分支必须用同一套判定，否则同一份目录会因为
+   * 是否重排而在时间轴上跳到不同日期。
+   */
+  private alignTimelineFocus(timeline: DirectoryTimeline): void {
+    if (timeline.eligible()) {
+      const earliest = DirectoryTimelinePolicy.localDayStart(timeline.earliestTime)
+      const latest = DirectoryTimelinePolicy.localDayStart(timeline.latestTime)
+      if (this.timelineFocusTime < earliest || this.timelineFocusTime > latest) {
+        this.timelineFocusTime = this.fileSortAscending ? earliest : latest
+      }
+    } else {
+      this.timelineFocusTime = 0
     }
   }
 
@@ -15159,14 +14565,41 @@ struct Index {
 
   private cancelPendingPreviewLoads(): void {
     this.repository.cancelThumbnailNotifications()
-    const cancelled = this.previewQueue.cancelPending()
-    for (const key of cancelled) {
-      const separator = key.indexOf('#preview:')
+    this.releaseQueuedPreviews(this.previewQueue.cancelPending())
+  }
+
+  private releaseQueuedPreviews(keys: string[]): void {
+    for (const key of keys) {
+      const separator = key.lastIndexOf('#preview:')
       const path = separator > 0 ? key.substring(0, separator) : key
       if (path.length > 0) {
         this.previewRequests[path] = 0
+        this.repository.cancelThumbnailNotifications(path)
       }
     }
+  }
+
+  private canDispatchPreviewLoads(): boolean {
+    return this.screen === 'files' && this.gestureSharePageVisible && !this.abilityInBackground &&
+      !this.showPageTransition && !this.showImageViewer && !this.viewerBlocksFileContent &&
+      !this.fileContentScrolling && !this.locateProgrammaticScrolling && !this.timelineScrubActive
+  }
+
+  /** Only the settled visible window and its existing eight-item margin. No directory scan. */
+  private reconcilePreviewLoads(start: number, end: number): void {
+    if (!this.canDispatchPreviewLoads() || this.fileViewMode === 'waterfall') { return }
+    const priorities = new Map<string, number>()
+    const suffix = '#preview:' + this.previewGeneration.toString()
+    const first = Math.max(0, start - 8)
+    const last = Math.min(this.entries.length - 1, end + 8, first + ThumbnailPolicy.MAX_PENDING_TASKS - 1)
+    for (let index = first; index <= last; index++) {
+      priorities.set(this.entries[index].path + suffix, this.previewPriority(index, this.fileViewMode))
+    }
+    // Native visibility includes clipped edge cells that onScrollIndex may omit.
+    this.pendingVisibleLoads.forEach((entry: FileEntry): void => {
+      if (this.fileEntryDataSource.indexOfPath(entry.path) >= 0) { priorities.set(entry.path + suffix, 0) }
+    })
+    this.releaseQueuedPreviews(this.previewQueue.reconcile(priorities))
   }
 
   /** 该 path 当前是否有在飞的缩略图请求（token > 0 即为有）。 */
@@ -15200,7 +14633,7 @@ struct Index {
       currentOffsetY = this.fileListScroller.currentOffset().yOffset
     } catch (_) {}
     this.returnPerfSession.noteScrollStart(currentOffsetY, this.getMonotonicNow())
-    this.cancelPendingPreviewLoads()
+    this.previewQueue.pause()
     this.releaseTimelineFocusPinFromFileScroll()
   }
 
@@ -15332,6 +14765,7 @@ struct Index {
     this.cancelTimelineVisibleFocus()
     this.timelineInteractionToken += 1
     this.timelineScrubActive = true
+    this.previewQueue.pause()
     this.timelineFocusPinned = true
     this.timelineIgnoreScrollStartUntil = Date.now() + 180
     this.timelineScrubPendingTime = this.timelineFocusTime
@@ -15410,6 +14844,7 @@ struct Index {
     // （之前 ±8 失败正是因为一次 warm 36~48 条 > 上限 32）。
     const visibleStart = Math.max(0, start)
     const visibleEnd = Math.min(source.length - 1, Math.max(visibleStart, end))
+    this.reconcilePreviewLoads(visibleStart, visibleEnd)
     start = Math.max(0, visibleStart - 8)
     end = Math.min(source.length - 1, Math.max(start, visibleEnd + 8))
     // A malformed/stale visible range must not turn a scrub release into
@@ -15430,6 +14865,7 @@ struct Index {
         this.loadEntryPreview(entry, this.previewPriority(index, this.fileViewMode))
       }
     }
+    this.previewQueue.resume()
   }
 
   /**
@@ -15498,6 +14934,7 @@ struct Index {
 
     const minIdx = Math.max(0, visibleStart - 8)
     const maxIdx = Math.min(items.length - 1, visibleEnd + 8)
+    this.reconcilePreviewLoads(visibleStart, visibleEnd > 0 ? visibleEnd : Math.min(items.length - 1, 24))
     let flushedCount = 0
     let scanNotifiedCount = 0
     const processedPaths = new Set<string>()
@@ -15557,6 +14994,7 @@ struct Index {
       }
     }
 
+    this.previewQueue.resume()
     const hadLocate = this.locateTargetIndex >= 0
     this.locateTargetIndex = -1
     if (hadLocate) {
@@ -15816,19 +15254,7 @@ struct Index {
       return
     }
     if (!entry.isDirectory) {
-      if (this.isImage(entry)) {
-        await this.openImageViewer(entry)
-        return
-      }
-      if (this.isAudio(entry)) {
-        await this.openAudioPlayer(entry)
-        return
-      }
-      if (this.isVideo(entry)) {
-        await this.openVideoPlayer(entry)
-        return
-      }
-      await this.downloadEntry(entry)
+      if (!await this.openMediaEntry(entry)) { await this.downloadEntry(entry) }
       return
     }
     const outgoingEntries = this.entries.slice()
@@ -16101,13 +15527,30 @@ struct Index {
     }
   }
 
+  /** Callers prepare the queues and own feedback/batch lifecycle. */
+  private async enqueueDownloadFile(entry: FileEntry, destinationRoot: string = '',
+    relativePath: string = '', batch: TransferBatch | null = null): Promise<void> {
+    if (entry.isDirectory) { throw new Error('文件夹应按目录加入下载') }
+    if (batch !== null && batch.ownerScope !== this.repository.cacheScopeHash()) {
+      throw new Error('账号已变化，已停止加入下载')
+    }
+    if (this.isVideo(entry)) {
+      // Reuse buffered ranges and completed caches rather than downloading a
+      // playing video again through the ordinary file queue.
+      await this.videoTransferManager.requestDownload(entry, destinationRoot, relativePath, batch)
+    } else {
+      await this.downloadQueue.enqueue(entry, destinationRoot, relativePath, batch)
+    }
+  }
+
   private async downloadEntry(entry: FileEntry): Promise<void> {
     if (entry.isDirectory) {
       return
     }
     try {
       await this.ensureDownloadState()
-      await this.downloadQueue.enqueue(entry)
+      if (this.isVideo(entry)) { await this.refreshVideoManager() }
+      await this.enqueueDownloadFile(entry)
       this.statusText = '已加入下载队列'
       this.showImmersiveToast('已加入下载：' + entry.name)
     } catch (error) {
@@ -16363,7 +15806,7 @@ struct Index {
       return
     }
     if (!entry.isDirectory) {
-      await this.cacheToLocal(entry)
+      await this.downloadFileFromAction(entry)
       return
     }
     this.closeActionMenu()
@@ -16394,15 +15837,8 @@ struct Index {
       throw new Error('账号已变化，已停止加入下载')
     }
     if (!entry.isDirectory) {
-      if (this.isVideo(entry)) {
-        // Video transfers use the MediaKit range/cache coordinator so an
-        // earlier stream is promoted instead of starting a second full-file
-        // download. The route remains the same system download directory.
-        await this.refreshVideoManager()
-        await this.videoTransferManager.requestDownload(entry, destinationRoot, relativePath, batch)
-      } else {
-        await this.downloadQueue.enqueue(entry, destinationRoot, relativePath, batch)
-      }
+      if (this.isVideo(entry)) { await this.refreshVideoManager() }
+      await this.enqueueDownloadFile(entry, destinationRoot, relativePath, batch)
       return 1
     }
     this.ensureLocalDirectory(destinationRoot + '/' + this.safeLocalPath(relativePath))
@@ -16486,29 +15922,31 @@ struct Index {
   private async showEntryDetails(entry: FileEntry): Promise<void> {
     if (this.continuationDialogCount > 0) { return }
     this.closeActionMenu()
-    const type = entry.isDirectory ? '文件夹' : (this.fileType(entry).length > 0 ? this.fileType(entry) : '文件')
-    const lines: string[] = [
-      '类型：' + type,
-      '大小：' + (entry.isDirectory ? '—' : this.formatSize(entry.size)),
-      '修改时间：' + this.formatTime(entry.modifiedTime),
-      '位置：' + (entry.path.length > 0 ? entry.path : '/')
-    ]
+    const data = new EntryDetailsData()
+    data.type = entry.isDirectory ? '文件夹' : (this.fileType(entry).length > 0 ? this.fileType(entry) : '文件')
+    data.size = this.formatSize(entry.size)
+    data.modifiedTime = this.formatTime(entry.modifiedTime)
+    data.path = entry.path.length > 0 ? entry.path : '/'
     if (entry.isDirectory && entry.childCount >= 0) {
-      lines.splice(1, 0, '项目：' + entry.childCount.toString() + ' 项')
+      data.items = entry.childCount.toString() + ' 项'
     }
-    await this.showTrackedDialog(() => this.presentEntryDetails(entry.name, lines.join('\n')))
+    const query = entry.isDirectory ? (): DirectorySizeQuery => this.repository.createDirectorySizeQuery(entry) : null
+    await this.showTrackedDialog(() => this.presentEntryDetails(entry.name, data, query))
   }
 
   @Builder
-  EntryDetailsDialogContent(title: string, message: string, onConfirm: () => void): void {
-    EntryDetailsContent({ title: title, message: message,
+  EntryDetailsDialogContent(title: string, data: EntryDetailsData, query: (() => DirectorySizeQuery) | null,
+    onConfirm: () => void): void {
+    EntryDetailsContent({ title: title, data: data, createSizeQuery: query,
+      formatSize: (size: number): string => size === 0 ? '0 B' : this.formatSize(size),
       maxContentHeight: Math.max(80, this.pageHeightVp - this.topSafeInset() - this.bottomSafeInset() - 160),
       onConfirm: onConfirm })
   }
 
-  private presentEntryDetails(title: string, message: string): Promise<promptAction.ShowDialogSuccessResponse> {
+  private presentEntryDetails(title: string, data: EntryDetailsData,
+    query: (() => DirectorySizeQuery) | null): Promise<promptAction.ShowDialogSuccessResponse> {
     return this.presentPageDialog((finish: (index: number) => void): void => {
-      this.EntryDetailsDialogContent(title, message, (): void => { finish(0) })
+      this.EntryDetailsDialogContent(title, data, query, (): void => { finish(0) })
     }, this.floatingPanelMaterial)
   }
 
@@ -16732,12 +16170,12 @@ struct Index {
       return
     }
     const name = this.destinationFolderText.trim()
-    if (name.length === 0 || name.indexOf('/') >= 0 || name.indexOf('\\') >= 0) {
-      this.presentErrorMessage('文件夹名称不能为空，且不能包含路径分隔符', '新建文件夹失败')
+    const nameError = this.entryNameError(name, '文件夹名称')
+    if (nameError.length > 0) {
+      this.presentErrorMessage(nameError, '新建文件夹失败')
       return
     }
-    const parent = this.destinationPath.replace(/[\\/]$/, '')
-    const path = parent.length > 0 ? parent + '/' + name : '/' + name
+    const path = this.childPath(this.destinationPath, name)
     const navigation = this.navigationRequestId
     const unchanged = (): boolean => navigation === this.navigationRequestId
     this.destinationOperationRunning = true
@@ -16983,7 +16421,8 @@ struct Index {
       return
     }
     const entries = this.destinationSelectedEntries.slice()
-    let navigation = this.navigationRequestId
+    const navigation = this.navigationRequestId
+    const scope = this.repository.sessionIdentity()
     const operation = this.destinationOperation
     const targetPath = this.destinationPath
     if (this.destinationContainsSource(targetPath)) {
@@ -17003,17 +16442,12 @@ struct Index {
     this.destinationOperationRunning = true
     this.destinationLoading = true
     try {
-      const paths = entries.map((entry: FileEntry): string => entry.path)
       if (operation === 'copy') {
-        await this.repository.copy(paths, targetPath)
+        await this.repository.copy(entries, targetPath, this.currentRootType)
       } else {
-        await this.repository.move(paths, targetPath)
+        await this.repository.move(entries, targetPath, this.currentRootType)
       }
-      if (navigation !== this.navigationRequestId) { return }
-      const refresh = this.refreshCurrentDirectory()
-      navigation = this.navigationRequestId
-      await refresh
-      if (navigation !== this.navigationRequestId) { return }
+      if (navigation !== this.navigationRequestId || scope !== this.repository.sessionIdentity()) { return }
       this.statusText = operation === 'copy' ? '已提交复制任务' : '已提交移动任务'
       HapticFeedback.success()
       this.showImmersiveToast(this.statusText)
@@ -17889,7 +17323,7 @@ struct Index {
     //   2) viewerClosing = false（L16136）→ 退出动画语义结束；
     //   3) viewerReturnReadyPath = ''（上一行）→ source 不再处于 transition-active 状态。
     // 此时再补一次【既有的】局部刷新：
-    //   · R2 之后 viewerClosing / geometryBound 这类父状态变化**驱动不到** GridThumbCell，
+    //   · R2 之后 viewerClosing / geometryBound 这类父状态变化**驱动不到** GridThumbnailCell，
     //     不能只等状态自己生效，必须主动通知该 cell；
     //   · cell 重建时会重算 transitionId —— 此时已不在 transition 中，算出来是 ''（idle），
     //     **不残留本次 exit 的 id**；
@@ -17957,6 +17391,25 @@ struct Index {
     // A queued open must see a completely cleared old Viewer session. Starting
     // it before replaceViewerImages([])/resetImageTransform corrupts fast reopen.
     this.runPendingOpenEntry()
+  }
+
+  /**
+   * 关闭动画结束时的统一收尾。两条关闭路径（普通关闭、返回浮层关闭）必须
+   * 记录同一个时间戳、清空同一次指针会话：任何一边漏掉一项，下一条关闭都会
+   * 继承上一次的诊断计数，"关闭后第一下点不动"就无法归因。
+   */
+  private beginViewerCloseSession(): void {
+    this.closeAnimFinishMonotonic = this.getMonotonicNow()
+    this.closeSessionActive = true
+    this.sessionTrackedPointerId = -1
+    this.sessionPreDispatchDownLogged = false
+    this.sessionRootDownLogged = false
+    this.sessionChildDownLogged = false
+    this.sessionPanStartLogged = false
+    this.sessionFirstPanUpdateLogged = false
+    this.sessionScrollStartLogged = false
+    this.sessionTouchTestCount = 0
+    this.tapTrace('after-closeAnim')
   }
 
   private closeImageViewer(skipReturnGeometry: boolean = false): void {
@@ -18087,17 +17540,7 @@ struct Index {
         this.restoreViewerReturnScrollPosition()
       }
     }
-    this.closeAnimFinishMonotonic = this.getMonotonicNow()
-    this.closeSessionActive = true
-    this.sessionTrackedPointerId = -1
-    this.sessionPreDispatchDownLogged = false
-    this.sessionRootDownLogged = false
-    this.sessionChildDownLogged = false
-    this.sessionPanStartLogged = false
-    this.sessionFirstPanUpdateLogged = false
-    this.sessionScrollStartLogged = false
-    this.sessionTouchTestCount = 0
-    this.tapTrace('after-closeAnim')
+    this.beginViewerCloseSession()
     if (closeGeneration === this.viewerGeneration) {
       this.finishCloseImageViewer(shouldRestoreSearch)
     }
@@ -18228,17 +17671,7 @@ struct Index {
     this.viewerReturnOverlayVisible = false
     this.viewerReturnSnapshot = new ViewerReturnSnapshot()
     this.restoreImageViewerOrientation()
-    this.closeAnimFinishMonotonic = this.getMonotonicNow()
-    this.closeSessionActive = true
-    this.sessionTrackedPointerId = -1
-    this.sessionPreDispatchDownLogged = false
-    this.sessionRootDownLogged = false
-    this.sessionChildDownLogged = false
-    this.sessionPanStartLogged = false
-    this.sessionFirstPanUpdateLogged = false
-    this.sessionScrollStartLogged = false
-    this.sessionTouchTestCount = 0
-    this.tapTrace('after-closeAnim')
+    this.beginViewerCloseSession()
     this.finishCloseImageViewer(shouldRestoreSearch)
     console.info('[ViewerReturnOverlay] session=' + this.closeSessionId.toString() +
       ' stage=closed dt=' +
@@ -18376,14 +17809,18 @@ struct Index {
     this.animateImageTransform(2, 0, 0)
   }
 
+  /** Shared admission gates. An accepted dismiss drag keeps its existing update/end lifecycle. */
+  private viewerGestureBlocked(): boolean {
+    return !this.showImageViewer || this.viewerClosePending || this.viewerTransitionActive ||
+      this.viewerEntryTransitionActive || this.isBusy || this.showImageMoreMenu ||
+      this.continuationDialogCount > 0 || this.showRenameDialog
+  }
+
   private imageDismissGestureEnabled(index: number): boolean {
-    // ⚠️ imageAnalyzerActive = 用户正在识别文字，此时文字选择层浮在图片上方，
-    // 若仍允许下拉关闭，拖动选择光标就会被它接走、导致图片跟着移动。
-    return this.showImageViewer && !this.viewerClosePending &&
-      index === this.viewerImageIndex && this.imageScale <= 1.001 &&
-      !this.viewerTransitionActive && !this.viewerEntryTransitionActive &&
-      !this.showImageMoreMenu && this.continuationDialogCount === 0 && !this.showRenameDialog &&
-      !this.imageAnalyzerActive
+    // Text selection owns vertical dragging while the analyzer is active.
+    // Horizontal paging keeps its separate Swiper behavior.
+    return !this.viewerGestureBlocked() && index === this.viewerImageIndex &&
+      this.imageScale <= 1.001 && !this.imageAnalyzerActive
   }
 
   private resetImageDismissTransform(): void {
@@ -18710,9 +18147,9 @@ struct Index {
       !this.shouldAutoLoadViewerOriginal()) {
       return
     }
-    // The current image has completed. Decode at most the previous and next
-    // pages in parallel; this keeps the visible page single-flight while
-    // warming exactly the pages a normal swipe is likely to reach.
+    // Prepare adjacent previews and frame geometry. Original-file prefetch
+    // stays in ViewerPrefetchCoordinator; decoded originals remain bounded
+    // by the current and pending pages.
     this.viewerMaxConcurrentLoads = this.networkPolicy.isMetered() ? 1 : 2
     const adjacentIndexes: number[] = []
     if (index - 1 >= 0) {
@@ -18728,9 +18165,6 @@ struct Index {
         await this.primeViewerOriginalFrame(adjacent)
         this.ensureViewerImageFrame(adjacent, false)
       }).catch((): void => {})
-      if (!EXPERIMENT_A3_SINGLE_ORIGINAL_VIEWER) {
-        this.enqueueViewerOriginal(adjacent, false, false)
-      }
     }
   }
 
@@ -18782,44 +18216,27 @@ struct Index {
   }
 
   private trimViewerOriginalState(): void {
-    // Keep only the visible page and its immediate Swiper neighbours.  A
+    // Keep only the current page and pending swipe target in the decoded original budget.  A
     // PixelMap is a native raster, so retaining every image visited during a
     // long swipe session would defeat the viewer memory budget.
     const keepPaths: Record<string, boolean> = {}
-    if (EXPERIMENT_A3_SINGLE_ORIGINAL_VIEWER) {
-      // A3: 仅当前项（以及正在滑动的目标 pending 项）允许保留 original
-      const centers: number[] = [this.viewerImageIndex, this.viewerPendingIndex]
-      for (const center of centers) {
-        if (center >= 0 && center < this.viewerImages.length) {
-          keepPaths[this.viewerImages[center].path] = true
-        }
-      }
-    } else {
-      const centers: number[] = [this.viewerImageIndex, this.viewerPendingIndex]
-      for (const center of centers) {
-        if (center < 0 || center >= this.viewerImages.length) {
-          continue
-        }
-        for (let index = Math.max(0, center - 2);
-          index <= Math.min(this.viewerImages.length - 1, center + 2); index += 1) {
-          keepPaths[this.viewerImages[index].path] = true
-        }
+    // The current and pending pages retain their decoded originals.
+    const centers: number[] = [this.viewerImageIndex, this.viewerPendingIndex]
+    for (const center of centers) {
+      if (center >= 0 && center < this.viewerImages.length) {
+        keepPaths[this.viewerImages[center].path] = true
       }
     }
     for (const key of Object.keys(this.viewerOriginalBitmaps)) {
       if (keepPaths[key] === true || this.viewerActiveLoadPaths[key] === true) {
         continue
       }
-      if (EXPERIMENT_A3_SINGLE_ORIGINAL_VIEWER) {
-        const oldRec = this.viewerOriginalBitmaps[key]
-        if (oldRec !== undefined) {
-          this.tryEnqueueViewerCleanupItem(oldRec, key, 'original')
-          this.removeViewerBitmap(this.viewerOriginalBitmaps, key)
-          this.viewerOriginalLocalPaths[key] = ''
-          this.requestViewerCleanup()
-        }
-      } else {
-        this.releaseViewerBitmap(this.viewerOriginalBitmaps, key).catch((): void => {})
+      const oldRec = this.viewerOriginalBitmaps[key]
+      if (oldRec !== undefined) {
+        this.tryEnqueueViewerCleanupItem(oldRec, key, 'original')
+        this.removeViewerBitmap(this.viewerOriginalBitmaps, key)
+        this.viewerOriginalLocalPaths[key] = ''
+        this.requestViewerCleanup()
       }
       this.updateImageVisualState(key, (state: ImageVisualState): void => {
         state.originalUri = ''
@@ -19090,7 +18507,7 @@ struct Index {
         ? existingPath : await coordinator.downloadCurrentOriginal(entry, progressListener, manual)
       if (!this.showImageViewer || generation !== this.viewerGeneration ||
         !this.viewerContainsPath(entry.path) ||
-        (EXPERIMENT_A3_SINGLE_ORIGINAL_VIEWER && entry.path !== this.viewerPrimaryPath)) {
+        (entry.path !== this.viewerPrimaryPath)) {
         return
       }
       if (existingPath.length > 0) {
@@ -19099,7 +18516,7 @@ struct Index {
       const record = await this.decodeViewerOriginalBitmap(entry, localPath)
       if (record === null || !this.showImageViewer || generation !== this.viewerGeneration ||
         !this.viewerContainsPath(entry.path) ||
-        (EXPERIMENT_A3_SINGLE_ORIGINAL_VIEWER && entry.path !== this.viewerPrimaryPath)) {
+        (entry.path !== this.viewerPrimaryPath)) {
         return
       }
       this.applyDecodedBitmapGeometry(entry.path, record, true)
@@ -19137,7 +18554,7 @@ struct Index {
         this.viewerLoadRequests[entry.path] = false
         this.viewerActiveLoadPaths[entry.path] = false
         this.viewerManualLoadPaths[entry.path] = false
-        if (EXPERIMENT_A3_SINGLE_ORIGINAL_VIEWER && entry.path !== this.viewerPrimaryPath) {
+        if (entry.path !== this.viewerPrimaryPath) {
           this.trimViewerOriginalState()
         }
         // A quick away/back can select this file while its old cancellation
@@ -19490,37 +18907,18 @@ struct Index {
     return entry
   }
 
-  private async saveCommittedViewerImage(): Promise<void> {
-    const entry = this.committedViewerActionEntry('save')
+  /**
+   * 大图底部栏动作的统一入口：先锁定「已提交的那一页」再执行。保存/分享/
+   * 加载原图/删除四个动作共用同一套守卫与诊断打点，避免转场或关闭过程中把
+   * 动作作用到下一张、或已经释放的条目上。
+   */
+  private async runCommittedViewerAction(action: string,
+    run: (entry: FileEntry) => void | Promise<void>): Promise<void> {
+    const entry = this.committedViewerActionEntry(action)
     if (entry !== null) {
-      await this.saveViewerImage(entry)
+      this.closeImageMoreMenu()
+      await run(entry)
     }
-  }
-
-  private async shareCommittedViewerImage(): Promise<void> {
-    const entry = this.committedViewerActionEntry('share')
-    if (entry !== null) {
-      await this.shareEntry(entry)
-    }
-  }
-
-  private async deleteCommittedViewerImage(): Promise<void> {
-    const entry = this.committedViewerActionEntry('delete')
-    if (entry !== null) {
-      await this.deleteViewerImage(entry)
-    }
-  }
-
-  private async loadCommittedViewerOriginalManually(): Promise<void> {
-    const entry = this.committedViewerActionEntry('load-original')
-    if (entry !== null) {
-      await this.loadViewerOriginalManually(entry)
-    }
-  }
-
-  private async saveViewerImage(entry: FileEntry): Promise<void> {
-    this.closeImageMoreMenu()
-    await this.saveToGallery(entry)
   }
 
   private openImageMoreMenu(): void {
@@ -19563,8 +18961,9 @@ struct Index {
     if (entry === null || !this.showImageViewer || this.isBusy) {
       return
     }
-    this.showImageMoreMenu = false
-    this.viewerOverlayEntry = null
+    // 与"其他应用打开""详情"走同一条收口：先关大图更多菜单（含滑动项注销），
+    // 再复用文件管理的重命名流程（校验/提交/状态回写都在 confirmRename 里）。
+    this.closeImageMoreMenu()
     this.openRename(entry)
   }
 
@@ -21507,7 +20906,7 @@ struct Index {
     try {
       await this.ensureDownloadState()
       await this.refreshVideoManager()
-      await this.videoTransferManager.requestDownload(entry)
+      await this.enqueueDownloadFile(entry)
       this.statusText = '已加入下载队列'
       this.showImmersiveToast('已加入下载：' + entry.name)
     } catch (error) {
@@ -22226,20 +21625,25 @@ struct Index {
     await this.openCachedEntry(entry, true)
   }
 
-  private async quickView(entry: FileEntry): Promise<void> {
-    if (this.isImage(entry)) {
-      await this.openImageViewer(entry)
-      return
-    }
-    if (this.isAudio(entry)) {
+  private async openMediaEntry(entry: FileEntry, fromSearch: boolean = false): Promise<boolean> {
+    const kind = MediaType.kind(entry)
+    if (kind === '') { return false }
+    if (fromSearch) { this.prepareSearchReturn(kind) }
+    if (kind === 'image') {
+      const images = fromSearch
+        ? this.searchResults.filter((item: FileEntry): boolean => !item.isDirectory && this.isImage(item))
+        : undefined
+      await this.openImageViewer(entry, images)
+    } else if (kind === 'audio') {
       await this.openAudioPlayer(entry)
-      return
-    }
-    if (this.isVideo(entry)) {
+    } else {
       await this.openVideoPlayer(entry)
-      return
     }
-    await this.openCachedEntry(entry, false)
+    return true
+  }
+
+  private async quickView(entry: FileEntry): Promise<void> {
+    if (!await this.openMediaEntry(entry)) { await this.openCachedEntry(entry, false) }
   }
 
   private async openCachedEntry(entry: FileEntry, forcePicker: boolean): Promise<void> {
@@ -22366,7 +21770,7 @@ struct Index {
     return this.repository.cacheKeyForFile(entry)
   }
 
-  private async cacheToLocal(entry: FileEntry): Promise<void> {
+  private async downloadFileFromAction(entry: FileEntry): Promise<void> {
     if (this.isBusy || entry.isDirectory) {
       return
     }
@@ -22378,15 +21782,7 @@ struct Index {
       await this.downloadVideoFromPlayer(entry)
       return
     }
-    try {
-      await this.ensureDownloadState()
-      await this.downloadQueue.enqueue(entry)
-      this.statusText = '已加入下载队列'
-      this.showImmersiveToast('已加入下载：' + entry.name)
-    } catch (error) {
-      this.reportError(error as Object, '加入下载失败')
-      this.statusText = '加入下载失败'
-    }
+    await this.downloadEntry(entry)
   }
 
   private async saveToGallery(entry: FileEntry): Promise<void> {
@@ -23374,11 +22770,8 @@ struct Index {
         }
         if (entry.isDirectory) {
           count += await this.enqueueRemoteTree(entry, destinationRoot, entry.name, batch)
-        } else if (this.isVideo(entry)) {
-          await this.videoTransferManager.requestDownload(entry, '', '', batch)
-          count += 1
         } else {
-          await this.downloadQueue.enqueue(entry, '', '', batch)
+          await this.enqueueDownloadFile(entry, '', '', batch)
           count += 1
         }
       }
@@ -23434,24 +22827,18 @@ struct Index {
     await this.saveToGallery(entry)
   }
 
-  private async openWithSelectedEntry(entry: FileEntry): Promise<void> {
+  /**
+   * 多选状态下执行单条动作的统一入口：先确认恰好选中一项、退出多选，再执行。
+   * 「其他应用打开 / 快速查看 / 重命名 / 详情」四处原先各写一份包装，退出时机
+   * 一旦不一致，动作返回后底栏会停在旧的选中态。
+   */
+  private async withSelectionExit(action: (entry: FileEntry) => void | Promise<void>): Promise<void> {
+    const entry = this.selectedSingleEntry()
+    if (entry === null) {
+      return
+    }
     this.exitSelectionMode()
-    await this.openWithOtherApp(entry)
-  }
-
-  private async quickViewSelectedEntry(entry: FileEntry): Promise<void> {
-    this.exitSelectionMode()
-    await this.quickView(entry)
-  }
-
-  private renameSelectedEntry(entry: FileEntry): void {
-    this.exitSelectionMode()
-    this.openRename(entry)
-  }
-
-  private async showEntryDetailsSelected(entry: FileEntry): Promise<void> {
-    this.exitSelectionMode()
-    await this.showEntryDetails(entry)
+    await action(entry)
   }
 
   private fileSortTitle(): string {
@@ -23535,12 +22922,12 @@ struct Index {
       return
     }
     const name = this.newFolderText.trim()
-    if (name.length === 0 || name.indexOf('/') >= 0 || name.indexOf('\\') >= 0) {
-      this.presentErrorMessage('文件夹名称不能为空，且不能包含路径分隔符', '新建文件夹失败')
+    const nameError = this.entryNameError(name, '文件夹名称')
+    if (nameError.length > 0) {
+      this.presentErrorMessage(nameError, '新建文件夹失败')
       return
     }
-    const parent = this.currentPath.replace(/\/+$/, '')
-    const path = parent + '/' + name
+    const path = this.childPath(this.currentPath, name)
     this.isBusy = true
     try {
       await this.repository.createFolder(path)
@@ -23555,6 +22942,29 @@ struct Index {
     } finally {
       this.isBusy = false
     }
+  }
+
+  /**
+   * 新建目录与重命名共用的名称校验，返回错误文案（空串表示通过）。
+   * 三处入口原先各写一份、规则还不一致（新建目录曾允许 `.` / `..`），统一到这里。
+   */
+  private entryNameError(name: string, label: string): string {
+    if (name.length === 0) {
+      return label + '不能为空'
+    }
+    if (name === '.' || name === '..') {
+      return label + '不能是 "." 或 ".."'
+    }
+    if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0) {
+      return label + '不能包含路径分隔符'
+    }
+    return ''
+  }
+
+  /** 目录路径 + 名称：只剥掉末尾的分隔符，根目录下也不会拼出 `//`。 */
+  private childPath(parent: string, name: string): string {
+    const trimmed = parent.replace(/[\\/]+$/, '')
+    return trimmed.length === 0 ? '/' + name : trimmed + '/' + name
   }
 
   private openRename(entry: FileEntry): void {
@@ -23578,9 +22988,9 @@ struct Index {
       return
     }
     const newName = this.renameText.trim()
-    if (newName.length === 0 || newName === '.' || newName === '..' ||
-      newName.indexOf('/') >= 0 || newName.indexOf('\\') >= 0) {
-      this.presentErrorMessage('名称不能为空，且不能包含路径分隔符', '重命名失败')
+    const nameError = this.entryNameError(newName, '名称')
+    if (nameError.length > 0) {
+      this.presentErrorMessage(nameError, '重命名失败')
       return
     }
     const entry = this.renameEntry
@@ -24392,40 +23802,25 @@ struct Index {
   // 已经处理过的上传任务 id（避免每次任务列表 publish 都重复插入）
   private syncedUploadTaskIds: string[] = []
 
-  /**
-   * 导入（上传）完成一个文件，就把它【增量插入】当前目录列表。
-   * 用的是 LazyForEach 的精准通知（onDataAdd）：
-   *   - 不重拉目录、不 replace  → 已有条目不重建 → 不闪烁、不上下位移
-   *   - 每完成一个插一个        → 需求要的「逐渐弹出新增文件」
-   * 边界：
-   *   - 只处理【刚变成 completed】的（用 id 去重，publish 会多次回调）
-   *   - 同名跳过（skipped）不插：服务器上本来就有，列表里也已经有
-   *   - 目标目录 ≠ 当前目录不插；不在文件页/正在搜索不插
-   *   - 同一 path 已在列表里不重复插
-   */
+  /** Upload and copy/move completion share one batched directory commit. */
   private syncImportedUploads(tasks: UploadTaskRecord[]): void {
     const aliveIds: string[] = []
+    const changes = new Map<string, DirectoryChange>()
     for (const task of tasks) {
-      if (this.syncedUploadTaskIds.indexOf(task.id) >= 0) {
-        aliveIds.push(task.id)
-        continue
-      }
-      if (task.status !== 'completed') {
-        continue
-      }
+      if (task.status !== 'completed') { continue }
       aliveIds.push(task.id)
-      if (task.skipped === true) {
-        continue
-      }
-      if (this.screen !== 'files' || this.showSearch) {
-        continue
-      }
-      if (task.destinationRoot.replace(/\/$/, '') !== this.currentPath.replace(/\/$/, '')) {
-        continue
-      }
-      this.insertImportedEntry(this.importedFileEntry(task))
+      if (this.syncedUploadTaskIds.indexOf(task.id) >= 0 || task.skipped === true ||
+        task.scope !== this.repository.cacheScopeHash()) { continue }
+      const parent = this.parentPath(task.remotePath)
+      let change = changes.get(parent)
+      if (change === undefined) { change = new DirectoryChange(parent); changes.set(parent, change) }
+      change.additions.push(this.importedFileEntry(task))
     }
     this.syncedUploadTaskIds = aliveIds
+    for (const change of changes.values()) {
+      this.repository.invalidateDirectory(change.path, this.currentRootType)
+      this.applyDirectoryChange(change)
+    }
   }
 
   private importedFileEntry(task: UploadTaskRecord): FileEntry {
@@ -24442,33 +23837,66 @@ struct Index {
     return entry
   }
 
-  private insertImportedEntry(entry: FileEntry): void {
-    if (entry.path.length === 0) {
-      return
-    }
-    for (const item of this.entries) {
-      if (item.path === entry.path) {
-        return
+  private applyDirectoryChange(change: DirectoryChange): void {
+    // Saved parent/search/playback snapshots must receive exactly the same delta;
+    // returning to them must not resurrect an entry already moved on the NAS.
+    this.patchDirectorySnapshots(this.navigationStack, this.navigationEntryStack, change)
+    const search = this.searchSession
+    if (search !== null) {
+      this.patchDirectorySnapshots(search.originNavigationStack, search.originNavigationEntryStack, change)
+      if (search.originPath === change.path) {
+        search.originEntries = this.sortEntriesForDisplay(DirectoryChange.apply(search.originEntries, change))
       }
     }
-    // 用工程自己的排序函数定位，避免出现第二套排序规则
-    const next = this.sortEntriesForDisplay(this.entries.concat([entry]))
-    let index = -1
-    for (let i = 0; i < next.length; i++) {
-      if (next[i].path === entry.path) {
-        index = i
-        break
+    for (const origin of [this.audioBackgroundOrigin, this.videoPipOrigin]) {
+      if (origin === null) { continue }
+      this.patchDirectorySnapshots(origin.navigationStack, origin.navigationEntryStack, change)
+      if (origin.currentPath === change.path) {
+        origin.entries = this.sortEntriesForDisplay(DirectoryChange.apply(origin.entries, change))
       }
     }
-    if (index < 0) {
-      return
-    }
+    if (this.screen !== 'files') { return }
+    if (!this.showSearch && this.currentPath !== change.path) { return }
+    const visibleChange = new DirectoryChange(change.path)
+    visibleChange.removals = change.removals
+    // Search results keep their original query order; newly copied/uploaded
+    // files are discovered by the next explicit search, as before.
+    visibleChange.additions = this.showSearch ? [] : change.additions
+    const applied = DirectoryChange.apply(this.entries, visibleChange)
+    const next = this.showSearch ? applied : this.sortEntriesForDisplay(applied)
+    if (next.length === this.entries.length && next.every((entry: FileEntry, index: number): boolean =>
+      entry === this.entries[index])) { return }
+    const state = this.captureDirectoryViewState()
+    const difference = next.length - this.entries.length
     this.entries = next
+    this.pendingDirectoryIndexSnapshot = null
+    this.fileEntryDataSource.reconcile(next)
     this.selectedEntriesCache = null
-    this.fileEntryDataSource.insertAt(index, entry)
-    this.syncDirectoryMediaEntries(this.entries, false)
+    const removed = new Set<string>(change.removals)
+    this.fileSelection.replace(this.selectedPaths.filter((path: string): boolean => !removed.has(path)))
+    this.publishFileSelection()
+    this.syncDirectoryMediaEntries(next, false)
+    if (!this.showSearch) {
+      this.directoryTimeline = DirectoryTimelinePolicy.build(next, !this.currentPageHasMore)
+      this.indexedDirectoryContentSignature = DirectoryTimelinePolicy.contentSignature(next)
+      const count = this.directoryCounts[this.currentPath]
+      if (typeof count === 'number') { this.updateDirectoryCount(this.currentPath, Math.max(0, count + difference)) }
+    }
     this.rebuildTimelineIndexes()
-    this.scheduleDirectoryVideoReconcile([entry])
+    this.scheduleDirectoryVideoReconcile(visibleChange.additions)
+    if (state.mode === 'waterfall' && this.fileViewMode === 'waterfall') {
+      this.waterfallAnchorRestoreToken++
+      this.restoreFileViewModePosition(state.mode, state.anchor, state.offset,
+        this.waterfallAnchorRestoreToken, 0)
+    }
+  }
+
+  private patchDirectorySnapshots(paths: string[], snapshots: FileEntry[][], change: DirectoryChange): void {
+    for (let index = 0; index < paths.length && index < snapshots.length; index++) {
+      if (paths[index] === change.path) {
+        snapshots[index] = this.sortEntriesForDisplay(DirectoryChange.apply(snapshots[index], change))
+      }
+    }
   }
 
   private appendEntries(nextEntries: FileEntry[]): void {
@@ -24845,8 +24273,7 @@ struct Index {
     // task for the same path after the user returns to that directory.
     const valid = (): boolean => generation === this.previewGeneration && this.isPathGenerationValid(entry.path, pathToken) &&
       this.screen === 'files' && this.gestureSharePageVisible && !this.abilityInBackground &&
-      !this.showPageTransition && !this.showImageViewer && !this.viewerBlocksFileContent &&
-      !this.fileContentScrolling && !this.locateProgrammaticScrolling && !this.timelineScrubActive
+      !this.showPageTransition && !this.showImageViewer && !this.viewerBlocksFileContent
     const accepted = this.previewQueue.enqueue(queueKey, priority, async (): Promise<void> => {
       if (!valid()) {
         if (this.previewRequests[entry.path] === requestToken) { this.previewRequests[entry.path] = 0 }
@@ -25095,31 +24522,15 @@ struct Index {
   }
 
   private isImage(entry: FileEntry): boolean {
-    const mime = entry.mimeType.trim().toLowerCase()
-    if (mime.startsWith('image/')) {
-      return true
-    }
-    const extension = this.fileExtension(entry.name)
-    return ['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'heif', 'bmp', 'tif', 'tiff'].indexOf(extension) >= 0
+    return MediaType.isImage(entry)
   }
 
   private isVideo(entry: FileEntry): boolean {
-    const mime = entry.mimeType.trim().toLowerCase()
-    if (mime.startsWith('video/')) {
-      return true
-    }
-    const extension = this.fileExtension(entry.name)
-    return ['mp4', 'mov', 'm4v', 'avi', 'mkv', 'webm', '3gp', 'ts', 'mpeg', 'mpg',
-      'm2ts', 'mts', 'wmv', 'flv', 'f4v', 'rmvb', 'asf'].indexOf(extension) >= 0
+    return MediaType.isVideo(entry)
   }
 
   private isAudio(entry: FileEntry): boolean {
-    const mime = entry.mimeType.trim().toLowerCase()
-    if (mime.startsWith('audio/')) {
-      return true
-    }
-    const extension = this.fileExtension(entry.name)
-    return ['mp3', 'wav', 'm4a', 'flac', 'aac', 'ogg', 'amr'].indexOf(extension) >= 0
+    return MediaType.isAudio(entry)
   }
 
   private fileType(entry: FileEntry): string {
@@ -25222,11 +24633,7 @@ struct Index {
   }
 
   private fileExtension(name: string): string {
-    const dot = name.lastIndexOf('.')
-    if (dot <= 0 || dot === name.length - 1) {
-      return ''
-    }
-    return name.substring(dot + 1).toLowerCase()
+    return MediaType.extension(name)
   }
 
   private async logout(): Promise<void> {

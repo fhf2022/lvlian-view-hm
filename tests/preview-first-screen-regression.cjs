@@ -3,8 +3,8 @@ const source=fs.readFileSync('entry/src/main/ets/pages/Index.ets','utf8');
 function method(text,name){const a=text.search(new RegExp('^  private (?:async )?'+name+'\\(','m'));assert.ok(a>=0,name);const b=text.slice(a+1).search(/^  (?:private |@Builder|async |[a-zA-Z]+\()/m);return text.slice(a,a+b+1)}
 function compile(text,globals={}){const exports={};vm.runInNewContext(ts.transpileModule(text,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2021}}).outputText,{exports,console,...globals});return exports;}
 class Failure extends Error{constructor(status){super('test');this.status=status}}
-const names=['finishPreparedFileTransition','resetPreviewState','resetWaterfallDirectoryState','schedulePreviewWarmup','previewPriority','loadEntryPreview','loadEntryPreviewNow','noteVisibleEntryForLoad','refreshVisiblePreviewIfNeeded','flushPendingVisibleLoads'];
-const {Page}=compile('export class Page {\n'+names.map(n=>method(source,n)).join('\n')+'\n}',{hilog:{info(){}},IMAGE_VIEWER_HILOG_DOMAIN:0,UgreenError:Failure,CacheManager:{exists:()=>false}});
+const names=['finishPreparedFileTransition','resetPreviewState','resetWaterfallDirectoryState','schedulePreviewWarmup','previewPriority','canDispatchPreviewLoads','reconcilePreviewLoads','releaseQueuedPreviews','cancelPendingPreviewLoads','onFileContentScrollStart','loadEntryPreview','loadEntryPreviewNow','noteVisibleEntryForLoad','refreshVisiblePreviewIfNeeded','flushPendingVisibleLoads'];
+const {Page}=compile('export class Page {\n'+names.map(n=>method(source,n)).join('\n')+'\n}',{TAP_TRACE:false,ContinuationManager:{shared:()=>({refresh(){}})},ThumbnailPolicy:{MAX_PENDING_TASKS:256},hilog:{info(){}},IMAGE_VIEWER_HILOG_DOMAIN:0,UgreenError:Failure,CacheManager:{exists:()=>false}});
 function fixture(mode='grid',cached=0,folders=0){
  const p=new Page(),frames=[],admitted=[],notified=[];p.gestureSharePageVisible=true;
  const entries=Array.from({length:100},(_,i)=>({path:'/album/'+i,name:i+'.jpg',index:i,isDirectory:i<folders,kind:i%3}));
@@ -12,9 +12,9 @@ function fixture(mode='grid',cached=0,folders=0){
  previewGeneration:3,resetPreviewAfterPageTransition:true,showPageTransition:true,pageTransitionToken:1,fileVisibleStartIndex:0,fileVisibleEndIndex:31,
  previewRecoveryAttempts:new Map(),previewReloadPaths:new Set(),previewRequests:{},pendingVisibleLoads:new Map(),gridRenderedPreviewKey:{},waterfallRenderedPreviewKey:{},
  previewRequestSequence:0,previewDuplicateBlockedCount:0,locateProgrammaticScrolling:false,locateTargetIndex:-1,timelineScrubActive:false,fileContentScrolling:true,
- repository:{cancelThumbnailNotifications(){}},networkPolicy:{isMetered:()=>false},isImage:e=>!e.isDirectory&&(mode!=='list'||e.kind===0),isVideo:e=>mode==='list'&&e.kind===1,isAudio:e=>mode==='list'&&e.kind===2,
+ noteUserInteraction(){},fileListScroller:{currentOffset:()=>({yOffset:0})},returnPerfSession:{noteScrollStart(){}},getMonotonicNow:()=>0,releaseTimelineFocusPinFromFileScroll(){},repository:{cancelThumbnailNotifications(){}},networkPolicy:{isMetered:()=>false},isImage:e=>!e.isDirectory&&(mode!=='list'||e.kind===0),isVideo:e=>mode==='list'&&e.kind===1,isAudio:e=>mode==='list'&&e.kind===2,
  previewUri:e=>e.index<cached?'file://cached/'+e.index:'',isPreviewRequestActive:path=>p.previewRequests[path]>0,
- resolveFileListImageRotation(){},acquirePathGeneration:()=>1,previewQueue:{enqueue(key){admitted.push(key);return true},cancelPending(){},promote(){}},
+ resolveFileListImageRotation(){},acquirePathGeneration:()=>1,previewQueue:{enqueue(key){admitted.push(key);return true},cancelPending(){return []},reconcile(){return []},resume(){},pause(){},promote(){}},
  notifyEntryChanged(path){notified.push(path);p.gridRenderedPreviewKey[path]=p.previewUri(entries.find(e=>e.path===path))},
  fileEntryDataSource:{indexOfPath:path=>entries.findIndex(e=>e.path===path)},postRenderFrame:fn=>frames.push(fn),rememberGridViewportAnchor(){},stopWaterfallPipeline(){},resetFileListScroll(){}});
  return {p,entries,admitted,notified,frame(){frames.splice(0).forEach(fn=>fn())}};
@@ -77,5 +77,49 @@ const recover=e=>e instanceof Failure&&e.status===423;
  p.loadEntryPreview(entry);await tick();assert.equal(binaryCalls,1,'visibility callback promotes deferred task without resetting its owner');
  await advance();assert.equal(binaryCalls,2);assert.deepEqual(published,['/cache/ready']);assert.equal(registered,2);assert.equal(p.previewRequests[entry.path],0);
  p.viewerBlocksFileContent=true;p.previewQueue=new Queue(4,256);p.loadEntryPreview(entry);await tick();assert.equal(binaryCalls,2,'opening the viewer must not start a file-surface thumbnail task');
+
+ // Execute the real page callback and repository path, not a substitute scroll cancellation.
+ const listenerStart=source.indexOf('    this.repository.setThumbnailReadyListener(');
+ const listenerEnd=source.indexOf('    this.observeGridLayoutSize()',listenerStart);
+ const {Listener}=compile('export class Listener { listen() {\n'+source.slice(listenerStart,listenerEnd)+'\n} }');
+ for(const responseDuringScroll of [false,true])for(const noticeBeforeResponse of [false,true]){
+  const scene=fixture(),page=scene.p,item=scene.entries[0],bindings=new Map();let receive,fail,reads=0,delivered=0;
+  page.fileContentScrolling=false;page.showPageTransition=false;page.entries=[item];page.fileVisibleStartIndex=0;page.fileVisibleEndIndex=0;
+  const r=new Repository();Object.assign(r,{cacheScopeHash:()=> 'a',signatureForFile:()=>({key:()=> 'signature'}),thumbnailIdentityKey:()=> 'identity',thumbnailCacheKey:()=> 'route',thumbnailRequests:new Map(),
+   thumbnailCacheStore:{find:async()=>'',register:async()=>{}},client:{completeThumbnail(path){bindings.delete(path)},thumbnailCandidates:async(e)=>{bindings.set(e.path,'server-id');return[{url:'https://example.invalid/thumbnail',headers:{'Thumb-ID':'server-id'},fileName:'image.thumbnail'}]}},
+   transport:{requestBinary:()=>++reads===1?new Promise((_,reject)=>fail=reject):Promise.resolve(new Uint8Array([1]))},thumbnailNormalizer:{prepare:async()=>({path:'/cache/ready'})},
+   thumbnailNotificationsConnected:()=>true,setThumbnailReadyListener(fn){receive=fn},cancelThumbnailNotifications(path){if(path)bindings.delete(path);else bindings.clear()}});
+  r.prepareThumbnail=r.prepareThumbnailOnce.bind(r);
+  Object.assign(page,{repository:r,previewQueue:new Queue(4,256,()=>page.canDispatchPreviewLoads()),previewLocalPaths:{},thumbnailDirectory:'/cache',thumbnailCacheLimitBytes:1000,
+   isPathGenerationValid:()=>true,ensureCacheState:async()=>{},mediaPreviewManager:{cachedImagePreview:()=>''},imageTelemetry:{recordStaleCompletion(){}},publishThumbnailPreview:async()=>{delivered++},previewUri:()=>''});
+  Listener.prototype.listen.call(page);page.loadEntryPreview(item);await tick();assert.equal(reads,1);
+  page.onFileContentScrollStart();assert.equal(bindings.has(item.path),true,'scroll preserves the active request notification identity');
+  const notice=()=>{if(bindings.has(item.path))receive(item.path)};
+  if(!responseDuringScroll)page.fileContentScrolling=false;
+  if(noticeBeforeResponse)notice();fail(new Failure(423));await tick();if(!noticeBeforeResponse)notice();await tick();
+  assert.equal(reads,1,'neither completion nor readiness dispatches work while the queue is paused');
+  assert.equal(timers.size,0,'paused work has no retry polling timer');
+  page.fileContentScrolling=false;page.pendingVisibleLoads.set(item.path,item);page.flushPendingVisibleLoads();await tick();
+  assert.equal(reads,2,'readiness survives either ordering and resumes immediately without the 15-second fallback');
+  assert.equal(delivered,1);assert.equal(page.previewQueue.activeCountValue(),0);assert.equal(page.previewQueue.pendingCount(),0);assert.equal(timers.size,0);
+ }
+ // The settled batch demotes old priorities, drops far-away work, and admits all
+ // visible tasks before starting preloads, with the original concurrency bound.
+ const preempt=new Queue(2,256),order=[];let releaseBusy;
+ preempt.enqueue('busy',0,()=>new Promise(resolve=>releaseBusy=resolve));preempt.pause();
+ for(const key of ['old-visible','near','far'])preempt.enqueue(key,0,async()=>{order.push(key)});
+ const removed=preempt.reconcile(new Map([['busy',1],['old-visible',5],['near',1],['new-a',0],['new-b',0]]));
+ assert.deepEqual([...removed],['far']);preempt.enqueue('new-a',0,async()=>{order.push('new-a')});preempt.enqueue('new-b',0,async()=>{order.push('new-b')});
+ assert.equal(order.length,0);preempt.resume();await tick();assert.deepEqual(order,['new-a','new-b','near','old-visible']);releaseBusy();await tick();
+ // An offscreen active 423 yields its slot, but is not requeued after pruning.
+ const distant=new Queue(1,256);let rejectDistant;distant.enqueue('distant',0,()=>new Promise((_,reject)=>rejectDistant=reject),recover,()=>true,()=>15000);
+ distant.pause();distant.reconcile(new Map());rejectDistant(new Failure(423));await tick();distant.resume();await tick();assert.equal(distant.pendingCount(),0);assert.equal(timers.size,0);
+ // Reconciliation is bounded by the viewport, even with a million-file directory.
+ const large=fixture(),largePage=large.p;let entryReads=0;
+ largePage.fileContentScrolling=false;largePage.showPageTransition=false;largePage.fileVisibleStartIndex=500000;largePage.fileVisibleEndIndex=500035;
+ largePage.entries=new Proxy({length:1000000},{get(target,key){if(key==='length')return target.length;entryReads++;return{path:'/big/'+key}}});
+ largePage.reconcilePreviewLoads(500000,500035);assert.equal(entryReads,52,'only 36 visible entries plus the existing eight-item margins are visited');
+ console.log('PASS soft preemption: real scroll/423/notification orderings, no dispatch or polling during scroll, visible batch priority, pruning and bounded large-directory work');
+
  console.log('PASS integrated production preview recovery: 423 propagates through both catches, deduplicates during delay and publishes the recovered cell');
 })().catch(error=>{console.error(error);process.exitCode=1});

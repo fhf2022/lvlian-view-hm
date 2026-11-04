@@ -1,6 +1,7 @@
+// 覆盖共享的 NameInputDialog（新建文件夹 / 目标目录新建 / 重命名 三处共用）。
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
 const ts = require(process.argv[2]);
-const source = fs.readFileSync('entry/src/main/ets/components/CreateFolderDialog.ets', 'utf8');
+const source = fs.readFileSync('entry/src/main/ets/components/NameInputDialog.ets', 'utf8');
 const methods = source.slice(source.indexOf('  aboutToAppear()'), source.indexOf('  @Builder'));
 const ex = {};
 class Controller { constructor() { this.closes = 0; } close() { this.closes++; } }
@@ -53,5 +54,20 @@ function make(width = 360) {
   const failed = make(); failed.opened[0].reject(new Error('open failed')); await tick();
   assert.equal(failed.p.visible, false);
   assert.equal(failed.p.dialogController, null);
-  console.log('PASS create-folder dialog: centered phone/tablet, keyboard policy, busy cancellation, late opens, stale callbacks and unmount');
+
+  // 三个入口必须共用同一个弹窗；重命名不得再退回页内 bindSheet 自带一套 UI。
+  const page = fs.readFileSync('entry/src/main/ets/pages/Index.ets', 'utf8');
+  for (const marker of [
+    "NameInputDialog({ visible: $showRenameDialog",
+    "title: '重命名'", "idPrefix: 'rename'",
+    "NameInputDialog({ visible: $showCreateFolderDialog",
+    "NameInputDialog({ visible: $destinationFolderDialog"
+  ]) {
+    assert.ok(page.includes(marker), 'Index.ets missing shared dialog wiring: ' + marker);
+  }
+  assert.ok(!page.includes('bindSheet($$this.showRenameDialog'), 'rename must not own a private sheet');
+  assert.ok(!page.includes('RenameOverlayContent'), 'rename must not own a private content builder');
+  assert.ok(!fs.existsSync('entry/src/main/ets/components/CreateFolderDialog.ets'),
+    'the create-folder-only dialog must stay merged into NameInputDialog');
+  console.log('PASS name input dialog: centered phone/tablet, keyboard policy, busy cancellation, late opens, stale callbacks, unmount, single shared UI for create/target/rename');
 })().catch(error => { console.error(error); process.exitCode = 1; });

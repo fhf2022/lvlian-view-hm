@@ -27,6 +27,15 @@ export class UgreenEndpoints {
     return this.baseUrl + '/ugreen/v2/filemgr/getDirFileListV2'
   }
 
+  directorySize(path: string, intranetShareId: number): string {
+    return this.baseUrl + '/ugreen/v2/filemgr/getSizeAndCount?path=' + encodeURIComponent(path) +
+      '&intranet_share_id=' + intranetShareId.toString()
+  }
+
+  cancelDirectorySize(): string {
+    return this.baseUrl + '/ugreen/v2/filemgr/delSizeAndCount'
+  }
+
   thumbnail(path: string): string {
     return this.baseUrl + '/ugreen/v1/filemgr/thumbnail?path=' + encodeURIComponent(path) +
       '&size_type=1&type=0'
@@ -116,6 +125,10 @@ export class UgreenEndpoints {
   copyOrMovePaths(): string {
     return this.baseUrl + '/ugreen/v2/filemgr/cpOrMvPath'
   }
+
+  fileTasks(): string { return this.baseUrl + '/ugreen/v1/desktop/task/list?type=1,2' }
+
+  pathExists(): string { return this.baseUrl + '/ugreen/v1/filemgr/pathExist' }
 
   deletePaths(): string {
     return this.baseUrl + '/ugreen/v2/filemgr/delPaths'

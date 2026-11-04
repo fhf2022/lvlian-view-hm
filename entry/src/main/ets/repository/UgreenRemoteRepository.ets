@@ -1,3 +1,6 @@
+import { DirectoryChange } from '../model/DirectoryChange'
+import { FileOperationQueue } from './FileOperationQueue'
+import { PendingFileOperation } from '../model/FileOperation'
 import { OriginalImageInfo, OriginalImageInfoReader } from '../media/OriginalImageInfoReader'
 import { Context } from '@kit.AbilityKit'
 import { DownloadManager } from '../download/DownloadManager'
@@ -5,6 +8,7 @@ import { CacheManager } from '../download/CacheManager'
 import { BinaryProgressListener, HttpTransport } from '../core/network/HttpTransport'
 import { DownloadCancellation } from '../core/network/DownloadCancellation'
 import { UgreenDirectoryPage, UgreenRemoteClient } from '../ugreen/UgreenRemoteClient'
+import { DirectorySizeQuery } from '../ugreen/DirectorySizeQuery'
 import { DownloadDescriptor, FileEntry, RootDirectory, LoginResult } from '../model/FileEntry'
 import { RemoteFileSignature } from '../media/MediaLocalStore'
 import { ThumbnailNormalizer } from '../media/ThumbnailNormalizer'
@@ -55,6 +59,7 @@ class RootListing {
 }
 
 export class UgreenRemoteRepository {
+  createDirectorySizeQuery(entry: FileEntry): DirectorySizeQuery { return this.client.createDirectorySizeQuery(entry) }
   // 个人空间：管理员/拥有者是 4，普通账号是 2。普通账号读 4 会返回
   // 1301 Access not allowed，所以按顺序试，用第一个能读到的。
   private static readonly PERSONAL_ROOT_TYPES: number[] = [4, 2]
@@ -69,6 +74,20 @@ export class UgreenRemoteRepository {
   private static readonly RECYCLE_ROOT_TYPE: number = 3
   private transport: HttpTransport = new HttpTransport()
   private client: UgreenRemoteClient = new UgreenRemoteClient(this.transport)
+  private fileOperationListener: ((changes: DirectoryChange[], uncertain: boolean) => void) | null = null
+  private fileOperations: FileOperationQueue = new FileOperationQueue(
+    () => this.client.fileOperationStates(), (path: string) => this.client.pathExists(path),
+    () => this.sessionIdentity(), (operation: PendingFileOperation, changes: DirectoryChange[], uncertain: boolean): void => {
+      // Invalidate both before submission and after completion: a directory may
+      // have been reopened and cached while the NAS was still moving its files.
+      this.invalidateFileOperation(operation)
+      if (this.fileOperationListener !== null) { this.fileOperationListener(changes, uncertain) }
+    })
+
+  setFileOperationListener(listener: ((changes: DirectoryChange[], uncertain: boolean) => void) | null): void {
+    this.fileOperationListener = listener
+  }
+
   private downloadManager: DownloadManager = new DownloadManager(this.transport)
   private directoryMetadataStore: DirectoryMetadataStore = new DirectoryMetadataStore()
   private metadataInitPromise: Promise<void> | null = null
@@ -76,6 +95,8 @@ export class UgreenRemoteRepository {
   private cachedScope: string = ''
   private cachedScopeHash: string = ''
   private directoryCache: Map<string, DirectoryCacheItem> = new Map<string, DirectoryCacheItem>()
+  private directoryMutationVersions: Map<string, number> = new Map<string, number>()
+  private directoryInvalidations: Map<string, Promise<void>> = new Map<string, Promise<void>>()
   private directoryPageCache: Map<string, Map<number, UgreenDirectoryPage>> =
     new Map<string, Map<number, UgreenDirectoryPage>>()
   private directoryRequests: Map<string, Promise<FileEntry[]>> = new Map<string, Promise<FileEntry[]>>()
@@ -113,8 +134,11 @@ export class UgreenRemoteRepository {
   }
 
   setThumbnailReadyListener(listener: ((path: string) => void) | null): void { this.client.setThumbnailReadyListener(listener) }
-  setThumbnailForeground(value: boolean): void { this.client.setThumbnailForeground(value) }
-  cancelThumbnailNotifications(): void { this.client.cancelThumbnailNotifications() }
+  setForeground(value: boolean): void {
+    this.client.setThumbnailForeground(value)
+    this.fileOperations.setForeground(value)
+  }
+  cancelThumbnailNotifications(path: string = ''): void { this.client.cancelThumbnailNotifications(path) }
   thumbnailNotificationsConnected(): boolean { return this.client.thumbnailNotificationsConnected() }
 
   async thumbnailCacheUsage(): Promise<number> {
@@ -201,6 +225,8 @@ export class UgreenRemoteRepository {
   }
 
   logout(): void {
+    this.fileOperations.reset()
+    this.directoryMutationVersions.clear()
     this.client.clearSession()
     this.clearDirectoryCache()
   }
@@ -251,6 +277,11 @@ export class UgreenRemoteRepository {
   }
 
   async list(path: string, rootType: number, forceNetwork: boolean = false): Promise<FileEntry[]> {
+    return await this.readStableDirectory(path, rootType, (force: boolean): Promise<FileEntry[]> =>
+      this.listOnce(path, rootType, force), forceNetwork)
+  }
+
+  private async listOnce(path: string, rootType: number, forceNetwork: boolean = false): Promise<FileEntry[]> {
     this.updateMetadataScope()
     const key = this.directoryCacheKey(path, rootType)
     const now = Date.now()
@@ -295,6 +326,12 @@ export class UgreenRemoteRepository {
 
   async listPage(path: string, rootType: number, pageIndex: number,
     forceNetwork: boolean = false): Promise<UgreenDirectoryPage> {
+    return await this.readStableDirectory(path, rootType, (force: boolean): Promise<UgreenDirectoryPage> =>
+      this.listPageOnce(path, rootType, pageIndex, force), forceNetwork)
+  }
+
+  private async listPageOnce(path: string, rootType: number, pageIndex: number,
+    forceNetwork: boolean = false): Promise<UgreenDirectoryPage> {
     this.updateMetadataScope()
     const key = this.directoryCacheKey(path, rootType)
     const pageKey = key + ':' + pageIndex.toString()
@@ -331,6 +368,12 @@ export class UgreenRemoteRepository {
 
   /** Complete metadata index. This path never requests thumbnails or originals. */
   async ensureDirectoryIndex(path: string, rootType: number,
+    forceNetwork: boolean = false): Promise<DirectoryIndexedSnapshot> {
+    return await this.readStableDirectory(path, rootType, (force: boolean): Promise<DirectoryIndexedSnapshot> =>
+      this.ensureDirectoryIndexOnce(path, rootType, force), forceNetwork)
+  }
+
+  private async ensureDirectoryIndexOnce(path: string, rootType: number,
     forceNetwork: boolean = false): Promise<DirectoryIndexedSnapshot> {
     this.updateMetadataScope()
     const key = this.directoryCacheKey(path, rootType)
@@ -516,6 +559,7 @@ export class UgreenRemoteRepository {
   invalidateDirectory(path: string, rootType: number): void {
     this.cacheGeneration += 1
     const key = this.directoryCacheKey(path, rootType)
+    this.directoryMutationVersions.set(key, (this.directoryMutationVersions.get(key) ?? 0) + 1)
     const timer = this.backgroundRefreshTimers[key]
     if (timer > 0) {
       clearTimeout(timer)
@@ -536,8 +580,15 @@ export class UgreenRemoteRepository {
     this.directoryTimelineFetchedAt.delete(key)
     if (this.metadataInitPromise !== null && this.metadataScope.length > 0) {
       const scope = this.metadataScope
-      this.metadataInitPromise.then((): Promise<void> =>
-        this.directoryMetadataStore.remove(scope, path, rootType)).catch((): void => {})
+      const previous = this.directoryInvalidations.get(key) ?? Promise.resolve()
+      const removal = previous.then(async (): Promise<void> => {
+        await this.metadataInitPromise
+        await this.directoryMetadataStore.remove(scope, path, rootType)
+      })
+      this.directoryInvalidations.set(key, removal)
+      removal.catch((): void => {}).finally((): void => {
+        if (this.directoryInvalidations.get(key) === removal) { this.directoryInvalidations.delete(key) }
+      })
     }
   }
 
@@ -563,8 +614,25 @@ export class UgreenRemoteRepository {
     await this.directoryMetadataStore.clear(this.metadataScope)
   }
 
+  private async readStableDirectory<T>(path: string, rootType: number,
+    read: (force: boolean) => Promise<T>, force: boolean): Promise<T> {
+    const key = this.directoryCacheKey(path, rootType)
+    const scope = this.sessionIdentity()
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const revision = this.directoryMutationVersions.get(key) ?? 0
+      const invalidation = this.directoryInvalidations.get(key)
+      if (invalidation !== undefined) { await invalidation }
+      if (scope !== this.sessionIdentity()) { throw new Error('账号已改变') }
+      const result = await read(force || attempt > 0)
+      if (scope !== this.sessionIdentity()) { throw new Error('账号已改变') }
+      if (revision === (this.directoryMutationVersions.get(key) ?? 0)) { return result }
+    }
+    throw new Error('目录正在更新，请稍后重试')
+  }
+
   private async readPersistedDirectory(path: string, rootType: number): Promise<DirectoryMetadataSnapshot | null> {
-    if (this.metadataInitPromise === null || this.metadataScope.length === 0) {
+    if (this.metadataInitPromise === null || this.metadataScope.length === 0 ||
+      this.fileOperations.affectsDirectory(path)) {
       return null
     }
     await this.metadataInitPromise
@@ -573,7 +641,8 @@ export class UgreenRemoteRepository {
 
   private async readPersistedDirectoryPage(path: string, rootType: number,
     pageIndex: number): Promise<UgreenDirectoryPage | null> {
-    if (this.metadataInitPromise === null || this.metadataScope.length === 0) {
+    if (this.metadataInitPromise === null || this.metadataScope.length === 0 ||
+      this.fileOperations.affectsDirectory(path)) {
       return null
     }
     await this.metadataInitPromise
@@ -623,7 +692,7 @@ export class UgreenRemoteRepository {
         this.cacheDirectoryEntries(key, entries, Date.now(), contentSignature)
         this.directoryTimelines.set(key, timeline)
         this.directoryTimelineFetchedAt.set(key, fetchedAt)
-        if (scope.length > 0 && complete) {
+        if (scope.length > 0 && complete && !this.fileOperations.affectsDirectory(path)) {
           this.directoryMetadataStore.saveSnapshot(scope, path, rootType, pageEntries, totalCount,
             timeline)
         }
@@ -642,7 +711,7 @@ export class UgreenRemoteRepository {
     const page = await this.client.listPage(path, rootType, pageIndex)
     if (generation === this.cacheGeneration && scope === this.metadataScope) {
       this.cacheDirectoryPage(key, page)
-      if (scope.length > 0) {
+      if (scope.length > 0 && !this.fileOperations.affectsDirectory(path)) {
         await this.directoryMetadataStore.savePage(scope, path, rootType, page.pageIndex,
           page.entries, page.totalCount)
       }
@@ -1160,14 +1229,26 @@ export class UgreenRemoteRepository {
     return renamed
   }
 
-  async copy(paths: string[], targetPath: string): Promise<void> {
-    await this.client.copy(paths, targetPath)
-    await this.clearDirectoryMetadataAfterMutation()
+  async copy(entries: FileEntry[], targetPath: string, rootType: number = 3): Promise<void> {
+    await this.submitFileOperation(entries, targetPath, rootType, false)
   }
 
-  async move(paths: string[], targetPath: string): Promise<void> {
-    await this.client.move(paths, targetPath)
-    await this.clearDirectoryMetadataAfterMutation()
+  async move(entries: FileEntry[], targetPath: string, rootType: number = 3): Promise<void> {
+    await this.submitFileOperation(entries, targetPath, rootType, true)
+  }
+
+  private async submitFileOperation(entries: FileEntry[], target: string, rootType: number, move: boolean): Promise<void> {
+    const operation = await this.fileOperations.prepare(entries, target, move, rootType)
+    if (operation.scope !== this.sessionIdentity()) { throw new Error('账号已改变') }
+    const paths = operation.entries.map((entry: FileEntry): string => entry.path)
+    operation.id = move ? await this.client.move(paths, operation.target) : await this.client.copy(paths, operation.target)
+    if (operation.scope !== this.sessionIdentity()) { return }
+    this.invalidateFileOperation(operation)
+    this.fileOperations.add(operation)
+  }
+
+  private invalidateFileOperation(operation: PendingFileOperation): void {
+    for (const path of operation.affectedPaths) { this.invalidateDirectory(path, operation.rootType) }
   }
 
   async createFolder(path: string): Promise<void> {

@@ -31,7 +31,7 @@ const qx={};vm.runInNewContext(ts.transpileModule('export class Queue {\n'+['enq
 const q=new qx.Queue(),jobs=[];let active=0,peak=0;
 Object.assign(q,{fileViewMode:'waterfall',fileContentScrolling:true,timelineScrubActive:false,showImageViewer:false,waterfallResourceResident:()=>true,waterfallVisiblePaths:{},waterfallLocalPaths:{},waterfallLocalSignatures:{},waterfallRasterFailed:{},waterfallDecodedPaths:{},waterfallActiveDecodePaths:{},waterfallDecodeQueue:[],waterfallActiveDecodes:0,waterfallGeneration:7,waterfallEntrySignature:e=>e.path,
 decodeWaterfallBitmap(e){peak=Math.max(peak,++active);jobs.push({entry:e,finish(){active--;q.waterfallActiveDecodePaths[e.path]=0;q.waterfallDecodedPaths[e.path]=true;q.waterfallActiveDecodes--;q.drainWaterfallDecodes()}})},
-noteUserInteraction(){},fileListScroller:{currentOffset:()=>({yOffset:0})},returnPerfSession:{noteScrollStart(){}},getMonotonicNow:()=>0,cancelPendingPreviewLoads(){},releaseTimelineFocusPinFromFileScroll(){}});
+noteUserInteraction(){},fileListScroller:{currentOffset:()=>({yOffset:0})},returnPerfSession:{noteScrollStart(){}},getMonotonicNow:()=>0,previewQueue:{pause(){}},releaseTimelineFocusPinFromFileScroll(){}});
 const entries=Array.from({length:8},(_,i)=>({path:'/photo/'+i}));
 for(const e of entries){q.waterfallVisiblePaths[e.path]=true;q.waterfallLocalPaths[e.path]='/cache/'+e.path;q.waterfallLocalSignatures[e.path]=e.path;q.enqueueWaterfallDecode(e);q.enqueueWaterfallDecode(e)}
 assert.equal(jobs.length,policy.ThumbnailPolicy.WATERFALL_MAX_CONCURRENT_DECODES,'moving viewport fills the fixed limit');assert.equal(q.waterfallDecodeQueue.length,entries.length-jobs.length,'repeated visible callbacks never duplicate queued work');

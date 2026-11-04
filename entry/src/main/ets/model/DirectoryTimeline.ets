@@ -1,3 +1,4 @@
+import { MediaType } from './MediaType'
 import { FileEntry } from './FileEntry'
 
 export type DirectorySortKey = 'name' | 'type' | 'time' | 'size'
@@ -260,23 +261,11 @@ export class DirectoryTimelinePolicy {
   }
 
   static isImage(entry: FileEntry): boolean {
-    const mime = entry.mimeType.toLowerCase()
-    if (mime.startsWith('image/')) {
-      return true
-    }
-    const extension = DirectoryTimelinePolicy.extension(entry.name)
-    return ['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'heif', 'bmp', 'tif', 'tiff']
-      .indexOf(extension) >= 0
+    return MediaType.isImage(entry)
   }
 
   private static isVideo(entry: FileEntry): boolean {
-    const mime = entry.mimeType.toLowerCase()
-    if (mime.startsWith('video/')) {
-      return true
-    }
-    const extension = DirectoryTimelinePolicy.extension(entry.name)
-    return ['mp4', 'mov', 'm4v', 'mkv', 'avi', 'webm', 'wmv', 'flv', 'ts', 'mts', 'm2ts',
-      '3gp'].indexOf(extension) >= 0
+    return MediaType.isVideo(entry)
   }
 
   private static matchesMediaFilter(entry: FileEntry, filter: DirectoryMediaFilter): boolean {
@@ -295,7 +284,6 @@ export class DirectoryTimelinePolicy {
   }
 
   private static extension(name: string): string {
-    const index = name.lastIndexOf('.')
-    return index >= 0 ? name.slice(index + 1).toLowerCase() : ''
+    return MediaType.extension(name)
   }
 }
