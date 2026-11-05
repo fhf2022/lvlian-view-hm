@@ -1,6 +1,6 @@
 const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm'),ts=require(process.argv[2]);
 const source=fs.readFileSync('entry/src/main/ets/pages/Index.ets','utf8');
-const names=['scrollMediaReturnSourceIntoView','scrollItemIntoContentBand','prepareMediaReturnSource','prepareViewerReturnSource','mediaReturnBandTop','mediaReturnBandBottom'];
+const names=['scrollMediaReturnSourceIntoView','scrollItemIntoContentBand','prepareMediaReturnSource','prepareViewerReturnSource','viewerReturnSourceReady','mediaReturnBandTop','mediaReturnBandBottom','mediaReturnScrollDelta'];
 const method=name=>{const start=source.search(new RegExp('^  private (?:async )?'+name+'\\(','m'));assert.ok(start>=0,name);const end=source.slice(start+1).search(/^  (?:private |@Builder)/m);return source.slice(start,start+end+1)};
 const exportsObject={};
 vm.runInNewContext(ts.transpileModule('export class Harness {\n'+names.map(method).join('\n')+'\n}',{compilerOptions:{target:ts.ScriptTarget.ES2020,module:ts.ModuleKind.CommonJS}}).outputText,
@@ -12,7 +12,7 @@ function make(){
  Object.assign(h,{screen:'files',showSearch:false,fileViewMode:'list',entries:[other,entry],waterfallEntries:[entry,other],searchResults:[other,entry],
   fileListScroller:scroller,waterfallScroller:scroller,searchResultScroller:scroller,pageHeightVp:800,
   targetLocateEntryPath:'',fileScrollViewport:{y:40,height:760},fileContentTopInset:()=>134,topSafeInset:()=>40,floatingBarContentInset:()=>76,nextRenderFrame:async()=>{},
-  showImageViewer:true,viewerImageEntry:entry,hasViewerTransitionSource:()=>true,
+  showImageViewer:true,viewerImageEntry:entry,hasViewerTransitionSource:()=>true,currentThumbnailSurface:()=>h.fileViewMode,viewerReturnTargetVisible:()=>true,
   ensureViewerPreviewBitmap:async()=>{events.push(['preview'])},ensureWaterfallIndex:async()=>{},waterfallLocalIndex:i=>i});
  return {h,events,setRect:r=>{rect=r}};
 }
@@ -33,6 +33,8 @@ async function run(){
  await t.h.prepareMediaReturnSource(entry,()=>true,()=>true);
  assert.deepEqual(t.events.find(e=>e[0]==='by'),['by',0,-34],'safe-area-expanded viewport uses its measured origin, not a fixed status-bar offset');
  t=make();t.h.fileViewMode='waterfall';await t.h.prepareMediaReturnSource(entry,()=>true,()=>true);
+ assert.equal(t.events.length,0,'a ready WaterFlow card retains its current position');
+ t.h.scrollMediaReturnSourceIntoView(entry);
  assert.deepEqual(t.events[0],['rect',0],'WaterFlow indexes its reordered entries without list spacer');
  t=make();t.h.fileViewMode='waterfall';let prepared=false;
  t.h.ensureWaterfallIndex=async()=>{prepared=true};t.h.waterfallLocalIndex=i=>prepared?i:-1;

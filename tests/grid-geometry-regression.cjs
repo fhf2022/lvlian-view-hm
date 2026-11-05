@@ -5,7 +5,7 @@ const vm = require('node:vm');
 const ts = require(process.argv[2]);
 const source = fs.readFileSync('entry/src/main/ets/pages/Index.ets', 'utf8');
 const names = ['gridThumbnailComponentId', 'gridTileComponentId', 'gridEntryUsesFileTile', 'refreshGridThumbnailArea',
-  'hasViewerTransitionSource', 'updateDragSelectionHit', 'audioThumbnailIconSize'];
+  'thumbnailIntersectsFileViewport', 'hasViewerTransitionSource', 'updateDragSelectionHit', 'audioThumbnailIconSize'];
 function method(name) {
   const start = source.search(new RegExp('^  private (?:async )?' + name + '\\(', 'm'));
   assert.ok(start >= 0, name);

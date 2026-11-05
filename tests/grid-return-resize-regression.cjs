@@ -3,7 +3,7 @@ const assert = require('node:assert/strict'), fs = require('node:fs'), vm = requ
 const ts = require(process.argv[2]);
 const source = fs.readFileSync('entry/src/main/ets/pages/Index.ets', 'utf8');
 const names = ['recordFilePageSize', 'updateFilePageSize', 'mediaReturnBandTop', 'mediaReturnBandBottom',
-  'gridViewerReturnTargetVisible', 'waitForFileViewport', 'scrollMediaReturnSourceIntoView',
+  'thumbnailIntersectsFileViewport', 'viewerReturnTargetVisible', 'mediaReturnScrollDelta', 'waitForFileViewport', 'scrollMediaReturnSourceIntoView',
   'scrollItemIntoContentBand', 'prepareMediaReturnSource', 'beginViewerCloseSession',
   'closeGridViewerWithReturnOverlay'];
 function method(name) {
@@ -42,7 +42,7 @@ function make() {
     viewerImageSource: () => 'borrowed-raster', viewerImageSourceOrientation: () => 0,
     viewerImageFit: () => 1, viewerImageFrameAspectRatio: () => 0.8, viewerPageVisualScale: () => 1,
     viewerPageOffsetX: () => 0, viewerPageOffsetY: () => 0,
-    refreshGridThumbnailArea: () => mounted, imageVisualState: () => state,
+    refreshGridThumbnailArea: () => mounted, imageVisualState: () => state, thumbnailSurfaceIsCurrent: () => true,
     nextRenderFrame: async () => { events.push(['frame']); },
     restoreImageViewerOrientation: async () => { events.push(['orientation']); },
     notifyEntryChanged: path => events.push(['notify', path]), clearViewerEntryTransition() {},
@@ -77,8 +77,62 @@ const movements = t => t.events.filter(e => ['by', 'index'].includes(e[0]));
     'normal return must keep its existing fast path');
   assert.equal(t.animations[0].duration, 240); assert.equal(t.events.filter(e => e[0] === 'orientation').length, 1);
   t = make(); t.mount(false); await t.h.closeGridViewerWithReturnOverlay(entry, false);
-  assert.deepEqual(movements(t), []); assert.equal(t.animations[0].duration, 160,
-    'an ordinary offscreen return retains its existing fade fallback');
+  assert.deepEqual(movements(t), [['index', 0, false, 3]]); assert.equal(t.animations[0].duration, 240,
+    'an ordinary offscreen return also recovers the target without requiring rotation');
+
+  t = make(); t.state.thumbnailY = 60; t.state.thumbnailVisibleRatio = 0.5;
+  await t.h.closeGridViewerWithReturnOverlay(entry, false);
+  assert.deepEqual(movements(t), [], 'normal clipped top: fly to the existing rect without scrolling');
+  assert.equal(t.animations[0].y, 60); assert.equal(t.animations[0].duration, 240);
+  t = make(); t.state.thumbnailY = 1100; t.state.thumbnailVisibleRatio = 0.1;
+  await t.h.closeGridViewerWithReturnOverlay(entry, false);
+  assert.deepEqual(movements(t), [], 'normal clipped bottom: preserve directory position');
+  assert.equal(t.animations[0].y, 1100); assert.equal(t.animations[0].duration, 240,
+    'fresh geometry permits the flight before visibility callbacks catch up');
+  for (const [x, y] of [[100, -119], [100, 1199], [-119, 200], [799, 200], [100, 1160]]) {
+    t = make(); t.state.thumbnailX = x; t.state.thumbnailY = y; t.state.thumbnailVisibleRatio = 0;
+    await t.h.closeGridViewerWithReturnOverlay(entry, false);
+    assert.deepEqual(movements(t), []); assert.equal(t.animations[0].duration, 240,
+      'one visible pixel or overlap under floating chrome still permits the normal flight');
+    assert.equal(t.animations[0].x, x); assert.equal(t.animations[0].y, y);
+    assert.equal(t.animations[0].width, 120, 'keep the full tile dimensions rather than stretching its visible slice');
+    assert.equal(t.events.some(e => e[0] === 'frame'), false, 'partial returns do not wait for scroll preparation');
+  }
+  for (const [x, y] of [[100, -120], [100, 1200], [-120, 200], [800, 200]]) {
+    t = make(); t.state.thumbnailX = x; t.state.thumbnailY = y;
+    await t.h.closeGridViewerWithReturnOverlay(entry, false);
+    if (x === 100) {
+      assert.deepEqual(movements(t), [['by', 0, y < 0 ? -220 : 196]]);
+      assert.equal(t.animations[0].duration, 240, 'vertical edge contact recovers the whole image before flight');
+    } else {
+      assert.deepEqual(movements(t), []); assert.equal(t.animations[0].duration, 160,
+        'vertical scrolling cannot recover invalid horizontal geometry');
+    }
+  }
+  for (const [y, expected] of [[180, false], [200, true], [799, true], [800, false]]) {
+    t = make(); t.h.fileScrollViewport.y = 300; t.h.fileScrollViewport.height = 500;
+    t.state.thumbnailY = y;
+    assert.equal(t.h.viewerReturnTargetVisible(entry, false), expected,
+      'use the actual scroll-container clip when it occupies only part of the page');
+  }
+  for (const size of ['width', 'height']) {
+    t = make(); t.state.thumbnailX = -20; t.state.thumbnailY = -20; t.h.fileScrollViewport[size] = 0;
+    assert.equal(t.h.viewerReturnTargetVisible(entry, false), false, 'an empty viewport has no visible pixels');
+  }
+  for (const y of [-140, 1300]) {
+    t = make(); t.state.thumbnailY = y;
+    await t.h.closeGridViewerWithReturnOverlay(entry, false);
+    assert.deepEqual(movements(t), [['by', 0, y < 0 ? y - 100 : y + 120 - 1124]],
+      'a cached row completely outside the viewport recovers by the minimum distance');
+    assert.equal(t.animations[0].duration, 240);
+  }
+  t = make(); t.state.thumbnailVisibleRatio = 0;
+  await t.h.closeGridViewerWithReturnOverlay(entry, false);
+  assert.equal(t.animations[0].duration, 240, 'current native rect overrides stale visibility data even without resize');
+  t = make(); t.state.thumbnailY = 1100;
+  t.h.onMount = () => { t.h.viewerGeneration++; };
+  await t.h.closeGridViewerWithReturnOverlay(entry, false);
+  assert.equal(t.animations.length, 0, 'cancelled edge handoff cannot animate another page');
 
   t = make(); t.state.thumbnailY = 900; t.resize(1200, 800);
   await t.h.closeGridViewerWithReturnOverlay(entry, false);
@@ -96,7 +150,8 @@ const movements = t => t.events.filter(e => ['by', 'index'].includes(e[0]));
 
   t = make(); t.resize(1200, 800); t.state.thumbnailY = 50;
   await t.h.closeGridViewerWithReturnOverlay(entry, false);
-  assert.deepEqual(movements(t), [['by', 0, -50]], 'align the thumbnail, excluding the first-row GridItem inset');
+  assert.deepEqual(movements(t), [], 'a partially visible target after rotation also flies without repositioning');
+  assert.equal(t.animations[0].y, 50); assert.equal(t.animations[0].duration, 240);
   t = make(); t.resize(1200, 800); t.state.thumbnailVisibleRatio = 0;
   await t.h.closeGridViewerWithReturnOverlay(entry, false);
   assert.deepEqual(movements(t), []); assert.equal(t.animations[0].duration, 240,
@@ -105,7 +160,7 @@ const movements = t => t.events.filter(e => ['by', 'index'].includes(e[0]));
   t = make(); t.resize(1200, 800); t.mount(false);
   await t.h.closeGridViewerWithReturnOverlay(entry, false);
   assert.deepEqual(movements(t), [['index', 0, false, 3], ['by', 0, 46]],
-    'unmounted target: native minimal mounting, then exact thumbnail correction');
+    'unmounted target: do not stop at a newly exposed sliver; correct into the full content band');
   assert.equal(t.animations[0].y, 604);
 
   t = make(); t.resize(1200, 800); t.state.thumbnailY = 900;
@@ -137,5 +192,5 @@ const movements = t => t.events.filter(e => ['by', 'index'].includes(e[0]));
   t.h.entries = [entry, latest]; t.h.viewerImageEntry = latest; t.h.viewerCurrentFramePath = latest.path;
   await t.h.closeGridViewerWithReturnOverlay(latest, false);
   assert.deepEqual(movements(t)[0], ['index', 1, false, 3], 'locate the current image after swiping, not the entry image');
-})().then(() => console.log('PASS: grid resize return — stable fast path, exact minimum scroll, lazy mount, bounded layout wait, cancellation and no late scroll'))
+})().then(() => console.log('PASS: grid edge/resize return — direct clipped-edge flight without scrolling, full target rect, offscreen recovery, bounded layout wait, cancellation and no late scroll'))
 .catch(error => { console.error(error); process.exitCode = 1; });

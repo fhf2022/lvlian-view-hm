@@ -3084,8 +3084,8 @@ struct Index {
       this.viewerFallbackEntryActive || this.viewerClosePending
   }
 
-  // Parent chrome is retained beneath overlays. Only input ownership changes;
-  // do not use these flags to unmount material hosts or change the bar's mode.
+  // Keep parent chrome mounted across overlays. Input ownership is separate
+  // from painting; these flags must not rebuild material hosts or bar modes.
   private parentOverlayOwnsInteraction(): boolean {
     return !this.startupAuthorized || this.startupRestoring || this.continuationSending ||
       this.viewerOwnsParentInteraction() || this.audioPlaybackUiVisible() ||
@@ -3093,6 +3093,22 @@ struct Index {
       this.contextMenuEntry !== null || this.showRenameDialog ||
       this.showDestinationPicker || this.showCreateFolderDialog ||
       this.showAlbumPicker || this.showAlbumUpload || this.showAlbumDetails
+  }
+
+  private bottomBarLayerZIndex(): number {
+    // Keep all parent controls above the moving image. Its opaque backdrop
+    // still hides them together through bottomBarLayerOpacity below.
+    return this.showImageViewer || this.viewerEntryTransitionActive ||
+      this.viewerFallbackEntryActive || this.viewerClosePending ||
+      this.viewerReturnOverlayVisible ? 35 : 20
+  }
+
+  private bottomBarLayerOpacity(): number {
+    // Follow the existing backdrop animation, including Grid's atomic
+    // Viewer -> return-overlay handoff. No extra animation or timer.
+    const backdrop = this.viewerReturnOverlayVisible ? this.viewerReturnOverlayBackdropOpacity :
+      (this.showImageViewer ? this.viewerSurfaceOpacity * this.imageDismissBackdropOpacity : 0)
+    return this.bottomBarOpacity * (1 - backdrop)
   }
 
   private shouldShowFloatingImportControl(): boolean {
@@ -3696,7 +3712,7 @@ struct Index {
       // matching the image viewer's return path.
       if (this.screen === 'files' || this.screen === 'downloads' || this.screen === 'settings') {
         // 三种底栏形态共用这一个常驻外壳，内部按 bottomBarMode() 交叉淡化；
-        // 显隐仍由 bottomBarOffsetY/bottomBarOpacity 控制。
+        // 位移沿用原逻辑；整组透明度同时跟随看图背景，避免单个按钮被图片遮挡。
         Stack({ alignContent: Alignment.Bottom }) {
           this.BottomBar()
         }
@@ -3704,8 +3720,8 @@ struct Index {
         .width('100%')
         .height('100%')
         .translate({ x: 0, y: this.bottomBarOffsetY, z: 0 })
-        .opacity(this.bottomBarOpacity)
-        .zIndex(20)
+        .opacity(this.bottomBarLayerOpacity())
+        .zIndex(this.bottomBarLayerZIndex())
         // The host is transparent and contains only the capsule. Its empty
         // area must pass through to the file surface below.
         .hitTestBehavior(this.parentOverlayOwnsInteraction()
@@ -5324,7 +5340,7 @@ struct Index {
     Grid(this.fileListScroller, this.fileGridOptions) {
       LazyForEach(this.fileEntryDataSource, (entry: FileEntry, index: number) => {
         GridItem() { this.FileGridInteractiveCell(entry, index) }
-          .margin({ top: index < this.fileGridColumnCount() ? this.fileContentTopInset() : 0 })
+          .margin({ top: this.fileItemTopInset(entry, 'grid') })
       }, (entry: FileEntry): string => entry.path)
     }
     .id('main-grid')
@@ -5398,7 +5414,7 @@ struct Index {
       footer: () => { this.WaterfallEndSpace() },
       layoutMode: WaterFlowLayoutMode.SLIDING_WINDOW
     }) {
-      LazyForEach(this.waterfallDataSource, (entry: FileEntry, index: number) => {
+      LazyForEach(this.waterfallDataSource, (entry: FileEntry) => {
         FlowItem() {
           Stack({ alignContent: Alignment.TopEnd }) {
             if (this.shouldReplaceViewerTransitionSource(entry) || !this.waterfallResourceResident(entry)) {
@@ -5455,7 +5471,7 @@ struct Index {
           )
         }
         .id('waterfall-item-' + this.waterfallEntryIndex(entry).toString())
-        .margin({ top: index < this.waterfallColumnCount() ? this.waterfallContentTopInset() : 0 })
+        .margin({ top: this.fileItemTopInset(entry, 'waterfall') })
         .onAppear(() => {
           this.resolveFileListImageRotation(entry)
           this.markWaterfallVisible(entry, true)
@@ -9626,14 +9642,16 @@ struct Index {
     }
     const state = this.imageVisualState(entry.path)
     const currentThumbnailUri = this.thumbnailSurfaceUri(entry, state.thumbnailSurface)
-    const requiredRatio = requireFullyVisible ? 0.999 : 0.001
+    const partialFileSurface = !requireFullyVisible && (state.thumbnailSurface === 'grid' ||
+      state.thumbnailSurface === 'waterfall' || state.thumbnailSurface === 'list')
+    const requiredRatio = requireFullyVisible ? 0.999 : (partialFileSurface ? 0 : 0.001)
     const topBoundary = state.thumbnailSurface === 'search'
       ? this.topSafeInset() + 124 : this.fileContentTopInset()
     const bottomBoundary = Math.max(topBoundary,
       this.pageHeightVp - this.bottomSafeInset() - 8)
-    const fitsReturnViewport = !requireFullyVisible ||
-      (state.thumbnailY >= topBoundary &&
-        state.thumbnailY + state.thumbnailHeight <= bottomBoundary)
+    const fitsReturnViewport = partialFileSurface ? this.thumbnailIntersectsFileViewport(state) :
+      (!requireFullyVisible || (state.thumbnailY >= topBoundary &&
+        state.thumbnailY + state.thumbnailHeight <= bottomBoundary))
     const transitionBitmapReady = this.viewerPreviewBitmaps[entry.path] !== undefined
     return transitionBitmapReady && currentThumbnailUri.length > 0 &&
       state.transitionThumbnailUri === currentThumbnailUri &&
@@ -9643,10 +9661,14 @@ struct Index {
       fitsReturnViewport && this.thumbnailSurfaceIsCurrent(state.thumbnailSurface)
   }
 
+  private viewerReturnSourceReady(entry: FileEntry | null): boolean {
+    return this.hasViewerTransitionSource(entry, this.currentThumbnailSurface() === 'search')
+  }
+
   private startViewerExitTransition(entry: FileEntry | null,
     layer: ViewerImageLayer): boolean {
     this.clearViewerEntryTransition()
-    if (!this.hasViewerTransitionSource(entry, true)) {
+    if (!this.viewerReturnSourceReady(entry)) {
       return false
     }
     const targetEntry = entry as FileEntry
@@ -9952,9 +9974,9 @@ struct Index {
           GestureGroup(
             GestureMode.Exclusive,
             TapGesture({ count: 2, distanceThreshold: 8 })
-              .onAction(() => {
+              .onAction((event: GestureEvent) => {
                 if (index === this.viewerImageIndex) {
-                  this.handleImageDoubleTap()
+                  this.handleImageDoubleTap(event)
                 }
               }),
             TapGesture({ count: 1, distanceThreshold: 8 })
@@ -12070,6 +12092,19 @@ struct Index {
   private waterfallEntryIndex(entry: FileEntry): number {
     const local = this.waterfallDataSource.indexOfPath(entry.path)
     return local >= 0 ? this.waterfallAbsoluteIndex(local) : -1
+  }
+
+  private fileItemTopInset(entry: FileEntry, surface: 'grid' | 'waterfall'): number {
+    // Retained lazy items keep their original builder indexes across inserts.
+    // Subscribe this native margin to the existing publication state and use
+    // the live O(1) path index. List keeps its single independent top spacer.
+    const waterfall = surface === 'waterfall'
+    const revision = waterfall ? this.waterfallBatchEpoch : this.entries.length
+    const data = waterfall ? this.waterfallDataSource : this.fileEntryDataSource
+    const index = data.indexOfPath(entry.path)
+    const columns = waterfall ? this.waterfallColumnCount() : this.fileGridColumnCount()
+    return revision >= 0 && index >= 0 && index < columns
+      ? (waterfall ? this.waterfallContentTopInset() : this.fileContentTopInset()) : 0
   }
 
   private waterfallResourceResident(entry: FileEntry): boolean {
@@ -17071,15 +17106,43 @@ struct Index {
       Math.min(this.pageHeightVp, viewport.y + height) - this.floatingBarContentInset(0))
   }
 
-  private gridViewerReturnTargetVisible(entry: FileEntry): boolean {
+  private thumbnailIntersectsFileViewport(state: ImageVisualState): boolean {
+    const viewport = this.fileScrollViewport
+    const left = Math.max(0, viewport.x)
+    const right = Math.min(this.pageWidthVp, viewport.x + viewport.width)
+    const top = Math.max(0, viewport.y)
+    const bottom = Math.min(this.pageHeightVp, viewport.y + viewport.height)
+    return state.thumbnailWidth > 0 && state.thumbnailHeight > 0 && right > left && bottom > top &&
+      state.thumbnailX < right && state.thumbnailX + state.thumbnailWidth > left &&
+      state.thumbnailY < bottom && state.thumbnailY + state.thumbnailHeight > top
+  }
+
+  private viewerReturnTargetVisible(entry: FileEntry, fullyVisible: boolean = false): boolean {
     if (!this.refreshGridThumbnailArea(entry)) { return false }
     const state = this.imageVisualState(entry.path)
     const viewport = this.fileScrollViewport
-    return state.thumbnailSurface === 'grid' && state.thumbnailWidth > 0 && state.thumbnailHeight > 0 &&
-      state.thumbnailX >= viewport.x - 0.5 &&
+    if (!this.thumbnailSurfaceIsCurrent(state.thumbnailSurface) || !this.thumbnailIntersectsFileViewport(state)) {
+      return false
+    }
+    // Existing overlap permits an in-place flight. After an offscreen
+    // recovery, require the complete image inside the unobscured band.
+    if (!fullyVisible) { return true }
+    return state.thumbnailX >= viewport.x - 0.5 &&
       state.thumbnailX + state.thumbnailWidth <= viewport.x + viewport.width + 0.5 &&
-      state.thumbnailY >= this.mediaReturnBandTop() - 0.5 &&
-      state.thumbnailY + state.thumbnailHeight <= this.mediaReturnBandBottom() + 0.5
+      Math.abs(this.mediaReturnScrollDelta(state.thumbnailY, state.thumbnailHeight)) < 0.5
+  }
+
+  private mediaReturnScrollDelta(top: number, height: number): number {
+    const bandTop = this.mediaReturnBandTop()
+    const bandBottom = this.mediaReturnBandBottom()
+    // A tall WaterFlow image cannot fit in the band. Reveal the maximum
+    // possible area with the minimum move, without oscillating between edges.
+    if (height > bandBottom - bandTop) {
+      if (top > bandTop) { return top - bandTop }
+      return Math.min(0, top + height - bandBottom)
+    }
+    if (top < bandTop) { return top - bandTop }
+    return Math.max(0, top + height - bandBottom)
   }
 
   private async waitForFileViewport(isCurrent: () => boolean): Promise<boolean> {
@@ -17188,14 +17251,7 @@ struct Index {
     // expansion can put its origin at 0 instead of below the status bar; use
     // the measured viewport shared with drag selection, not a fixed 94 vp.
     const viewportY = this.fileScrollViewport.y
-    const bandTop = this.mediaReturnBandTop() - viewportY
-    const bandBottom = this.mediaReturnBandBottom() - viewportY
-    let delta = 0
-    if (itemY < bandTop) {
-      delta = itemY - bandTop
-    } else if (itemY + itemHeight > bandBottom) {
-      delta = itemY + itemHeight - bandBottom
-    }
+    const delta = this.mediaReturnScrollDelta(itemY + viewportY, itemHeight)
     if (Math.abs(delta) < 0.5) {
       return
     }
@@ -17209,26 +17265,38 @@ struct Index {
   /** Shared image/audio return preparation. Never use the explicit file locator here. */
   private async prepareMediaReturnSource(entry: FileEntry, isCurrent: () => boolean,
     sourceReady: () => boolean, prepareSource?: () => Promise<void>,
-    positionGridSource: boolean = false): Promise<boolean> {
+    imageReturn: boolean = false): Promise<boolean> {
     if (!isCurrent()) { return false }
-    if (this.screen === 'files' && !this.showSearch && this.fileViewMode === 'waterfall') {
+    let sourcePrepared = false
+    const fileSurface = this.screen === 'files' && !this.showSearch
+    const positionImageSource = fileSurface && imageReturn
+    // Freeze this decision before mounting a missing group/thumbnail. A newly
+    // mounted sliver must not be mistaken for an originally visible image.
+    const keepImagePosition = positionImageSource && this.viewerReturnTargetVisible(entry)
+    if (fileSurface && this.fileViewMode === 'waterfall') {
       const index = this.waterfallEntries.findIndex((item: FileEntry): boolean => item.path === entry.path)
       if (index < 0) { return false }
       await this.ensureWaterfallIndex(index)
       if (!isCurrent() || this.waterfallLocalIndex(index) < 0) { return false }
     }
-    // Ordinary Grid returns keep the mounted target/fade fast path. Only
-    // explicit resize recovery may position a missing Grid thumbnail.
-    if (this.screen === 'files' && !this.showSearch && this.fileViewMode === 'grid') {
-      const ready = sourceReady()
-      if (!positionGridSource || ready) { return ready }
+    if (fileSurface && prepareSource !== undefined) {
+      await prepareSource()
+      sourcePrepared = true
+      if (!isCurrent()) { return false }
+    }
+    if (keepImagePosition) { return sourceReady() }
+    // Audio/search retain their existing positioning policy. All three image
+    // modes recover offscreen targets, even without an orientation change.
+    if (!positionImageSource && fileSurface) {
+      if ((sourcePrepared || this.fileViewMode === 'waterfall') && sourceReady()) { return true }
+      if (this.fileViewMode === 'grid') { return sourceReady() }
     }
     if (!this.scrollMediaReturnSourceIntoView(entry)) { return false }
-    if (prepareSource !== undefined) { await prepareSource() }
+    if (prepareSource !== undefined && !sourcePrepared) { await prepareSource() }
     for (let frame = 0; frame < IMAGE_RETURN_MOUNT_FRAME_LIMIT; frame += 1) {
       await this.nextRenderFrame()
       if (!isCurrent()) { return false }
-      if (sourceReady()) { return true }
+      if (sourceReady() && (!positionImageSource || this.viewerReturnTargetVisible(entry, true))) { return true }
       // A post-frame callback can still see the pre-scroll rect. Allow the
       // following layout to commit before applying another minimal correction;
       // otherwise the same scrollBy delta can be submitted twice.
@@ -17245,10 +17313,12 @@ struct Index {
     const isCurrent = (): boolean => this.showImageViewer && this.viewerImageEntry !== null &&
       this.viewerImageEntry.path === entry.path
     const ready = await this.prepareMediaReturnSource(entry, isCurrent,
-      (): boolean => this.hasViewerTransitionSource(entry, true),
+      (): boolean => this.viewerReturnSourceReady(entry),
       // Swiper can return to another image. Prepare its shared preview bitmap
       // before binding the return id; audio uses its already displayed cover.
-      async (): Promise<void> => { await this.ensureViewerPreviewBitmap(entry) })
+      // Grid prewarming stays stationary; only actual close recovers its target.
+      async (): Promise<void> => { await this.ensureViewerPreviewBitmap(entry) },
+      this.fileViewMode !== 'grid' || this.viewerClosePending)
     if (isCurrent()) { this.viewerReturnReadyPath = ready ? entry.path : '' }
     return ready
   }
@@ -17450,8 +17520,8 @@ struct Index {
     this.isBusy = true
     this.setImageChromeVisible(false, false)
 
-    // Ordinary Grid keeps its stationary overlay return. A changed viewport
-    // may position only the target thumbnail; it never decodes an Original.
+    // Grid flies to an already visible full or clipped tile without scrolling.
+    // Offscreen targets recover by the minimum scroll; no Original decode.
     if (!skipReturnGeometry && this.screen === 'files' && !this.showSearch &&
       this.fileViewMode === 'grid') {
       await this.closeGridViewerWithReturnOverlay(returningEntry, shouldRestoreSearch)
@@ -17555,18 +17625,17 @@ struct Index {
       openingGeneration === this.viewerGeneration && this.showImageViewer &&
       this.viewerImageEntry?.path === entry.path
     const layoutChanged = this.viewerReturnViewportVersion !== this.fileViewportVersion
-    let positioned = true
+    let viewportReady = true
     if (layoutChanged) {
       // Restore the window policy before choosing a target; restoring it
       // after the flight could trigger another layout and invalidate it.
       await this.restoreImageViewerOrientation()
-      positioned = await this.waitForFileViewport(isCurrent)
-      if (positioned) {
-        positioned = await this.prepareMediaReturnSource(entry, isCurrent,
-          (): boolean => this.gridViewerReturnTargetVisible(entry), undefined, true)
-      }
+      viewportReady = await this.waitForFileViewport(isCurrent)
       if (!isCurrent()) { return }
     }
+    const targetReady = viewportReady && await this.prepareMediaReturnSource(entry, isCurrent,
+      (): boolean => this.viewerReturnTargetVisible(entry), undefined, true)
+    if (!isCurrent()) { return }
     const snapshot = new ViewerReturnSnapshot()
     snapshot.path = entry.path
     snapshot.source = this.viewerImageSource(entry)
@@ -17594,13 +17663,10 @@ struct Index {
     this.viewerReturnOverlayScale = scale
     this.viewerReturnOverlayOpacity = this.viewerSurfaceOpacity
     this.viewerReturnOverlayBackdropOpacity = this.imageDismissBackdropOpacity
-    const hasGridArea = this.refreshGridThumbnailArea(entry)
     const state = this.imageVisualState(entry.path)
-    snapshot.hasTarget = hasGridArea && state.thumbnailSurface === 'grid' &&
-      (layoutChanged ? positioned && this.gridViewerReturnTargetVisible(entry)
-        : state.thumbnailVisibleRatio >= 0.999) && state.thumbnailWidth > 0 && state.thumbnailHeight > 0 &&
-      state.thumbnailY >= this.fileContentTopInset() &&
-      state.thumbnailY + state.thumbnailHeight <= this.pageHeightVp - this.bottomSafeInset() - 8
+    // The readiness check above refreshed native geometry in this same turn.
+    // Reuse it; visibility callbacks can still describe the pre-scroll clip.
+    snapshot.hasTarget = targetReady
     snapshot.target.x = state.thumbnailX - this.viewerLayerOriginX
     snapshot.target.y = state.thumbnailY - this.viewerLayerOriginY
     snapshot.target.width = state.thumbnailWidth
@@ -17797,16 +17863,30 @@ struct Index {
     this.toggleImageChrome()
   }
 
-  private handleImageDoubleTap(): void {
+  private handleImageDoubleTap(event: GestureEvent): void {
     this.lastImageDoubleTapAt = Date.now()
-    if (this.viewerTransitionActive) {
+    if (this.viewerGestureBlocked() || this.imageDismissDragging) {
       return
     }
     if (this.imageScale > 1.001) {
       this.animateImageTransform(1, 0, 0)
       return
     }
-    this.animateImageTransform(2, 0, 0)
+    // Gesture belongs to the untransformed full-page Stack. Its local vp
+    // coordinates remain valid in split windows and across image aspect ratios.
+    // fingerList can be sparse, or empty for keyboard/controller activation.
+    const point = event.fingerList.find((finger: FingerInfo): boolean =>
+      finger !== undefined && Number.isFinite(finger.localX) && Number.isFinite(finger.localY))
+    const width = Math.max(1, this.imageViewportWidthVp)
+    const height = Math.max(1, this.imageViewportHeightVp)
+    const x = point === undefined ? width / 2 : Math.min(width, Math.max(0, point.localX))
+    const y = point === undefined ? height / 2 : Math.min(height, Math.max(0, point.localY))
+    const ratio = 2 / this.imageScale
+    // Keep the tapped source pixel stationary while the center-based frame
+    // scales: offset' = ratio * offset + (1 - ratio) * (tap - center).
+    this.animateImageTransform(2,
+      ratio * this.imageOffsetX + (1 - ratio) * (x - width / 2),
+      ratio * this.imageOffsetY + (1 - ratio) * (y - height / 2))
   }
 
   /** Shared admission gates. An accepted dismiss drag keeps its existing update/end lifecycle. */
