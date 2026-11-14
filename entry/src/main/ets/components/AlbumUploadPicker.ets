@@ -4,6 +4,7 @@ import { LocalAlbumSource } from '../upload/LocalAlbumSource'
 import { LocalImageAlbum } from '../upload/AlbumUploadModel'
 import { FileRowStyle } from '../ui/FileRowStyle'
 import { TaskPanel, TaskPanelSection } from './TaskPanel'
+import { GamepadModalFocus, ModalFocusTarget } from '../ui/GamepadModalFocus'
 
 /** Only the system album list is shown here; upload options belong to the next page. */
 @Component
@@ -15,12 +16,23 @@ export struct AlbumUploadPicker {
   @Prop safeBottom: number = 0
   onSelected: (album: LocalImageAlbum) => void = () => {}
   onNotice: (message: string) => void = () => {}
+  onPadScope: (id: string, scope: GamepadModalFocus | null) => void = () => {}
+  @State private padItem: string = ''
   @State loading: boolean = false
   private generation: number = 0
   private options: AlbumPickerOptions = { filterType: photoAccessHelper.PhotoViewMIMETypes.IMAGE_TYPE,
     fontSize: FileRowStyle.titleSize, themeColorMode: PickerColorMode.AUTO }
 
-  aboutToDisappear(): void { this.generation++ }
+  aboutToAppear(): void {
+    this.onPadScope('album-upload-picker', new GamepadModalFocus('album-upload-picker',
+      (): ModalFocusTarget[] => [{ id: 'close', activate: () => this.close() }],
+      (id: string): void => { this.padItem = id }, () => this.close(),
+      (): string => '', (): boolean => false, true))
+  }
+
+  aboutToDisappear(): void { this.generation++; this.onPadScope('album-upload-picker', null) }
+
+  private close(): void { this.generation++; this.visible = false }
 
   private async select(info: AlbumInfo): Promise<void> {
     if (this.loading || !this.visible) { return }
@@ -62,7 +74,7 @@ export struct AlbumUploadPicker {
     TaskPanel({ title: '我的相册', idPrefix: 'album-upload-picker', floating: true,
       viewportWidth: this.viewportWidth, viewportHeight: this.viewportHeight,
       safeTop: this.safeTop, safeBottom: this.safeBottom,
-      onClose: (): void => { this.generation++; this.visible = false },
+      gamepadItem: this.padItem, onClose: () => this.close(),
       content: (): void => { this.PickerContent() } })
   }
 }

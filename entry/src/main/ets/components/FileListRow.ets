@@ -15,6 +15,7 @@ export struct FileListRow {
   @Prop endInset: number = FileRowStyle.horizontalPadding
   @Prop leadingGap: number = FileRowStyle.leadingGap
   @Prop showDivider: boolean = false
+  @Prop gamepadFocused: boolean = false
   @BuilderParam leading: () => void = EmptyFileListSlot
   @BuilderParam trailing: () => void = EmptyFileListSlot
 
@@ -36,6 +37,8 @@ export struct FileListRow {
         this.trailing()
       }
       .width('100%').alignItems(VerticalAlign.Center)
+      .backgroundColor(this.gamepadFocused ? '#1C5F9BF2' : Color.Transparent)
+      .borderRadius(12)
       .padding({ left: this.startInset, right: this.endInset,
         top: FileRowStyle.verticalPadding, bottom: FileRowStyle.verticalPadding })
       if (this.showDivider) {

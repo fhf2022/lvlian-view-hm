@@ -1,5 +1,6 @@
 import { FileEntry } from '../model/FileEntry'
 import { FileGridLayout } from '../ui/FileGridLayout'
+import { FileGamepadFocusRing } from './FileGamepadFocusRing'
 
 export class FileGridCellEvents {
   click: (entry: FileEntry) => void = (_entry: FileEntry): void => {}
@@ -26,10 +27,18 @@ export struct FileGridCell {
   @Prop topInset: number = 0
   @Prop thumbnailId: string = ''
   @Prop tileId: string = ''
+  @Prop gamepadFocused: boolean = false
   events: FileGridCellEvents = new FileGridCellEvents()
   @BuilderParam content: () => void = EmptyGridCellSlot
   @BuilderParam videoIndicator: () => void = EmptyGridCellSlot
   @BuilderParam selectionIndicator: () => void = EmptyGridCellSlot
+
+  @Builder
+  GamepadFocusRing(): void {
+    FileGamepadFocusRing({ active: this.gamepadFocused, itemPath: this.entry.path,
+      widthVp: FileGridLayout.thumbnailWidth(this.tileWidth, 1),
+      heightVp: FileGridLayout.thumbnailWidth(this.tileWidth, 1) })
+  }
 
   build() {
     Stack({ alignContent: Alignment.BottomEnd }) {
@@ -64,6 +73,7 @@ export struct FileGridCell {
         }
         .width('100%')
         .aspectRatio(1)
+        .overlay(this.GamepadFocusRing, { align: Alignment.Center })
         .borderRadius(0)
         .id(this.showName ? this.tileId : this.thumbnailId)
         .onVisibleAreaChange([0.0, 0.999], (_expanding: boolean, ratio: number): void => {

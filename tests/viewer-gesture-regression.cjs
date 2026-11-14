@@ -26,7 +26,7 @@ function page() {
   Object.assign(p, { showImageViewer: true, viewerClosePending: false, viewerTransitionActive: false,
     viewerEntryTransitionActive: false, isBusy: false, showImageMoreMenu: false,
     continuationDialogCount: 0, showRenameDialog: false, viewerImageIndex: 0, imageScale: 1,
-    imageAnalyzerActive: false, imageDismissDragging: false, imageViewportHeightVp: 800,
+    imageAnalyzerActive: false, imageDismissDragging: false, imagePinchActive: false, imageViewportHeightVp: 800,
     imageChromeVisible: true, imageTouchLastX: 200, closeCount: 0, restoreCount: 0,
     setImageChromeVisible() {}, closeImageViewer() { this.closeCount++; },
     animateImageDismissBack() { this.restoreCount++; }
@@ -47,6 +47,9 @@ p = page(); p.imageScale = 2;
 assert.equal(p.swipeBlocked(), true); assert.equal(p.imageDismissGestureEnabled(0), false);
 p = page(); p.imageScale = 1.001;
 assert.equal(p.swipeBlocked(), false); assert.equal(p.imageDismissGestureEnabled(0), true);
+p.imagePinchActive = true;
+assert.equal(p.swipeBlocked(), true); assert.equal(p.imageDismissGestureEnabled(0), false);
+p.imagePinchActive = false;
 p = page(); assert.equal(p.imageDismissGestureEnabled(1), false, 'a cached neighbor cannot start dismiss');
 p.imageAnalyzerActive = true;
 assert.equal(p.imageDismissGestureEnabled(0), false, 'text selection retains vertical dragging');

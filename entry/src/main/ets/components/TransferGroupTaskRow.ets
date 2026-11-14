@@ -1,3 +1,4 @@
+import { GamepadAction } from '../ui/GamepadControls'
 import { DownloadTaskRecord } from '../model/FileEntry'
 import { TransferTaskGroup } from '../transfer/TransferTaskGroup'
 import { TransferTaskListRow, TransferQueueTaskRow } from './TransferTaskListRow'
@@ -44,7 +45,9 @@ export struct TransferGroupTaskRow {
         progressForTask: this.progressForTask,
         leading: (): void => { this.leading(task) } })
     }.width('100%')
-      .onClick((): void => this.onActivate(task))
+      .attributeModifier(new GamepadAction(this.getUIContext(), 'downloads', task.id,
+        (): void => this.onActivate(task), (): boolean => true, 'transfer-file:' + task.id, true,
+        { hold: (): void => this.onRemove(task) }))
       .priorityGesture(LongPressGesture({ repeat: false }).onAction((): void => this.onRemove(task)))
       .id('transfer-file:' + task.id)
   }
@@ -54,7 +57,7 @@ export struct TransferGroupTaskRow {
       if (this.group.grouped) {
         TransferTaskListRow({ title: this.group.name, info: this.group.info,
           progress: this.group.percent, loading: this.group.loading,
-          expandable: true, expanded: this.expanded,
+          expandable: true, expanded: this.expanded, gamepadKey: this.group.batchId,
           onExpand: (): void => { this.expanded = !this.expanded },
           leading: (): void => { this.BatchIcon() } })
           .id('transfer-batch:' + this.group.batchId)
@@ -66,11 +69,14 @@ export struct TransferGroupTaskRow {
             if (this.group.tasks.length > 100) {
               Row({ space: 16 }) {
                 Button('上一页').fontSize(14).height(36).backgroundColor(Color.Transparent).fontColor('#2E6BFF')
-                  .enabled(this.pageIndex() > 0).onClick((): void => { this.page = this.pageIndex() - 1 })
+                  .enabled(this.pageIndex() > 0).attributeModifier(new GamepadAction(this.getUIContext(), 'downloads', this.group.batchId + ':previous',
+                    (): void => { this.page = this.pageIndex() - 1 }, (): boolean => this.pageIndex() > 0))
                 Text((this.pageIndex() + 1).toString()).fontSize(14).fontColor($r('app.color.text_secondary'))
                 Button('下一页').fontSize(14).height(36).backgroundColor(Color.Transparent).fontColor('#2E6BFF')
                   .enabled((this.pageIndex() + 1) * 100 < this.group.tasks.length)
-                  .onClick((): void => { this.page = this.pageIndex() + 1 })
+                  .attributeModifier(new GamepadAction(this.getUIContext(), 'downloads', this.group.batchId + ':next',
+                    (): void => { this.page = this.pageIndex() + 1 },
+                    (): boolean => (this.pageIndex() + 1) * 100 < this.group.tasks.length))
               }.width('100%').justifyContent(FlexAlign.Center).padding(12)
             }
           }.width('100%').padding({ left: 24 })

@@ -1,3 +1,5 @@
+import { PadDirection } from '../ui/GamepadNavigation'
+import { GamepadAction } from '../ui/GamepadControls'
 /*
  * Copyright (c) 2026 Huawei Device Co., Ltd.
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,7 +18,7 @@
  * state is supplied by LinkFiles. Favorites, comments and mini bar removed.
  */
 import { uiObserver } from '@kit.ArkUI'
-import { AVCastPicker } from '@kit.AVSessionKit'
+import { AVCastPicker, AVCastPickerState } from '@kit.AVSessionKit'
 import { AudioLyricLine, AudioPlayerPolicy, AudioPlayMode } from '../media/AudioPlayerPolicy'
 import { HeaderStyle } from '../ui/HeaderStyle'
 
@@ -66,6 +68,8 @@ export struct AudioPlayerPage {
   @Event onQueue: () => void = () => {}
   @Event onDownload: () => void = () => {}
   @Event onDetails: () => void = () => {}
+  @Event onCastRequest: () => void = () => {}
+  @Event onCastState: (state: AVCastPickerState) => void = () => {}
   @Event onSeek: (value: number) => void = () => {}
   @Event onCoverArea: (area: Area) => void = () => {}
   @Event onCoverVisibility: (ratio: number) => void = () => {}
@@ -79,6 +83,14 @@ export struct AudioPlayerPage {
   private lyricScroller: Scroller = new Scroller()
   private lyricSource: AudioLyricSource = new AudioLyricSource()
   private lastLyricIndex: number = -1
+  private adjustGamepadProgress(direction: PadDirection): boolean {
+    if (direction !== 'left' && direction !== 'right') { return false }
+    if (!this.busy && this.durationMs > 0) {
+      this.onSeek(Math.max(0, Math.min(this.durationMs, this.positionMs + (direction === 'right' ? 10000 : -10000))))
+    }
+    return true
+  }
+
   private seekCancelled: boolean = false
   private seekClickCommitted: boolean = false
 
@@ -134,7 +146,8 @@ export struct AudioPlayerPage {
         .fontColor([$r('sys.color.icon_primary')])
     }
     .width(HeaderStyle.controlHeight).height(HeaderStyle.controlHeight)
-    .type(ButtonType.Circle).backgroundColor(Color.Transparent).onClick(() => this.onBack())
+    .type(ButtonType.Circle).backgroundColor(Color.Transparent).attributeModifier(new GamepadAction(this.getUIContext(), 'audio', 'audio-back', () => this.onBack(),
+      (): boolean => !this.busy, 'audio-back'))
     .stateEffect(false).hoverEffect(HoverEffect.None).draggable(false)
     .accessibilityText('返回')
   }
@@ -148,7 +161,8 @@ export struct AudioPlayerPage {
     .type(ButtonType.Normal).width(40).height(40).borderRadius(20)
     .stateEffect(false).hoverEffect(HoverEffect.None).draggable(false)
     .backgroundColor(Color.Transparent).accessibilityText(label).enabled(!this.busy)
-    .onClick(action).accessibilityLevel('yes').id('audio-control-' + label)
+    .attributeModifier(new GamepadAction(this.getUIContext(), 'audio', 'audio-control-' + label, action,
+      (): boolean => !this.busy, 'audio-control-' + label)).accessibilityLevel('yes').id('audio-control-' + label)
   }
 
   @Builder
@@ -214,7 +228,9 @@ export struct AudioPlayerPage {
               .draggable(false)
               .fontColor(this.foreground())
               .opacity(index === this.activeLyricIndex ? 1 : 0.42)
-              .padding({ top: 8, bottom: 8 }).onClick(() => this.onSeek(line.timeMs))
+              .padding({ top: 8, bottom: 8 })
+              .attributeModifier(new GamepadAction(this.getUIContext(), 'audio', 'audio-lyric-' + line.timeMs,
+                () => this.onSeek(line.timeMs), (): boolean => !this.busy, 'audio-lyric-' + line.timeMs))
           }
         }, (line: AudioLyricLine, index: number) => index.toString() + ':' + line.timeMs.toString())
       }
@@ -252,6 +268,9 @@ export struct AudioPlayerPage {
             this.seekClickCommitted = false
           }
         }).id('audio-progress-slider')
+        .attributeModifier(new GamepadAction(this.getUIContext(), 'audio', 'progress', (): void => {},
+          (): boolean => !this.busy && this.durationMs > 0, 'audio-progress-slider', false,
+          { adjust: (direction: PadDirection): boolean => this.adjustGamepadProgress(direction) }))
       Row() {
         Text(this.time(this.seeking ? this.seekValue : this.positionMs)).fontSize(10).fontColor(this.secondary()).lineHeight(14)
           .draggable(false)
@@ -277,7 +296,8 @@ export struct AudioPlayerPage {
     }
     .width(size + 8).height(Math.max(44, size)).type(ButtonType.Normal)
     .stateEffect(false).hoverEffect(HoverEffect.None).draggable(false)
-    .backgroundColor(Color.Transparent).accessibilityText(label).enabled(!this.busy).onClick(action)
+    .backgroundColor(Color.Transparent).accessibilityText(label).enabled(!this.busy).attributeModifier(new GamepadAction(this.getUIContext(), 'audio', 'audio-control-' + label, action,
+      (): boolean => !this.busy, 'audio-control-' + label))
     .accessibilityLevel('yes').id('audio-control-' + label)
   }
 
@@ -301,7 +321,8 @@ export struct AudioPlayerPage {
     }
     .width(this.playSize() + 8).height(this.playSize()).type(ButtonType.Normal)
     .stateEffect(false).hoverEffect(HoverEffect.None).draggable(false)
-    .backgroundColor(Color.Transparent).enabled(!this.busy).onClick(() => this.onToggle())
+    .backgroundColor(Color.Transparent).enabled(!this.busy).attributeModifier(new GamepadAction(this.getUIContext(), 'audio', 'audio-play-toggle', () => this.onToggle(),
+      (): boolean => !this.busy, 'audio-play-toggle'))
     .accessibilityText(this.playing ? '暂停' : '播放').accessibilityLevel('yes').id('audio-play-toggle')
   }
 
@@ -315,7 +336,8 @@ export struct AudioPlayerPage {
     }
     .type(ButtonType.Normal).width(40).height(40).borderRadius(20)
     .stateEffect(false).hoverEffect(HoverEffect.None).draggable(false)
-    .backgroundColor(Color.Transparent).enabled(!this.busy).onClick(() => this.onMode())
+    .backgroundColor(Color.Transparent).enabled(!this.busy).attributeModifier(new GamepadAction(this.getUIContext(), 'audio', 'audio-play-mode', () => this.onMode(),
+      (): boolean => !this.busy, 'audio-play-mode'))
     .accessibilityText(this.playMode === 'order' ? '顺序循环' :
       (this.playMode === 'repeat' ? '单曲循环' : '随机播放')).accessibilityLevel('yes').id('audio-play-mode')
   }
@@ -333,9 +355,12 @@ export struct AudioPlayerPage {
       }.width('100%').justifyContent(FlexAlign.SpaceBetween)
       Row() {
         AVCastPicker({ normalColor: this.dark ? '#99FFFFFF' : '#99172033',
-          activeColor: '#2E6BFF', customPicker: () => { this.CastIcon() } })
+          activeColor: '#2E6BFF', customPicker: () => { this.CastIcon() },
+          onStateChange: (state: AVCastPickerState): void => this.onCastState(state) })
           .width(40).height(40)
           .draggable(false).hoverEffect(HoverEffect.None).id('audio-control-音频输出设备')
+          .attributeModifier(new GamepadAction(this.getUIContext(), 'audio', 'cast', (): void => this.onCastRequest(),
+            (): boolean => !this.busy, 'audio-control-音频输出设备', false))
         this.Glyph($r('sys.symbol.arrow_down_circle'), '下载', () => this.onDownload(), 22)
         this.Glyph($r('sys.symbol.info_circle'), '详情', () => this.onDetails(), 22)
       }

@@ -1,8 +1,18 @@
+import { GamepadMenuStyle } from '../ui/GamepadMenuStyle'
+import { GamepadAction, GamepadControls } from '../ui/GamepadControls'
 import { ImageLoadCompleteEvent as ViewerImageCompleteEvent } from '../media/ImageLoadEvent'
 import { GridThumbnailCell, GridThumbnailBridge, GridImageState } from '../components/GridThumbnailCell'
 import { WaterfallThumbnailCell, WaterfallThumbnailBridge, WaterfallImageState } from '../components/WaterfallThumbnailCell'
 import { MediaType } from '../model/MediaType'
 import { DirectoryChange } from '../model/DirectoryChange'
+import { KeyCode, inputDevice } from '@kit.InputKit'
+import { GamepadFocusHistory, GamepadNavigation, GamepadPressFilter, GamepadStickRepeat,
+  PadDirection } from '../ui/GamepadNavigation'
+import { GamepadModalFocus, ModalFocusTarget } from '../ui/GamepadModalFocus'
+import { videoRateAt, videoRatePosition } from '../ui/VideoControlLayout'
+import { GamepadMenuKeyInput, GamepadMenuKeyRelay } from '../components/GamepadMenuKeyRelay'
+import { MenuPadEvent, start as startMenuPad, stop as stopMenuPad, capture as captureMenuPad,
+  read as readMenuPad } from 'liblinkfiles_pad.so'
 import { DEBUG } from 'BuildProfile'
 import { rekeyRecord } from '../model/RecordUtils'
 import { StartupAuthorization } from '../core/authorization/StartupAuthorization'
@@ -13,7 +23,7 @@ import { ContinuationPolicy, ContinuationSnapshot, ContinuationState } from '../
 import { StorageBudget } from '../download/StorageBudget'
 import { DownloadDestination } from '../download/DownloadDestination'
 import { TransferBackgroundManager } from '../transfer/TransferBackgroundManager'
-import { promptAction, uiMaterial, curves, window, LengthMetrics, FrameCallback, PiPWindow,
+import { promptAction, uiMaterial, curves, window, LengthMetrics, ColorMetrics, FrameCallback, PiPWindow,
   CapsuleSegmentButtonV2, SegmentButtonV2Items } from '@kit.ArkUI'
 import { systemShare, harmonyShare } from '@kit.ShareKit'
 import { Context, Want, common, wantConstant, autoFillManager, bundleManager } from '@kit.AbilityKit'
@@ -40,6 +50,7 @@ import { AlertDialog as SystemAlertDialog, CustomContentDialog, ButtonOptions } 
 import { FileRowStyle } from '../ui/FileRowStyle'
 import { FileGridLayout } from '../ui/FileGridLayout'
 import { FileGridCell, FileGridCellEvents } from '../components/FileGridCell'
+import { FileGamepadFocusRing } from '../components/FileGamepadFocusRing'
 import { TaskPanel, TaskPanelFooter, TaskPanelSection } from '../components/TaskPanel'
 import { NameInputDialog } from '../components/NameInputDialog'
 import { DirectoryHeaderState } from '../ui/DirectoryHeaderState'
@@ -266,6 +277,12 @@ interface ViewerReturnScrollOffset {
 
 interface PopupStateChange {
   isVisible: boolean
+}
+
+interface FloatingMenuAction {
+  icon: Resource
+  title: string
+  action: () => void
 }
 
 type ViewerImageLayer = 'thumbnail' | 'original'
@@ -697,24 +714,24 @@ struct Index {
   @State renameEntry: FileEntry | null = null
   @State renameText: string = ''
   @State @Watch('onContinuationSceneChanged') showRenameDialog: boolean = false
-  @State showStorageSettings: boolean = false
-  @State showNetworkSettings: boolean = false
-  @State showPlaybackSettings: boolean = false
-  @State showViewSettings: boolean = false
-  @State showRecycleBinSettings: boolean = false
+  @State @Watch('syncOrdinaryGamepadScope') showStorageSettings: boolean = false
+  @State @Watch('syncOrdinaryGamepadScope') showNetworkSettings: boolean = false
+  @State @Watch('syncOrdinaryGamepadScope') showPlaybackSettings: boolean = false
+  @State @Watch('syncOrdinaryGamepadScope') showViewSettings: boolean = false
+  @State @Watch('syncOrdinaryGamepadScope') showRecycleBinSettings: boolean = false
   @State appVersionName: string = ''
   // UGOS keeps one recycle repository per first-level folder, so the signed-in
   // user's own folder and the shared folders are genuinely disjoint sets with
   // different permission rules — a shared folder's bin is the administrator's
   // unless that was turned off. They are two scopes of one page rather than a
   // single merged list, because merging them would hide which rule applied.
-  @State recycleScope: string = 'personal'
+  @State @Watch('syncOrdinaryGamepadScope') recycleScope: string = 'personal'
   @State recycleEntries: FileEntry[] = []
   @State recycleLoading: boolean = false
   // Full recycle paths the user has drilled into, e.g.
   // `/home/fhf/#recycle/Photos`. An empty stack means the top level, which
   // lists each share's `#recycle` direct children.
-  @State recycleStack: string[] = []
+  @State @Watch('onContinuationSceneChanged') recycleStack: string[] = []
   // Folders whose bin exists but could not be read (usually a permission wall
   // on a shared folder). Kept so a partial result can be explained.
   @State recycleBlockedShares: string[] = []
@@ -778,10 +795,175 @@ struct Index {
   private imageLongPressTimer: number = 0
   @State @Watch('onContinuationSceneChanged') imageScale: number = 1
   @State imageSavedScale: number = 1
+  @State imagePinchActive: boolean = false
   @State imageOffsetX: number = 0
   @State imageOffsetY: number = 0
   @State imageSavedOffsetX: number = 0
   @State imageSavedOffsetY: number = 0
+  @State private gamepadArea: string = ''
+  @State private gamepadItem: string = ''
+  @State private gamepadFilePath: string = ''
+  private gamepadFileDirectory: string = ''
+  private gamepadFocusHistory: GamepadFocusHistory = new GamepadFocusHistory()
+  private gamepadFileIndex: number = 0
+  private gamepadListRevealToken: number = 0
+  private gamepadTouchScrollPending: boolean = false
+  private gamepadTouchScrollDirectory: string = ''
+  private gamepadSourceId: number = -1
+  private gamepadHeldKeys: Set<number> = new Set<number>()
+  private gamepadConfirmTimer: number = -1
+  private gamepadConfirmTarget: string = ''
+  private gamepadAxisTimer: number = -1
+  private gamepadLastAxisTick: number = 0
+  private gamepadLeftX: number = 0
+  private gamepadLeftY: number = 0
+  private gamepadRightY: number = 0
+  private gamepadHatX: number = 0
+  private gamepadHatY: number = 0
+  private gamepadHatDirection: PadDirection = ''
+  private gamepadLastDpad: PadDirection = ''
+  private gamepadLastDpadAt: number = 0
+  private gamepadLeftLatched: boolean = false
+  private gamepadRepeatAt: number = 0
+  private gamepadTurnUntil: number = 0
+  private gamepadAxisLogged: boolean = false
+  private gamepadMenuScroller: Scroller = new Scroller()
+  private gamepadMenuKeys: GamepadMenuKeyInput = new GamepadMenuKeyInput()
+  private nativeMenuArea: string = ''
+  private nativeMenuTimer: number = -1
+  private nativeMenuRegistration: number = -1
+  private nativeMenuInputSeen: boolean = false
+  private nativeMenuStick: GamepadStickRepeat = new GamepadStickRepeat()
+  private gamepadPresses: GamepadPressFilter = new GamepadPressFilter()
+  private importPadOpen: (() => void) | null = null
+  private ordinaryPadStick: GamepadStickRepeat = new GamepadStickRepeat()
+  private ordinaryPadTimer: number = -1
+  private ordinaryPadScope: string = ''
+  private ordinaryPadActive: boolean = false
+  private ordinaryPadMagnitude: number = 0
+  private ordinaryPadNeedsNeutral: boolean = false
+  @State @Watch('syncOrdinaryGamepadScope') private systemGamepadInput: boolean = false
+  private controllerCastPicker: avSession.AVCastPickerHelper | null = null
+  private controllerCastState = (state: AVCastPickerState): void => {
+    this.systemGamepadInput = state === AVCastPickerState.STATE_APPEARING
+    if (this.videoPlaybackUiVisible()) { this.handleVideoCastPickerState(state) }
+  }
+
+  private openControllerCastPicker(video: boolean): void {
+    try {
+      if (this.controllerCastPicker === null) {
+        this.controllerCastPicker = new avSession.AVCastPickerHelper(this.getUIContext().getHostContext() as common.UIAbilityContext)
+        this.controllerCastPicker.on('pickerStateChange', this.controllerCastState)
+      }
+      this.systemGamepadInput = true
+      this.controllerCastPicker.select({ sessionType: video ? 'video' : 'audio' }).catch((error: Error): void => {
+        this.systemGamepadInput = false
+        this.showImmersiveToast(error.message || '无法打开投播设备列表')
+      })
+    } catch (_) {
+      this.systemGamepadInput = false
+      this.showImmersiveToast('无法打开投播设备列表')
+    }
+  }
+  private ordinaryEditing: boolean = false
+  private ordinaryHat: PadDirection = ''
+  private ordinaryDigital: PadDirection = ''
+  private ordinaryDigitalAt: number = 0
+  @State private ordinaryPadItem: string = ''
+
+  private setOrdinaryHighlight(id: string, selected: boolean): void {
+    if (selected) { this.ordinaryPadItem = id }
+    else if (this.ordinaryPadItem === id) { this.ordinaryPadItem = '' }
+  }
+
+  private syncOrdinaryGamepadScope(): void {
+    const scope = this.ordinaryGamepadScope()
+    if (scope === this.ordinaryPadScope) { return }
+    this.ordinaryPadScope = scope
+    this.stopOrdinaryGamepadAxes()
+    GamepadControls.setScope(this.ordinaryPadActive ? scope : '')
+    if (this.ordinaryPadActive && scope !== '') {
+      this.postRenderFrame((): void => {
+        if (this.ordinaryPadActive && this.ordinaryGamepadScope() === scope) { GamepadControls.focus(scope) }
+      })
+    }
+  }
+
+  private stopOrdinaryGamepadAxes(): void {
+    this.ordinaryPadNeedsNeutral = this.ordinaryPadMagnitude >= GamepadNavigation.release
+    if (this.ordinaryPadTimer >= 0) { clearInterval(this.ordinaryPadTimer) }
+    this.ordinaryPadTimer = -1
+    this.ordinaryPadStick.reset()
+    this.ordinaryHat = ''
+  }
+
+  private ordinaryGamepadBack(): void {
+    GamepadControls.cancelPress()
+    if (this.ordinaryEditing || this.searchEditing) {
+      this.ordinaryEditing = false
+      this.dismissKeyboard()
+      try { this.getUIContext().getFocusController().requestFocus('linkfiles-controller-root') } catch (_) {}
+      return
+    }
+    if (this.showSearch) { this.gamepadBackFromSearch() }
+    else { this.onBackPress() }
+    this.syncOrdinaryGamepadScope()
+  }
+
+  private ordinaryGamepadScope(): string {
+    if (this.abilityInBackground || this.startupRestoring || this.systemGamepadInput) { return '' }
+    if (this.currentGamepadModal() !== null || this.openGamepadMenu() !== '' ||
+      this.pageDialogClosers.size > 0 || this.continuationDialogCount > 0 ||
+      this.continuationPending || this.continuationSending) { return '' }
+    if (!this.startupAuthorized) { return 'startup' }
+    if (this.showImageViewer || this.viewerBlocksFileContent) { return '' }
+    if (this.audioPlaybackUiVisible()) { return 'audio' }
+    if (this.videoPlaybackUiVisible()) { return 'video' }
+    if (this.parentOverlayOwnsInteraction()) { return '' }
+    if (this.showSearch) { return 'search' }
+    if (this.screen === 'files') { return '' }
+    return this.screen === 'settings' ? this.settingsGamepadScope() : this.screen
+  }
+
+  private settingsGamepadScope(): string {
+    return 'settings:' + (this.showStorageSettings ? 'storage' : this.showPlaybackSettings ? 'playback' :
+      this.showNetworkSettings ? 'network' : this.showViewSettings ? 'view' :
+      this.showRecycleBinSettings ? 'recycle:' + this.recycleScope + ':' + this.recycleCurrentPath() : 'main')
+  }
+  private nativeModal: GamepadModalFocus | null = null
+  private gamepadDialogScopes: GamepadModalFocus[] = []
+  private registeredGamepadScopes: Map<string, GamepadModalFocus> = new Map<string, GamepadModalFocus>()
+  @State private gamepadDialogItem: string = ''
+  @State private gamepadModalActive: boolean = false
+  @State private destinationPadItem: string = ''
+  @State private audioQueuePadItem: string = ''
+  @State private videoRatePadItem: string = ''
+  private destinationPadScroller: Scroller = new Scroller()
+  private destinationPadHistory: GamepadFocusHistory = new GamepadFocusHistory()
+  private destinationPad: GamepadModalFocus = new GamepadModalFocus('destination',
+    () => this.destinationPadTargets(), (id: string): void => {
+      this.destinationPadItem = id
+      if (!this.destinationLoading) { this.destinationPadHistory.remember(this.destinationPath, id, 0) }
+    }, () => this.goDestinationBack(), (): string => this.destinationPadHistory.get(this.destinationPath)?.id ?? 'close')
+  private audioQueuePad: GamepadModalFocus = new GamepadModalFocus('audio-queue',
+    () => this.audioQueuePadTargets(), (id: string): void => { this.audioQueuePadItem = id },
+    (): void => { this.showAudioQueue = false }, (): string => this.audioEntry?.path ?? '')
+  private videoRatePad: GamepadModalFocus = new GamepadModalFocus('video-rate',
+    (): ModalFocusTarget[] => [
+      { id: 'rate', activate: () => {} },
+      { id: 'reset', activate: (): void => { if (!this.videoRatePending) { this.setVideoPlaybackRate(1) } } }
+    ], (id: string): void => { this.videoRatePadItem = id }, (): void => { this.onBackPress() },
+    () => 'rate', (direction: PadDirection, id: string): boolean => this.adjustVideoRate(direction, id))
+  private gamepadDeviceIds: Set<number> = new Set<number>()
+  private gamepadDeviceChanged = (change: inputDevice.DeviceListener): void => {
+    if (change.type === 'add') {
+      this.identifyGamepad(change.deviceId)
+    } else if (this.gamepadDeviceIds.delete(change.deviceId) || change.deviceId === this.gamepadSourceId) {
+      this.releaseGamepad()
+      this.nativeMenuStick.reset()
+      this.nativeModal?.reset()
+    }
+  }
   @State imageChromeVisible: boolean = true
   @State imageChromeOpacity: number = 1
   @State imageTopChromeOffsetY: number = 0
@@ -991,6 +1173,7 @@ struct Index {
   @State fileTransitionHeader: DirectoryHeaderState | null = null
   @State outgoingEntries: FileEntry[] = []
   @State @Watch('onContinuationSceneChanged') showSearch: boolean = false
+  private searchEditing: boolean = false
   @State searchQuery: string = ''
   private searchDraft: string = ''
   private searchController: SearchController = new SearchController()
@@ -1451,6 +1634,8 @@ struct Index {
   private imageTouchMoved: boolean = false
   private imageTouchStartX: number = 0
   private imageTouchStartY: number = 0
+  private imagePinchStartX: number = 0
+  private imagePinchStartY: number = 0
   // Latest raw touch X, refreshed on every Move. The dismiss pull is anchored
   // HERE rather than at touch-down: the recognizer only fires after 5vp of
   // vertical travel, so anchoring at touch-down would make the image jump
@@ -1553,6 +1738,11 @@ struct Index {
   private timelineRailMaterial: uiMaterial.ImmersiveMaterial = GlassMaterial.timeline()
   private floatingPanelMaterial: uiMaterial.ImmersiveMaterial = GlassMaterial.overlay()
   aboutToAppear(): void {
+    this.gamepadMenuKeys.attach(this.getUIContext(), (event: KeyEvent): boolean => this.handleLocalMenuKey(event))
+    try { inputDevice.on('change', this.gamepadDeviceChanged) } catch (_) {}
+    inputDevice.getDeviceList().then((ids: number[]): void => {
+      ids.forEach((id: number): void => this.identifyGamepad(id))
+    }).catch((): void => {})
     this.repository.setFileOperationListener((changes: DirectoryChange[], uncertain: boolean): void => {
       for (const change of changes) { this.applyDirectoryChange(change) }
       if (uncertain) { this.showImmersiveToast('部分文件任务未能确认完成，请刷新目录核对') }
@@ -1582,6 +1772,8 @@ struct Index {
   }
 
   private onContinuationSceneChanged(): void {
+    this.syncNativeMenuPad()
+    this.syncOrdinaryGamepadScope()
     if (this.dropImportHover && !this.canAcceptFileDrop()) { this.dropImportHover = false }
     ContinuationManager.shared().refresh()
     this.onContinuationNoticeChanged()
@@ -2146,6 +2338,12 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    this.controllerCastPicker?.off('pickerStateChange', this.controllerCastState)
+    this.controllerCastPicker = null
+    this.stopNativeMenuPad()
+    this.gamepadMenuKeys.detach()
+    this.releaseGamepad()
+    try { inputDevice.off('change', this.gamepadDeviceChanged) } catch (_) {}
     this.cancelPendingPreviewLoads()
     this.repository.setThumbnailReadyListener(null)
     this.repository.setFileOperationListener(null)
@@ -2325,6 +2523,8 @@ struct Index {
   }
 
   onPageHide(): void {
+    this.stopNativeMenuPad()
+    this.releaseGamepad()
     if (!this.startupAuthorized) { return }
     this.fileContentScrolling = false
     this.cancelPendingPreviewLoads()
@@ -2341,6 +2541,8 @@ struct Index {
   onPageShow(): void {
     this.repository.setForeground(!this.abilityInBackground)
     if (!this.startupAuthorized) { return }
+    if (this.gamepadDeviceIds.size > 0) { this.ensureNativeMenuPad() }
+    this.syncNativeMenuPad()
     this.albumUpload.setForeground(!this.abilityInBackground)
     this.gestureSharePageVisible = true
     this.onContinuationNoticeChanged()
@@ -2360,6 +2562,13 @@ struct Index {
   }
 
   onAbilityBackgroundChanged(): void {
+    if (this.abilityInBackground) {
+      this.stopNativeMenuPad()
+      this.releaseGamepad()
+    } else {
+      if (this.gamepadDeviceIds.size > 0) { this.ensureNativeMenuPad() }
+      this.syncNativeMenuPad()
+    }
     if (!this.startupAuthorized) { return }
     this.repository.setForeground(this.gestureSharePageVisible && !this.abilityInBackground)
     if (this.abilityInBackground) {
@@ -2919,6 +3128,11 @@ struct Index {
     return this.topSafeInset() + HeaderStyle.contentTopInset
   }
 
+  private fileListLeadingSpace(): number {
+    // A selected first row must clear the blur even at the start of the list.
+    return this.gamepadArea === '' ? this.fileContentTopInset() : this.topSafeInset() + HeaderStyle.overlayHeight
+  }
+
   private hasSettingsSubpage(): boolean {
     return this.showStorageSettings || this.showPlaybackSettings || this.showViewSettings ||
       this.showNetworkSettings || this.showRecycleBinSettings
@@ -3254,7 +3468,10 @@ struct Index {
     this.transitionSnapshotMode = 'list'
     this.outgoingEntries = []
     this.isBusy = false
-    this.postRenderFrame((): void => this.rememberGridViewportAnchor())
+    this.postRenderFrame((): void => {
+      this.rememberGridViewportAnchor()
+      if (this.gamepadArea === 'files' && this.gamepadFilesAvailable()) { this.gamepadCurrentFile() }
+    })
     if (this.resetPreviewAfterPageTransition) {
       this.resetPreviewAfterPageTransition = false
       this.fileContentScrolling = false
@@ -3445,7 +3662,10 @@ struct Index {
     this.pageTransitionFinishing = false
     this.traceStateWrite('StateWrite:cbf.isBusy')
     this.isBusy = false
-    this.postRenderFrame((): void => this.rememberGridViewportAnchor())
+    this.postRenderFrame((): void => {
+      this.rememberGridViewportAnchor()
+      if (this.gamepadArea === 'files' && this.gamepadFilesAvailable()) { this.gamepadCurrentFile() }
+    })
   }
 
   /**
@@ -3505,6 +3725,979 @@ struct Index {
       this.outgoingPageOffsetX = 0
     })
     return true
+  }
+
+  private identifyGamepad(id: number): void {
+    inputDevice.getDeviceInfo(id).then((device: inputDevice.InputDeviceData): void => {
+      if (!device.sources.includes('joystick')) { return }
+      this.gamepadDeviceIds.add(id)
+      this.ordinaryPadActive = true
+      this.ensureNativeMenuPad()
+      this.currentGamepadModal()?.focusInitial()
+      const menu = this.openGamepadMenu()
+      if (menu !== '' && this.currentGamepadModal() === null) { this.focusGamepadMenu(menu) }
+      this.requestGamepadInputFocus()
+      GamepadControls.focus(this.ordinaryGamepadScope())
+    }).catch((): void => {})
+  }
+
+  private requestGamepadInputFocus(): void {
+    if (!this.gamepadAvailable() || this.openGamepadMenu() !== '' || this.currentGamepadModal() !== null ||
+      (!this.showImageViewer && (this.screen !== 'files' || this.showSearch))) { return }
+    const target = this.showImageViewer ? 'linkfiles-gamepad-viewer-input' : 'linkfiles-gamepad-input'
+    try { this.getUIContext().getFocusController().requestFocus(target) } catch (_) {}
+  }
+
+  private gamepadFilesAvailable(): boolean {
+    return this.screen === 'files' && !this.showSearch &&
+      !this.parentOverlayOwnsInteraction() && !this.showPageTransition && !this.isNavigating
+  }
+
+  private gamepadAvailable(): boolean {
+    return this.startupAuthorized && !this.startupRestoring && !this.abilityInBackground &&
+      this.pageDialogClosers.size === 0 && this.continuationDialogCount === 0 &&
+      !this.continuationSending && !this.continuationPending && !this.showDestinationPicker &&
+      !this.showCreateFolderDialog && !this.showRenameDialog && !this.importExpanded &&
+      !this.showAlbumPicker && !this.showAlbumUpload && !this.showAlbumDetails &&
+      !this.audioPlaybackUiVisible() && !this.videoPlaybackUiVisible() &&
+      (this.showImageViewer || this.gamepadFilesAvailable() || this.openGamepadMenu() !== '')
+  }
+
+  private gamepadPresent(): boolean {
+    return this.gamepadDeviceIds.size > 0 || this.gamepadArea !== '' || this.gamepadSourceId >= 0
+  }
+
+  private registerGamepadScope(id: string, scope: GamepadModalFocus | null): void {
+    if (scope === null) { this.registeredGamepadScopes.delete(id) }
+    else { this.registeredGamepadScopes.set(id, scope) }
+    this.syncNativeMenuPad()
+    this.syncOrdinaryGamepadScope()
+  }
+
+  private currentGamepadModal(): GamepadModalFocus | null {
+    const dialog = this.gamepadDialogScopes[this.gamepadDialogScopes.length - 1]
+    if (dialog !== undefined) { return dialog }
+    if (this.showRenameDialog) { return this.registeredGamepadScopes.get('rename') ?? null }
+    if (this.showCreateFolderDialog) { return this.registeredGamepadScopes.get('create-folder') ?? null }
+    if (this.destinationFolderDialog) { return this.registeredGamepadScopes.get('destination-folder') ?? null }
+    if (this.showAlbumPicker) { return this.registeredGamepadScopes.get('album-upload-picker') ?? null }
+    if (this.showAlbumUpload) { return this.registeredGamepadScopes.get('album-upload') ?? null }
+    if (this.showAlbumDetails) { return this.registeredGamepadScopes.get('album-details') ?? null }
+    if (this.showDestinationPicker) { return this.destinationPad }
+    if (this.showAudioQueue) { return this.audioQueuePad }
+    if (this.videoRatePanel) { return this.videoRatePad }
+    if (this.importExpanded) { return this.registeredGamepadScopes.get('floating-import') ?? null }
+    return null
+  }
+
+  private destinationPadTargets(): ModalFocusTarget[] {
+    if (this.destinationOperationRunning || this.destinationPickerClosing) { return [] }
+    const items: ModalFocusTarget[] = [{ id: 'close', activate: () => this.closeDestinationPicker() }]
+    if (this.destinationLoading) { return items }
+    if (!this.destinationContainsSource(this.destinationPath)) {
+      items.push({ id: 'auxiliary', activate: () => this.openDestinationFolderDialog() })
+    }
+    if (this.destinationPath !== this.destinationRootPath) {
+      items.push({ id: 'parent', activate: () => this.goDestinationBack(),
+        reveal: (): void => this.destinationPadScroller.scrollToIndex(0, false, ScrollAlign.AUTO) })
+    }
+    for (let index = 0; index < this.destinationDataSource.totalCount(); index++) {
+      const path = this.destinationDataSource.getData(index).path
+      items.push({ id: path, activate: () => this.loadDestinationEntries(path),
+        reveal: (): void => this.destinationPadScroller.scrollToIndex(index + 1, false, ScrollAlign.AUTO) })
+    }
+    if (this.destinationItemCount() > 0 && this.destinationPath.length > 0 &&
+      !this.destinationContainsSource(this.destinationPath)) {
+      items.push({ id: 'confirm', activate: () => this.confirmDestinationOperation() })
+    }
+    return items
+  }
+
+  private audioQueuePadTargets(): ModalFocusTarget[] {
+    const items: ModalFocusTarget[] = [{ id: 'close', activate: (): void => { this.showAudioQueue = false } }]
+    if (this.isBusy || this.audioClosing) { return items }
+    for (let index = 0; index < this.audioQueueSource.totalCount(); index++) {
+      const entry = this.audioQueueSource.getData(index)
+      items.push({ id: entry.path, activate: () => this.activateAudioQueueEntry(entry),
+        reveal: (): void => this.audioQueueScroller.scrollToIndex(index, false, ScrollAlign.AUTO) })
+    }
+    return items
+  }
+
+  private openGamepadMenu(): string {
+    if (this.showImageViewer && this.showImageMoreMenu) { return 'viewermenu' }
+    if (this.contextMenuVisible && this.contextMenuEntry !== null) { return 'ctxmenu' }
+    if (this.showSelectionMoreMenu) { return 'selmore' }
+    if (this.showFileSortMenu) { return 'sortmenu' }
+    return ''
+  }
+
+  private focusGamepadMenu(area: string): void {
+    if (area === '' || area === this.gamepadArea) { return }
+    this.cancelGamepadConfirm()
+    this.gamepadArea = area
+    switch (area) {
+      case 'viewermenu': this.gamepadItem = '旋转'; break
+      case 'ctxmenu': {
+        const entry = this.contextMenuEntry
+        this.gamepadItem = this.contextMenuContext === 'recycle' ? '还原' :
+          (entry !== null && this.actionSupportsShare(entry) ? '分享' : '复制')
+        break
+      }
+      case 'selmore': this.gamepadItem = '移动'; break
+      case 'sortmenu': this.gamepadItem = this.fileSortKey; break
+    }
+  }
+
+  private gamepadMarkInput(): boolean {
+    const menu = this.openGamepadMenu()
+    if (menu !== '') {
+      this.focusGamepadMenu(menu)
+      return false
+    }
+    if (this.gamepadArea !== '') { return false }
+    this.requestGamepadInputFocus()
+    if (this.showImageViewer) {
+      this.gamepadArea = 'canvas'
+    } else {
+      this.gamepadArea = 'files'
+      if (this.gamepadCurrentFile() !== null && this.fileViewMode === 'list') { this.revealGamepadListRow() }
+    }
+    this.postRenderFrame((): void => {
+      if (this.gamepadArea !== '') { this.requestGamepadInputFocus() }
+    })
+    return true
+  }
+
+  private gamepadFocused(area: string, item: string): boolean {
+    return !this.gamepadModalActive && this.ordinaryGamepadScope() === '' &&
+      this.gamepadArea === area && this.gamepadItem === item
+  }
+
+  private gamepadNativeFocusBox(): FocusBoxStyle {
+    // The controller paints one app-owned target. Keep native keyboard focus
+    // styling available again as soon as the controller leaves this surface.
+    if (this.gamepadArea === '') { return {} }
+    return { strokeColor: ColorMetrics.resourceColor(Color.Transparent), strokeWidth: LengthMetrics.vp(0) }
+  }
+
+  private gamepadFocusColor(area: string, item: string): ResourceColor {
+    return this.gamepadFocused(area, item) ? (this.isDarkTheme ? '#A6C9FF' : '#6095E4') : Color.Transparent
+  }
+
+  private gamepadGlassInk(area: string, item: string, regular: ResourceColor): ResourceColor {
+    return (this.gamepadFocused(area, item) || this.ordinaryPadItem === area + ':' + item)
+      ? (this.isDarkTheme ? '#B6D7FF' : '#165FBA') : regular
+  }
+
+  private gamepadGlassLight(area: string, item: string): RadialGradientOptions | undefined {
+    if (!this.gamepadFocused(area, item) && this.ordinaryPadItem !== area + ':' + item) { return undefined }
+    return {
+      center: ['50%', '44%'], radius: Glass.barHeight * 0.58,
+      colors: this.isDarkTheme
+        ? [['#55E0EFFF', 0], ['#22AED2FF', 0.57], ['#00AED2FF', 1]]
+        : [['#4CAED6FF', 0], ['#2275B0FD', 0.57], ['#0075B0FD', 1]]
+    }
+  }
+
+  private cancelGamepadConfirm(): void {
+    if (this.gamepadConfirmTimer >= 0) { clearTimeout(this.gamepadConfirmTimer) }
+    this.gamepadConfirmTimer = -1
+    this.gamepadConfirmTarget = ''
+  }
+
+  private stopGamepadAxes(): void {
+    if (this.gamepadAxisTimer >= 0) { clearInterval(this.gamepadAxisTimer) }
+    this.gamepadAxisTimer = -1
+    // A stick already neutral at the handoff can move on the next sample.
+    // A stick still held from the toolbar has to return to center first.
+    this.gamepadLeftLatched = GamepadNavigation.direction(this.gamepadLeftX, this.gamepadLeftY,
+      GamepadNavigation.release) !== ''
+    this.gamepadLeftX = 0
+    this.gamepadLeftY = 0
+    this.gamepadRightY = 0
+    this.gamepadRepeatAt = 0
+  }
+
+  private releaseGamepad(): void {
+    this.ordinaryPadActive = false
+    this.stopOrdinaryGamepadAxes()
+    GamepadControls.setScope('')
+    this.cancelGamepadConfirm()
+    this.stopGamepadAxes()
+    this.gamepadHeldKeys.clear()
+    this.gamepadPresses.reset()
+    this.gamepadHatX = 0
+    this.gamepadHatY = 0
+    this.gamepadHatDirection = ''
+    this.gamepadLastDpad = ''
+    this.gamepadLeftLatched = false
+    this.gamepadSourceId = -1
+    this.gamepadAxisLogged = false
+    this.gamepadTurnUntil = 0
+    this.gamepadArea = ''
+    this.gamepadItem = ''
+  }
+
+  private gamepadDirectoryKey(): string {
+    return this.repository.cacheScopeHash() + ':' + this.currentRootType.toString() + ':' + this.currentPath
+  }
+
+  private gamepadFollowTouchViewport(): void {
+    if (!this.gamepadTouchScrollPending) { return }
+    this.gamepadTouchScrollPending = false
+    if (this.gamepadArea !== '' || !this.gamepadFilesAvailable() || this.showImageViewer ||
+      this.gamepadTouchScrollDirectory !== this.gamepadDirectoryKey()) { return }
+    const anchor = this.captureFileViewAnchor()
+    if (anchor === null) { return }
+    this.gamepadFileDirectory = this.gamepadDirectoryKey()
+    this.gamepadFilePath = anchor.path
+    this.gamepadCurrentFile()
+  }
+
+  private gamepadCurrentFile(): FileEntry | null {
+    const directory = this.gamepadDirectoryKey()
+    const count = this.fileViewMode === 'waterfall' ? this.waterfallEntries.length : this.fileEntryDataSource.totalCount()
+    if (count === 0) {
+      return null
+    }
+    const sameDirectory = this.gamepadFileDirectory === directory
+    const saved = this.gamepadFocusHistory.get(directory)
+    const previousPath = sameDirectory && this.gamepadFilePath !== '' ? this.gamepadFilePath : (saved?.id ?? '')
+    const previous = this.fileViewMode === 'waterfall'
+      ? this.waterfallEntries.findIndex((item: FileEntry): boolean => item.path === previousPath)
+      : this.fileEntryDataSource.indexOfPath(previousPath)
+    const visibleIndex = Math.max(0, this.fileViewMode === 'waterfall' ? this.waterfallVisibleStartIndex :
+      this.fileVisibleStartIndex - (this.fileViewMode === 'list' ? 1 : 0))
+    const index = previous >= 0 ? previous :
+      Math.min(count - 1, sameDirectory && this.gamepadFilePath !== '' ? this.gamepadFileIndex :
+        (saved?.index ?? visibleIndex))
+    const entry = this.fileViewMode === 'waterfall' ? this.waterfallEntries[index] : this.fileEntryDataSource.getData(index)
+    this.gamepadFileDirectory = directory
+    this.gamepadFileIndex = index
+    this.gamepadFilePath = entry.path
+    this.gamepadFocusHistory.remember(directory, entry.path, index)
+    if (!sameDirectory && (saved !== undefined || (this.fileViewMode === 'list' && this.gamepadArea === 'files'))) {
+      this.scrollToGamepadFile()
+    }
+    return entry
+  }
+
+  private gamepadMoveFile(direction: PadDirection, repeating: boolean): void {
+    const entry = this.gamepadCurrentFile()
+    if (entry === null) {
+      if (!repeating && (direction === 'up' || direction === 'down')) { this.gamepadEnterBar(direction === 'up') }
+      return
+    }
+    if (this.fileViewMode === 'list' && (direction === 'left' || direction === 'right')) { return }
+    const target = this.fileViewMode === 'waterfall' ? this.gamepadWaterfallNeighbor(direction) :
+      GamepadNavigation.gridNeighbor(this.gamepadFileIndex, this.fileEntryDataSource.totalCount(),
+        this.fileViewMode === 'list' ? 1 : this.fileGridColumnCount(), direction)
+    if (target < 0) {
+      if (!repeating && (direction === 'up' || direction === 'down')) { this.gamepadEnterBar(direction === 'up') }
+      return
+    }
+    this.gamepadFileIndex = target
+    this.gamepadFilePath = this.fileViewMode === 'waterfall' ? this.waterfallEntries[target].path :
+      this.fileEntryDataSource.getData(target).path
+    this.gamepadFocusHistory.remember(this.gamepadFileDirectory, this.gamepadFilePath, target)
+    this.scrollToGamepadFile()
+  }
+
+  private gamepadWaterfallNeighbor(direction: PadDirection): number {
+    const current = this.rowHitAreas.get('waterfall:' + this.gamepadFilePath)
+    let nearest = -1
+    let score = Number.POSITIVE_INFINITY
+    if (current !== undefined) {
+      this.rowHitAreas.forEach((item: RowHitArea): void => {
+        if (item.surface !== 'waterfall' || item.index === current.index || item.width <= 0 || item.height <= 0) { return }
+        const dx = item.x + item.width / 2 - current.x - current.width / 2
+        const dy = item.y + item.height / 2 - current.y - current.height / 2
+        const horizontal = direction === 'left' || direction === 'right'
+        const forward = direction === 'left' ? -dx : direction === 'right' ? dx : direction === 'up' ? -dy : dy
+        const distance = forward + Math.abs(horizontal ? dy : dx) * 2
+        if (forward > 1 && distance < score) { nearest = item.index; score = distance }
+      })
+    }
+    // Off-screen cells are materialized through the existing batch coordinator.
+    return nearest >= 0 ? nearest : GamepadNavigation.gridNeighbor(this.gamepadFileIndex,
+      this.waterfallEntries.length, this.waterfallColumnCount(), direction)
+  }
+
+  private scrollToGamepadFile(): void {
+    if (this.fileViewMode === 'waterfall') {
+      this.jumpWaterfallTo(this.gamepadFileIndex, ScrollAlign.AUTO).catch((): void => {})
+      return
+    }
+    if (this.fileViewMode === 'list') {
+      this.revealGamepadListRow()
+      return
+    }
+    this.fileListScroller.scrollToIndex(this.gamepadFileIndex, false, ScrollAlign.AUTO)
+  }
+
+  private async revealGamepadListRow(): Promise<void> {
+    const path = this.gamepadFilePath
+    if (path === '' || this.gamepadArea !== 'files' || this.fileViewMode !== 'list') { return }
+    const token = ++this.gamepadListRevealToken
+    const directory = this.gamepadDirectoryKey()
+    const scroller = this.fileListScroller
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await this.nextRenderFrame()
+      if (token !== this.gamepadListRevealToken || this.gamepadFilePath !== path || this.gamepadArea !== 'files' ||
+        this.fileViewMode !== 'list' || this.gamepadDirectoryKey() !== directory || !this.gamepadFilesAvailable() ||
+        this.fileContentTouchActive || this.gamepadModalActive || this.showImageViewer) { return }
+      const index = this.fileEntryDataSource.indexOfPath(path)
+      if (index < 0) { return }
+      const viewport = this.fileScrollViewport
+      const top = Math.max(0, this.mainContentOriginY + this.topSafeInset() + HeaderStyle.overlayHeight - viewport.y)
+      const bottom = viewport.height - this.floatingBarContentInset(Glass.barEffectTop)
+      if (bottom <= top) { continue }
+      try {
+        const rect = scroller.getItemRect(index + 1) // The leading spacer is also a ListItem.
+        if (rect.height <= 0) {
+          scroller.scrollToIndex(index + 1, false, ScrollAlign.CENTER)
+          continue
+        }
+        const delta = rect.y < top ? rect.y - top : Math.max(0, rect.y + rect.height - bottom)
+        if (Math.abs(delta) >= 0.5) { scroller.scrollBy(0, delta) }
+        return
+      } catch (_) {
+        // The list can be between layouts when focus returns from a toolbar.
+      }
+    }
+  }
+
+  private gamepadBarItems(area: string): string[] {
+    switch (area) {
+      case 'filetop': {
+        const items: string[] = this.mainHeaderHasLeading() ? ['返回'] : []
+        if (this.entries.length > 0) { items.push('多选') }
+        if (!this.selectionMode) { items.push('搜索') }
+        if (this.shouldShowFloatingImportControl() && this.importPadOpen !== null) { items.push('导入') }
+        if (this.nasRetryVisible()) { items.push('重连') }
+        if (this.fileViewMode === 'waterfall' && this.waterfallBatches?.error) { items.push('重试加载') }
+        return items
+      }
+      case 'viewertop': {
+        const items = this.isSearchViewer() ? ['返回', '定位到所在目录'] : ['返回']
+        if (this.nasRetryVisible()) { items.push('重连') }
+        return items
+      }
+      case 'viewer': return ['保存', '分享', '进度', '删除', '更多']
+      case 'tools': return ['新建', '排序', '视图']
+      case 'home': return ['home', 'shared', 'downloads', 'settings']
+      case 'selection': return ['分享', '复制', '删除', '更多'].filter((title: string): boolean =>
+        this.selectionActionEnabled(title))
+      default: return []
+    }
+  }
+
+  private gamepadEnterBar(top: boolean): void {
+    const area = this.showImageViewer ? (top ? 'viewertop' : 'viewer') : (top ? 'filetop' : this.bottomBarMode())
+    const items = this.gamepadBarItems(area)
+    if (items.length === 0) { return }
+    if (this.gamepadArea === area) {
+      this.gamepadLeaveBar()
+      return
+    }
+    this.cancelGamepadConfirm()
+    this.stopGamepadAxes()
+    if (this.showImageViewer && !this.imageChromeVisible) { this.setImageChromeVisible(true) }
+    this.gamepadArea = area
+    this.gamepadItem = area === 'viewer' ? '更多' : (area === 'tools' ? '排序' : items[0])
+    if (this.showImageViewer) { this.postRenderFrame((): void => this.requestGamepadInputFocus()) }
+  }
+
+  private gamepadLeaveBar(): void {
+    this.cancelGamepadConfirm()
+    this.stopGamepadAxes()
+    this.gamepadItem = ''
+    if (this.showImageViewer) {
+      this.gamepadArea = 'canvas'
+      this.setImageChromeVisible(false)
+      this.postRenderFrame((): void => this.requestGamepadInputFocus())
+    } else {
+      this.gamepadArea = 'files'
+      if (this.gamepadCurrentFile() !== null) { this.scrollToGamepadFile() }
+    }
+  }
+
+  private gamepadMenuArea(): boolean {
+    return this.gamepadArea === 'ctxmenu' || this.gamepadArea === 'viewermenu' ||
+      this.gamepadArea === 'sortmenu' || this.gamepadArea === 'selmore'
+  }
+
+  private gamepadMoveMenu(direction: PadDirection): void {
+    const prefix = this.gamepadArea + ':'
+    // Floating menus are vertical lists. Their order is stable before layout and
+    // throughout the opening scale animation; screen coordinates are touch-only.
+    if (this.gamepadArea !== 'ctxmenu') {
+      if (direction !== 'up' && direction !== 'down') { return }
+      const items = Array.from(this.slideItems.keys()).filter((key: string): boolean => key.startsWith(prefix))
+      const current = items.indexOf(prefix + this.gamepadItem)
+      const next = current < 0 ? 0 : current + (direction === 'down' ? 1 : -1)
+      if (next >= 0 && next < items.length) { this.gamepadItem = items[next].slice(prefix.length) }
+      return
+    }
+    const current = this.slideItems.get(prefix + this.gamepadItem)
+    if (current === undefined) { return }
+    const x = current.x + current.width / 2
+    const y = current.y + current.height / 2
+    let best = ''
+    let score = Number.POSITIVE_INFINITY
+    this.slideItems.forEach((item: SlideActionItem, key: string): void => {
+      if (!key.startsWith(prefix) || item === current || item.width <= 0 || item.height <= 0) { return }
+      const dx = item.x + item.width / 2 - x
+      const dy = item.y + item.height / 2 - y
+      const horizontal = direction === 'left' || direction === 'right'
+      const distance = direction === 'left' ? -dx : direction === 'right' ? dx : direction === 'up' ? -dy : dy
+      if (distance <= 2 || (horizontal && Math.abs(dy) > 12)) { return }
+      const candidate = distance + Math.abs(horizontal ? dy : dx) * 0.6
+      if (candidate < score) { score = candidate; best = key }
+    })
+    if (best === '') { return }
+    this.gamepadItem = best.slice(prefix.length)
+    const target = this.slideItems.get(best)
+    if (this.gamepadArea === 'ctxmenu' && target !== undefined) {
+      const rect = this.contextMenuScrollRect
+      if (target.y < rect.y) {
+        this.gamepadMenuScroller.scrollBy(0, target.y - rect.y)
+      } else if (target.y + target.height > rect.y + rect.height) {
+        this.gamepadMenuScroller.scrollBy(0, target.y + target.height - rect.y - rect.height)
+      }
+    }
+  }
+
+  private gamepadDirection(direction: PadDirection, digital: boolean, repeating: boolean = false): void {
+    this.cancelGamepadConfirm()
+    if (this.gamepadMenuArea()) {
+      this.gamepadMoveMenu(direction)
+      return
+    }
+    if (this.showImageViewer && this.gamepadArea === 'canvas') {
+      if (this.viewerGestureBlocked() || this.viewerFallbackEntryActive) { return }
+      if (direction === 'left' || direction === 'right') {
+        if (digital || this.imageScale <= 1.001) { this.gamepadFlipImage(direction === 'right' ? 1 : -1) }
+      } else if (digital) {
+        this.gamepadEnterBar(direction === 'up')
+      }
+      return
+    }
+    if (this.gamepadArea === 'files') {
+      if (this.gamepadFilesAvailable() && !this.isBusy) { this.gamepadMoveFile(direction, repeating) }
+      return
+    }
+    const items = this.gamepadBarItems(this.gamepadArea)
+    if (direction === 'up' || direction === 'down') {
+      const top = this.gamepadArea === 'filetop' || this.gamepadArea === 'viewertop'
+      if ((top && direction === 'down') || (!top && direction === 'up')) { this.gamepadLeaveBar() }
+      return
+    }
+    const index = items.indexOf(this.gamepadItem) + (direction === 'right' ? 1 : -1)
+    if (index >= 0 && index < items.length) { this.gamepadItem = items[index] }
+  }
+
+  private gamepadFlipImage(delta: number): void {
+    const target = this.viewerImageIndex + delta
+    if (this.getMonotonicNow() < this.gamepadTurnUntil || this.viewerTransitionActive ||
+      target < 0 || target >= this.viewerImages.length) {
+      return
+    }
+    this.gamepadTurnUntil = this.getMonotonicNow() + 230
+    this.viewerSwiperController.changeIndex(target, true)
+  }
+
+  private gamepadBack(): void {
+    if (this.gamepadMenuArea()) {
+      this.onBackPress()
+    } else if (this.gamepadBarItems(this.gamepadArea).length > 0 &&
+      (!this.showImageViewer || !this.viewerGestureBlocked())) {
+      this.gamepadLeaveBar()
+    } else if (this.showImageViewer && this.imageChromeVisible && !this.viewerGestureBlocked()) {
+      this.gamepadLeaveBar()
+    } else {
+      this.onBackPress()
+    }
+  }
+
+  private gamepadConfirmId(): string {
+    return this.gamepadArea + ':' + (this.gamepadArea === 'files' ? this.gamepadFilePath :
+      this.gamepadArea === 'canvas' ? (this.committedViewerEntry()?.path ?? '') : this.gamepadItem)
+  }
+
+  private gamepadOpenMore(): void {
+    if (this.gamepadArea === 'canvas' && !this.viewerGestureBlocked() && !this.viewerFallbackEntryActive) {
+      this.gamepadEnterBar(false)
+      this.openImageMoreMenu(true)
+    } else if (this.gamepadArea === 'files' && !this.selectionMode && this.gamepadFilesAvailable() && !this.isBusy) {
+      const entry = this.gamepadCurrentFile()
+      if (entry !== null) { this.showActionMenu(entry, undefined, true) }
+    }
+  }
+
+  private nasRetryVisible(): boolean {
+    return this.nasState !== 'connecting' && (this.nasState === 'unavailable' || this.offlineCacheMode)
+  }
+
+  private gamepadConfirm(): void {
+    if (this.gamepadArea === 'canvas') {
+      if (!this.viewerGestureBlocked() && !this.viewerFallbackEntryActive) { this.gamepadEnterBar(false) }
+      return
+    }
+    if (this.gamepadArea === 'files') {
+      const entry = this.gamepadCurrentFile()
+      if (entry !== null && this.gamepadFilesAvailable() && !this.isBusy) { this.handleFileEntryClick(entry) }
+      return
+    }
+    if (this.gamepadArea === 'viewer' && this.gamepadItem === '更多') {
+      this.openImageMoreMenu(true)
+      return
+    }
+    if (this.gamepadArea === 'tools' && this.gamepadItem === '排序') {
+      this.toggleFileSortMenu()
+      if (this.showFileSortMenu) { this.focusGamepadMenu('sortmenu') }
+      return
+    }
+    if (this.gamepadArea === 'selection' && this.gamepadItem === '更多') {
+      this.toggleSelectionMoreMenu()
+      if (this.showSelectionMoreMenu) { this.focusGamepadMenu('selmore') }
+      return
+    }
+    if (!this.gamepadBarItems(this.gamepadArea).includes(this.gamepadItem)) { return }
+    if (this.gamepadArea === 'filetop' && this.gamepadItem === '导入') { this.importPadOpen?.(); return }
+    if (this.gamepadItem === '重连' && (this.gamepadArea === 'filetop' || this.gamepadArea === 'viewertop')) {
+      this.retryNasConnection(); return
+    }
+    if (this.gamepadArea === 'filetop' && this.gamepadItem === '重试加载') { this.waterfallBatches?.retry(); return }
+    this.slideItems.get(this.gamepadArea + ':' + this.gamepadItem)?.action?.()
+  }
+
+  private handleGamepadBackInput(code: number, type: KeyType, onBack: () => void): boolean {
+    if (code !== KeyCode.KEYCODE_BUTTON_B) { return false }
+    if (type === KeyType.Down) { this.gamepadHeldKeys.add(code) }
+    if (type === KeyType.Up && this.gamepadHeldKeys.delete(code)) { onBack() }
+    return true
+  }
+
+  private gamepadBackOverlayVisible(): boolean {
+    return !this.abilityInBackground && this.pageDialogClosers.size === 0 &&
+      !this.showRenameDialog && !this.showCreateFolderDialog && !this.destinationFolderDialog &&
+      (this.showDestinationPicker || this.importExpanded || this.showAlbumPicker || this.showAlbumUpload ||
+        this.showAlbumDetails || this.audioPlaybackUiVisible() || this.videoPlaybackUiVisible())
+  }
+
+  private gamepadBackFromSearch(): void {
+    this.cancelGamepadConfirm()
+    this.stopGamepadAxes()
+    if (this.searchEditing) {
+      this.dismissKeyboard()
+      return
+    }
+    this.closeSearch()
+    this.gamepadItem = ''
+    this.gamepadArea = this.gamepadFilesAvailable() ? 'files' : ''
+    if (this.gamepadArea === 'files' && this.gamepadCurrentFile() !== null && this.fileViewMode === 'list') {
+      this.revealGamepadListRow()
+    }
+    this.postRenderFrame((): void => this.requestGamepadInputFocus())
+  }
+
+  private gamepadDpadKey(code: number): PadDirection {
+    switch (code) {
+      case KeyCode.KEYCODE_DPAD_LEFT: return 'left'
+      case KeyCode.KEYCODE_DPAD_RIGHT: return 'right'
+      case KeyCode.KEYCODE_DPAD_UP: return 'up'
+      case KeyCode.KEYCODE_DPAD_DOWN: return 'down'
+      default: return ''
+    }
+  }
+
+  private stopNativeMenuPad(): void {
+    this.resetGamepadMenuRoute()
+    if (this.nativeMenuRegistration > 0) { stopMenuPad() }
+    this.nativeMenuRegistration = -1
+  }
+
+  private ensureNativeMenuPad(): void {
+    if (this.nativeMenuRegistration >= 0 || this.abilityInBackground) { return }
+    this.nativeMenuRegistration = startMenuPad()
+    if (this.nativeMenuRegistration > 0 && this.nativeMenuArea !== '') { captureMenuPad(true) }
+    if (DEBUG) { console.info('[LinkFilesGamepad] monitors=' + this.nativeMenuRegistration.toString()) }
+  }
+
+  private resetGamepadMenuRoute(): void {
+    if (this.nativeMenuTimer >= 0) {
+      clearInterval(this.nativeMenuTimer)
+    }
+    if (this.nativeMenuRegistration > 0) { captureMenuPad(false) }
+    this.nativeMenuTimer = -1
+    this.nativeMenuArea = ''
+    this.nativeMenuInputSeen = false
+    this.nativeMenuStick.reset()
+    this.gamepadModalActive = false
+    this.nativeModal?.suspend()
+    this.nativeModal = null
+  }
+
+  private syncNativeMenuPad(): void {
+    this.syncOrdinaryGamepadScope()
+    const modal = this.abilityInBackground ? null : this.currentGamepadModal()
+    const menu = this.abilityInBackground ? '' : (modal?.id ?? this.openGamepadMenu())
+    if (menu === this.nativeMenuArea && modal === this.nativeModal) { return }
+    const leavingSurface = this.nativeMenuArea !== ''
+    this.resetGamepadMenuRoute()
+    if (menu === '') {
+      if (leavingSurface && this.gamepadPresent()) {
+        this.postRenderFrame((): void => this.requestGamepadInputFocus())
+      }
+      return
+    }
+    this.nativeModal = modal
+    this.nativeMenuArea = menu
+    this.gamepadModalActive = modal !== null
+    this.cancelGamepadConfirm()
+    this.gamepadHeldKeys.clear()
+    this.stopGamepadAxes()
+    this.gamepadHatDirection = ''
+    this.gamepadLastDpad = ''
+    if (this.gamepadPresent()) {
+      if (modal !== null) { modal.focusInitial() }
+      else { this.focusGamepadMenu(menu) }
+    }
+    if (this.nativeMenuRegistration > 0) { captureMenuPad(true) }
+    else { this.ensureNativeMenuPad() }
+    if (DEBUG) { console.info('[LinkFilesGamepad] native menu=' + menu) }
+    this.nativeMenuTimer = setInterval((): void => {
+      if (this.nativeMenuArea !== menu || this.nativeModal !== modal) { return }
+      for (const event of readMenuPad()) {
+        const current = this.currentGamepadModal()
+        if (current !== modal || (current === null && (this.openGamepadMenu() !== menu || !this.gamepadAvailable()))) { return }
+        this.handleNativeMenuPad(event)
+      }
+      if (this.nativeMenuArea !== menu || this.nativeModal !== modal) { return }
+      if (modal !== null) { modal.tick(); return }
+      const direction = this.nativeMenuStick.tick(this.getMonotonicNow())
+      if (direction !== '' && this.openGamepadMenu() === menu) { this.gamepadDirection(direction, false, true) }
+    }, 16)
+  }
+
+  private handleNativeMenuPad(event: MenuPadEvent): void {
+    if (!this.nativeMenuInputSeen && DEBUG) {
+      console.info('[LinkFilesGamepad] native input received in ' + this.nativeMenuArea)
+    }
+    this.nativeMenuInputSeen = true
+    const modal = this.nativeModal
+    if (modal !== null) {
+      if (event.kind === 0) {
+        this.routeGamepadKey(event.code, event.down ? KeyType.Down : KeyType.Up,
+          this.gamepadSourceId, KeySource.JOYSTICK, 'native')
+      }
+      else { modal.axis(event.x, event.y, event.kind === 2) }
+      return
+    }
+    if (event.kind === 0) {
+      this.routeGamepadKey(event.code, event.down ? KeyType.Down : KeyType.Up,
+        this.gamepadSourceId, KeySource.JOYSTICK, 'native')
+      return
+    }
+    this.handleGamepadMenuAxis(event.x, event.y, event.kind === 2)
+  }
+
+  private handleGamepadMenuAxis(x: number, y: number, isHat: boolean): void {
+    this.focusGamepadMenu(this.openGamepadMenu())
+    if (isHat) {
+      const direction = GamepadNavigation.direction(x, y, GamepadNavigation.engage)
+      const previous = this.gamepadHatDirection
+      this.gamepadHatDirection = direction
+      if (direction !== '' && direction !== previous &&
+        (direction !== this.gamepadLastDpad || this.getMonotonicNow() - this.gamepadLastDpadAt > 120)) {
+        this.gamepadDirection(direction, true)
+      }
+      return
+    }
+    const step = this.nativeMenuStick.sample(x, y, this.getMonotonicNow())
+    if (step !== '') { this.gamepadDirection(step, false) }
+  }
+
+  private handleLocalMenuKey(event: KeyEvent): boolean {
+    return (this.currentGamepadModal() !== null || this.openGamepadMenu() !== '') && this.handleGamepadKey(event)
+  }
+
+  private handleGamepadKey(event: KeyEvent): boolean {
+    return this.routeGamepadKey(event.keyCode, event.type, event.deviceId, event.keySource, 'arkui')
+  }
+
+  private routeGamepadKey(code: number, type: KeyType, deviceId: number, source: KeySource,
+    channel: string): boolean {
+    if (this.abilityInBackground || this.systemGamepadInput) { return false }
+    const a = code === KeyCode.KEYCODE_BUTTON_A
+    const b = code === KeyCode.KEYCODE_BUTTON_B
+    if (this.currentGamepadModal()?.systemContent === true && !b) { return false }
+    if (a || b || (source === KeySource.JOYSTICK && GamepadModalFocus.directionForKey(code) !== '')) {
+      this.ordinaryPadActive = true
+    }
+    if ((a || b) && (type === KeyType.Down || type === KeyType.Up) &&
+      !this.gamepadPresses.accept(code, type === KeyType.Down, this.getMonotonicNow())) { return true }
+    const modal = this.currentGamepadModal()
+    if (modal !== null) {
+      const dpad = GamepadModalFocus.directionForKey(code)
+      const supported = a || b || (dpad !== '' && (source === KeySource.JOYSTICK ||
+        deviceId === this.gamepadSourceId || this.gamepadDeviceIds.has(deviceId)))
+      if (!supported) { return false }
+      if (type === KeyType.Down || type === KeyType.Up) {
+        if (DEBUG && (a || b)) {
+          console.info('[LinkFilesGamepad] ' + channel + ' modal=' + modal.id + ' key=' + code + ' type=' + type)
+        }
+        return modal.key(code, type === KeyType.Down)
+      }
+      return true
+    }
+    const menu = this.openGamepadMenu()
+    if (menu !== '' && (a || b)) {
+      if (type === KeyType.Down && this.gamepadAvailable()) {
+        this.focusGamepadMenu(menu)
+        if (b) { this.gamepadBack() }
+        else {
+          if (menu === 'ctxmenu') { this.contextMenuScrollMoved = false }
+          const action = this.slideItems.get(menu + ':' + this.gamepadItem)?.action
+          if (DEBUG) {
+            console.info('[LinkFilesGamepad] ' + channel + ' menu=' + menu + ' confirm=' + this.gamepadItem +
+              ' ready=' + (action !== null && action !== undefined))
+          }
+          action?.()
+        }
+      }
+      return true
+    }
+    const scope = this.ordinaryGamepadScope()
+    if (scope !== '') {
+      const direction = GamepadModalFocus.directionForKey(code)
+      if (!a && !b && (direction === '' || (source !== KeySource.JOYSTICK &&
+        deviceId !== this.gamepadSourceId && !this.gamepadDeviceIds.has(deviceId)))) { return false }
+      if ((this.ordinaryEditing || this.searchEditing) && !b) { return false }
+      this.gamepadSourceId = deviceId
+      GamepadControls.setScope(scope)
+      if (scope === 'video' && type === KeyType.Down) { this.revealVideoChrome() }
+      if (a) { GamepadControls.confirm(scope, type === KeyType.Down) }
+      else if (b && type === KeyType.Down) { this.ordinaryGamepadBack() }
+      else if (direction !== '' && type === KeyType.Down) {
+        if (this.ordinaryDigital === direction && this.getMonotonicNow() - this.ordinaryDigitalAt < 40) { return true }
+        if (this.ordinaryHat !== direction) { GamepadControls.move(scope, direction) }
+        this.ordinaryDigital = direction
+        this.ordinaryDigitalAt = this.getMonotonicNow()
+      }
+      return true
+    }
+    return this.handleGamepadButton(code, type, deviceId, source)
+  }
+
+  private handleGamepadButton(code: number, type: KeyType, deviceId: number, source: KeySource): boolean {
+    // Search owns B even while its input method is active. The rest of the
+    // controller map stays inactive until the search surface closes.
+    if (code === KeyCode.KEYCODE_BUTTON_B && this.showSearch && !this.parentOverlayOwnsInteraction()) {
+      return this.handleGamepadBackInput(code, type, () => this.gamepadBackFromSearch())
+    }
+    if (code === KeyCode.KEYCODE_BUTTON_B && this.gamepadBackOverlayVisible()) {
+      return this.handleGamepadBackInput(code, type, () => { this.onBackPress() })
+    }
+    const dpad = this.gamepadDpadKey(code)
+    const isButton = code === KeyCode.KEYCODE_BUTTON_A || code === KeyCode.KEYCODE_BUTTON_B ||
+      code === KeyCode.KEYCODE_BUTTON_X || code === KeyCode.KEYCODE_BUTTON_Y || code === KeyCode.KEYCODE_BUTTON_L1 ||
+      code === KeyCode.KEYCODE_BUTTON_R1 || code === KeyCode.KEYCODE_BUTTON_THUMBR
+    if (!isButton && (dpad === '' || (source !== KeySource.JOYSTICK &&
+      deviceId !== this.gamepadSourceId && !this.gamepadDeviceIds.has(deviceId)))) { return false }
+    if (type === KeyType.Up && this.gamepadHeldKeys.delete(code)) {
+      if (code === KeyCode.KEYCODE_BUTTON_A) {
+        const confirm = this.gamepadConfirmTarget !== '' && this.gamepadConfirmTarget === this.gamepadConfirmId()
+        this.cancelGamepadConfirm()
+        if (confirm && this.gamepadAvailable()) { this.gamepadConfirm() }
+      }
+      return true
+    }
+    if (!this.gamepadAvailable()) { return false }
+    if (type !== KeyType.Down || this.gamepadHeldKeys.has(code)) { return true }
+    this.gamepadSourceId = deviceId
+    if (DEBUG) { console.info('[LinkFilesGamepad] key=' + code.toString() + ' area=' + this.gamepadArea) }
+    this.gamepadHeldKeys.add(code)
+    const initial = this.gamepadMarkInput()
+    if (dpad !== '') {
+      if (!(initial && this.gamepadArea === 'files') && this.gamepadHatDirection !== dpad) {
+        this.gamepadDirection(dpad, true)
+      }
+      this.gamepadLastDpad = dpad
+      this.gamepadLastDpadAt = this.getMonotonicNow()
+    } else if (code === KeyCode.KEYCODE_BUTTON_A) {
+      this.gamepadConfirmTarget = this.gamepadConfirmId()
+      if (this.gamepadArea === 'canvas' || (this.gamepadArea === 'files' && !this.selectionMode)) {
+        this.gamepadConfirmTimer = setTimeout((): void => {
+          this.gamepadConfirmTimer = -1
+          const valid = this.gamepadConfirmTarget === this.gamepadConfirmId()
+          this.gamepadConfirmTarget = ''
+          if (valid && this.gamepadAvailable()) { this.gamepadOpenMore() }
+        }, 380)
+      }
+    } else if (code === KeyCode.KEYCODE_BUTTON_B) {
+      this.gamepadBack()
+    } else if (code === KeyCode.KEYCODE_BUTTON_X) {
+      this.gamepadOpenMore()
+    } else if (code === KeyCode.KEYCODE_BUTTON_Y) {
+      if (this.gamepadArea === 'files' && !this.selectionMode && !this.isBusy) {
+        const entry = this.gamepadCurrentFile()
+        if (entry !== null) { this.enterSelection(entry) }
+      }
+    } else if (!this.gamepadMenuArea() && (!this.showImageViewer || !this.viewerGestureBlocked())) {
+      if (code === KeyCode.KEYCODE_BUTTON_L1 || code === KeyCode.KEYCODE_BUTTON_R1) {
+        this.gamepadEnterBar(code === KeyCode.KEYCODE_BUTTON_L1)
+      } else if (this.gamepadArea === 'canvas') {
+        this.stopGamepadAxes()
+        this.animateImageTransform(1, 0, 0)
+      }
+    }
+    return true
+  }
+
+  private handleGamepadAxes(event: FocusAxisEvent): void {
+    if (this.systemGamepadInput || this.currentGamepadModal()?.systemContent === true) { return }
+    this.ordinaryPadActive = true
+    const axes = event.axisMap
+    const scope = this.ordinaryGamepadScope()
+    if (scope !== '') {
+      if (this.ordinaryEditing || this.searchEditing) { return }
+      event.stopPropagation()
+      const now = this.getMonotonicNow()
+      const hat = GamepadNavigation.direction(axes.get(AxisModel.ABS_HAT0X) ?? 0,
+        axes.get(AxisModel.ABS_HAT0Y) ?? 0, GamepadNavigation.engage)
+      if (hat !== '' && hat !== this.ordinaryHat &&
+        (hat !== this.ordinaryDigital || now - this.ordinaryDigitalAt > 120)) {
+        GamepadControls.move(scope, hat)
+      }
+      this.ordinaryHat = hat
+      const x = axes.get(AxisModel.ABS_X) ?? 0
+      const y = axes.get(AxisModel.ABS_Y) ?? 0
+      this.ordinaryPadMagnitude = Math.max(Math.abs(x), Math.abs(y))
+      if (this.ordinaryPadNeedsNeutral) {
+        if (this.ordinaryPadMagnitude < GamepadNavigation.release) { this.ordinaryPadNeedsNeutral = false }
+        return
+      }
+      const step = this.ordinaryPadStick.sample(x, y, now)
+      if (step !== '') {
+        if (scope === 'video') { this.revealVideoChrome() }
+        GamepadControls.move(scope, step)
+      }
+      if (Math.max(Math.abs(x), Math.abs(y)) < GamepadNavigation.release) {
+        if (this.ordinaryPadTimer >= 0) { clearInterval(this.ordinaryPadTimer); this.ordinaryPadTimer = -1 }
+      } else if (this.ordinaryPadTimer < 0) {
+        this.ordinaryPadTimer = setInterval((): void => {
+          if (this.ordinaryGamepadScope() !== scope) { this.stopOrdinaryGamepadAxes(); return }
+          const direction = this.ordinaryPadStick.tick(this.getMonotonicNow())
+          if (direction !== '') {
+            if (scope === 'video') { this.revealVideoChrome() }
+            GamepadControls.move(scope, direction)
+          }
+        }, 16)
+      }
+      return
+    }
+    const modal = this.currentGamepadModal()
+    if (modal !== null) {
+      event.stopPropagation()
+      modal.axis(axes.get(AxisModel.ABS_HAT0X) ?? 0, axes.get(AxisModel.ABS_HAT0Y) ?? 0, true)
+      modal.axis(axes.get(AxisModel.ABS_X) ?? 0, axes.get(AxisModel.ABS_Y) ?? 0, false)
+      return
+    }
+    if (!this.gamepadAvailable()) { return }
+    event.stopPropagation()
+    if (this.openGamepadMenu() !== '') {
+      this.handleGamepadMenuAxis(axes.get(AxisModel.ABS_HAT0X) ?? 0, axes.get(AxisModel.ABS_HAT0Y) ?? 0, true)
+      this.handleGamepadMenuAxis(axes.get(AxisModel.ABS_X) ?? 0, axes.get(AxisModel.ABS_Y) ?? 0, false)
+      return
+    }
+    if (DEBUG && !this.gamepadAxisLogged) {
+      this.gamepadAxisLogged = true
+      console.info('[LinkFilesGamepad] first axis event, axes=' + Array.from(axes.keys()).join(','))
+    }
+    this.gamepadLeftX = GamepadNavigation.axis(axes.get(AxisModel.ABS_X) ?? this.gamepadLeftX)
+    this.gamepadLeftY = GamepadNavigation.axis(axes.get(AxisModel.ABS_Y) ?? this.gamepadLeftY)
+    this.gamepadRightY = GamepadNavigation.axis(axes.get(AxisModel.ABS_RZ) ?? this.gamepadRightY)
+    this.gamepadHatX = GamepadNavigation.axis(axes.get(AxisModel.ABS_HAT0X) ?? this.gamepadHatX)
+    this.gamepadHatY = GamepadNavigation.axis(axes.get(AxisModel.ABS_HAT0Y) ?? this.gamepadHatY)
+    const hat = GamepadNavigation.direction(this.gamepadHatX, this.gamepadHatY, GamepadNavigation.engage)
+    const now = this.getMonotonicNow()
+    if (hat !== '' && hat !== this.gamepadHatDirection) {
+      const initial = this.gamepadMarkInput()
+      if (!(initial && this.gamepadArea === 'files') &&
+        (hat !== this.gamepadLastDpad || now - this.gamepadLastDpadAt > 120)) {
+        this.gamepadDirection(hat, true)
+      }
+    }
+    this.gamepadHatDirection = hat
+    this.gamepadAxisTick(now, 0)
+    if (this.gamepadAxisTimer < 0 && this.gamepadAxesActive()) {
+      this.gamepadLastAxisTick = now
+      this.gamepadAxisTimer = setInterval((): void => {
+        const time = this.getMonotonicNow()
+        const seconds = Math.min(32, Math.max(0, time - this.gamepadLastAxisTick)) / 1000
+        this.gamepadLastAxisTick = time
+        this.gamepadAxisTick(time, seconds)
+        if (!this.gamepadAxesActive() && this.gamepadAxisTimer >= 0) {
+          clearInterval(this.gamepadAxisTimer)
+          this.gamepadAxisTimer = -1
+        }
+      }, 16)
+    }
+  }
+
+  private gamepadAxesActive(): boolean {
+    return Math.max(Math.abs(this.gamepadLeftX), Math.abs(this.gamepadLeftY), Math.abs(this.gamepadRightY)) > 0.19
+  }
+
+  private gamepadAxisTick(now: number, seconds: number): void {
+    if (!this.gamepadAvailable() || (this.showImageViewer &&
+      (this.imageTouchActive || this.imagePinchActive || this.imageDismissDragging))) {
+      this.stopGamepadAxes()
+      return
+    }
+    // Preserve a held stick while the current Swiper animation settles.
+    if (this.showImageViewer && !this.gamepadMenuArea() &&
+      (this.viewerGestureBlocked() || this.viewerFallbackEntryActive || now < this.gamepadTurnUntil)) { return }
+    const initial = this.gamepadAxesActive() && this.gamepadMarkInput()
+    const left = GamepadNavigation.direction(this.gamepadLeftX, this.gamepadLeftY, GamepadNavigation.engage)
+    if (GamepadNavigation.direction(this.gamepadLeftX, this.gamepadLeftY, GamepadNavigation.release) === '') {
+      this.gamepadLeftLatched = false
+    }
+    const canvas = this.showImageViewer && this.gamepadArea === 'canvas'
+    if (canvas && seconds > 0) {
+      const previous = this.imageScale
+      const scale = Math.max(1, Math.min(5, previous *
+        Math.exp(-GamepadNavigation.analog(this.gamepadRightY) * 1.35 * seconds)))
+      if (scale !== previous) {
+        this.imageScale = scale
+        this.clampImageOffset(this.imageOffsetX * scale / previous, this.imageOffsetY * scale / previous)
+        if (scale <= 1.001 && left !== '') { this.gamepadLeftLatched = true }
+      }
+      if (this.imageScale > 1.001) {
+        const speed = Math.min(this.imageViewportWidthVp, this.imageViewportHeightVp) * 0.95 * seconds
+        this.clampImageOffset(this.imageOffsetX - GamepadNavigation.analog(this.gamepadLeftX) * speed,
+          this.imageOffsetY - GamepadNavigation.analog(this.gamepadLeftY) * speed)
+      }
+    }
+    if (left === '' || (canvas && this.imageScale > 1.001)) { return }
+    if (!this.gamepadLeftLatched) {
+      this.gamepadLeftLatched = true
+      this.gamepadRepeatAt = now + GamepadNavigation.repeatDelayMs
+      if (!(initial && this.gamepadArea === 'files')) { this.gamepadDirection(left, false) }
+    } else if (this.gamepadRepeatAt > 0 && now >= this.gamepadRepeatAt &&
+      (this.gamepadArea === 'files' || (canvas && (left === 'left' || left === 'right')))) {
+      const interval = GamepadNavigation.repeatInterval(Math.max(Math.abs(this.gamepadLeftX),
+        Math.abs(this.gamepadLeftY)), canvas)
+      if (interval > 0) {
+        this.gamepadRepeatAt = now + interval
+        this.gamepadDirection(left, false, true)
+      } else {
+        this.gamepadRepeatAt = now + GamepadNavigation.repeatDelayMs
+      }
+    }
   }
 
   onBackPress(): boolean {
@@ -3624,6 +4817,21 @@ struct Index {
 
   build() {
     Stack() {
+      if (this.screen === 'files' && !this.showSearch) {
+        // ArkUI routes joystick axes through native focus. The visible highlight
+        // belongs to the selected file or action rather than this input node.
+        Row() {}
+          .id('linkfiles-gamepad-input')
+          .width(1).height(1).position({ x: 0, y: 0 })
+          .focusable(true).defaultFocus(true)
+          .onKeyPreIme((event: KeyEvent): boolean => this.handleGamepadKey(event))
+          .focusBox({ strokeColor: ColorMetrics.resourceColor(Color.Transparent), strokeWidth: LengthMetrics.vp(0) })
+          .hitTestBehavior(HitTestMode.None)
+          .accessibilityLevel('no')
+          .onAppear((): void => {
+            if (this.gamepadDeviceIds.size > 0) { this.postRenderFrame((): void => this.requestGamepadInputFocus()) }
+          })
+      }
       if (this.screen === 'files' && !this.showSearch && this.showPageTransition) {
         Stack() {
           this.FileContentSnapshot(this.outgoingEntries, this.transitionSnapshotMode)
@@ -3815,10 +5023,13 @@ struct Index {
           .zIndex(18)
         }
         FloatingImportControl({ viewportWidth: this.pageWidthVp, viewportHeight: this.pageHeightVp,
+          gamepadFocused: this.gamepadFocused('filetop', '导入'),
+          onPadOpen: (action: (() => void) | null): void => { this.importPadOpen = action },
           // The title controls end at topSafeInset + 56vp. Keep only an 8vp
           // clearance instead of treating the 30vp gradient tail as a blocker.
           safeTop: this.topSafeInset() + 64, safeBottom: this.floatingBarContentInset(8),
           expanded: $importExpanded, onSelect: (source: string): void => { this.selectImportSource(source) },
+          onPadScope: (id: string, scope: GamepadModalFocus | null) => this.registerGamepadScope(id, scope),
           onControlAreaChange: (area: Area): void => { this.updateFloatingImportRect(area) } })
           .id('floating-import-host')
           .position({ x: 0, y: 0 })
@@ -3923,10 +5134,11 @@ struct Index {
             Button('查看隐私声明').height(48).padding({ left: 24, right: 24 })
               .fontSize(16).backgroundColor($r('sys.color.comp_background_emphasize'))
               .fontColor($r('sys.color.font_on_primary'))
-              .onClick(() => this.completeStartupAuthorization(true)).id('startup-authorization-retry')
+              .attributeModifier(new GamepadAction(this.getUIContext(), 'startup', 'retry',
+                () => this.completeStartupAuthorization(true), (): boolean => !this.startupRestoring, 'startup-authorization-retry'))
             Button('退出').height(40).fontSize(14).backgroundColor(Color.Transparent)
-              .fontColor($r('sys.color.font_secondary')).onClick(() => this.exitBeforeAuthorization())
-              .id('startup-authorization-exit')
+              .fontColor($r('sys.color.font_secondary')).attributeModifier(new GamepadAction(this.getUIContext(), 'startup', 'exit',
+                () => this.exitBeforeAuthorization(), (): boolean => true, 'startup-authorization-exit'))
           }
         }
         .width('100%').height('100%')
@@ -3946,6 +5158,11 @@ struct Index {
     // dismisses the menu cannot also activate the file list underneath
     // (official bindContextMenu event-passthrough guidance).
     .hitTestBehavior(this.contextMenuEntry !== null ? HitTestMode.Block : HitTestMode.Default)
+    .id('linkfiles-controller-root').focusable(true)
+    .focusBox({ strokeColor: ColorMetrics.resourceColor(Color.Transparent), strokeWidth: LengthMetrics.vp(0) })
+    .onKeyPreIme((event: KeyEvent): boolean => this.handleGamepadKey(event))
+    .onKeyEventDispatch((event: KeyEvent): boolean => this.handleGamepadKey(event))
+    .onFocusAxisEvent((event: FocusAxisEvent): void => this.handleGamepadAxes(event))
     .onChildTouchTest((infos: Array<TouchTestInfo>): TouchResult => {
       if (this.closeSessionActive && this.sessionTouchTestCount < 3) {
         this.sessionTouchTestCount += 1
@@ -3989,6 +5206,10 @@ struct Index {
       }
       this.handleDragSelectionTouch(event)
       if (event.type === TouchType.Down) {
+        this.ordinaryPadActive = false
+        GamepadControls.setScope('')
+        this.stopOrdinaryGamepadAxes()
+        if (this.gamepadArea !== '') { this.releaseGamepad() }
         this.gridViewportRestore = null
         this.waterfallViewportAnchorLocked = false
         if (this.waterfallResizeVersion >= 0) {
@@ -4114,6 +5335,12 @@ struct Index {
             .backgroundColor(Color.Transparent)
             .padding({ left: 0, right: 0 })
             .onChange((value: string) => this.linkId = value)
+            .attributeModifier(new GamepadAction(this.getUIContext(), 'login', 'linkId',
+              (): void => this.getUIContext().getFocusController().requestFocus('pad-control:login:linkId'),
+              (): boolean => !this.isBusy, '', false, { nativeFocus: false }))
+            .onEditChange((editing: boolean): void => { this.ordinaryEditing = editing })
+            .onKeyPreIme((event: KeyEvent): boolean =>
+              event.keyCode === KeyCode.KEYCODE_BUTTON_B && this.handleGamepadKey(event))
           Button('解析')
             .height(34)
             .padding({ left: 14, right: 14 })
@@ -4122,7 +5349,7 @@ struct Index {
             .backgroundColor($r('app.color.surface_selected'))
             .borderRadius(17)
             .enabled(!this.isBusy)
-            .onClick(() => this.handleResolve())
+            .attributeModifier(new GamepadAction(this.getUIContext(), 'login', 'resolve', () => this.handleResolve(), (): boolean => !this.isBusy))
         }
         .width('100%')
         .height(58)
@@ -4140,6 +5367,12 @@ struct Index {
           .borderRadius(14)
           .padding({ left: 16, right: 16 })
           .onChange((value: string) => this.username = value)
+          .attributeModifier(new GamepadAction(this.getUIContext(), 'login', 'username',
+            (): void => this.getUIContext().getFocusController().requestFocus('pad-control:login:username'),
+            (): boolean => !this.isBusy, '', false, { nativeFocus: false }))
+          .onEditChange((editing: boolean): void => { this.ordinaryEditing = editing })
+          .onKeyPreIme((event: KeyEvent): boolean =>
+            event.keyCode === KeyCode.KEYCODE_BUTTON_B && this.handleGamepadKey(event))
 
         TextInput({ placeholder: '云盘密码', text: this.password })
           .type(InputType.Password)
@@ -4152,6 +5385,12 @@ struct Index {
           .borderRadius(14)
           .padding({ left: 16, right: 16 })
           .onChange((value: string) => this.password = value)
+          .attributeModifier(new GamepadAction(this.getUIContext(), 'login', 'password',
+            (): void => this.getUIContext().getFocusController().requestFocus('pad-control:login:password'),
+            (): boolean => !this.isBusy, '', false, { nativeFocus: false }))
+          .onEditChange((editing: boolean): void => { this.ordinaryEditing = editing })
+          .onKeyPreIme((event: KeyEvent): boolean =>
+            event.keyCode === KeyCode.KEYCODE_BUTTON_B && this.handleGamepadKey(event))
       }
       .width('100%')
 
@@ -4174,7 +5413,7 @@ struct Index {
         .height(44)
         .borderRadius(22)
         .backgroundColor(this.autoLogin ? '#2E6BFF' : $r('app.color.surface_input'))
-        .onClick(() => this.toggleAutoLogin())
+        .attributeModifier(new GamepadAction(this.getUIContext(), 'login', 'auto-login', () => this.toggleAutoLogin(), (): boolean => !this.isBusy))
 
         Row({ space: 6 }) {
           if (this.rememberAddress) {
@@ -4191,7 +5430,7 @@ struct Index {
         .height(44)
         .borderRadius(22)
         .backgroundColor(this.rememberAddress ? '#2E6BFF' : $r('app.color.surface_input'))
-        .onClick(() => this.toggleRememberAddress())
+        .attributeModifier(new GamepadAction(this.getUIContext(), 'login', 'remember-address', () => this.toggleRememberAddress(), (): boolean => !this.isBusy))
       }
       .width('100%')
 
@@ -4204,7 +5443,7 @@ struct Index {
         .backgroundColor('#2E6BFF')
         .borderRadius(16)
         .enabled(!this.isBusy)
-        .onClick(() => this.handleLogin())
+        .attributeModifier(new GamepadAction(this.getUIContext(), 'login', 'login', () => this.handleLogin(), (): boolean => !this.isBusy))
 
       if (this.statusText.length > 0) {
         Text(this.statusText)
@@ -4244,6 +5483,12 @@ struct Index {
         .borderRadius(14)
         .padding({ left: 16, right: 16 })
         .onChange((value: string) => this.otpCode = value)
+        .attributeModifier(new GamepadAction(this.getUIContext(), 'otp', 'otpCode',
+          (): void => this.getUIContext().getFocusController().requestFocus('pad-control:otp:otpCode'),
+          (): boolean => !this.isBusy, '', false, { nativeFocus: false }))
+        .onEditChange((editing: boolean): void => { this.ordinaryEditing = editing })
+        .onKeyPreIme((event: KeyEvent): boolean =>
+          event.keyCode === KeyCode.KEYCODE_BUTTON_B && this.handleGamepadKey(event))
       Row() {
         Text('信任此设备')
           .fontSize(14)
@@ -4252,27 +5497,31 @@ struct Index {
         Toggle({ type: ToggleType.Switch, isOn: this.trustDevice })
           .selectedColor('#2E6BFF')
           .onChange((value: boolean) => this.trustDevice = value)
+          .attributeModifier(new GamepadAction(this.getUIContext(), 'otp', 'trust',
+            (): void => { this.trustDevice = !this.trustDevice }, (): boolean => !this.isBusy, '', false))
       }
       .width('100%')
       Button(this.isBusy ? '验证中…' : '验证并登录')
         .width('100%')
         .height(52)
         .fontSize(16)
-        .fontColor(Color.White)
+        .fontColor(this.ordinaryPadItem === 'otp-confirm' ? '#A6C9FF' : Color.White)
         .backgroundColor(Color.Transparent)
         .borderRadius(14)
         .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.REGULAR, true, '#552E6BFF'))
         .enabled(!this.isBusy)
-        .onClick(() => this.handleOtp())
+        .attributeModifier(new GamepadAction(this.getUIContext(), 'otp', 'otp-confirm', () => this.handleOtp(), (): boolean => !this.isBusy, '', true,
+          { highlight: (selected: boolean): void => this.setOrdinaryHighlight('otp-confirm', selected) }))
       Button('返回登录')
         .width('100%')
         .height(44)
-        .fontColor($r('app.color.text_secondary'))
+        .fontColor(this.ordinaryPadItem === 'otp-back' ? '#A6C9FF' : $r('app.color.text_secondary'))
         .backgroundColor(Color.Transparent)
         .borderRadius(14)
         .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN))
         .enabled(!this.isBusy)
-        .onClick(() => this.screen = 'login')
+        .attributeModifier(new GamepadAction(this.getUIContext(), 'otp', 'otp-back', () => this.screen = 'login', (): boolean => !this.isBusy, '', true,
+          { highlight: (selected: boolean): void => this.setOrdinaryHighlight('otp-back', selected) }))
       Text(this.statusText)
         .fontSize(13)
         .fontColor($r('app.color.text_secondary'))
@@ -4352,7 +5601,7 @@ struct Index {
           .width(25)
           .height(25)
           .backgroundColor('#AAB3C1')
-          .color('#2E6BFF')
+          .color(this.gamepadGlassInk('viewer', '进度', '#2E6BFF'))
           .style({
             strokeWidth: 3,
             enableSmoothEffect: false,
@@ -4451,14 +5700,16 @@ struct Index {
       // 这里再钉一个最小高度，保证胶囊是完整的 36vp。
       .constraintSize({ minHeight: 36 })
       .fontSize(14)
-      .fontColor(this.searchScope === scope ? Color.White : $r('app.color.text_secondary'))
+      .fontColor(this.ordinaryPadItem === 'search-scope:' + scope ? '#A6C9FF' :
+        (this.searchScope === scope ? Color.White : $r('app.color.text_secondary')))
       .backgroundColor(Color.Transparent)
       .borderRadius(18)
       .systemMaterial(this.searchScope === scope
         ? this.immersiveMaterial(uiMaterial.ImmersiveStyle.THIN, true, '#552E6BFF')
         : this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THIN, true))
       .monopolizeEvents(true)
-      .onClick(() => this.setSearchScope(scope))
+      .attributeModifier(new GamepadAction(this.getUIContext(), 'search', 'scope' + ':' + scope, () => this.setSearchScope(scope), (): boolean => !this.isBusy, '', true,
+        { highlight: (selected: boolean): void => this.setOrdinaryHighlight('search-scope:' + scope, selected) }))
   }
 
   @Builder
@@ -4466,14 +5717,15 @@ struct Index {
     Button(keyword)
       .height(34)
       .fontSize(13)
-      .fontColor($r('app.color.text_secondary'))
+      .fontColor(this.ordinaryPadItem === 'search-history:' + keyword ? $r('sys.color.font_emphasize') : $r('app.color.text_secondary'))
       .backgroundColor(Color.Transparent)
       .borderRadius(17)
       .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THIN, true))
-      .onClick(() => {
+      .attributeModifier(new GamepadAction(this.getUIContext(), 'search', 'history' + ':' + keyword, () => {
         this.dismissKeyboard()
         this.submitSearch(keyword)
-      })
+      }, (): boolean => !this.isBusy, '', true,
+        { highlight: (selected: boolean): void => this.setOrdinaryHighlight('search-history:' + keyword, selected) }))
   }
 
   @Builder
@@ -4491,26 +5743,28 @@ struct Index {
               Button() {
                 SymbolGlyph($r('sys.symbol.trash'))
                   .fontSize(18)
-                  .fontColor([$r('sys.color.icon_primary')])
+                  .fontColor([this.ordinaryPadItem === 'clear-history' ? $r('sys.color.icon_emphasize') : $r('sys.color.icon_primary')])
               }
               .type(ButtonType.Normal)
               .width(34)
               .height(34)
               .backgroundColor(Color.Transparent)
               .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THIN, true))
-              .onClick(() => this.clearSearchHistory())
+              .attributeModifier(new GamepadAction(this.getUIContext(), 'search', 'clear-history', () => this.clearSearchHistory(), (): boolean => !this.isBusy, '', true,
+          { highlight: (selected: boolean): void => this.setOrdinaryHighlight('clear-history', selected) }))
               Button() {
                 SymbolGlyph(this.searchHistoryExpanded
                   ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
                   .fontSize(17)
-                  .fontColor([$r('sys.color.icon_primary')])
+                  .fontColor([this.ordinaryPadItem === 'expand-history' ? $r('sys.color.icon_emphasize') : $r('sys.color.icon_primary')])
               }
               .type(ButtonType.Normal)
               .width(34)
               .height(34)
               .backgroundColor(Color.Transparent)
               .systemMaterial(this.immersiveMaterial(uiMaterial.ImmersiveStyle.ULTRA_THIN, true))
-              .onClick(() => this.searchHistoryExpanded = !this.searchHistoryExpanded)
+              .attributeModifier(new GamepadAction(this.getUIContext(), 'search', 'expand-history', () => this.searchHistoryExpanded = !this.searchHistoryExpanded, (): boolean => !this.isBusy, '', true,
+          { highlight: (selected: boolean): void => this.setOrdinaryHighlight('expand-history', selected) }))
             }
           }
           .width('100%')
@@ -4583,7 +5837,7 @@ struct Index {
                 leading: (): void => { this.FileLeadingVisual(entry, index, 'search') },
                 trailing: (): void => { this.SearchRowTrailing(entry) } })
             }
-            .onClick(() => this.openSearchResult(entry))
+            .attributeModifier(new GamepadAction(this.getUIContext(), 'search', 'result' + ':' + entry.path, () => this.openSearchResult(entry), (): boolean => !this.isBusy))
           }, (entry: FileEntry) => entry.path)
 
           if (this.searchLoading && this.searchResults.length > 0) {
@@ -4653,13 +5907,15 @@ struct Index {
         ListItem() {
           Row()
             .width('100%')
-            .height(this.fileContentTopInset())
+            .height(this.fileListLeadingSpace())
         }
         .width('100%')
 
         LazyForEach(this.fileEntryDataSource, (entry: FileEntry, index: number) => {
           ListItem() {
             FileListRow({ title: entry.name, info: this.entryInfo(entry),
+              gamepadFocused: !this.gamepadModalActive && !this.showImageViewer && !this.showPageTransition &&
+                this.gamepadArea === 'files' && this.gamepadFilePath === entry.path,
               showDivider: index < this.entries.length - 1,
               leading: (): void => { this.FileLeadingVisual(entry, index, 'list') },
               trailing: (): void => { this.FileListRowTrailing(entry) } })
@@ -4770,8 +6026,7 @@ struct Index {
                 .id('transfer-background-status')
               if (this.transferNotificationBlocked) {
                 Button('开启通知').fontSize(13).height(36)
-                  .onClick(() => { TransferBackgroundManager.shared().openNotificationSettings().catch(() => {}) })
-                  .id('transfer-notifications-enable')
+                  .attributeModifier(new GamepadAction(this.getUIContext(), 'downloads', 'notifications', () => { TransferBackgroundManager.shared().openNotificationSettings().catch(() => {}) }, (): boolean => !this.isBusy, 'transfer-notifications-enable'))
               }
             }.padding({ left: 20, right: 20, top: 8, bottom: 16 }).width('100%')
           }.width('100%')
@@ -4783,7 +6038,8 @@ struct Index {
             }
             .width('100%')
             .id('album-upload-task:' + job.id)
-            .onClick(() => this.activateAlbumUpload(job))
+            .attributeModifier(new GamepadAction(this.getUIContext(), 'downloads', 'album-task' + ':' + job.id, () => this.activateAlbumUpload(job), (): boolean => !this.isBusy, 'album-upload-task:' + job.id, true,
+              { hold: (): void => { this.showAlbumUploadActions(job) } }))
             .priorityGesture(LongPressGesture({ repeat: false }).onAction(() => {
               this.showAlbumUploadActions(job)
             }))
@@ -4985,6 +6241,7 @@ struct Index {
   AlbumUploadPickerContent(): void {
     AlbumUploadPicker({ visible: $showAlbumPicker, viewportWidth: this.pageWidthVp, viewportHeight: this.pageHeightVp,
       safeTop: this.topSafeInset(), safeBottom: this.bottomSafeInset(),
+      onPadScope: (id: string, scope: GamepadModalFocus | null) => this.registerGamepadScope(id, scope),
       onNotice: (message: string): void => {
         if (this.showAlbumPicker && this.albumUploadContextValid()) { this.showImmersiveToast(message) }
       },
@@ -5007,6 +6264,7 @@ struct Index {
       destination: this.albumUploadDestination, starting: this.albumUploadStarting,
       viewportWidth: this.pageWidthVp, viewportHeight: this.pageHeightVp,
       safeTop: this.topSafeInset(), safeBottom: this.bottomSafeInset(),
+      onPadScope: (id: string, scope: GamepadModalFocus | null) => this.registerGamepadScope(id, scope),
       onNotice: (message: string): void => {
         if (this.showAlbumUpload && this.albumUploadContextValid()) { this.showImmersiveToast(message) }
       },
@@ -5035,6 +6293,11 @@ struct Index {
   @Builder
   AlbumUploadDetailsContent(): void {
     AlbumUploadDetails({ manager: this.albumUpload, batchId: this.albumDetailsId, albumName: this.albumDetailsName,
+      onFailure: (name: string, message: string): void => {
+        this.showTrackedDialog({ title: name, message: message, buttons: [{ text: '关闭', color: '#2E6BFF' }] }).catch(() => {})
+      },
+      onPadScope: (id: string, scope: GamepadModalFocus | null) => this.registerGamepadScope(id, scope),
+      onClose: (): void => { this.showAlbumDetails = false },
       total: this.albumUploadDetailsJob().total, failedCount: this.albumUploadDetailsJob().failed,
       batchState: this.albumUploadDetailsJob().state, currentName: this.albumUploadDetailsJob().currentName,
       currentBytes: this.albumUploadDetailsJob().currentBytes, currentSize: this.albumUploadDetailsJob().currentSize,
@@ -5060,6 +6323,8 @@ struct Index {
       selectedIndex: this.transferDirection === 'upload' ? 1 : 0,
       $selectedIndex: (index: number): void => { this.transferDirection = index === 1 ? 'upload' : 'download' },
       itemFontSize: LengthMetrics.fp(HeaderStyle.actionSize), itemSelectedFontSize: LengthMetrics.fp(HeaderStyle.actionSize),
+      itemSelectedFontColor: ColorMetrics.resourceColor(this.ordinaryPadItem === 'transfer-direction'
+        ? $r('sys.color.font_emphasize') : $r('sys.color.font_primary')),
       // Match the home header's 40 vp controls: a 36 vp item inside a 2 vp frame.
       buttonMinHeight: LengthMetrics.vp(HeaderStyle.controlHeight), itemMinHeight: LengthMetrics.vp(HeaderStyle.controlHeight - 4),
       buttonPadding: LengthMetrics.vp(2),
@@ -5069,7 +6334,10 @@ struct Index {
     })
       .width(132)
       .height(HeaderStyle.controlHeight)
-      .id('transfer-direction-control')
+      .attributeModifier(new GamepadAction(this.getUIContext(), 'downloads', 'direction',
+        (): void => { this.transferDirection = this.transferDirection === 'upload' ? 'download' : 'upload' },
+        (): boolean => !this.isBusy, 'transfer-direction-control', false,
+        { highlight: (selected: boolean): void => this.setOrdinaryHighlight('transfer-direction', selected) }))
   }
 
   private transferControlMaterial(): uiMaterial.ImmersiveMaterial {
@@ -5249,7 +6517,7 @@ struct Index {
         Column({ space: 1 }) {
           SymbolGlyph($r('sys.symbol.arrow_down'))
             .fontSize(FileRowStyle.titleSize)
-            .fontColor([$r('sys.color.icon_primary')])
+            .fontColor([this.ordinaryPadItem === 'download-speed' ? $r('sys.color.icon_emphasize') : $r('sys.color.icon_primary')])
           Text(this.formatSpeed(this.downloadSpeedBytesPerSecond))
             .fontSize(10)
             .fontColor($r('sys.color.font_primary'))
@@ -5263,7 +6531,9 @@ struct Index {
       .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN, true, '#442E6BFF'))
       .hitTestBehavior(HitTestMode.Default)
       .monopolizeEvents(true)
-      .onClick(() => this.openDownloads())
+      .attributeModifier(new GamepadAction(this.getUIContext(), 'downloads', 'speed', () => this.openDownloads(),
+        (): boolean => this.transferDirection === 'download' && this.hasActiveDownload(), '', true,
+        { highlight: (selected: boolean): void => this.setOrdinaryHighlight('download-speed', selected) }))
       .margin({ right: 18,
         bottom: this.floatingBarBottomMargin() + Glass.barHeight + 16 })
     }
@@ -5278,6 +6548,11 @@ struct Index {
   }
 
   /** 瀑布流列数：目标列宽 240vp（区间 240–360vp）。列宽直接决定图片高度，所以比网格大一档。 */
+  private waterfallGamepadCellWidth(): number {
+    const columns = this.waterfallColumnCount()
+    return Math.max(1, ((this.waterfallLayoutWidth || this.effectivePageWidth()) - 20 - (columns - 1) * 8) / columns)
+  }
+
   private waterfallColumnCount(): number {
     const width = this.pageWidthVp - 20
     if (!(width > 0)) {
@@ -5377,6 +6652,8 @@ struct Index {
       topInset: 0,
       thumbnailId: this.gridThumbnailComponentId(entry),
       tileId: this.gridTileComponentId(entry),
+      gamepadFocused: !this.gamepadModalActive && !this.showImageViewer && !this.showPageTransition &&
+        this.gamepadArea === 'files' && this.gamepadFilePath === entry.path,
       events: this.fileGridCellEvents,
       videoIndicator: () => { this.VideoTransferIndicator(entry) },
       selectionIndicator: () => { this.SelectionCheckbox(entry) },
@@ -5429,6 +6706,10 @@ struct Index {
               .width('100%')
               .height('100%')
             }
+            FileGamepadFocusRing({ active: !this.gamepadModalActive && !this.showImageViewer && !this.showPageTransition &&
+              this.gamepadArea === 'files' && this.gamepadFilePath === entry.path,
+              itemPath: entry.path, widthVp: this.waterfallGamepadCellWidth(),
+              heightVp: this.waterfallGamepadCellWidth() / this.waterfallAspectRatio(entry) })
             if (this.selectionMode) {
               FileSelectionOutline({ selection: this.fileSelection.stateFor(entry.path) })
             }
@@ -5438,15 +6719,15 @@ struct Index {
           .aspectRatio(this.waterfallAspectRatio(entry))
           .backgroundColor('#12000000')
           .borderRadius(10)
-          .onAreaChange((_, area) => {
-            this.recordThumbnailArea(entry, this.waterfallEntryIndex(entry), 'waterfall', area)
-            this.recordRowHitArea(entry, this.waterfallEntryIndex(entry), 'waterfall', area)
-          })
           .onVisibleAreaChange([0.0, 0.999],
             (_isExpanding: boolean, ratio: number): void =>
               this.recordThumbnailVisibility(entry, this.waterfallEntryIndex(entry), 'waterfall', ratio))
           .onClick((): void => {
             if (this.waterfallResourceResident(entry)) { this.handleFileEntryClick(entry) }
+          })
+          .onAreaChange((_, area) => {
+            this.recordThumbnailArea(entry, this.waterfallEntryIndex(entry), 'waterfall', area)
+            this.recordRowHitArea(entry, this.waterfallEntryIndex(entry), 'waterfall', area)
           })
           .priorityGesture(
             GestureGroup(GestureMode.Sequence,
@@ -5598,7 +6879,7 @@ struct Index {
         ListItem() {
           Row()
             .width('100%')
-            .height(this.topSafeInset() + 76)
+            .height(this.fileListLeadingSpace())
         }
         .width('100%')
 
@@ -5683,12 +6964,18 @@ struct Index {
           this.OfficialBackButton(() => {
             this.dismissKeyboard()
             this.closeSearch()
-          })
+          }, '', 'search')
           Search({ value: this.searchQuery, placeholder: '搜索文件', controller: this.searchController })
-            .id('file-search-input')
+            .attributeModifier(new GamepadAction(this.getUIContext(), 'search', 'input',
+              (): void => this.getUIContext().getFocusController().requestFocus('file-search-input'),
+              (): boolean => !this.searchLoading, 'file-search-input', false, { nativeFocus: false,
+                highlight: (selected: boolean): void => this.setOrdinaryHighlight('search-input', selected) }))
+            .fontColor(this.ordinaryPadItem === 'search-input' ? $r('sys.color.font_emphasize') : $r('sys.color.font_primary'))
+            .onEditChange((editing: boolean): void => { this.searchEditing = editing })
+            .onKeyPreIme((event: KeyEvent): boolean =>
+              event.keyCode === KeyCode.KEYCODE_BUTTON_B && this.handleGamepadKey(event))
             .layoutWeight(1)
             .height(HeaderStyle.controlHeight)
-            .fontColor($r('sys.color.font_primary'))
             .placeholderColor($r('sys.color.font_secondary'))
             .backgroundColor(Color.Transparent)
             .borderRadius(HeaderStyle.controlHeight / 2)
@@ -5716,7 +7003,7 @@ struct Index {
               Text(this.searchLoading ? '搜索中' : '搜索')
                 .fontSize(HeaderStyle.actionSize)
                 .fontWeight(FontWeight.Medium)
-                .fontColor($r('sys.color.font_primary'))
+                .fontColor(this.ordinaryPadItem === 'search-submit' ? $r('sys.color.font_emphasize') : $r('sys.color.font_primary'))
             }
           }
             .type(ButtonType.Normal)
@@ -5727,12 +7014,13 @@ struct Index {
             .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN, true))
             .hitTestBehavior(HitTestMode.Default)
             .monopolizeEvents(true)
-            .onClick(() => {
+            .attributeModifier(new GamepadAction(this.getUIContext(), 'search', 'submit', () => {
               if (this.searchDraft.trim().length > 0) {
                 this.dismissKeyboard()
                 this.submitSearch(this.searchDraft)
               }
-            })
+            }, (): boolean => this.searchDraft.trim().length > 0 && !this.searchLoading, '', true,
+              { highlight: (selected: boolean): void => this.setOrdinaryHighlight('search-submit', selected) }))
         }
         .width('100%')
         // Keep the search header in exactly the same layout box as the normal
@@ -5839,14 +7127,22 @@ struct Index {
         .height(24)
         .padding({ left: 10, right: 10 })
         .backgroundColor(Color.Transparent)
-        .fontColor($r('sys.color.font_primary'))
+        .fontColor(this.gamepadFocused(this.showImageViewer ? 'viewertop' : 'filetop', '重连') ||
+          this.ordinaryPadItem === 'nas-retry' ? $r('sys.color.font_emphasize') : $r('sys.color.font_primary'))
         .enabled(this.nasState !== 'connecting')
-        .onClick((): void => { this.retryNasConnection() })
+        .attributeModifier(new GamepadAction(this.getUIContext(), this.showSearch ? 'search' : '', 'nas-retry',
+          (): void => { this.retryNasConnection() }, (): boolean => this.nasRetryVisible(), '', true,
+          { highlight: (selected: boolean): void => this.setOrdinaryHighlight('nas-retry', selected) }))
     }
     .height(24)
     .width('100%')
     .padding({ left: 24, right: 16 })
     .hitTestBehavior(HitTestMode.None)
+  }
+
+  private activateFileTopSelection(): void {
+    if (this.selectionMode) { this.toggleSelectAll() }
+    else { this.enterSelectionMode() }
   }
 
   @Builder
@@ -5894,13 +7190,11 @@ struct Index {
       // 真的忙时点击会被各自的入口守卫挡下，不会出错。空目录时禁用仍然合理。
       .enabled(this.entries.length > 0)
       .monopolizeEvents(true)
-      .onClick(() => {
-        if (this.selectionMode) {
-          this.toggleSelectAll()
-        } else {
-          this.enterSelectionMode()
-        }
-      })
+      .focusBox(this.gamepadNativeFocusBox())
+      .outline({ width: 1.5, radius: HeaderStyle.controlHeight / 2, color: this.gamepadFocusColor('filetop', '多选') })
+      .onAreaChange((_, area: Area): void =>
+        this.registerSlideItem('filetop', '多选', area, () => this.activateFileTopSelection()))
+      .onClick(() => this.activateFileTopSelection())
       .animation({ duration: 180, curve: Curve.FastOutSlowIn })
 
       // The search container also remains in the tree. It fades and disables
@@ -5921,6 +7215,10 @@ struct Index {
       .systemMaterial(this.adaptiveControlMaterial(uiMaterial.ImmersiveStyle.THIN, true))
       .overlay(this.ImportLightOverlay, { align: Alignment.Center })
       .monopolizeEvents(true)
+      .focusBox(this.gamepadNativeFocusBox())
+      .outline({ width: 1.5, radius: HeaderStyle.controlHeight / 2, color: this.gamepadFocusColor('filetop', '搜索') })
+      .onAreaChange((_, area: Area): void =>
+        this.registerSlideItem('filetop', '搜索', area, () => this.openSearch()))
       .onClick(() => this.openSearch())
       .animation({ duration: 180, curve: Curve.FastOutSlowIn })
     }
@@ -6055,7 +7353,7 @@ struct Index {
     }
     .width('100%')
     .padding({ left: 16, right: 16, top: 12, bottom: 12 })
-    .onClick(onTap)
+    .attributeModifier(new GamepadAction(this.getUIContext(), this.settingsGamepadScope(), 'setting' + ':' + title, onTap, (): boolean => !this.isBusy))
   }
 
   @Builder
@@ -6078,7 +7376,7 @@ struct Index {
       Text(this.recycleScope === 'personal' ? '个' : '共')
         .fontSize(16)
         .fontWeight(FontWeight.Bold)
-        .fontColor($r('sys.color.icon_primary'))
+        .fontColor(this.ordinaryPadItem === 'recycle-scope' ? $r('sys.color.icon_emphasize') : $r('sys.color.icon_primary'))
     }
     .type(ButtonType.Normal)
     .width(40)
@@ -6089,7 +7387,8 @@ struct Index {
     .overlay(this.ImportLightOverlay, { align: Alignment.Center })
     .hitTestBehavior(HitTestMode.Default)
     .monopolizeEvents(true)
-    .onClick(() => this.selectRecycleScope(this.recycleScope === 'personal' ? 'shared' : 'personal'))
+    .attributeModifier(new GamepadAction(this.getUIContext(), this.settingsGamepadScope(), 'recycle-scope', () => this.selectRecycleScope(this.recycleScope === 'personal' ? 'shared' : 'personal'), (): boolean => !this.isBusy, '', true,
+        { highlight: (selected: boolean): void => this.setOrdinaryHighlight('recycle-scope', selected) }))
   }
 
   /**
@@ -6126,7 +7425,8 @@ struct Index {
       leading: (): void => { this.FileLeadingVisual(entry) },
       trailing: (): void => { this.DirectoryRowTrailing(entry) } })
     .width('100%')
-    .onClick(() => this.onRecycleEntryClick(entry))
+    .attributeModifier(new GamepadAction(this.getUIContext(), this.settingsGamepadScope(), 'recycle-entry' + ':' + entry.path, () => this.onRecycleEntryClick(entry), (): boolean => !this.isBusy, '', true,
+      { hold: (): void => this.showActionMenu(entry, undefined, true) }))
     .priorityGesture(
       LongPressGesture({ repeat: false })
         .onAction((event: GestureEvent): void => {
@@ -6205,11 +7505,11 @@ struct Index {
             .fontColor('#D34D5C')
             .width('100%')
             .textAlign(TextAlign.Center)
-            .onClick(() => {
+            .attributeModifier(new GamepadAction(this.getUIContext(), this.settingsGamepadScope(), 'empty-recycle', () => {
               if (!this.isBusy) {
                 this.purgeCurrentRecycleLayer()
               }
-            })
+            }, (): boolean => !this.isBusy))
         }
         .width('100%')
         .padding({ left: 20, right: 20, top: 16, bottom: this.bottomSafeInset() + 16 })
@@ -6301,7 +7601,7 @@ struct Index {
           .backgroundColor('#33D34D5C')
           .borderRadius(14)
           .enabled(!this.isBusy)
-          .onClick(() => this.clearCache())
+          .attributeModifier(new GamepadAction(this.getUIContext(), this.settingsGamepadScope(), 'clear-cache', () => this.clearCache(), (): boolean => !this.isBusy))
 
         if (this.statusText.length > 0) {
           Text(this.statusText)
@@ -6349,8 +7649,7 @@ struct Index {
           .borderRadius(17)
           .backgroundColor(this.defaultViewMode(kind) === mode
             ? '#2E6BFF' : $r('app.color.surface_card'))
-          .onClick(() => { this.setDefaultViewMode(kind, mode) })
-          .id('default-view-' + kind + '-' + mode)
+          .attributeModifier(new GamepadAction(this.getUIContext(), this.settingsGamepadScope(), 'view-mode' + ':' + kind + ':' + mode, () => { this.setDefaultViewMode(kind, mode) }, (): boolean => !this.isBusy, 'default-view-' + kind + '-' + mode))
       }, (mode: FileViewMode) => mode)
     }
     .width('100%')
@@ -6456,6 +7755,8 @@ struct Index {
               .selectedColor('#2E6BFF')
               .enabled(!this.isBusy)
               .onChange((value: boolean) => this.setAutoPlayOnOpen(value))
+              .attributeModifier(new GamepadAction(this.getUIContext(), this.settingsGamepadScope(), 'autoPlayOnOpen',
+                () => this.setAutoPlayOnOpen(!this.autoPlayOnOpen), (): boolean => !this.isBusy, '', false))
           }
           .width('100%')
 
@@ -6475,6 +7776,8 @@ struct Index {
               .selectedColor('#2E6BFF')
               .enabled(!this.isBusy)
               .onChange((value: boolean) => this.setBackgroundVideoPlayback(value))
+              .attributeModifier(new GamepadAction(this.getUIContext(), this.settingsGamepadScope(), 'backgroundVideoPlayback',
+                () => this.setBackgroundVideoPlayback(!this.backgroundVideoPlayback), (): boolean => !this.isBusy, '', false))
           }
           .width('100%')
 
@@ -6494,6 +7797,8 @@ struct Index {
               .selectedColor('#2E6BFF')
               .enabled(!this.isBusy)
               .onChange((value: boolean) => this.setBackgroundAudioPlayback(value))
+              .attributeModifier(new GamepadAction(this.getUIContext(), this.settingsGamepadScope(), 'backgroundAudioPlayback',
+                () => this.setBackgroundAudioPlayback(!this.backgroundAudioPlayback), (): boolean => !this.isBusy, '', false))
           }
           .width('100%')
 
@@ -6515,6 +7820,8 @@ struct Index {
               .selectedColor('#2E6BFF')
               .enabled(!this.isBusy && this.backgroundVideoPlayback)
               .onChange((value: boolean) => this.setVideoBackgroundAutoPip(value))
+              .attributeModifier(new GamepadAction(this.getUIContext(), this.settingsGamepadScope(), 'videoBackgroundAutoPip',
+                () => this.setVideoBackgroundAutoPip(!this.videoBackgroundAutoPip), (): boolean => !this.isBusy, '', false))
           }
           .width('100%')
         }
@@ -6590,6 +7897,8 @@ struct Index {
             Toggle({ type: ToggleType.Switch, isOn: this.meteredAutoOriginal })
               .selectedColor('#2E6BFF')
               .onChange((value: boolean) => this.setMeteredAutoOriginal(value))
+              .attributeModifier(new GamepadAction(this.getUIContext(), this.settingsGamepadScope(), 'meteredAutoOriginal',
+                () => this.setMeteredAutoOriginal(!this.meteredAutoOriginal), (): boolean => !this.isBusy, '', false))
           }
           .width('100%')
 
@@ -6608,6 +7917,8 @@ struct Index {
             Toggle({ type: ToggleType.Switch, isOn: this.meteredBackgroundRefresh })
               .selectedColor('#2E6BFF')
               .onChange((value: boolean) => this.setMeteredBackgroundRefresh(value))
+              .attributeModifier(new GamepadAction(this.getUIContext(), this.settingsGamepadScope(), 'meteredBackgroundRefresh',
+                () => this.setMeteredBackgroundRefresh(!this.meteredBackgroundRefresh), (): boolean => !this.isBusy, '', false))
           }
           .width('100%')
 
@@ -6626,6 +7937,8 @@ struct Index {
             Toggle({ type: ToggleType.Switch, isOn: this.meteredDownloadContinue })
               .selectedColor('#2E6BFF')
               .onChange((value: boolean) => this.setMeteredDownloadContinue(value))
+              .attributeModifier(new GamepadAction(this.getUIContext(), this.settingsGamepadScope(), 'meteredDownloadContinue',
+                () => this.setMeteredDownloadContinue(!this.meteredDownloadContinue), (): boolean => !this.isBusy, '', false))
           }
           .width('100%')
         }
@@ -6815,6 +8128,7 @@ struct Index {
         }
         .type(ButtonType.Normal)
         .id('file-tools-sort')
+        .outline({ width: 1.5, radius: Glass.barHeight / 2, color: this.gamepadFocusColor('tools', '排序') })
         .width(Glass.sortWidth)
         .height(Glass.barHeight)
         .borderRadius(Glass.barHeight / 2)
@@ -6893,11 +8207,11 @@ struct Index {
         SymbolGlyph(icon)
           .fontSize(Glass.iconSize)
           .fontColor([this.selectionActionEnabled(title)
-            ? $r('sys.color.icon_primary') : $r('sys.color.icon_tertiary')])
+            ? this.gamepadGlassInk('selection', title, $r('sys.color.icon_primary')) : $r('sys.color.icon_tertiary')])
         Text(title)
           .fontSize(Glass.labelSize)
           .fontColor(this.selectionActionEnabled(title)
-            ? $r('sys.color.font_primary') : $r('sys.color.font_tertiary'))
+            ? this.gamepadGlassInk('selection', title, $r('sys.color.font_primary')) : $r('sys.color.font_tertiary'))
       }
       .justifyContent(FlexAlign.Center)
     }
@@ -6910,6 +8224,7 @@ struct Index {
     .enabled(this.selectionActionEnabled(title))
     .hitTestBehavior(this.bottomBarMode() === 'selection' ? HitTestMode.Default : HitTestMode.None)
     .monopolizeEvents(this.bottomBarMode() === 'selection')
+    .radialGradient(this.selectionActionEnabled(title) ? this.gamepadGlassLight('selection', title) : undefined)
     .onAreaChange((_, area) => this.registerSlideItem('selection', title, area, action))
     .onTouch((event: TouchEvent) => this.slideItemTouch('selection', title, event))
     .onClick(() => {
@@ -6925,11 +8240,11 @@ struct Index {
         SymbolGlyph($r('sys.symbol.more'))
           .fontSize(Glass.iconSize)
           .fontColor([this.selectedEntryCount > 0
-            ? $r('sys.color.icon_primary') : $r('sys.color.icon_tertiary')])
+            ? this.gamepadGlassInk('selection', '更多', $r('sys.color.icon_primary')) : $r('sys.color.icon_tertiary')])
         Text('更多')
           .fontSize(Glass.labelSize)
           .fontColor(this.selectedEntryCount > 0
-            ? $r('sys.color.font_primary') : $r('sys.color.font_tertiary'))
+            ? this.gamepadGlassInk('selection', '更多', $r('sys.color.font_primary')) : $r('sys.color.font_tertiary'))
       }
       .justifyContent(FlexAlign.Center)
     }
@@ -6944,6 +8259,7 @@ struct Index {
     .monopolizeEvents(this.bottomBarMode() === 'selection')
     .onAreaChange((_, area) =>
       this.registerSlideItem('selection', '更多', area, () => this.toggleSelectionMoreMenu()))
+    .radialGradient(this.selectedEntryCount > 0 ? this.gamepadGlassLight('selection', '更多') : undefined)
     .onTouch((event: TouchEvent) => this.slideItemTouch('selection', '更多', event))
     .onClick(() => {
       HapticFeedback.confirm()
@@ -6957,6 +8273,9 @@ struct Index {
   @Builder
   SelectionMorePopup(): void {
     GlassMenuSurface({ widthVp: Math.min(Glass.menuWidth, this.effectivePageWidth() - 40),
+      shouldFocus: (): boolean => this.openGamepadMenu() !== '' && this.gamepadPresent(),
+      onPadKey: (event: KeyEvent): boolean => this.handleGamepadKey(event),
+      onPadAxis: (event: FocusAxisEvent): void => this.handleGamepadAxes(event),
       content: () => {
         this.SelectionMoreRow($r('sys.symbol.move'), '移动',
           () => this.beginSelectionDestinationPicker('move'))
@@ -7016,6 +8335,8 @@ struct Index {
     showDivider: boolean = true): void {
     GlassMenuRow({ icon: icon, title: title, showDivider: showDivider,
       rowId: 'floating-menu-' + group + '-' + title, onActivate: action,
+      gamepadFocused: this.gamepadFocused(group, title),
+      onRowReady: (): void => this.registerSlideAction(group, title, action),
       onRowArea: (area: Area) => this.registerSlideItem(group, title, area, action),
       onRowTouch: (event: TouchEvent) => this.slideItemTouch(group, title, event) })
   }
@@ -7036,6 +8357,7 @@ struct Index {
     }
     .type(ButtonType.Normal)
     .id('file-tool-' + options.slideKey)
+    .outline({ width: 1.5, radius: Glass.barHeight / 2, color: this.gamepadFocusColor('tools', options.slideKey) })
     .accessibilityText(options.slideKey)
     .width(Glass.barHeight)
     .height(Glass.barHeight)
@@ -7046,6 +8368,7 @@ struct Index {
     .monopolizeEvents(this.bottomBarMode() === 'tools')
     .onAreaChange((_, area: Area) => {
       this.updateBottomBarInteractiveRect('tools:' + options.slideKey, area)
+      this.registerSlideItem('tools', options.slideKey, area, options.action)
     })
     .onClick(() => {
       HapticFeedback.confirm()
@@ -7056,6 +8379,9 @@ struct Index {
   @Builder
   FileSortPopup(): void {
     GlassMenuSurface({ widthVp: Math.min(Glass.menuWidth, this.effectivePageWidth() - 40),
+      shouldFocus: (): boolean => this.openGamepadMenu() !== '' && this.gamepadPresent(),
+      onPadKey: (event: KeyEvent): boolean => this.handleGamepadKey(event),
+      onPadAxis: (event: FocusAxisEvent): void => this.handleGamepadAxes(event),
       content: () => {
         this.FileSortOption('名称', 'name')
         this.FileSortOption('类型', 'type')
@@ -7067,7 +8393,7 @@ struct Index {
   private floatingMenuOptions(builder: CustomBuilder, transition: TransitionEffect,
     onClosed: () => void): CustomPopupOptions {
     return { builder: builder, placement: Placement.Top, targetSpace: 6,
-      maskColor: Color.Transparent, enableArrow: false, autoCancel: true,
+      maskColor: Color.Transparent, enableArrow: false, autoCancel: true, focusable: true,
       radius: Glass.menuRadius, transition: transition, systemMaterial: this.floatingPanelMaterial,
       onStateChange: (state: PopupStateChange): void => {
         if (!state.isVisible) { onClosed() }
@@ -7114,21 +8440,25 @@ struct Index {
     Row() {
       Text(title)
         .fontSize(16)
-        .fontColor($r('sys.color.font_primary'))
+        .fontColor(GamepadMenuStyle.ink(this.gamepadFocused('sortmenu', key), $r('sys.color.font_primary')))
+        .fontWeight(this.gamepadFocused('sortmenu', key) ? FontWeight.Medium : FontWeight.Normal)
         .layoutWeight(1)
       if (this.fileSortKey === key) {
         SymbolGlyph(this.fileSortAscending
           ? $r('sys.symbol.arrow_up')
           : $r('sys.symbol.arrow_down'))
           .fontSize(20)
-          .fontColor([$r('sys.color.icon_primary')])
+          .fontColor([GamepadMenuStyle.ink(this.gamepadFocused('sortmenu', key), $r('sys.color.icon_primary'))])
       }
     }
     .width('100%')
     .height(52)
     .padding({ left: 10, right: 8 })
     .borderRadius(14)
-    .backgroundColor(Color.Transparent)
+    .backgroundColor(GamepadMenuStyle.background(this.gamepadFocused('sortmenu', key), this.isDarkTheme))
+    .onAppear((): void => this.registerSlideAction('sortmenu', key, () => this.selectFileSort(key)))
+    .onAreaChange((_, area: Area): void =>
+      this.registerSlideItem('sortmenu', key, area, () => this.selectFileSort(key)))
     .onClick(() => this.selectFileSort(key))
     if (key !== 'size') {
       ContentDivider({ startInset: 10, endInset: 8, lineColor: $r('sys.color.comp_divider') })
@@ -7141,8 +8471,8 @@ struct Index {
       Stack() {
         SymbolGlyph(icon)
           .fontSize(Glass.iconSize)
-          .fontColor([this.selectedBottomTab === tab
-            ? $r('sys.color.icon_emphasize') : $r('sys.color.icon_primary')])
+          .fontColor([this.gamepadGlassInk('home', tab,
+            this.selectedBottomTab === tab ? $r('sys.color.icon_emphasize') : $r('sys.color.icon_primary'))])
       }
       .width('100%')
       .height(Glass.iconSize)
@@ -7150,8 +8480,8 @@ struct Index {
       Text(title)
         .fontSize(Glass.labelSize)
         .fontWeight(this.selectedBottomTab === tab ? FontWeight.Medium : FontWeight.Normal)
-        .fontColor(this.selectedBottomTab === tab
-          ? $r('sys.color.font_emphasize') : $r('sys.color.font_primary'))
+        .fontColor(this.gamepadGlassInk('home', tab,
+          this.selectedBottomTab === tab ? $r('sys.color.font_emphasize') : $r('sys.color.font_primary')))
     }
     .layoutWeight(1)
     .height('100%')
@@ -7160,20 +8490,28 @@ struct Index {
     // 否则 monopolizeEvents 会越过父级 HitTestMode.None 挡住可见层。
     .hitTestBehavior(this.bottomBarMode() === 'home' ? HitTestMode.Default : HitTestMode.None)
     .monopolizeEvents(this.bottomBarMode() === 'home')
-    .onAreaChange((_, area) => this.registerSlideItem('home', tab, area, action))
+    .radialGradient(this.gamepadGlassLight('home', tab))
     .onTouch((event: TouchEvent) => this.slideItemTouch('home', tab, event))
-    .onClick(() => {
+    .attributeModifier(new GamepadAction(this.getUIContext(), this.screen === 'settings' ? this.settingsGamepadScope() :
+      (this.screen === 'downloads' ? 'downloads' : ''), 'nav:' + tab, () => {
       HapticFeedback.confirm()
       action()
+    }, (): boolean => this.bottomBarMode() === 'home' && !this.parentOverlayOwnsInteraction() && !this.showSearch,
+      'pad-nav:' + tab, true,
+      { highlight: (selected: boolean): void => this.setOrdinaryHighlight('home:' + tab, selected) }))
+    .onAreaChange((_, area) => {
+      this.registerSlideItem('home', tab, area, action)
+      GamepadControls.mount('pad-nav:' + tab, area)
     })
   }
 
   @Builder
-  OfficialBackButton(action: () => void): void {
+  OfficialBackButton(action: () => void, padArea: string = '', ordinaryScope: string = ''): void {
     Button() {
       SymbolGlyph($r('sys.symbol.chevron_backward'))
         .fontSize(HeaderStyle.iconSize)
-        .fontColor([$r('sys.color.icon_primary')])
+        .fontColor([this.ordinaryPadItem === ordinaryScope + ':back' ?
+          $r('sys.color.icon_emphasize') : $r('sys.color.icon_primary')])
     }
     .type(ButtonType.Normal)
     .width(HeaderStyle.controlHeight)
@@ -7184,7 +8522,25 @@ struct Index {
     .overlay(this.ImportLightOverlay, { align: Alignment.Center })
     .hitTestBehavior(HitTestMode.Default)
     .monopolizeEvents(true)
-    .onClick(action)
+    .focusBox(padArea === '' ? {} : this.gamepadNativeFocusBox())
+    .outline({ width: 1.5, radius: HeaderStyle.controlHeight / 2,
+      color: padArea === '' ? Color.Transparent : this.gamepadFocusColor(padArea, '返回') })
+    .attributeModifier(new GamepadAction(this.getUIContext(), ordinaryScope, 'back', action,
+      (): boolean => this.ordinaryGamepadScope() === ordinaryScope, 'pad-back:' + ordinaryScope, true,
+      { highlight: (selected: boolean): void => this.setOrdinaryHighlight(ordinaryScope + ':back', selected) }))
+    .onAreaChange((_, area: Area): void => {
+      if (ordinaryScope !== '') { GamepadControls.mount('pad-back:' + ordinaryScope, area) }
+      if (padArea !== '') { this.registerSlideItem(padArea, '返回', area, action) }
+    })
+  }
+
+  private activateMainHeaderLeading(): void {
+    if (this.screen === 'files') {
+      if (this.selectionMode) { this.exitSelectionMode() }
+      else if (this.currentPath.length > 0) { this.goBack() }
+    } else if (this.screen === 'settings') {
+      this.closeSettingsSubpage()
+    }
   }
 
   @Builder
@@ -7196,7 +8552,8 @@ struct Index {
         SymbolGlyph(this.screen === 'files' && this.selectionMode
           ? $r('sys.symbol.xmark') : $r('sys.symbol.chevron_backward'))
           .fontSize(HeaderStyle.iconSize)
-          .fontColor([$r('sys.color.icon_primary')])
+          .fontColor([this.ordinaryPadItem === 'settings:back' ?
+            $r('sys.color.icon_emphasize') : $r('sys.color.icon_primary')])
       }
       .type(ButtonType.Normal)
       .width(HeaderStyle.controlHeight)
@@ -7209,13 +8566,15 @@ struct Index {
       .hitTestBehavior(this.mainHeaderHasLeading() ? HitTestMode.Default : HitTestMode.BLOCK_DESCENDANTS)
       .monopolizeEvents(true)
       .id('main-header-leading')
-      .onClick(() => {
-        if (this.screen === 'files') {
-          if (this.selectionMode) { this.exitSelectionMode() }
-          else if (this.currentPath.length > 0) { this.goBack() }
-        } else if (this.screen === 'settings') {
-          this.closeSettingsSubpage()
-        }
+      .focusBox(this.gamepadNativeFocusBox())
+      .outline({ width: 1.5, radius: HeaderStyle.controlHeight / 2, color: this.gamepadFocusColor('filetop', '返回') })
+      .attributeModifier(new GamepadAction(this.getUIContext(), this.screen === 'settings' ? this.settingsGamepadScope() : '',
+        'back', () => this.activateMainHeaderLeading(),
+        (): boolean => this.mainHeaderHasLeading() && !this.parentOverlayOwnsInteraction(), 'main-header-leading', true,
+        { highlight: (selected: boolean): void => this.setOrdinaryHighlight('settings:back', selected) }))
+      .onAreaChange((_, area: Area): void => {
+        this.registerSlideItem('filetop', '返回', area, () => this.activateMainHeaderLeading())
+        GamepadControls.mount('main-header-leading', area)
       })
     }
     .width(this.mainHeaderHasLeading() ? HeaderStyle.controlHeight : 0)
@@ -7250,7 +8609,7 @@ struct Index {
       .backgroundColor(this.cacheLimitBytes === value ? '#2E6BFF' : $r('app.color.surface_card'))
       .borderRadius(12)
       .enabled(!this.isBusy)
-      .onClick(() => this.setCacheLimit(value))
+      .attributeModifier(new GamepadAction(this.getUIContext(), this.settingsGamepadScope(), 'cache-limit' + ':' + value.toString(), () => this.setCacheLimit(value), (): boolean => !this.isBusy))
   }
 
   /**
@@ -7335,7 +8694,12 @@ struct Index {
   @Builder
   NativeActionMenuContent(): void {
     if (this.contextMenuEntry !== null) {
-      this.ActionContextMenu(this.contextMenuEntry as FileEntry)
+      Stack({ alignContent: Alignment.TopStart }) {
+        this.ActionContextMenu(this.contextMenuEntry as FileEntry)
+        GamepadMenuKeyRelay({ onKey: (event: KeyEvent): boolean => this.handleLocalMenuKey(event),
+          onAxis: (event: FocusAxisEvent): void => this.handleGamepadAxes(event),
+          shouldFocus: (): boolean => this.contextMenuVisible && this.gamepadPresent() })
+      }.focusable(true)
     }
   }
 
@@ -7454,10 +8818,16 @@ struct Index {
 
   @Builder
   ScrollableActionMenuSurface(entry: FileEntry): void {
-    Scroll() {
+    Scroll(this.gamepadMenuScroller) {
       this.ActionMenuSurfaceFor(entry)
     }
     .id('context-menu-actions')
+    .focusable(true)
+    .focusBox({ strokeColor: ColorMetrics.resourceColor(Color.Transparent), strokeWidth: LengthMetrics.vp(0) })
+    .defaultFocus(true)
+    .onKeyPreIme((event: KeyEvent): boolean => this.handleGamepadKey(event))
+    .onKeyEventDispatch((event: KeyEvent): boolean => this.handleGamepadKey(event))
+    .onFocusAxisEvent((event: FocusAxisEvent): void => this.handleGamepadAxes(event))
     .width('100%')
     .height(this.actionMenuHeight(entry))
     .enableScrollInteraction(this.actionMenuNaturalHeight(entry) > this.actionMenuHeight(entry) + 1)
@@ -7621,18 +8991,20 @@ struct Index {
     Column({ space: 4 }) {
       SymbolGlyph(icon)
         .fontSize(24)
-        .fontColor([$r('sys.color.icon_primary')])
+        .fontColor([GamepadMenuStyle.ink(this.gamepadFocused('ctxmenu', title), $r('sys.color.icon_primary'))])
       Text(title)
         .fontSize(12)
-        .fontColor($r('sys.color.font_primary'))
+        .fontColor(GamepadMenuStyle.ink(this.gamepadFocused('ctxmenu', title), $r('sys.color.font_primary')))
+        .fontWeight(this.gamepadFocused('ctxmenu', title) ? FontWeight.Medium : FontWeight.Normal)
         .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
     }
     .layoutWeight(1)
     .height(58)
     .justifyContent(FlexAlign.Center)
-    .backgroundColor(Color.Transparent)
+    .backgroundColor(GamepadMenuStyle.background(this.gamepadFocused('ctxmenu', title), this.isDarkTheme))
     .borderRadius(14)
+    .onAppear((): void => this.registerSlideAction('ctxmenu', title, () => this.runContextAction(action)))
     .onAreaChange((_, area) =>
       this.registerSlideItem('ctxmenu', title, area, () => this.runContextAction(action)))
     .onTouch((event: TouchEvent) => this.slideItemTouch('ctxmenu', title, event))
@@ -7648,6 +9020,8 @@ struct Index {
     // bindContextMenu 上，但条目是自绘的，所以能收到触摸事件。
     GlassMenuRow({ icon: icon, title: title, showDivider: !last, danger: danger,
       variant: 'menu', rowId: 'context-menu-row-' + title,
+      gamepadFocused: this.gamepadFocused('ctxmenu', title),
+      onRowReady: (): void => this.registerSlideAction('ctxmenu', title, () => this.runContextAction(action)),
       onActivate: () => this.runContextAction(action),
       onRowArea: (area: Area) => this.registerSlideItem('ctxmenu', title, area,
         () => this.runContextAction(action)),
@@ -7658,6 +9032,7 @@ struct Index {
   DestinationPickerOverlay(): void {
     TaskPanel({ title: this.destinationOperation === 'upload' ? '选择上传位置' : '选择目标文件夹',
       idPrefix: 'destination-picker', floating: true, closing: this.destinationPickerClosing,
+      gamepadItem: this.destinationPadItem,
       viewportWidth: this.pageWidthVp, viewportHeight: this.pageHeightVp,
       safeTop: this.topSafeInset(), safeBottom: this.bottomSafeInset(),
       hasFooter: true, showAuxiliary: true, auxiliaryLabel: '新建文件夹',
@@ -7674,7 +9049,7 @@ struct Index {
   DestinationPickerContent(): void {
     TaskPanelSection({ fillHeight: true, paddingSize: 0 }) {
       Stack() {
-        List() {
+        List({ scroller: this.destinationPadScroller }) {
           ListItem() { this.DestinationCloudRootRow() }
           LazyForEach(this.destinationDataSource, (entry: FileEntry) => {
             ListItem() { this.DestinationFolderRow(entry) }
@@ -7694,6 +9069,7 @@ struct Index {
       (this.destinationOperation === 'upload' ? '上传 ' : this.destinationOperation === 'copy' ? '复制 ' : '移动 ') +
         this.destinationItemCount().toString() + ' 项到此处',
       actionId: 'destination-picker-confirm', busy: this.destinationOperationRunning,
+      gamepadFocused: this.destinationPadItem === 'confirm',
       actionEnabled: !this.destinationLoading && !this.destinationPickerClosing &&
         this.destinationItemCount() > 0 && this.destinationPath.length > 0 &&
         !this.destinationContainsSource(this.destinationPath),
@@ -7715,6 +9091,7 @@ struct Index {
   @Builder
   DestinationCloudRootRow(): void {
     FileListRow({ title: this.destinationPath === this.destinationRootPath ? this.destinationDisplayName() : '上一级',
+      gamepadFocused: this.destinationPadItem === 'parent',
       titleColor: $r('sys.color.font_primary'),
       leading: (): void => { this.DestinationRootLeading() } })
       .id('destination-picker-root').onClick((): void => {
@@ -7725,6 +9102,7 @@ struct Index {
   @Builder
   DestinationFolderRow(entry: FileEntry): void {
     FileListRow({ title: entry.name, info: this.destinationEntryInfo(entry), showDivider: true,
+      gamepadFocused: this.destinationPadItem === entry.path,
       titleColor: $r('sys.color.font_primary'), infoColor: $r('sys.color.font_secondary'),
       leading: (): void => { this.FolderIcon(FileRowStyle.iconSize) },
       trailing: (): void => { this.DestinationRowTrailing() } })
@@ -7735,6 +9113,8 @@ struct Index {
   DestinationFolderOverlay(): void {
     NameInputDialog({ visible: $destinationFolderDialog, name: $destinationFolderText,
       title: '新建文件夹', placeholder: '输入文件夹名称', idPrefix: 'destination-folder',
+      onPadScope: (scope: GamepadModalFocus | null): void => this.registerGamepadScope('destination-folder', scope),
+      onPadKey: (event: KeyEvent): boolean => this.handleGamepadKey(event),
       busy: this.destinationLoading, viewportWidth: this.pageWidthVp,
       material: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
       onClose: (): void => { this.closeDestinationFolderDialog() },
@@ -7745,6 +9125,8 @@ struct Index {
   RenameOverlay(): void {
     NameInputDialog({ visible: $showRenameDialog, name: $renameText,
       title: '重命名', placeholder: '输入新名称', idPrefix: 'rename',
+      onPadScope: (scope: GamepadModalFocus | null): void => this.registerGamepadScope('rename', scope),
+      onPadKey: (event: KeyEvent): boolean => this.handleGamepadKey(event),
       busy: this.isBusy, viewportWidth: this.pageWidthVp,
       material: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
       onClose: (): void => { this.closeRename() },
@@ -7755,6 +9137,8 @@ struct Index {
   CreateFolderOverlay(): void {
     NameInputDialog({ visible: $showCreateFolderDialog, name: $newFolderText,
       title: '新建文件夹', placeholder: '输入文件夹名称', idPrefix: 'create-folder',
+      onPadScope: (scope: GamepadModalFocus | null): void => this.registerGamepadScope('create-folder', scope),
+      onPadKey: (event: KeyEvent): boolean => this.handleGamepadKey(event),
       busy: this.isBusy, viewportWidth: this.pageWidthVp,
       material: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
       onClose: (): void => { this.closeCreateFolder() },
@@ -9767,6 +11151,20 @@ struct Index {
   @Builder
   ImageViewer(): void {
     Stack() {
+      // Keep a native input target on the canvas, independent of either toolbar.
+      Row() {}
+        .id('linkfiles-gamepad-viewer-input')
+        .width(1).height(1).position({ x: 0, y: 0 })
+        .focusable(true)
+        .focusBox({ strokeColor: ColorMetrics.resourceColor(Color.Transparent), strokeWidth: LengthMetrics.vp(0) })
+        .hitTestBehavior(HitTestMode.None).accessibilityLevel('no')
+        .onKeyPreIme((event: KeyEvent): boolean => this.handleGamepadKey(event))
+        .onFocusAxisEvent((event: FocusAxisEvent): void => this.handleGamepadAxes(event))
+        .onAppear((): void => {
+          if (this.gamepadArea !== '' || this.gamepadDeviceIds.size > 0) {
+            this.postRenderFrame((): void => this.requestGamepadInputFocus())
+          }
+        })
       // Keep the file surface mounted underneath the viewer. During a
       // downward pull this is the only layer that fades, so the unchanged
       // list/grid/waterfall page is revealed progressively behind the image.
@@ -9794,7 +11192,7 @@ struct Index {
       .duration(180)
       .curve(Curve.FastOutSlowIn)
       .effectMode(EdgeEffect.Spring)
-      .disableSwipe(this.viewerGestureBlocked() || this.imageScale > 1.001 || this.imageDismissDragging)
+      .disableSwipe(this.viewerGestureBlocked() || this.imageScale > 1.001 || this.imageDismissDragging || this.imagePinchActive)
       .width('100%')
       .height('100%')
       .onAreaChange((_, area) => this.handleImageViewportArea(area))
@@ -9847,6 +11245,7 @@ struct Index {
       }
       .width('100%')
       .height('100%')
+      .focusable(this.imageChromeVisible)
       .opacity(this.imageChromeOpacity)
       .translate({ x: 0, y: this.imageTopChromeOffsetY, z: 0 })
       .hitTestBehavior(HitTestMode.None)
@@ -9859,6 +11258,7 @@ struct Index {
       }
       .width('100%')
       .height('100%')
+      .focusable(this.imageChromeVisible)
       .opacity(this.imageChromeOpacity)
       .translate({ x: 0, y: this.imageBottomChromeOffsetY, z: 0 })
       .hitTestBehavior(HitTestMode.None)
@@ -9989,40 +11389,29 @@ struct Index {
           GestureGroup(
             GestureMode.Parallel,
             PinchGesture({ fingers: 2 })
-              .onActionStart(() => {
-                if (index === this.viewerImageIndex) {
-                  this.imageSavedScale = this.imageScale
-                }
-              })
-              .onActionUpdate((event) => {
-                if (index === this.viewerImageIndex) {
-                  this.imageScale = Math.min(5, Math.max(1, this.imageSavedScale * event.scale))
-                }
-              })
-              .onActionEnd(() => {
-                if (index === this.viewerImageIndex) {
-                  this.normalizeImageTransform()
-                }
-              }),
+              .onActionStart((event: GestureEvent) => this.handleImagePinchStart(index, event))
+              .onActionUpdate((event: GestureEvent) => this.handleImagePinchUpdate(index, event))
+              .onActionEnd(() => this.handleImagePinchEnd(index))
+              .onActionCancel(() => this.handleImagePinchEnd(index)),
             PanGesture({
               fingers: 1,
               direction: PanDirection.All,
               distance: this.imageScale > 1.001 && index === this.viewerImageIndex ? 1 : 100000
             })
               .onActionStart(() => {
-                if (index === this.viewerImageIndex && this.imageScale > 1.001) {
+                if (index === this.viewerImageIndex && this.imageScale > 1.001 && !this.imagePinchActive) {
                   this.imageSavedOffsetX = this.imageOffsetX
                   this.imageSavedOffsetY = this.imageOffsetY
                 }
               })
               .onActionUpdate((event) => {
-                if (index === this.viewerImageIndex && this.imageScale > 1.001) {
+                if (index === this.viewerImageIndex && this.imageScale > 1.001 && !this.imagePinchActive) {
                   this.imageOffsetX = this.imageSavedOffsetX + event.offsetX
                   this.imageOffsetY = this.imageSavedOffsetY + event.offsetY
                 }
               })
-              .onActionEnd((event) => this.handleImagePanEnd(event))
-              .onActionCancel(() => this.handleImagePanCancel())
+              .onActionEnd((event: GestureEvent) => this.handleImagePanEnd(index, event))
+              .onActionCancel(() => this.handleImagePanCancel(index))
             ,
             // At the base zoom level, vertical dragging belongs to the
             // pull-to-dismiss interaction. Horizontal dragging remains owned
@@ -10093,7 +11482,7 @@ struct Index {
         .hitTestBehavior(HitTestMode.None)
 
       Row({ space: HeaderStyle.gap }) {
-        this.OfficialBackButton(() => this.closeImageViewer())
+        this.OfficialBackButton(() => this.closeImageViewer(), 'viewertop')
         Text(this.viewerHeaderTitle)
           .fontSize(HeaderStyle.titleSize)
           .fontWeight(FontWeight.Bold)
@@ -10126,6 +11515,10 @@ struct Index {
               this.tapTrace('touch-up', 'locate-btn')
             }
           })
+          .focusBox(this.gamepadNativeFocusBox())
+          .outline({ width: 1.5, radius: HeaderStyle.controlHeight / 2, color: this.gamepadFocusColor('viewertop', '定位到所在目录') })
+          .onAreaChange((_, area: Area): void => this.registerSlideItem('viewertop', '定位到所在目录',
+            area, () => this.triggerLocateFromViewer()))
           .onClick(() => this.triggerLocateFromViewer())
         }
       }
@@ -10193,6 +11586,7 @@ struct Index {
       .height('100%')
       .hitTestBehavior(HitTestMode.Default)
       .monopolizeEvents(true)
+      .radialGradient(this.gamepadGlassLight('viewer', '进度'))
       .onAreaChange((_, area) => this.registerSlideItem('viewer', '进度', area,
         () => this.runCommittedViewerAction('load-original',
           (entry: FileEntry): Promise<void> => this.loadViewerOriginalManually(entry))))
@@ -10217,14 +11611,14 @@ struct Index {
       Stack() {
         SymbolGlyph(icon)
           .fontSize(Glass.iconSize)
-          .fontColor([$r('sys.color.icon_primary')])
+          .fontColor([this.gamepadGlassInk('viewer', title, $r('sys.color.icon_primary'))])
       }
       .width('100%')
       .height(Glass.iconSize)
 
       Text(title)
         .fontSize(Glass.labelSize)
-        .fontColor($r('sys.color.font_primary'))
+        .fontColor(this.gamepadGlassInk('viewer', title, $r('sys.color.font_primary')))
     }
     .layoutWeight(1)
     .height('100%')
@@ -10232,6 +11626,7 @@ struct Index {
     .hitTestBehavior(HitTestMode.Default)
     .monopolizeEvents(true)
     // 一排按钮上滑动：按下 A、滑到 B 松手 → 触发 B。
+    .radialGradient(this.gamepadGlassLight('viewer', title))
     .onAreaChange((_, area) => this.registerSlideItem('viewer', title, area, action))
     .onTouch((event: TouchEvent) => this.slideItemTouch('viewer', title, event))
     .onClick(action)
@@ -10252,9 +11647,25 @@ struct Index {
   }
 
 
+  private imageViewerMoreActions(): FloatingMenuAction[] {
+    const actions: FloatingMenuAction[] = []
+    if (this.isSearchViewer()) {
+      actions.push({ icon: $r('sys.symbol.folder'), title: '定位到所在目录', action: () => this.triggerLocateFromViewer() })
+    }
+    actions.push({ icon: $r('sys.symbol.rotate_left'), title: '旋转', action: () => this.rotateViewerOverlayImage() },
+      { icon: $r('sys.symbol.rectangle_and_arrowshape_turn_up_right'), title: '其他应用打开',
+        action: () => this.openViewerOverlayWithOtherApp() },
+      { icon: $r('sys.symbol.rename'), title: '重命名', action: () => this.openRenameFromViewerOverlay() },
+      { icon: $r('sys.symbol.info_circle'), title: '详情', action: () => this.openImageDetails() })
+    return actions
+  }
+
   @Builder
   ImageViewerMoreContent(): void {
     GlassMenuSurface({ widthVp: Math.min(Glass.menuWidth, this.effectivePageWidth() - 40),
+      shouldFocus: (): boolean => this.openGamepadMenu() !== '' && this.gamepadPresent(),
+      onPadKey: (event: KeyEvent): boolean => this.handleGamepadKey(event),
+      onPadAxis: (event: FocusAxisEvent): void => this.handleGamepadAxes(event),
       content: () => {
         if (this.isSearchViewer()) {
           this.FloatingMenuActionRow('viewermenu', $r('sys.symbol.folder'), '定位到所在目录',
@@ -10333,9 +11744,13 @@ struct Index {
         },
         onShare: () => { if (this.audioEntry !== null) { this.shareEntry(this.audioEntry) } },
         onSeek: (value: number) => this.seekAudio(value),
+        onCastRequest: (): void => this.openControllerCastPicker(false),
+        onCastState: (state: AVCastPickerState): void => {
+          this.systemGamepadInput = state === AVCastPickerState.STATE_APPEARING
+        },
         onCoverArea: (area: Area) => this.recordAudioCoverArea(area),
         onCoverVisibility: (ratio: number) => { this.audioCoverVisibleRatio = ratio },
-        backButton: () => { this.OfficialBackButton(() => this.closeAudioPlayer()) } })
+        backButton: () => { this.OfficialBackButton(() => this.closeAudioPlayer(), '', 'audio') } })
     }
     .width('100%').height('100%').zIndex(30).id('audio-overlay-root')
     .opacity(this.audioPageOpacity)
@@ -10356,9 +11771,15 @@ struct Index {
 
   @Builder
   AudioQueueContent(): void {
-    TaskPanel({ title: '播放列表', idPrefix: 'audio-queue',
+    TaskPanel({ title: '播放列表', idPrefix: 'audio-queue', gamepadItem: this.audioQueuePadItem,
       onClose: () => { this.showAudioQueue = false },
       content: () => { this.AudioQueueList() } })
+  }
+
+  private activateAudioQueueEntry(item: FileEntry): void {
+    if (this.isBusy || this.audioClosing) { return }
+    this.showAudioQueue = false
+    this.openAudioPlayer(item, true)
   }
 
   @Builder
@@ -10374,11 +11795,9 @@ struct Index {
               }
               .width('100%').height(FileRowStyle.leadingHeight + FileRowStyle.verticalPadding * 2)
               .padding({ left: 12, right: 12 })
-              .onClick(() => {
-                if (this.isBusy || this.audioClosing) { return }
-                this.showAudioQueue = false
-                this.openAudioPlayer(item, true)
-              })
+              .backgroundColor(this.audioQueuePadItem === item.path ? '#1C5F9BF2' : Color.Transparent)
+              .borderRadius(12)
+              .onClick(() => this.activateAudioQueueEntry(item))
             }
           }, (item: FileEntry) => item.path)
         }.width('100%').height('100%').scrollBar(BarState.Auto)
@@ -10557,14 +11976,16 @@ struct Index {
     Stack({ alignContent: Alignment.Center }) {
       SymbolGlyph($r('sys.symbol.chevron_backward'))
         .fontSize(HeaderStyle.iconSize)
-        .fontColor([$r('sys.color.font_on_primary')])
+        .fontColor([this.ordinaryPadItem === 'video:back' ? '#A6C9FF' : $r('sys.color.font_on_primary')])
         .draggable(false).hitTestBehavior(HitTestMode.None)
     }
       .width(HeaderStyle.controlHeight)
       .height(HeaderStyle.controlHeight)
       .draggable(false).focusable(true).accessibilityRole(AccessibilityRoleType.BUTTON)
       .id('video-back').accessibilityText('返回')
-      .onClick(() => this.closeVideoPlayer(true))
+      .attributeModifier(new GamepadAction(this.getUIContext(), 'video', 'back', () => this.closeVideoPlayer(true),
+        (): boolean => this.videoChromeVisible, 'video-back', true,
+        { highlight: (selected: boolean): void => this.setOrdinaryHighlight('video:back', selected) }))
     Text(this.videoEntry === null ? '' : (this.videoEntry as FileEntry).name)
       .fontSize(HeaderStyle.titleSize)
       .fontWeight(FontWeight.Bold)
@@ -10578,6 +11999,7 @@ struct Index {
       // Keep the supplied PiP artwork as a hand-drawn vector asset.  The
       // SVG has no raster background, so it stays crisp at every density.
       Image($r('app.media.video_pip_icon'))
+        .fillColor(this.ordinaryPadItem === 'video:pip' ? '#A6C9FF' : Color.White)
         .width(HeaderStyle.iconSize)
         .height(HeaderStyle.iconSize)
         .objectFit(ImageFit.Contain)
@@ -10591,7 +12013,9 @@ struct Index {
       .opacity(this.videoSurfaceReady && this.videoPrepared && !this.videoPipCreating && !this.isBusy ? 1 : 0.4)
       .enabled(this.videoSurfaceReady && this.videoPrepared &&
         !this.videoPipCreating && !this.isBusy)
-      .onClick(() => this.toggleVideoPip())
+      .attributeModifier(new GamepadAction(this.getUIContext(), 'video', 'pip', () => this.toggleVideoPip(),
+        (): boolean => this.videoChromeVisible && this.videoSurfaceReady && this.videoPrepared && !this.videoPipCreating && !this.isBusy, 'video-pip', true,
+        { highlight: (selected: boolean): void => this.setOrdinaryHighlight('video:pip', selected) }))
     // Use the official picker with a synchronously loaded local glyph. Its
     // default symbol initializes asynchronously when Navigation relayouts.
     Stack({ alignContent: Alignment.Center }) {
@@ -10605,6 +12029,10 @@ struct Index {
         .width(HeaderStyle.iconSize)
         .height(HeaderStyle.iconSize)
         .backgroundColor(Color.Transparent)
+        .attributeModifier(new GamepadAction(this.getUIContext(), 'video', 'cast',
+          (): void => this.openControllerCastPicker(true), (): boolean => this.videoChromeVisible && !this.isBusy,
+          'video-cast', false,
+          { highlight: (selected: boolean): void => this.setOrdinaryHighlight('video:cast', selected) }))
     }
       .width(HeaderStyle.controlHeight)
       .height(HeaderStyle.controlHeight)
@@ -10622,7 +12050,7 @@ struct Index {
       .width(HeaderStyle.iconSize)
       .height(HeaderStyle.iconSize)
       .objectFit(ImageFit.Contain)
-      .fillColor(this.videoCasting
+      .fillColor(this.videoCasting || this.ordinaryPadItem === 'video:cast'
         ? $r('sys.color.icon_emphasize') : $r('sys.color.font_on_primary'))
       .syncLoad(true)
       .draggable(false)
@@ -10639,10 +12067,10 @@ struct Index {
         positionMs: this.videoGestureSeeking ? this.videoGesturePositionMs : this.videoCurrentMs,
         durationMs: this.videoDurationMs,
         bufferedMs: this.videoBufferedTimelineMs(), rate: this.videoCasting ? 1 : this.videoPlaybackRate,
-        playing: this.videoPlaying, isEnabled: this.videoPrepared && !this.isBusy,
+        playing: this.videoPlaying, isEnabled: this.videoPrepared && !this.isBusy, controlsVisible: this.videoChromeVisible,
         timelineReady: this.videoTimelineReady, rotating: this.videoOrientationChanging,
         landscape: this.videoLandscape, rateEnabled: !this.videoCasting,
-        ratePending: this.videoRatePending, ratePanel: this.videoRatePanel,
+        ratePending: this.videoRatePending, ratePanel: this.videoRatePanel, padItem: this.videoRatePadItem,
         onToggle: () => this.toggleVideo(), onSeek: (value: number) => this.seekVideo(value),
         onSeeking: (active: boolean) => {
           this.videoSeekDragging = active
@@ -10650,6 +12078,7 @@ struct Index {
         },
         onInteraction: (active: boolean) => this.handleVideoControlInteraction(active),
         onRate: (rate: number) => this.setVideoPlaybackRate(rate),
+        onPadKey: (event: KeyEvent): boolean => this.handleGamepadKey(event),
         onRatePanel: (visible: boolean) => {
           this.videoRatePanel = visible
           if (visible) { this.cancelVideoGestures(); this.clearVideoChromeTimer() }
@@ -11569,6 +12998,7 @@ struct Index {
   }
 
   private dismissKeyboard(): void {
+    this.searchEditing = false
     this.searchFocusPending = false
     try {
       this.searchController.stopEditing()
@@ -11827,6 +13257,7 @@ struct Index {
     if (this.isRootListing()) {
       return
     }
+    this.gamepadFollowTouchViewport()
     const sourceMode = this.fileViewMode
     const anchor = this.captureFileViewAnchor()
     const sourceOffset = this.captureFileViewOffset(sourceMode)
@@ -11873,8 +13304,8 @@ struct Index {
   private restoreFileViewModePosition(sourceMode: FileViewMode,
     anchor: FileViewAnchor | null, sourceOffset: ViewerReturnScrollOffset | null,
     token: number, attempt: number, maxAttempts: number = 8): void {
-    if (token !== this.waterfallAnchorRestoreToken || this.screen !== 'files' ||
-      this.showSearch) {
+    if (token !== this.waterfallAnchorRestoreToken || this.screen !== 'files' || this.showSearch ||
+      (this.fileViewMode === 'list' && this.gamepadArea === 'files')) {
       return
     }
 
@@ -12299,7 +13730,7 @@ struct Index {
         total: 100, type: ProgressType.Ring }).width(28).height(28).color('#2E6BFF').margin(12)
         .style({ enableSmoothEffect: false })
     } else if (this.waterfallBatchEpoch >= 0 && this.waterfallBatches?.error) {
-      Text('点击重试').fontSize(14).fontColor('#888888').padding(16)
+      Text('点击重试').fontSize(14).fontColor(this.gamepadFocused('filetop', '重试加载') ? '#5F9BF2' : '#888888').padding(16)
         .onClick((): void => this.waterfallBatches?.retry())
     } else {
       LoadingProgress().width(28).height(28).color('#2E6BFF').margin(12)
@@ -14644,6 +16075,10 @@ struct Index {
   }
 
   private onFileContentScrollStart(): void {
+    if (this.fileContentTouchActive && this.gamepadFilesAvailable() && !this.showImageViewer) {
+      this.gamepadTouchScrollPending = true
+      this.gamepadTouchScrollDirectory = this.gamepadDirectoryKey()
+    }
     if (this.dragSelectionPanActive && this.fileContentScrolling) {
       this.noteUserInteraction()
       return
@@ -14681,6 +16116,7 @@ struct Index {
     }
     this.closeSessionActive = false
     this.fileContentScrolling = false
+    this.gamepadFollowTouchViewport()
     if (this.fileViewMode === 'waterfall') {
       this.prefetchWaterfallRange(this.waterfallVisibleStartIndex, this.waterfallVisibleEndIndex)
     }
@@ -15612,7 +17048,7 @@ struct Index {
     this.openEntry(entry)
   }
 
-  private showActionMenu(entry: FileEntry, event: GestureEvent): void {
+  private showActionMenu(entry: FileEntry, event?: GestureEvent, fromGamepad: boolean = false): void {
     // The file manager and the recycle bin share this one menu shell — the
     // anchor, the preview and the dismissal lifecycle — because a long press
     // should feel identical in both places. Only the rows inside differ, and
@@ -15648,19 +17084,26 @@ struct Index {
         this.fileGridColumnCount() - 2)
     const height = this.contextMenuPreviewSurface === 'waterfall'
       ? width / this.waterfallAspectRatio(entry) : width
-    const finger = event.fingerList.length > 0 ? event.fingerList[0] : null
+    const directoryKey = this.currentRootType.toString() + ':' + this.currentPath + ':' +
+      this.contextMenuPreviewSurface
+    const area = hasCurrentArea && this.rowHitDirectoryKey === directoryKey
+      ? this.rowHitAreas.get(this.contextMenuPreviewSurface + ':' + entry.path) : undefined
+    const finger = event !== undefined && event.fingerList.length > 0 ? event.fingerList[0] : null
+    // Match a press at the center of the focused row when there is no finger.
+    const focusArea = fromGamepad ? area : undefined
+    const originX = finger !== null ? finger.globalX - this.mainContentOriginX :
+      (focusArea === undefined ? this.effectivePageWidth() / 2 :
+        focusArea.x - this.mainContentOriginX + focusArea.width / 2)
+    const originY = finger !== null ? finger.globalY - this.mainContentOriginY :
+      (focusArea === undefined ? this.pageHeightVp / 2 :
+        focusArea.y - this.mainContentOriginY + focusArea.height / 2)
     const fallback: ContextPreviewRect = {
-      x: (finger === null ? this.effectivePageWidth() / 2 : finger.globalX - this.mainContentOriginX) - width / 2,
-      y: (finger === null ? this.pageHeightVp / 2 : finger.globalY - this.mainContentOriginY) -
-        (tile ? height / 2 : 29),
+      x: originX - width / 2,
+      y: originY - (tile ? height / 2 : 29),
       width: width,
       height: height
     }
-    const directoryKey = this.currentRootType.toString() + ':' + this.currentPath + ':' +
-      this.contextMenuPreviewSurface
-    const area = tile && hasCurrentArea && this.rowHitDirectoryKey === directoryKey
-      ? this.rowHitAreas.get(this.contextMenuPreviewSurface + ':' + entry.path) : undefined
-    const rect: ContextPreviewRect | null = area === undefined ? null : {
+    const rect: ContextPreviewRect | null = !tile || area === undefined ? null : {
       x: area.x - this.mainContentOriginX,
       y: area.y - this.mainContentOriginY,
       width: area.width,
@@ -15683,6 +17126,11 @@ struct Index {
       this.contextMenuPreviewOrientation = this.fileListImageBaseOrientation(entry)
     }
     this.contextMenuEntry = entry
+    if (fromGamepad) {
+      this.stopGamepadAxes()
+      this.gamepadArea = 'ctxmenu'
+      this.gamepadItem = this.actionSupportsShare(entry) ? '分享' : '复制'
+    }
     this.contextMenuOpening = true
     const token = ++this.contextMenuOpenToken
     // Submit the new anchor geometry before presenting the native subwindow.
@@ -15757,6 +17205,11 @@ struct Index {
     this.pendingContextAction = null
     this.contextMenuScrollMoved = false
     this.clearSlideItems('ctxmenu')
+    if (this.gamepadArea === 'ctxmenu') {
+      this.gamepadArea = 'files'
+      this.gamepadItem = ''
+    }
+    if (this.gamepadPresent()) { this.postRenderFrame((): void => this.requestGamepadInputFocus()) }
     if (bitmap !== null) {
       this.viewerBitmapStore.releasePreview(bitmap).catch((): void => {})
     }
@@ -15971,39 +17424,61 @@ struct Index {
 
   @Builder
   EntryDetailsDialogContent(title: string, data: EntryDetailsData, query: (() => DirectorySizeQuery) | null,
-    onConfirm: () => void): void {
-    EntryDetailsContent({ title: title, data: data, createSizeQuery: query,
-      formatSize: (size: number): string => size === 0 ? '0 B' : this.formatSize(size),
-      maxContentHeight: Math.max(80, this.pageHeightVp - this.topSafeInset() - this.bottomSafeInset() - 160),
-      onConfirm: onConfirm })
+    finish: (index: number) => void): void {
+    Column() {
+      EntryDetailsContent({ title: title, data: data, createSizeQuery: query,
+        formatSize: (size: number): string => size === 0 ? '0 B' : this.formatSize(size),
+        maxContentHeight: Math.max(80, this.pageHeightVp - this.topSafeInset() - this.bottomSafeInset() - 160),
+        onConfirm: () => finish(0), gamepadFocused: this.gamepadDialogItem === '0' })
+    }.focusable(true)
+      .onKeyPreIme((event: KeyEvent): boolean => this.handleGamepadKey(event))
+      .onKeyEventDispatch((event: KeyEvent): boolean => this.handleGamepadKey(event))
+      .onFocusAxisEvent((event: FocusAxisEvent): void => this.handleGamepadAxes(event))
   }
 
   private presentEntryDetails(title: string, data: EntryDetailsData,
     query: (() => DirectorySizeQuery) | null): Promise<promptAction.ShowDialogSuccessResponse> {
     return this.presentPageDialog((finish: (index: number) => void): void => {
-      this.EntryDetailsDialogContent(title, data, query, (): void => { finish(0) })
-    }, this.floatingPanelMaterial)
+      this.EntryDetailsDialogContent(title, data, query, finish)
+    }, this.floatingPanelMaterial, [0], 0)
   }
 
   private confirmationButton(options: promptAction.ShowDialogOptions, index: number,
     finish: (index: number) => void): ButtonOptions | undefined {
     const button = options.buttons?.[index]
-    return button === undefined ? undefined : { value: button.text, fontColor: button.color,
+    const singleAction = this.dialogButtonIndices(options.buttons ?? []).length === 1
+    const focused = this.gamepadDialogItem === index.toString()
+    return button === undefined ? undefined : { value: button.text,
+      fontColor: singleAction ? (focused ? $r('sys.color.font_emphasize') : $r('sys.color.font_primary')) : button.color,
+      background: !singleAction && focused ? '#305F9BF2' : undefined,
       action: (): void => { finish(index) } }
   }
 
   @Builder
   ConfirmationDialogContent(options: promptAction.ShowDialogOptions, finish: (index: number) => void): void {
-    SystemAlertDialog({ primaryTitle: options.title, content: options.message ?? '',
-      primaryButton: this.confirmationButton(options, 0, finish),
-      secondaryButton: this.confirmationButton(options, 1, finish) })
-      .id('page-confirmation-dialog')
+    Column() {
+      SystemAlertDialog({ primaryTitle: options.title, content: options.message ?? '',
+        primaryButton: this.confirmationButton(options, 0, finish),
+        secondaryButton: this.confirmationButton(options, 1, finish) })
+        .id('page-confirmation-dialog')
+    }.focusable(true)
+      .onKeyPreIme((event: KeyEvent): boolean => this.handleGamepadKey(event))
+      .onKeyEventDispatch((event: KeyEvent): boolean => this.handleGamepadKey(event))
+      .onFocusAxisEvent((event: FocusAxisEvent): void => this.handleGamepadAxes(event))
   }
 
   private presentConfirmationDialog(options: promptAction.ShowDialogOptions): Promise<promptAction.ShowDialogSuccessResponse> {
     return this.presentPageDialog((finish: (index: number) => void): void => {
       this.ConfirmationDialogContent(options, finish)
-    }, options.systemMaterial ?? this.floatingPanelMaterial)
+    }, options.systemMaterial ?? this.floatingPanelMaterial, this.dialogButtonIndices(options.buttons ?? []), 0)
+  }
+
+  private dialogButtonIndices(buttons: (promptAction.Button | undefined)[]): number[] {
+    const indices: number[] = []
+    buttons.forEach((button: promptAction.Button | undefined, index: number): void => {
+      if (button !== undefined) { indices.push(index) }
+    })
+    return indices
   }
 
   private actionMenuButtons(options: promptAction.ActionMenuOptions,
@@ -16011,7 +17486,9 @@ struct Index {
     const buttons: ButtonOptions[] = []
     options.buttons.forEach((button: promptAction.Button | undefined, index: number): void => {
       if (button !== undefined) {
-        buttons.push({ value: button.text, fontColor: button.color, action: (): void => { finish(index) } })
+        buttons.push({ value: button.text, fontColor: button.color,
+          background: this.gamepadDialogItem === index.toString() ? '#305F9BF2' : undefined,
+          action: (): void => { finish(index) } })
       }
     })
     return buttons
@@ -16024,19 +17501,32 @@ struct Index {
 
   @Builder
   ActionMenuDialogContent(options: promptAction.ActionMenuOptions, finish: (index: number) => void): void {
-    CustomContentDialog({ primaryTitle: options.title,
-      contentBuilder: (): void => { this.ActionMenuEmptyContent() }, buttons: this.actionMenuButtons(options, finish) })
-      .id('page-action-menu')
+    Column() {
+      CustomContentDialog({ primaryTitle: options.title,
+        contentBuilder: (): void => { this.ActionMenuEmptyContent() }, buttons: this.actionMenuButtons(options, finish) })
+        .id('page-action-menu')
+    }.focusable(true)
+      .onKeyPreIme((event: KeyEvent): boolean => this.handleGamepadKey(event))
+      .onKeyEventDispatch((event: KeyEvent): boolean => this.handleGamepadKey(event))
+      .onFocusAxisEvent((event: FocusAxisEvent): void => this.handleGamepadAxes(event))
   }
 
   private presentActionMenu(options: promptAction.ActionMenuOptions): Promise<promptAction.ShowDialogSuccessResponse> {
     return this.presentPageDialog((finish: (index: number) => void): void => {
       this.ActionMenuDialogContent(options, finish)
-    }, options.systemMaterial ?? this.floatingPanelMaterial)
+    }, options.systemMaterial ?? this.floatingPanelMaterial, this.dialogButtonIndices(options.buttons),
+    options.buttons.findIndex((button: promptAction.Button | undefined): boolean => button?.text === '取消'))
+  }
+
+  private removePagePadScope(scope: GamepadModalFocus): void {
+    const index = this.gamepadDialogScopes.indexOf(scope)
+    if (index >= 0) { this.gamepadDialogScopes.splice(index, 1) }
+    this.syncNativeMenuPad()
   }
 
   private presentPageDialog(builder: (finish: (index: number) => void) => void,
-    material: SystemUiMaterial): Promise<promptAction.ShowDialogSuccessResponse> {
+    material: SystemUiMaterial, padButtons: number[] = [], preferredPadButton: number = -1):
+    Promise<promptAction.ShowDialogSuccessResponse> {
     const prompt = this.getUIContext().getPromptAction()
     return new Promise<promptAction.ShowDialogSuccessResponse>((resolve, reject) => {
       let dialogId = -1
@@ -16050,12 +17540,22 @@ struct Index {
       }
       const cancel = (): void => { finish(-1) }
       this.pageDialogClosers.add(cancel)
+      const padScope = padButtons.length === 0 ? null : new GamepadModalFocus('page-dialog',
+        (): ModalFocusTarget[] => closePending ? [] : padButtons.map((index: number): ModalFocusTarget => ({
+          id: index.toString(), activate: () => finish(index)
+        })), (id: string): void => { this.gamepadDialogItem = id }, cancel,
+        (): string => preferredPadButton.toString())
+      if (padScope !== null) {
+        this.gamepadDialogScopes.push(padScope)
+        this.syncNativeMenuPad()
+      }
       prompt.openCustomDialog({ builder: () => { builder(finish) },
         alignment: DialogAlignment.Center, autoCancel: true,
         width: Math.min(400, this.effectivePageWidth() - Glass.windowInset * 2),
         systemMaterial: material,
         onDidDisappear: (): void => {
           this.pageDialogClosers.delete(cancel)
+          if (padScope !== null) { this.removePagePadScope(padScope) }
           resolve({ index: selected })
         }
       }).then((id: number): void => {
@@ -16063,6 +17563,7 @@ struct Index {
         if (closePending) { prompt.closeCustomDialog(id) }
       }).catch((error: Error): void => {
         this.pageDialogClosers.delete(cancel)
+        if (padScope !== null) { this.removePagePadScope(padScope) }
         reject(error)
       })
     })
@@ -16074,6 +17575,8 @@ struct Index {
 
   private beginDestinationPickerForEntries(operation: DestinationOperation, entries: FileEntry[]): void {
     if (this.isBusy || this.destinationOperationRunning) { return }
+    this.destinationPad.reset()
+    this.destinationPadHistory = new GamepadFocusHistory()
     this.destinationPickerCloseToken++
     this.destinationOperation = operation; this.destinationSelectedEntries = entries.slice()
     this.destinationSourceFolders.clear()
@@ -16132,6 +17635,7 @@ struct Index {
     const token = ++this.destinationLoadToken
     const identity = this.repository.sessionIdentity()
     this.destinationLoading = true
+    this.destinationPad.reset()
     this.destinationPath = path
     this.destinationDataSource.replace([])
     try {
@@ -16142,7 +17646,13 @@ struct Index {
     } catch (error) {
       if (token === this.destinationLoadToken) { this.reportError(error as Object, '读取目标目录失败') }
     } finally {
-      if (token === this.destinationLoadToken) { this.destinationLoading = false }
+      if (token === this.destinationLoadToken) {
+        this.destinationLoading = false
+        if (this.gamepadPresent() && this.currentGamepadModal() === this.destinationPad) {
+          this.destinationPad.reset()
+          this.destinationPad.focusInitial()
+        }
+      }
     }
   }
 
@@ -16584,6 +18094,12 @@ struct Index {
       return
     }
     this.closeActionMenu()
+    const fromGamepad = this.gamepadArea === 'files'
+    if (fromGamepad) {
+      this.stopGamepadAxes()
+      this.gamepadArea = 'canvas'
+      this.gamepadItem = ''
+    }
     this.viewerBlocksFileContent = true
     this.cancelPendingPreviewLoads()
     this.viewerClosing = false
@@ -16728,6 +18244,7 @@ struct Index {
       if (!this.showImageViewer || openingGeneration !== this.viewerGeneration) {
         return
       }
+      if (fromGamepad && this.gamepadArea === 'canvas') { this.setImageChromeVisible(false) }
       if (this.viewerCloseRequested) {
         this.viewerCloseRequested = false
         this.postRenderFrame((): void => this.closeImageViewer())
@@ -17364,6 +18881,7 @@ struct Index {
       this.rememberGridViewportAnchor()
       this.prefetchWaterfallRange(this.waterfallVisibleStartIndex, this.waterfallVisibleEndIndex)
       this.warmTimelineVisibleEntries()
+      this.revealGamepadListRow()
     })
     const closingImages = this.viewerImages.slice()
     const returnedEntry = this.viewerImageEntry
@@ -17371,6 +18889,12 @@ struct Index {
     const returningPath = this.viewerReturnReadyPath.length > 0
       ? this.viewerReturnReadyPath
       : (returnedEntry === null ? '' : returnedEntry.path)
+    if (this.gamepadArea !== '') {
+      this.stopGamepadAxes()
+      this.gamepadArea = this.fileViewMode !== 'waterfall' && !shouldRestoreSearch ? 'files' : ''
+      this.gamepadItem = ''
+      this.gamepadFilePath = returnedEntry?.path ?? returningPath
+    }
     this.clearViewerEntryTransition()
     const closingPreviewBitmaps = this.viewerPreviewBitmaps
     const closingOriginalBitmaps = this.viewerOriginalBitmaps
@@ -17865,7 +19389,7 @@ struct Index {
 
   private handleImageDoubleTap(event: GestureEvent): void {
     this.lastImageDoubleTapAt = Date.now()
-    if (this.viewerGestureBlocked() || this.imageDismissDragging) {
+    if (this.viewerGestureBlocked() || this.imageDismissDragging || this.imagePinchActive) {
       return
     }
     if (this.imageScale > 1.001) {
@@ -17879,14 +19403,58 @@ struct Index {
       finger !== undefined && Number.isFinite(finger.localX) && Number.isFinite(finger.localY))
     const width = Math.max(1, this.imageViewportWidthVp)
     const height = Math.max(1, this.imageViewportHeightVp)
-    const x = point === undefined ? width / 2 : Math.min(width, Math.max(0, point.localX))
-    const y = point === undefined ? height / 2 : Math.min(height, Math.max(0, point.localY))
+    const x = point === undefined ? 0 : Math.min(width, Math.max(0, point.localX)) - width / 2
+    const y = point === undefined ? 0 : Math.min(height, Math.max(0, point.localY)) - height / 2
     const ratio = 2 / this.imageScale
-    // Keep the tapped source pixel stationary while the center-based frame
-    // scales: offset' = ratio * offset + (1 - ratio) * (tap - center).
     this.animateImageTransform(2,
-      ratio * this.imageOffsetX + (1 - ratio) * (x - width / 2),
-      ratio * this.imageOffsetY + (1 - ratio) * (y - height / 2))
+      this.imageZoomOffset(this.imageOffsetX, x, x, ratio),
+      this.imageZoomOffset(this.imageOffsetY, y, y, ratio))
+  }
+
+  private imageZoomOffset(offset: number, start: number, current: number, ratio: number): number {
+    // Coordinates are relative to the frame center. Map the source point
+    // beneath the original focal point to the current one at the new scale.
+    return current - (start - offset) * ratio
+  }
+
+  private handleImagePinchStart(index: number, event: GestureEvent): void {
+    if (index !== this.viewerImageIndex || this.viewerGestureBlocked() || this.imageDismissDragging ||
+      !Number.isFinite(event.pinchCenterX) || !Number.isFinite(event.pinchCenterY)) {
+      return
+    }
+    this.imagePinchStartX = event.pinchCenterX - this.imageViewportWidthVp / 2
+    this.imagePinchStartY = event.pinchCenterY - this.imageViewportHeightVp / 2
+    this.imageSavedScale = this.imageScale
+    this.imageSavedOffsetX = this.imageOffsetX
+    this.imageSavedOffsetY = this.imageOffsetY
+    this.cancelImageLongPressWatch()
+    this.imageTouchMoved = true
+    this.imagePinchActive = true
+  }
+
+  private handleImagePinchUpdate(index: number, event: GestureEvent): void {
+    if (!this.imagePinchActive || index !== this.viewerImageIndex || !this.showImageViewer || this.viewerClosePending ||
+      !Number.isFinite(event.scale) || event.scale < 0 ||
+      !Number.isFinite(event.pinchCenterX) || !Number.isFinite(event.pinchCenterY)) {
+      return
+    }
+    this.imageScale = Math.min(5, Math.max(1, this.imageSavedScale * event.scale))
+    const ratio = this.imageScale / this.imageSavedScale
+    const offsetX = this.imageZoomOffset(this.imageSavedOffsetX, this.imagePinchStartX,
+      event.pinchCenterX - this.imageViewportWidthVp / 2, ratio)
+    const offsetY = this.imageZoomOffset(this.imageSavedOffsetY, this.imagePinchStartY,
+      event.pinchCenterY - this.imageViewportHeightVp / 2, ratio)
+    this.clampImageOffset(offsetX, offsetY)
+  }
+
+  private handleImagePinchEnd(index: number): void {
+    if (!this.imagePinchActive || index !== this.viewerImageIndex) {
+      return
+    }
+    this.imagePinchActive = false
+    if (!this.viewerClosePending) {
+      this.normalizeImageTransform()
+    }
   }
 
   /** Shared admission gates. An accepted dismiss drag keeps its existing update/end lifecycle. */
@@ -17900,7 +19468,7 @@ struct Index {
     // Text selection owns vertical dragging while the analyzer is active.
     // Horizontal paging keeps its separate Swiper behavior.
     return !this.viewerGestureBlocked() && index === this.viewerImageIndex &&
-      this.imageScale <= 1.001 && !this.imageAnalyzerActive
+      this.imageScale <= 1.001 && !this.imageAnalyzerActive && !this.imagePinchActive
   }
 
   private resetImageDismissTransform(): void {
@@ -18033,8 +19601,8 @@ struct Index {
     })
   }
 
-  private handleImagePanEnd(event: GestureEvent): void {
-    if (this.imageScale <= 1.001) {
+  private handleImagePanEnd(index: number, event: GestureEvent): void {
+    if (index !== this.viewerImageIndex || this.imagePinchActive || this.imageScale <= 1.001) {
       return
     }
 
@@ -18075,13 +19643,13 @@ struct Index {
     })
   }
 
-  private handleImagePanCancel(): void {
-    if (this.imageScale > 1) {
+  private handleImagePanCancel(index: number): void {
+    if (index === this.viewerImageIndex && !this.imagePinchActive && this.imageScale > 1) {
       this.normalizeImageTransform()
     }
   }
 
-  private clampImageOffset(): void {
+  private clampImageOffset(offsetX: number = this.imageOffsetX, offsetY: number = this.imageOffsetY): void {
     if (this.imageScale <= 1) {
       this.imageOffsetX = 0
       this.imageOffsetY = 0
@@ -18089,11 +19657,12 @@ struct Index {
     }
     const maxX = Math.max(0, this.imageViewportWidthVp * (this.imageScale - 1) * 0.5)
     const maxY = Math.max(0, this.imageViewportHeightVp * (this.imageScale - 1) * 0.5)
-    this.imageOffsetX = Math.min(maxX, Math.max(-maxX, this.imageOffsetX))
-    this.imageOffsetY = Math.min(maxY, Math.max(-maxY, this.imageOffsetY))
+    this.imageOffsetX = Math.min(maxX, Math.max(-maxX, offsetX))
+    this.imageOffsetY = Math.min(maxY, Math.max(-maxY, offsetY))
   }
 
   private normalizeImageTransform(): void {
+    this.imagePinchActive = false
     if (this.imageScale <= 1) {
       this.resetImageTransform()
       return
@@ -18105,6 +19674,7 @@ struct Index {
   }
 
   private resetImageTransform(): void {
+    this.imagePinchActive = false
     this.imageScale = 1
     this.imageSavedScale = 1
     this.imageOffsetX = 0
@@ -19001,7 +20571,7 @@ struct Index {
     }
   }
 
-  private openImageMoreMenu(): void {
+  private openImageMoreMenu(fromGamepad: boolean = false): void {
     if (!this.showImageViewer || this.isBusy || this.showImageMoreMenu || this.continuationDialogCount > 0) {
       return
     }
@@ -19011,10 +20581,24 @@ struct Index {
     }
     this.clearSlideItems('viewermenu')
     this.viewerOverlayEntry = entry
+    // Rendering and controller activation share one definition. Input is ready
+    // before the native popup starts its scale animation or mounts its rows.
+    for (const item of this.imageViewerMoreActions()) {
+      this.registerSlideAction('viewermenu', item.title, item.action)
+    }
+    if (fromGamepad) {
+      this.stopGamepadAxes()
+      this.gamepadArea = 'viewermenu'
+      this.gamepadItem = '旋转'
+    }
     this.showImageMoreMenu = true
   }
 
   private closeImageMoreMenu(): void {
+    if (this.gamepadArea === 'viewermenu') {
+      this.gamepadArea = 'viewer'
+      this.gamepadItem = '更多'
+    }
     this.showImageMoreMenu = false
     this.viewerOverlayEntry = null
     this.clearSlideItems('viewermenu')
@@ -20869,6 +22453,14 @@ struct Index {
     this.videoRatePanel = false
   }
 
+  private adjustVideoRate(direction: PadDirection, id: string): boolean {
+    if (id !== 'rate' || (direction !== 'left' && direction !== 'right')) { return false }
+    const position = videoRatePosition(this.videoPlaybackRate) + (direction === 'left' ? -16 : 16)
+    const rate = videoRateAt(position)
+    if (!this.videoRatePending && rate !== this.videoPlaybackRate) { this.setVideoPlaybackRate(rate) }
+    return true
+  }
+
   private async setVideoPlaybackRate(rate: number, temporary: boolean = false): Promise<void> {
     if (!this.showVideoPlayer || !this.videoPrepared || this.videoCasting ||
       this.isBusy || !Number.isFinite(rate) || rate < 0.25 || rate > 4) { return }
@@ -21044,6 +22636,7 @@ struct Index {
   }
 
   private handleVideoCastPickerState(state: AVCastPickerState): void {
+    this.systemGamepadInput = state === AVCastPickerState.STATE_APPEARING
     console.info('[UgreenVideo] AVCastPicker state=' + state.toString())
     if (this.showVideoPlayer) {
       this.handleVideoControlInteraction(state === AVCastPickerState.STATE_APPEARING)
@@ -22195,10 +23788,13 @@ struct Index {
       typeof area.globalPosition.y !== 'number') {
       return
     }
+    const verticalBandChanged = this.fileScrollViewport.y !== area.globalPosition.y ||
+      this.fileScrollViewport.height !== area.height
     this.fileScrollViewport.x = area.globalPosition.x
     this.fileScrollViewport.y = area.globalPosition.y
     this.fileScrollViewport.width = area.width
     this.fileScrollViewport.height = area.height
+    if (surface === 'list' && verticalBandChanged) { this.revealGamepadListRow() }
   }
 
   private dragSelectionBandTop(): number {
@@ -22428,6 +24024,13 @@ struct Index {
     })
   }
 
+  private registerSlideAction(barId: string, key: string, action: () => void): void {
+    const id = barId + ':' + key
+    const item = this.slideItems.get(id) ?? new SlideActionItem()
+    item.action = action
+    this.slideItems.set(id, item)
+  }
+
   private registerSlideItem(barId: string, key: string, area: Area, action: () => void): void {
     const position = area.globalPosition
     if (typeof position.x !== 'number' || typeof position.y !== 'number') {
@@ -22641,6 +24244,10 @@ struct Index {
   }
 
   private closeSelectionMoreMenu(): void {
+    if (this.gamepadArea === 'selmore') {
+      this.gamepadArea = 'selection'
+      this.gamepadItem = '更多'
+    }
     this.showSelectionMoreMenu = false
     this.clearSlideItems('selmore')
   }
@@ -22650,6 +24257,10 @@ struct Index {
     this.getUIContext().animateTo({ duration: 180, curve: Curve.FastOutSlowIn }, () => {
       this.selectionMode = false
       this.setSelectedPaths([])
+      if (this.gamepadArea === 'selection') {
+        this.gamepadArea = 'files'
+        this.gamepadItem = ''
+      }
     })
   }
 
@@ -22939,11 +24550,21 @@ struct Index {
     if (this.isBusy) {
       return
     }
-    this.showFileSortMenu = !this.showFileSortMenu
+    if (this.showFileSortMenu) {
+      this.closeFileSortMenu()
+    } else {
+      this.clearSlideItems('sortmenu')
+      this.showFileSortMenu = true
+    }
   }
 
   private closeFileSortMenu(): void {
+    if (this.gamepadArea === 'sortmenu') {
+      this.gamepadArea = 'tools'
+      this.gamepadItem = '排序'
+    }
     this.showFileSortMenu = false
+    this.clearSlideItems('sortmenu')
   }
 
   private selectFileSort(key: FileSortKey): void {

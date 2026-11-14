@@ -1,5 +1,6 @@
 import { GlassControlGeometry as Glass } from '../ui/GlassControlGeometry'
 import { ContentDivider } from './ContentDivider'
+import { GamepadMenuStyle } from '../ui/GamepadMenuStyle'
 
 /** 菜单行版式：glass = 悬浮玻璃菜单，menu = 长按上下文菜单（尺寸与内边距更紧凑）。 */
 export type MenuRowVariant = 'glass' | 'menu'
@@ -20,7 +21,10 @@ export struct GlassMenuRow {
   @Prop rowId: string = ''
   @Prop variant: MenuRowVariant = 'glass'
   @Prop danger: boolean = false
+  @Prop gamepadFocused: boolean = false
+  @StorageProp('isDarkTheme') private isDarkTheme: boolean = false
   onActivate: () => void = () => {}
+  onRowReady: () => void = () => {}
   onRowTouch: (event: TouchEvent) => void = () => {}
   onRowArea: (area: Area) => void = () => {}
 
@@ -33,11 +37,13 @@ export struct GlassMenuRow {
   }
 
   private titleColor(): ResourceColor {
-    return this.danger ? $r('sys.color.warning') : $r('sys.color.font_primary')
+    return GamepadMenuStyle.ink(this.gamepadFocused,
+      this.danger ? $r('sys.color.warning') : $r('sys.color.font_primary'), this.danger)
   }
 
   private iconColor(): ResourceColor {
-    return this.danger ? $r('sys.color.warning') : $r('sys.color.icon_primary')
+    return GamepadMenuStyle.ink(this.gamepadFocused,
+      this.danger ? $r('sys.color.warning') : $r('sys.color.icon_primary'), this.danger)
   }
 
   @Builder
@@ -45,6 +51,7 @@ export struct GlassMenuRow {
     Row() {
       Text(this.title)
         .fontSize(16)
+        .fontWeight(this.gamepadFocused ? FontWeight.Medium : FontWeight.Normal)
         .fontColor(this.titleColor())
         .layoutWeight(1)
       SymbolGlyph(this.icon)
@@ -65,7 +72,9 @@ export struct GlassMenuRow {
         .id(this.rowId)
         .width('100%')
         .height(this.rowHeight())
-        .backgroundColor(Color.Transparent)
+        .borderRadius(12)
+        .backgroundColor(GamepadMenuStyle.background(this.gamepadFocused, this.isDarkTheme, this.danger))
+        .onAppear(() => this.onRowReady())
         .onAreaChange((_, area: Area) => this.onRowArea(area))
         .onTouch((event: TouchEvent) => this.onRowTouch(event))
         .onClick(() => this.onActivate())
@@ -75,7 +84,10 @@ export struct GlassMenuRow {
         }
         .id(this.rowId)
         .type(ButtonType.Normal).width('100%').height(this.rowHeight())
-        .padding(0).borderRadius(14).backgroundColor(Color.Transparent).stateEffect(true)
+        .padding(0).borderRadius(14)
+        .backgroundColor(GamepadMenuStyle.background(this.gamepadFocused, this.isDarkTheme, this.danger))
+        .stateEffect(true).focusOnTouch(false)
+        .onAppear(() => this.onRowReady())
         .onAreaChange((_, area: Area) => this.onRowArea(area))
         .onTouch((event: TouchEvent) => this.onRowTouch(event))
         .onClick(() => this.onActivate())

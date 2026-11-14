@@ -3,10 +3,14 @@ import { AlbumUploadItem, AlbumUploadState } from '../upload/AlbumUploadModel'
 import { AlbumUploadManager } from '../upload/AlbumUploadManager'
 import { TransferTaskListRow } from './TransferTaskListRow'
 import { HeaderStyle } from '../ui/HeaderStyle'
+import { GamepadModalFocus, ModalFocusTarget } from '../ui/GamepadModalFocus'
 
 @Component
 export struct AlbumUploadDetails {
   manager: AlbumUploadManager = new AlbumUploadManager()
+  onClose: () => void = () => {}
+  onFailure: (name: string, message: string) => void = () => {}
+  onPadScope: (id: string, scope: GamepadModalFocus | null) => void = () => {}
   @Prop batchId: string = ''
   @Prop albumName: string = ''
   @Prop total: number = 0
@@ -21,6 +25,7 @@ export struct AlbumUploadDetails {
   @State failures: boolean = false
   @State loading: boolean = false
   @State error: string = ''
+  @State private padItem: string = ''
   private readonly filters: SegmentButtonV2Items = new SegmentButtonV2Items([{ text: '全部' }, { text: '失败' }])
   private readonly scroller: Scroller = new Scroller()
   private generation: number = 0
@@ -28,8 +33,48 @@ export struct AlbumUploadDetails {
   private reloadPending: boolean = false
   private renderedFailures: boolean = false
 
-  aboutToAppear(): void { this.visible = true; this.load(0) }
-  aboutToDisappear(): void { this.visible = false; this.reloadPending = false; this.generation++ }
+  aboutToAppear(): void {
+    this.visible = true
+    this.onPadScope('album-details', new GamepadModalFocus('album-details',
+      () => this.padTargets(), (id: string): void => {
+        this.padItem = id
+        const index = this.items.findIndex((item: AlbumUploadItem): boolean => id === 'item:' + item.id)
+        if (index >= 0) { this.scroller.scrollToIndex(index, false, ScrollAlign.AUTO) }
+      }, () => this.onClose(), () => 'filter'))
+    this.load(0)
+  }
+
+  aboutToDisappear(): void {
+    this.visible = false; this.reloadPending = false; this.generation++
+    this.onPadScope('album-details', null)
+  }
+
+  private selectFilter(failures: boolean): void {
+    if (this.loading || this.failures === failures) { return }
+    this.failures = failures
+    this.load(0)
+  }
+
+  private padTargets(): ModalFocusTarget[] {
+    const items: ModalFocusTarget[] = [
+      { id: 'filter', activate: () => this.selectFilter(!this.failures) },
+      { id: 'refresh', activate: () => { if (!this.loading) { this.load(this.pageOffset) } } }
+    ]
+    if (!this.loading) {
+      for (const item of this.items) {
+        if (item.state === 'failed') {
+          items.push({ id: 'item:' + item.id, activate: (): void => this.showFailure(item) })
+        }
+      }
+    }
+    if (!this.loading && this.pageOffset > 0) {
+      items.push({ id: 'previous', activate: () => { if (!this.loading) { this.load(this.pageOffset - 100) } } })
+    }
+    if (!this.loading && this.hasNext()) {
+      items.push({ id: 'next', activate: () => { if (!this.loading) { this.load(this.pageOffset + 100) } } })
+    }
+    return items
+  }
 
   private onRevisionChanged(): void {
     if (!this.visible) { return }
@@ -91,12 +136,8 @@ export struct AlbumUploadDetails {
     return Math.min(99, Math.max(0, this.currentBytes / this.currentSize * 100))
   }
 
-  private async showFailure(item: AlbumUploadItem): Promise<void> {
-    if (item.state !== 'failed') { return }
-    try {
-      await this.getUIContext().getPromptAction().showDialog({ title: item.name,
-        message: item.error || '上传失败', buttons: [{ text: '关闭', color: '#2E6BFF' }] })
-    } catch (_) {}
+  private showFailure(item: AlbumUploadItem): void {
+    if (item.state === 'failed') { this.onFailure(item.name, item.error || '上传失败') }
   }
 
   build() {
@@ -111,11 +152,7 @@ export struct AlbumUploadDetails {
           .layoutWeight(1)
           .id('album-details-title')
         CapsuleSegmentButtonV2({ items: this.filters, selectedIndex: this.failures ? 1 : 0,
-          $selectedIndex: (index: number): void => {
-            const failures = index === 1
-            if (this.loading || this.failures === failures) { return }
-            this.failures = failures; this.load(0)
-          },
+          $selectedIndex: (index: number): void => this.selectFilter(index === 1),
           itemFontSize: LengthMetrics.fp(HeaderStyle.actionSize), itemSelectedFontSize: LengthMetrics.fp(HeaderStyle.actionSize),
           buttonMinHeight: LengthMetrics.vp(HeaderStyle.controlHeight), itemMinHeight: LengthMetrics.vp(HeaderStyle.controlHeight - 4),
           buttonPadding: LengthMetrics.vp(2),
@@ -123,6 +160,8 @@ export struct AlbumUploadDetails {
             start: LengthMetrics.vp(12), end: LengthMetrics.vp(12) } })
           .width(124)
           .height(HeaderStyle.controlHeight)
+          .borderRadius(HeaderStyle.controlHeight / 2)
+          .backgroundColor(this.padItem === 'filter' ? '#305F9BF2' : Color.Transparent)
           .enabled(!this.loading)
           .id('album-details-filter')
         Button({ type: ButtonType.Circle }) {
@@ -132,7 +171,7 @@ export struct AlbumUploadDetails {
         }
         .width(HeaderStyle.controlHeight)
         .height(HeaderStyle.controlHeight)
-        .backgroundColor(Color.Transparent)
+        .backgroundColor(this.padItem === 'refresh' ? '#305F9BF2' : Color.Transparent)
         .enabled(!this.loading)
         .accessibilityText('刷新明细')
         .id('album-details-refresh')
@@ -158,6 +197,7 @@ export struct AlbumUploadDetails {
             }
             .width('100%')
             .id('album-details-item:' + item.id)
+            .borderRadius(12).backgroundColor(this.padItem === 'item:' + item.id ? '#1C5F9BF2' : Color.Transparent)
             .onClick(() => this.showFailure(item))
           }, (item: AlbumUploadItem): string => item.id + ':' + item.state + ':' + item.error)
         }
@@ -176,12 +216,14 @@ export struct AlbumUploadDetails {
       }.layoutWeight(1).width('100%')
       if (this.pageOffset > 0 || this.hasNext()) {
         Row({ space: 16 }) {
-          Button('上一页').fontSize(14).height(36).backgroundColor(Color.Transparent).fontColor('#2E6BFF')
+          Button('上一页').fontSize(14).height(36).fontColor('#2E6BFF')
+            .backgroundColor(this.padItem === 'previous' ? '#305F9BF2' : Color.Transparent)
             .enabled(!this.loading && this.pageOffset > 0)
             .onClick(() => this.load(this.pageOffset - 100))
           Text((Math.floor(this.pageOffset / 100) + 1).toString()).fontSize(14)
             .fontColor($r('app.color.text_secondary'))
-          Button('下一页').fontSize(14).height(36).backgroundColor(Color.Transparent).fontColor('#2E6BFF')
+          Button('下一页').fontSize(14).height(36).fontColor('#2E6BFF')
+            .backgroundColor(this.padItem === 'next' ? '#305F9BF2' : Color.Transparent)
             .enabled(!this.loading && this.hasNext())
             .onClick(() => this.load(this.pageOffset + 100))
         }.width('100%').justifyContent(FlexAlign.Center).padding({ top: 8 })

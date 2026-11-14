@@ -3,6 +3,7 @@ import { GlassMaterial } from '../ui/GlassMaterial'
 import { uiMaterial, LengthMetrics } from '@kit.ArkUI'
 import { preferences } from '@kit.ArkData'
 import { ImportLightState } from './ProximityLighting'
+import { GamepadModalFocus, ModalFocusTarget } from '../ui/GamepadModalFocus'
 
 /**
  * 光晕半径 / 直径，vp（球本体 56vp）。
@@ -31,8 +32,12 @@ export struct FloatingImportControl {
   @Prop safeTop: number = 96
   @Prop safeBottom: number = 100
   @Link expanded: boolean
+  @Prop gamepadFocused: boolean = false
+  onPadOpen: (action: (() => void) | null) => void = () => {}
   onSelect: (source: string) => void = () => {}
   onControlAreaChange: (area: Area) => void = () => {}
+  onPadScope: (id: string, scope: GamepadModalFocus | null) => void = () => {}
+  @State private padItem: string = ''
   @State edge: string = 'right'
   @State fraction: number = 0.68
   @State dragging: boolean = false
@@ -60,7 +65,7 @@ export struct FloatingImportControl {
       active && !this.expanded))
   }
 
-  aboutToDisappear(): void { this.publishLight(false) }
+  aboutToDisappear(): void { this.publishLight(false); this.onPadScope('floating-import', null); this.onPadOpen(null) }
 
   // Native light is disabled for the moving ball. TouchLight paints the
   // frozen press point in local coordinates without recreating the material.
@@ -71,7 +76,18 @@ export struct FloatingImportControl {
     return this.pressed || this.dragging
   }
 
-  aboutToAppear(): void { this.restore() }
+  aboutToAppear(): void {
+    this.restore()
+    this.onPadOpen((): void => this.openCollapsed())
+    this.onPadScope('floating-import', new GamepadModalFocus('floating-import',
+      (): ModalFocusTarget[] => ['files', 'gallery', 'album', 'folder'].map((source: string): ModalFocusTarget =>
+        ({ id: source, activate: () => this.choose(source) })),
+      (id: string): void => { this.padItem = id }, () => this.changeExpanded(false)))
+  }
+  private openCollapsed(): void {
+    if (!this.expanded && !this.dragging) { this.changeExpanded(true) }
+  }
+
   private async restore(): Promise<void> {
     try {
       this.prefs = await preferences.getPreferences(getContext(this), 'ugreen-import-control')
@@ -172,7 +188,7 @@ export struct FloatingImportControl {
       Row() {
         SymbolGlyph($r('sys.symbol.plus'))
           .fontSize(Glass.iconSize)
-          .fontColor([$r('sys.color.icon_primary')])
+          .fontColor([this.gamepadFocused ? '#5F9BF2' : $r('sys.color.icon_primary')])
       }
       .width(Glass.barHeight)
       .height(Glass.barHeight)
@@ -182,10 +198,10 @@ export struct FloatingImportControl {
       // The visible choices must stay inside the material subtree for
       // colorInvert to react to the content underneath the floating panel.
       Column() {
-        this.ChoiceVisual($r('sys.symbol.folder'), '文件')
-        this.ChoiceVisual($r('sys.symbol.picture_on_square'), '图库')
-        this.ChoiceVisual($r('sys.symbol.picture_on_square'), '图库文件夹')
-        this.ChoiceVisual($r('sys.symbol.folder_badge_plus'), '新建文件夹')
+        this.ChoiceVisual($r('sys.symbol.folder'), '文件', 'files')
+        this.ChoiceVisual($r('sys.symbol.picture_on_square'), '图库', 'gallery')
+        this.ChoiceVisual($r('sys.symbol.picture_on_square'), '图库文件夹', 'album')
+        this.ChoiceVisual($r('sys.symbol.folder_badge_plus'), '新建文件夹', 'folder')
       }
       .width(this.expandedSurfaceWidth())
       .height(Glass.importHeight)
@@ -203,17 +219,18 @@ export struct FloatingImportControl {
   }
 
   @Builder
-  ChoiceVisual(symbol: Resource, label: string) {
+  ChoiceVisual(symbol: Resource, label: string, source: string) {
     Row({ space: 12 }) {
       SymbolGlyph(symbol)
         .fontSize(Glass.iconSize)
-        .fontColor([$r('sys.color.icon_primary')])
+        .fontColor([this.padItem === source ? '#5F9BF2' : $r('sys.color.icon_primary')])
       Text(label)
         .fontSize(16)
         .fontColor($r('sys.color.font_primary'))
         .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
     }
     .width('100%').height(Glass.importRowHeight).padding({ left: 16, right: 12 })
+    .borderRadius(14).backgroundColor(this.padItem === source ? '#305F9BF2' : Color.Transparent)
     .hitTestBehavior(HitTestMode.None)
   }
 
@@ -301,7 +318,7 @@ export struct FloatingImportControl {
       }
       this.publishLight(event.type !== TouchType.Up && event.type !== TouchType.Cancel && this.lit())
     })
-    .onClick(() => { if (!this.expanded && !this.dragging) { this.changeExpanded(true) } })
+    .onClick(() => this.openCollapsed())
     .accessibilityText(this.expanded ? '导入选项' : '导入文件或图片')
     .id('import-open-button')
     .gesture(PanGesture({ direction: PanDirection.All, distance: DRAG_SLOP })

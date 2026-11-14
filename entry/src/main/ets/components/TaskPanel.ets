@@ -20,6 +20,7 @@ export struct TaskPanel {
   @Prop hasFooter: boolean = false
   @Prop closeEnabled: boolean = true
   @Prop showAuxiliary: boolean = false
+  @Prop gamepadItem: string = ''
   @Prop auxiliaryEnabled: boolean = true
   @Prop auxiliaryIcon: Resource = $r('sys.symbol.folder_badge_plus')
   @Prop auxiliaryLabel: string = ''
@@ -34,7 +35,8 @@ export struct TaskPanel {
         TaskPanelHeader({ title: this.title, idPrefix: this.idPrefix,
           closeEnabled: this.closeEnabled, showAuxiliary: this.showAuxiliary,
           auxiliaryEnabled: this.auxiliaryEnabled, auxiliaryIcon: this.auxiliaryIcon,
-          auxiliaryLabel: this.auxiliaryLabel, onClose: this.onClose, onAuxiliary: this.onAuxiliary })
+          auxiliaryLabel: this.auxiliaryLabel, gamepadItem: this.gamepadItem,
+          onClose: this.onClose, onAuxiliary: this.onAuxiliary })
         Column() { this.content() }
           .width('100%').layoutWeight(this.floating || this.fillHeight ? 1 : 0)
           .padding({ left: this.floating ? 0 : TaskPanelStyle.inset,
@@ -85,6 +87,7 @@ export struct TaskPanel {
 @Component
 export struct TaskPanelHeader {
   @Prop title: string = ''
+  @Prop gamepadItem: string = ''
   @Prop idPrefix: string = 'task-panel'
   @Prop closeEnabled: boolean = true
   @Prop showAuxiliary: boolean = false
@@ -103,19 +106,21 @@ export struct TaskPanelHeader {
       if (this.showAuxiliary) {
         Button({ type: ButtonType.Circle }) {
           SymbolGlyph(this.auxiliaryIcon).fontSize(HeaderStyle.iconSize)
-            .fontColor([$r('sys.color.icon_primary')])
+            .fontColor([this.gamepadItem === 'auxiliary' && this.auxiliaryEnabled ? '#6095E4' : $r('sys.color.icon_primary')])
         }
         .width(HeaderStyle.controlHeight).height(HeaderStyle.controlHeight)
-        .backgroundColor($r('app.color.task_panel_control_background'))
+        .backgroundColor(this.gamepadItem === 'auxiliary' && this.auxiliaryEnabled ? '#305F9BF2' :
+          $r('app.color.task_panel_control_background'))
         .enabled(this.auxiliaryEnabled).accessibilityText(this.auxiliaryLabel)
         .onClick(() => this.onAuxiliary()).id(this.idPrefix + '-auxiliary')
       }
       Button({ type: ButtonType.Circle }) {
         SymbolGlyph($r('sys.symbol.xmark')).fontSize(HeaderStyle.iconSize)
-          .fontColor([$r('sys.color.icon_primary')])
+          .fontColor([this.gamepadItem === 'close' && this.closeEnabled ? '#6095E4' : $r('sys.color.icon_primary')])
       }
       .width(HeaderStyle.controlHeight).height(HeaderStyle.controlHeight)
-      .backgroundColor($r('app.color.task_panel_control_background'))
+      .backgroundColor(this.gamepadItem === 'close' && this.closeEnabled ? '#305F9BF2' :
+        $r('app.color.task_panel_control_background'))
       .enabled(this.closeEnabled).accessibilityText('关闭' + this.title)
       .onClick(() => this.onClose()).id(this.idPrefix + '-close')
     }
@@ -142,6 +147,7 @@ export struct TaskPanelFooter {
   @Prop label: string = ''
   @Prop actionId: string = 'task-panel-action'
   @Prop actionEnabled: boolean = true
+  @Prop gamepadFocused: boolean = false
   @Prop busy: boolean = false
   @Prop summaryTitle: string = ''
   @Prop summaryValue: string = ''
@@ -172,6 +178,8 @@ export struct TaskPanelFooter {
       }
       .width('100%').height(TaskPanelStyle.actionHeight)
       .backgroundColor($r('sys.color.comp_background_emphasize'))
+      .outline({ width: 1.5, radius: TaskPanelStyle.actionHeight / 2,
+        color: this.gamepadFocused && this.actionEnabled && !this.busy ? '#6095E4' : Color.Transparent })
       .enabled(this.actionEnabled && !this.busy).onClick(() => this.onAction()).id(this.actionId)
     }
     .width('100%').padding({ left: TaskPanelStyle.inset, right: TaskPanelStyle.inset,

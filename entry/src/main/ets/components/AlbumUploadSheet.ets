@@ -6,6 +6,7 @@ import { TaskPanel, TaskPanelFooter, TaskPanelSection } from './TaskPanel'
 import { TaskPanelStyle } from '../ui/TaskPanelStyle'
 import { FileRowStyle } from '../ui/FileRowStyle'
 import { ContentDivider } from './ContentDivider'
+import { GamepadModalFocus, ModalFocusTarget } from '../ui/GamepadModalFocus'
 
 @Component
 export struct AlbumUploadSheet {
@@ -19,13 +20,42 @@ export struct AlbumUploadSheet {
   onReselect: () => void = () => {}
   onNotice: (message: string) => void = () => {}
   onStart: (album: LocalImageAlbum) => Promise<void> = async () => {}
+  onPadScope: (id: string, scope: GamepadModalFocus | null) => void = () => {}
+  @State private padItem: string = ''
   @State selected: LocalImageAlbum | null = null
   @State loading: boolean = false
   @Prop starting: boolean = false
   private startPending: boolean = false
   private generation: number = 0
-  aboutToAppear(): void { this.selected = this.album }
-  aboutToDisappear(): void { this.generation++ }
+  aboutToAppear(): void {
+    this.selected = this.album
+    this.onPadScope('album-upload', new GamepadModalFocus('album-upload',
+      () => this.padTargets(), (id: string): void => { this.padItem = id }, () => this.close()))
+  }
+
+  aboutToDisappear(): void { this.generation++; this.onPadScope('album-upload', null) }
+
+  private close(): void {
+    if (this.starting || this.startPending) { return }
+    this.generation++
+    this.visible = false
+  }
+
+  private reselect(): void { this.generation++; this.onReselect() }
+
+  private refreshCount(): void {
+    if (this.selected) { this.select(this.selected.uri, this.selected.name) }
+  }
+
+  private padTargets(): ModalFocusTarget[] {
+    if (this.starting || this.startPending) { return [] }
+    const items: ModalFocusTarget[] = [{ id: 'close', activate: () => this.close() }]
+    if (this.loading) { return items }
+    items.push({ id: 'reselect', activate: () => this.reselect() })
+    items.push({ id: 'refresh', activate: () => this.refreshCount() })
+    if ((this.selected?.localCount || 0) > 0) { items.push({ id: 'start', activate: () => { this.start() } }) }
+    return items
+  }
   private async select(uri: string, name: string): Promise<void> {
     if (this.loading || this.starting) { return }
     const generation = ++this.generation
@@ -68,9 +98,10 @@ export struct AlbumUploadSheet {
               .fontColor($r('sys.color.font_primary')).maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
           }.alignItems(HorizontalAlign.Start).layoutWeight(1)
           Button('更换').fontSize(14).height(40).padding({ left: 12, right: 12 })
-            .fontColor($r('sys.color.font_secondary')).backgroundColor(Color.Transparent)
+            .fontColor($r('sys.color.font_secondary'))
+            .backgroundColor(this.padItem === 'reselect' ? '#305F9BF2' : Color.Transparent)
             .enabled(!this.starting && !this.loading).accessibilityText('重新选择相册')
-            .onClick(() => { this.generation++; this.onReselect() }).id('album-upload-reselect')
+            .onClick(() => this.reselect()).id('album-upload-reselect')
         }.width('100%')
         Row({ space: FileRowStyle.leadingGap }) {
           Text() {
@@ -80,9 +111,10 @@ export struct AlbumUploadSheet {
           }.layoutWeight(1).id('album-upload-count')
             .accessibilityText('可上传 ' + (this.selected?.localCount || 0).toString() + ' 张图片')
           Button(this.loading ? '读取中…' : '刷新数量').fontSize(13).height(40).padding({ left: 12, right: 12 })
-            .fontColor($r('sys.color.font_secondary')).backgroundColor($r('sys.color.comp_background_tertiary'))
+            .fontColor($r('sys.color.font_secondary'))
+            .backgroundColor(this.padItem === 'refresh' ? '#305F9BF2' : $r('sys.color.comp_background_tertiary'))
             .enabled(!this.loading && !this.starting)
-            .onClick(() => { if (this.selected) { this.select(this.selected.uri, this.selected.name) } })
+            .onClick(() => this.refreshCount())
             .id('album-upload-refresh')
         }.width('100%')
         ContentDivider({ verticalInset: 2 })
@@ -122,6 +154,7 @@ export struct AlbumUploadSheet {
   ConfirmationFooter(): void {
     TaskPanelFooter({ label: this.starting ? '正在准备…' : '开始上传', actionId: 'album-upload-start',
       busy: this.starting, actionEnabled: !this.loading && (this.selected?.localCount || 0) > 0,
+      gamepadFocused: this.padItem === 'start',
       onAction: (): void => { this.start() } })
   }
 
@@ -129,7 +162,7 @@ export struct AlbumUploadSheet {
     TaskPanel({ title: '上传相册', idPrefix: 'album-upload', floating: true, compact: true, hasFooter: true,
       viewportWidth: this.viewportWidth, viewportHeight: this.viewportHeight,
       safeTop: this.safeTop, safeBottom: this.safeBottom,
-      closeEnabled: !this.starting, onClose: (): void => { this.generation++; this.visible = false },
+      closeEnabled: !this.starting, gamepadItem: this.padItem, onClose: () => this.close(),
       content: (): void => { this.ConfirmationContent() },
       footer: (): void => { this.ConfirmationFooter() } })
   }

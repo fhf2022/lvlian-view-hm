@@ -25,6 +25,8 @@ export struct GlassBarHost {
     Tabs({ barPosition: BarPosition.End }) {
       TabContent() {}.tabBar(this.BarContent)
     }
+    // Tabs provides the material slot. Its synthetic tab must never get a focus ring.
+    .focusable(false)
     .vertical(false).scrollable(false).barOverlap(true)
     .barHeight(Glass.barSlotHeight)
     .barBackgroundColor(Color.Transparent).barBackgroundBlurStyle(BlurStyle.NONE)

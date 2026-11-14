@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.16)
+project(linkfiles_pad LANGUAGES CXX)
+add_library(linkfiles_pad SHARED gamepad_menu.cpp)
+target_compile_features(linkfiles_pad PRIVATE cxx_std_17)
+target_link_libraries(linkfiles_pad PRIVATE libace_napi.z.so dl)

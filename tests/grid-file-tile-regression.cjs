@@ -50,7 +50,7 @@ for (const kind of ['photo', 'video', 'file']) {
   const h = new exportsObject.Tile();
   Object.assign(h, { showName, tileWidth, selectionMode: false, topInset: 0, entry: { name: 'a-long-filename' },
     thumbnailId: 'artwork', tileId: 'tile', events: { isVideo: () => kind === 'video' },
-    content() { contentParent = stack.at(-1); }, videoIndicator() { videoIndicators++; } });
+    content() { contentParent = stack.at(-1); }, videoIndicator() { videoIndicators++; }, GamepadFocusRing() {} });
   h.initialRender();
   assert.equal(stack.length, 0);
   const square = nodes.find(n => n.aspectRatio === 1);

@@ -1,6 +1,8 @@
 import { promptAction, uiMaterial } from '@kit.ArkUI'
+import { KeyCode } from '@kit.InputKit'
 import { TaskPanelStyle } from '../ui/TaskPanelStyle'
 import { ContentDivider } from './ContentDivider'
+import { GamepadModalFocus, ModalFocusTarget } from '../ui/GamepadModalFocus'
 
 /**
  * 统一的名字输入弹窗：新建文件夹、目标目录新建、重命名共用一套外观与生命周期。
@@ -21,13 +23,21 @@ export struct NameInputDialog {
   @Prop material: uiMaterial.Material = uiMaterial.Material.empty
   onClose: () => void = () => {}
   onConfirm: () => void = () => {}
+  onPadScope: (scope: GamepadModalFocus | null) => void = (_scope: GamepadModalFocus | null): void => {}
+  onPadKey: (event: KeyEvent) => boolean = (_event: KeyEvent): boolean => false
+  @State private gamepadItem: string = ''
   private dialogController: promptAction.DialogController | null = null
   private mounted: boolean = false
+  private nameController: TextInputController = new TextInputController()
+  private editing: boolean = false
+  private backHeld: boolean = false
 
   aboutToAppear(): void { this.mounted = true; this.syncVisible() }
   aboutToDisappear(): void { this.mounted = false; this.closeDialog() }
 
   private closeDialog(): void {
+    this.editing = false
+    this.backHeld = false
     const controller = this.dialogController
     this.dialogController = null
     controller?.close()
@@ -62,33 +72,77 @@ export struct NameInputDialog {
     })
   }
 
+  private registerGamepadFocus(): void {
+    this.onPadScope(new GamepadModalFocus(this.idPrefix, (): ModalFocusTarget[] => {
+      if (this.busy) { return [] }
+      return [
+        { id: 'name', activate: (): void => {
+          try { this.getUIContext().getFocusController().requestFocus(this.idPrefix + '-name') } catch (_) {}
+        } },
+        { id: 'cancel', activate: () => this.onClose() },
+        { id: 'confirm', activate: () => this.onConfirm() }
+      ]
+    }, (id: string): void => { this.gamepadItem = id }, () => this.gamepadBack()))
+  }
+
+  private gamepadBack(): void {
+    if (this.busy) { return }
+    if (this.editing) {
+      this.editing = false
+      this.nameController.stopEditing()
+      this.getUIContext().getFocusController().clearFocus()
+    } else {
+      this.onClose()
+    }
+  }
+
+  private handleGamepadBack(event: KeyEvent): boolean {
+    if (this.onPadKey(event)) { return true }
+    if (event.keyCode !== KeyCode.KEYCODE_BUTTON_B || !this.visible) { return false }
+    if (event.type === KeyType.Down) { this.backHeld = true }
+    if (event.type === KeyType.Up && this.backHeld) {
+      this.backHeld = false
+      this.gamepadBack()
+    }
+    return true
+  }
+
   @Builder
   Content(): void {
     Column({ space: 14 }) {
       Text(this.title).fontSize(20).fontWeight(FontWeight.Bold)
         .fontColor($r('app.color.text_primary')).width('100%')
       Column({ space: 2 }) {
-        TextInput({ placeholder: this.placeholder, text: this.name })
+        TextInput({ placeholder: this.placeholder, text: this.name, controller: this.nameController })
           .height(40).fontSize(16).fontColor($r('app.color.text_primary'))
-          .backgroundColor(Color.Transparent)
-          .border({ width: 0, color: Color.Transparent, radius: 0 })
+          .backgroundColor(this.gamepadItem === 'name' && !this.busy ? '#305F9BF2' : Color.Transparent)
+          .border({ width: 0, color: Color.Transparent, radius: this.gamepadItem === 'name' ? 10 : 0 })
           .padding({ left: 14, right: 14 }).enabled(!this.busy)
           .onChange((value: string) => { this.name = value })
+          .onEditChange((editing: boolean): void => { this.editing = editing })
+          .onKeyPreIme((event: KeyEvent): boolean => this.handleGamepadBack(event))
           .id(this.idPrefix + '-name')
         ContentDivider({ startInset: 14, endInset: 14 })
       }
       Row({ space: 8 }) {
         Button('取消').layoutWeight(1).height(42).fontSize(15)
-          .fontColor($r('app.color.text_secondary')).backgroundColor(Color.Transparent)
+          .fontColor($r('app.color.text_secondary'))
+          .backgroundColor(this.gamepadItem === 'cancel' && !this.busy ? '#305F9BF2' : Color.Transparent)
           .stateEffect(false).enabled(!this.busy)
           .onClick(() => this.onClose()).id(this.idPrefix + '-cancel')
         Button(this.busy ? '处理中…' : '确定').layoutWeight(1).height(42).fontSize(15)
-          .fontColor('#2E6BFF').backgroundColor(Color.Transparent)
+          .fontColor('#2E6BFF')
+          .backgroundColor(this.gamepadItem === 'confirm' && !this.busy ? '#305F9BF2' : Color.Transparent)
           .stateEffect(false).enabled(!this.busy)
           .onClick(() => this.onConfirm()).id(this.idPrefix + '-confirm')
       }.width('100%')
     }.width('100%').padding({ left: 18, right: 18, top: 18, bottom: 12 })
       .borderRadius(24).backgroundColor(Color.Transparent).id(this.idPrefix + '-content')
+      .focusable(true)
+      .onAppear(() => this.registerGamepadFocus())
+      .onDisAppear(() => this.onPadScope(null))
+      .onKeyPreIme((event: KeyEvent): boolean => this.handleGamepadBack(event))
+      .onKeyEventDispatch((event: KeyEvent): boolean => this.handleGamepadBack(event))
   }
 
   build() {

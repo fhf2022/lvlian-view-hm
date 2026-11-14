@@ -16,6 +16,7 @@ export struct EntryDetailsContent {
   @Prop title: string = ''
   @Prop data: EntryDetailsData = new EntryDetailsData()
   @Prop maxContentHeight: number = 400
+  @Prop gamepadFocused: boolean = false
   createSizeQuery: (() => DirectorySizeQuery) | null = null
   formatSize: (size: number) => string = (size: number): string => size.toString()
   onConfirm: () => void = () => {}
@@ -58,7 +59,8 @@ export struct EntryDetailsContent {
       .scrollBar(BarState.Auto).edgeEffect(EdgeEffect.None).margin({ top: 20, bottom: 8 })
       Button('确定').id('entry-details-confirm').type(ButtonType.Normal)
         .width('100%').height(48).borderRadius(14).padding(0)
-        .backgroundColor(Color.Transparent).fontSize(16).fontColor($r('sys.color.font_emphasize'))
+        .backgroundColor(Color.Transparent)
+        .fontSize(16).fontColor(this.gamepadFocused ? $r('sys.color.font_emphasize') : $r('sys.color.font_primary'))
         .onClick(() => this.onConfirm())
     }
     .id('entry-details-content')

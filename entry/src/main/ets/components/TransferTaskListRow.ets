@@ -1,3 +1,4 @@
+import { GamepadAction } from '../ui/GamepadControls'
 import { DownloadTaskRecord } from '../model/FileEntry'
 import { FileListRow } from './FileListRow'
 import { FileRowStyle } from '../ui/FileRowStyle'
@@ -27,6 +28,7 @@ export struct TransferTaskListRow {
   @Prop loading: boolean = false
   @Prop infoColor: ResourceColor = $r('app.color.text_muted')
   @Prop expandable: boolean = false
+  @Prop gamepadKey: string = ''
   @Prop expanded: boolean = false
   onExpand: () => void = () => {}
   @BuilderParam leading: () => void = this.ImageIcon
@@ -54,7 +56,8 @@ export struct TransferTaskListRow {
             .fontColor([$r('app.color.text_muted')])
             .rotate({ angle: this.expanded ? 90 : 0 })
         }.width(32).height(32).padding(0).backgroundColor(Color.Transparent).stateEffect(false)
-          .accessibilityText(this.expanded ? '收起明细' : '展开明细').onClick((): void => this.onExpand())
+          .accessibilityText(this.expanded ? '收起明细' : '展开明细').attributeModifier(new GamepadAction(this.getUIContext(), 'downloads', this.gamepadKey + ':expand',
+            (): void => this.onExpand(), (): boolean => this.expandable))
       }
       Progress({ value: this.progress, total: 100, type: ProgressType.Ring })
         .width(30).height(30).backgroundColor('#AAB3C1').color('#2E6BFF')

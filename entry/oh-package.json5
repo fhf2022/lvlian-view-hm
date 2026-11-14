@@ -5,6 +5,8 @@
   "main": "",
   "author": "",
   "license": "",
-  "dependencies": {}
+  "dependencies": {
+    "liblinkfiles_pad.so": "file:./src/main/cpp/types/liblinkfiles_pad"
+  }
 }
 
