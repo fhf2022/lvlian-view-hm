@@ -77,10 +77,12 @@ export class GamepadModalFocus {
     }
   }
 
+  dismiss(): void { this.back() }
+
   key(code: number, down: boolean): boolean {
     if (code === KeyCode.KEYCODE_BUTTON_B) {
       if (down) { this.backHeld = true }
-      else if (this.backHeld) { this.backHeld = false; this.back() }
+      else if (this.backHeld) { this.backHeld = false; this.dismiss() }
       return true
     }
     if (this.systemContent) { return false }

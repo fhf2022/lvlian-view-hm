@@ -13,7 +13,7 @@ vm.runInNewContext(ts.transpileModule('export class Picker {\n' + [
   'fetchDestinationFolders', 'loadDestinationEntries', 'destinationUserRootPath', 'confirmDestinationOperation'
 ].map(method).join('\n') + '\n}', { compilerOptions: {
   target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS
-} }).outputText, { exports: ex, HapticFeedback: { success() {} } });
+} }).outputText, { exports: ex, HapticFeedback: { success() {} }, GamepadFocusHistory: class {} });
 
 const folder = path => ({ path, name: path.split('/').at(-1), isDirectory: true });
 const file = path => ({ ...folder(path), isDirectory: false });
@@ -24,6 +24,7 @@ function make(operation, selected, entries) {
     username: 'user', rootKind: 'personal', personalRoots: [folder(parent)], sharedRoots: [],
     currentPath: parent, currentRootType: 3, currentPageHasMore: false, directoryTimeline: { complete: true },
     entries, destinationSourceFolders: new Set(), destinationPickerCloseToken: 0, destinationLoadToken: 0,
+    destinationPad: { reset() {} }, gamepadPresent: () => false,
     navigationRequestId: 0, destinationDataSource: { replace: items => rows.push(items) },
     repository: {
       sessionIdentity: () => 'account',

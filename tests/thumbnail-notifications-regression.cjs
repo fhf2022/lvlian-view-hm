@@ -66,6 +66,7 @@ const ready=(socket,id)=>socket.emit('message',JSON.stringify({type:'filemgr',ap
  const page=new exported.Page(),foreground=[];let cancelled=0,warmed=0;
  Object.assign(page,{startupAuthorized:true,gestureSharePageVisible:true,abilityInBackground:true,fileContentScrolling:true,previewGeneration:9,
   repository:{setForeground:value=>foreground.push(value)},albumUpload:{setForeground(){}},cancelPendingPreviewLoads(){cancelled++},
+  gamepadDeviceIds:new Set(),stopNativeMenuPad(){},releaseGamepad(){},syncNativeMenuPad(){},
   scheduleNasRecovery(){},syncGestureShareRegistration(){},handlePlaybackBackgroundState(){},schedulePreviewWarmup(generation){assert.equal(generation,9);warmed++},
   onContinuationNoticeChanged(){},onContinuationMessage(){},onIncomingShareRequested(){},scheduleVideoPipRestore(){}});
  page.onAbilityBackgroundChanged();assert.equal(cancelled,1);assert.equal(page.fileContentScrolling,false);assert.equal(warmed,0);

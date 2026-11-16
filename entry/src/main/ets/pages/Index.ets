@@ -825,10 +825,11 @@ struct Index {
   private gamepadLastDpadAt: number = 0
   private gamepadLeftLatched: boolean = false
   private gamepadRepeatAt: number = 0
-  private gamepadTurnUntil: number = 0
+  private viewerStepUntil: number = 0
   private gamepadAxisLogged: boolean = false
   private gamepadMenuScroller: Scroller = new Scroller()
   private gamepadMenuKeys: GamepadMenuKeyInput = new GamepadMenuKeyInput()
+  private keyboardEscapeAction: (() => void) | null = null
   private nativeMenuArea: string = ''
   private nativeMenuTimer: number = -1
   private nativeMenuRegistration: number = -1
@@ -2523,6 +2524,7 @@ struct Index {
   }
 
   onPageHide(): void {
+    this.keyboardEscapeAction = null
     this.stopNativeMenuPad()
     this.releaseGamepad()
     if (!this.startupAuthorized) { return }
@@ -2563,6 +2565,7 @@ struct Index {
 
   onAbilityBackgroundChanged(): void {
     if (this.abilityInBackground) {
+      this.keyboardEscapeAction = null
       this.stopNativeMenuPad()
       this.releaseGamepad()
     } else {
@@ -3934,7 +3937,7 @@ struct Index {
     this.gamepadLeftLatched = false
     this.gamepadSourceId = -1
     this.gamepadAxisLogged = false
-    this.gamepadTurnUntil = 0
+    this.viewerStepUntil = 0
     this.gamepadArea = ''
     this.gamepadItem = ''
   }
@@ -4178,7 +4181,7 @@ struct Index {
     if (this.showImageViewer && this.gamepadArea === 'canvas') {
       if (this.viewerGestureBlocked() || this.viewerFallbackEntryActive) { return }
       if (direction === 'left' || direction === 'right') {
-        if (digital || this.imageScale <= 1.001) { this.gamepadFlipImage(direction === 'right' ? 1 : -1) }
+        if (digital || this.imageScale <= 1.001) { this.stepViewerImage(direction === 'right' ? 1 : -1) }
       } else if (digital) {
         this.gamepadEnterBar(direction === 'up')
       }
@@ -4198,13 +4201,14 @@ struct Index {
     if (index >= 0 && index < items.length) { this.gamepadItem = items[index] }
   }
 
-  private gamepadFlipImage(delta: number): void {
+  private stepViewerImage(delta: number): void {
     const target = this.viewerImageIndex + delta
-    if (this.getMonotonicNow() < this.gamepadTurnUntil || this.viewerTransitionActive ||
+    const now = this.getMonotonicNow()
+    if (now < this.viewerStepUntil || this.viewerTransitionActive ||
       target < 0 || target >= this.viewerImages.length) {
       return
     }
-    this.gamepadTurnUntil = this.getMonotonicNow() + 230
+    this.viewerStepUntil = now + 230
     this.viewerSwiperController.changeIndex(target, true)
   }
 
@@ -4421,11 +4425,78 @@ struct Index {
   }
 
   private handleLocalMenuKey(event: KeyEvent): boolean {
-    return (this.currentGamepadModal() !== null || this.openGamepadMenu() !== '') && this.handleGamepadKey(event)
+    return (this.currentGamepadModal() !== null || this.openGamepadMenu() !== '') && this.handleInputKey(event)
   }
 
-  private handleGamepadKey(event: KeyEvent): boolean {
+  private handleInputKey(event: KeyEvent): boolean {
+    if (this.handleKeyboardShortcut(event)) { return true }
     return this.routeGamepadKey(event.keyCode, event.type, event.deviceId, event.keySource, 'arkui')
+  }
+
+  private handleKeyboardShortcut(event: KeyEvent): boolean {
+    if (event.keySource !== KeySource.Keyboard || this.abilityInBackground || this.systemGamepadInput) { return false }
+    const direction = this.gamepadDpadKey(event.keyCode)
+    const escape = event.keyCode === KeyCode.KEYCODE_ESCAPE
+    if (!escape && (direction === '' || (event.deviceId >= 0 && event.deviceId === this.gamepadSourceId) ||
+      this.gamepadDeviceIds.has(event.deviceId))) { return false }
+    if (event.metaKey || event.getModifierKeyState?.(['Ctrl']) || event.getModifierKeyState?.(['Alt']) ||
+      event.getModifierKeyState?.(['Shift'])) { return false }
+    const modal = this.currentGamepadModal()
+    if (modal?.systemContent === true) { return false }
+    if (escape) {
+      this.handleKeyboardEscape(event.type, modal)
+      return true
+    }
+    if (!this.startupAuthorized || this.startupRestoring || this.isBusy || this.isNavigating ||
+      this.showPageTransition || this.ordinaryEditing || this.searchEditing || modal !== null ||
+      this.pageDialogClosers.size > 0 || this.continuationDialogCount > 0 || this.continuationPending ||
+      this.openGamepadMenu() !== '') { return false }
+    if (this.showImageViewer) {
+      if (direction !== 'left' && direction !== 'right') { return false }
+      if (event.type === KeyType.Down && !this.viewerGestureBlocked() && !this.viewerFallbackEntryActive &&
+        !this.imagePinchActive && !this.imageDismissDragging && !this.imageAnalyzerActive) {
+        if (this.gamepadArea !== '' || this.ordinaryPadActive) { this.releaseGamepad() }
+        this.stepViewerImage(direction === 'right' ? 1 : -1)
+      }
+      return true
+    }
+    if (this.screen !== 'files' || (direction !== 'up' && direction !== 'down') ||
+      this.parentOverlayOwnsInteraction()) { return false }
+    if (event.type === KeyType.Down) {
+      if (this.gamepadArea !== '' || this.ordinaryPadActive) { this.releaseGamepad() }
+      const scroller = this.showSearch ? this.searchResultScroller :
+        (this.activeListSurface() === 'waterfall' ? this.waterfallScroller : this.fileListScroller)
+      scroller.scrollBy(0, direction === 'down' ? 96 : -96)
+    }
+    return true
+  }
+
+  private handleKeyboardEscape(type: KeyType, modal: GamepadModalFocus | null): void {
+    if (type === KeyType.Down) {
+      if (this.keyboardEscapeAction !== null) { return }
+      const menu = this.openGamepadMenu()
+      const dialog = Array.from(this.pageDialogClosers).pop()
+      const viewer = this.showImageViewer
+      const search = this.showSearch
+      const selecting = this.selectionMode
+      const screen = this.screen
+      const path = this.currentPath
+      this.keyboardEscapeAction = (): void => {
+        // Native popups can consume Down and deliver Up to the parent.
+        // If the original surface already closed, the release is a no-op.
+        if (this.currentGamepadModal() !== modal || this.openGamepadMenu() !== menu ||
+          this.showImageViewer !== viewer || this.showSearch !== search || this.screen !== screen ||
+          this.selectionMode !== selecting || this.currentPath !== path ||
+          (dialog !== undefined && !this.pageDialogClosers.has(dialog))) { return }
+        if (modal !== null) { modal.dismiss() }
+        else if (dialog !== undefined) { dialog() }
+        else { this.onBackPress() }
+      }
+    } else if (type === KeyType.Up || type === KeyType.CANCEL) {
+      const action = this.keyboardEscapeAction
+      this.keyboardEscapeAction = null
+      if (type === KeyType.Up) { action?.() }
+    }
   }
 
   private routeGamepadKey(code: number, type: KeyType, deviceId: number, source: KeySource,
@@ -4443,7 +4514,7 @@ struct Index {
     if (modal !== null) {
       const dpad = GamepadModalFocus.directionForKey(code)
       const supported = a || b || (dpad !== '' && (source === KeySource.JOYSTICK ||
-        deviceId === this.gamepadSourceId || this.gamepadDeviceIds.has(deviceId)))
+        (deviceId >= 0 && deviceId === this.gamepadSourceId) || this.gamepadDeviceIds.has(deviceId)))
       if (!supported) { return false }
       if (type === KeyType.Down || type === KeyType.Up) {
         if (DEBUG && (a || b)) {
@@ -4474,7 +4545,7 @@ struct Index {
     if (scope !== '') {
       const direction = GamepadModalFocus.directionForKey(code)
       if (!a && !b && (direction === '' || (source !== KeySource.JOYSTICK &&
-        deviceId !== this.gamepadSourceId && !this.gamepadDeviceIds.has(deviceId)))) { return false }
+        (deviceId < 0 || deviceId !== this.gamepadSourceId) && !this.gamepadDeviceIds.has(deviceId)))) { return false }
       if ((this.ordinaryEditing || this.searchEditing) && !b) { return false }
       this.gamepadSourceId = deviceId
       GamepadControls.setScope(scope)
@@ -4506,7 +4577,7 @@ struct Index {
       code === KeyCode.KEYCODE_BUTTON_X || code === KeyCode.KEYCODE_BUTTON_Y || code === KeyCode.KEYCODE_BUTTON_L1 ||
       code === KeyCode.KEYCODE_BUTTON_R1 || code === KeyCode.KEYCODE_BUTTON_THUMBR
     if (!isButton && (dpad === '' || (source !== KeySource.JOYSTICK &&
-      deviceId !== this.gamepadSourceId && !this.gamepadDeviceIds.has(deviceId)))) { return false }
+      (deviceId < 0 || deviceId !== this.gamepadSourceId) && !this.gamepadDeviceIds.has(deviceId)))) { return false }
     if (type === KeyType.Up && this.gamepadHeldKeys.delete(code)) {
       if (code === KeyCode.KEYCODE_BUTTON_A) {
         const confirm = this.gamepadConfirmTarget !== '' && this.gamepadConfirmTarget === this.gamepadConfirmId()
@@ -4660,7 +4731,7 @@ struct Index {
     }
     // Preserve a held stick while the current Swiper animation settles.
     if (this.showImageViewer && !this.gamepadMenuArea() &&
-      (this.viewerGestureBlocked() || this.viewerFallbackEntryActive || now < this.gamepadTurnUntil)) { return }
+      (this.viewerGestureBlocked() || this.viewerFallbackEntryActive || now < this.viewerStepUntil)) { return }
     const initial = this.gamepadAxesActive() && this.gamepadMarkInput()
     const left = GamepadNavigation.direction(this.gamepadLeftX, this.gamepadLeftY, GamepadNavigation.engage)
     if (GamepadNavigation.direction(this.gamepadLeftX, this.gamepadLeftY, GamepadNavigation.release) === '') {
@@ -4824,7 +4895,7 @@ struct Index {
           .id('linkfiles-gamepad-input')
           .width(1).height(1).position({ x: 0, y: 0 })
           .focusable(true).defaultFocus(true)
-          .onKeyPreIme((event: KeyEvent): boolean => this.handleGamepadKey(event))
+          .onKeyPreIme((event: KeyEvent): boolean => this.handleInputKey(event))
           .focusBox({ strokeColor: ColorMetrics.resourceColor(Color.Transparent), strokeWidth: LengthMetrics.vp(0) })
           .hitTestBehavior(HitTestMode.None)
           .accessibilityLevel('no')
@@ -5160,8 +5231,8 @@ struct Index {
     .hitTestBehavior(this.contextMenuEntry !== null ? HitTestMode.Block : HitTestMode.Default)
     .id('linkfiles-controller-root').focusable(true)
     .focusBox({ strokeColor: ColorMetrics.resourceColor(Color.Transparent), strokeWidth: LengthMetrics.vp(0) })
-    .onKeyPreIme((event: KeyEvent): boolean => this.handleGamepadKey(event))
-    .onKeyEventDispatch((event: KeyEvent): boolean => this.handleGamepadKey(event))
+    .onKeyPreIme((event: KeyEvent): boolean => this.handleInputKey(event))
+    .onKeyEventDispatch((event: KeyEvent): boolean => this.handleInputKey(event))
     .onFocusAxisEvent((event: FocusAxisEvent): void => this.handleGamepadAxes(event))
     .onChildTouchTest((infos: Array<TouchTestInfo>): TouchResult => {
       if (this.closeSessionActive && this.sessionTouchTestCount < 3) {
@@ -5340,7 +5411,7 @@ struct Index {
               (): boolean => !this.isBusy, '', false, { nativeFocus: false }))
             .onEditChange((editing: boolean): void => { this.ordinaryEditing = editing })
             .onKeyPreIme((event: KeyEvent): boolean =>
-              event.keyCode === KeyCode.KEYCODE_BUTTON_B && this.handleGamepadKey(event))
+              event.keyCode === KeyCode.KEYCODE_BUTTON_B && this.handleInputKey(event))
           Button('解析')
             .height(34)
             .padding({ left: 14, right: 14 })
@@ -5372,7 +5443,7 @@ struct Index {
             (): boolean => !this.isBusy, '', false, { nativeFocus: false }))
           .onEditChange((editing: boolean): void => { this.ordinaryEditing = editing })
           .onKeyPreIme((event: KeyEvent): boolean =>
-            event.keyCode === KeyCode.KEYCODE_BUTTON_B && this.handleGamepadKey(event))
+            event.keyCode === KeyCode.KEYCODE_BUTTON_B && this.handleInputKey(event))
 
         TextInput({ placeholder: '云盘密码', text: this.password })
           .type(InputType.Password)
@@ -5390,7 +5461,7 @@ struct Index {
             (): boolean => !this.isBusy, '', false, { nativeFocus: false }))
           .onEditChange((editing: boolean): void => { this.ordinaryEditing = editing })
           .onKeyPreIme((event: KeyEvent): boolean =>
-            event.keyCode === KeyCode.KEYCODE_BUTTON_B && this.handleGamepadKey(event))
+            event.keyCode === KeyCode.KEYCODE_BUTTON_B && this.handleInputKey(event))
       }
       .width('100%')
 
@@ -5488,7 +5559,7 @@ struct Index {
           (): boolean => !this.isBusy, '', false, { nativeFocus: false }))
         .onEditChange((editing: boolean): void => { this.ordinaryEditing = editing })
         .onKeyPreIme((event: KeyEvent): boolean =>
-          event.keyCode === KeyCode.KEYCODE_BUTTON_B && this.handleGamepadKey(event))
+          event.keyCode === KeyCode.KEYCODE_BUTTON_B && this.handleInputKey(event))
       Row() {
         Text('信任此设备')
           .fontSize(14)
@@ -6973,7 +7044,7 @@ struct Index {
             .fontColor(this.ordinaryPadItem === 'search-input' ? $r('sys.color.font_emphasize') : $r('sys.color.font_primary'))
             .onEditChange((editing: boolean): void => { this.searchEditing = editing })
             .onKeyPreIme((event: KeyEvent): boolean =>
-              event.keyCode === KeyCode.KEYCODE_BUTTON_B && this.handleGamepadKey(event))
+              event.keyCode === KeyCode.KEYCODE_BUTTON_B && this.handleInputKey(event))
             .layoutWeight(1)
             .height(HeaderStyle.controlHeight)
             .placeholderColor($r('sys.color.font_secondary'))
@@ -8274,7 +8345,7 @@ struct Index {
   SelectionMorePopup(): void {
     GlassMenuSurface({ widthVp: Math.min(Glass.menuWidth, this.effectivePageWidth() - 40),
       shouldFocus: (): boolean => this.openGamepadMenu() !== '' && this.gamepadPresent(),
-      onPadKey: (event: KeyEvent): boolean => this.handleGamepadKey(event),
+      onPadKey: (event: KeyEvent): boolean => this.handleInputKey(event),
       onPadAxis: (event: FocusAxisEvent): void => this.handleGamepadAxes(event),
       content: () => {
         this.SelectionMoreRow($r('sys.symbol.move'), '移动',
@@ -8380,7 +8451,7 @@ struct Index {
   FileSortPopup(): void {
     GlassMenuSurface({ widthVp: Math.min(Glass.menuWidth, this.effectivePageWidth() - 40),
       shouldFocus: (): boolean => this.openGamepadMenu() !== '' && this.gamepadPresent(),
-      onPadKey: (event: KeyEvent): boolean => this.handleGamepadKey(event),
+      onPadKey: (event: KeyEvent): boolean => this.handleInputKey(event),
       onPadAxis: (event: FocusAxisEvent): void => this.handleGamepadAxes(event),
       content: () => {
         this.FileSortOption('名称', 'name')
@@ -8825,8 +8896,8 @@ struct Index {
     .focusable(true)
     .focusBox({ strokeColor: ColorMetrics.resourceColor(Color.Transparent), strokeWidth: LengthMetrics.vp(0) })
     .defaultFocus(true)
-    .onKeyPreIme((event: KeyEvent): boolean => this.handleGamepadKey(event))
-    .onKeyEventDispatch((event: KeyEvent): boolean => this.handleGamepadKey(event))
+    .onKeyPreIme((event: KeyEvent): boolean => this.handleInputKey(event))
+    .onKeyEventDispatch((event: KeyEvent): boolean => this.handleInputKey(event))
     .onFocusAxisEvent((event: FocusAxisEvent): void => this.handleGamepadAxes(event))
     .width('100%')
     .height(this.actionMenuHeight(entry))
@@ -9114,7 +9185,7 @@ struct Index {
     NameInputDialog({ visible: $destinationFolderDialog, name: $destinationFolderText,
       title: '新建文件夹', placeholder: '输入文件夹名称', idPrefix: 'destination-folder',
       onPadScope: (scope: GamepadModalFocus | null): void => this.registerGamepadScope('destination-folder', scope),
-      onPadKey: (event: KeyEvent): boolean => this.handleGamepadKey(event),
+      onPadKey: (event: KeyEvent): boolean => this.handleInputKey(event),
       busy: this.destinationLoading, viewportWidth: this.pageWidthVp,
       material: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
       onClose: (): void => { this.closeDestinationFolderDialog() },
@@ -9126,7 +9197,7 @@ struct Index {
     NameInputDialog({ visible: $showRenameDialog, name: $renameText,
       title: '重命名', placeholder: '输入新名称', idPrefix: 'rename',
       onPadScope: (scope: GamepadModalFocus | null): void => this.registerGamepadScope('rename', scope),
-      onPadKey: (event: KeyEvent): boolean => this.handleGamepadKey(event),
+      onPadKey: (event: KeyEvent): boolean => this.handleInputKey(event),
       busy: this.isBusy, viewportWidth: this.pageWidthVp,
       material: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
       onClose: (): void => { this.closeRename() },
@@ -9138,7 +9209,7 @@ struct Index {
     NameInputDialog({ visible: $showCreateFolderDialog, name: $newFolderText,
       title: '新建文件夹', placeholder: '输入文件夹名称', idPrefix: 'create-folder',
       onPadScope: (scope: GamepadModalFocus | null): void => this.registerGamepadScope('create-folder', scope),
-      onPadKey: (event: KeyEvent): boolean => this.handleGamepadKey(event),
+      onPadKey: (event: KeyEvent): boolean => this.handleInputKey(event),
       busy: this.isBusy, viewportWidth: this.pageWidthVp,
       material: this.immersiveMaterial(uiMaterial.ImmersiveStyle.THICK, false),
       onClose: (): void => { this.closeCreateFolder() },
@@ -11158,7 +11229,7 @@ struct Index {
         .focusable(true)
         .focusBox({ strokeColor: ColorMetrics.resourceColor(Color.Transparent), strokeWidth: LengthMetrics.vp(0) })
         .hitTestBehavior(HitTestMode.None).accessibilityLevel('no')
-        .onKeyPreIme((event: KeyEvent): boolean => this.handleGamepadKey(event))
+        .onKeyPreIme((event: KeyEvent): boolean => this.handleInputKey(event))
         .onFocusAxisEvent((event: FocusAxisEvent): void => this.handleGamepadAxes(event))
         .onAppear((): void => {
           if (this.gamepadArea !== '' || this.gamepadDeviceIds.size > 0) {
@@ -11664,7 +11735,7 @@ struct Index {
   ImageViewerMoreContent(): void {
     GlassMenuSurface({ widthVp: Math.min(Glass.menuWidth, this.effectivePageWidth() - 40),
       shouldFocus: (): boolean => this.openGamepadMenu() !== '' && this.gamepadPresent(),
-      onPadKey: (event: KeyEvent): boolean => this.handleGamepadKey(event),
+      onPadKey: (event: KeyEvent): boolean => this.handleInputKey(event),
       onPadAxis: (event: FocusAxisEvent): void => this.handleGamepadAxes(event),
       content: () => {
         if (this.isSearchViewer()) {
@@ -12078,7 +12149,7 @@ struct Index {
         },
         onInteraction: (active: boolean) => this.handleVideoControlInteraction(active),
         onRate: (rate: number) => this.setVideoPlaybackRate(rate),
-        onPadKey: (event: KeyEvent): boolean => this.handleGamepadKey(event),
+        onPadKey: (event: KeyEvent): boolean => this.handleInputKey(event),
         onRatePanel: (visible: boolean) => {
           this.videoRatePanel = visible
           if (visible) { this.cancelVideoGestures(); this.clearVideoChromeTimer() }
@@ -17431,8 +17502,8 @@ struct Index {
         maxContentHeight: Math.max(80, this.pageHeightVp - this.topSafeInset() - this.bottomSafeInset() - 160),
         onConfirm: () => finish(0), gamepadFocused: this.gamepadDialogItem === '0' })
     }.focusable(true)
-      .onKeyPreIme((event: KeyEvent): boolean => this.handleGamepadKey(event))
-      .onKeyEventDispatch((event: KeyEvent): boolean => this.handleGamepadKey(event))
+      .onKeyPreIme((event: KeyEvent): boolean => this.handleInputKey(event))
+      .onKeyEventDispatch((event: KeyEvent): boolean => this.handleInputKey(event))
       .onFocusAxisEvent((event: FocusAxisEvent): void => this.handleGamepadAxes(event))
   }
 
@@ -17462,8 +17533,8 @@ struct Index {
         secondaryButton: this.confirmationButton(options, 1, finish) })
         .id('page-confirmation-dialog')
     }.focusable(true)
-      .onKeyPreIme((event: KeyEvent): boolean => this.handleGamepadKey(event))
-      .onKeyEventDispatch((event: KeyEvent): boolean => this.handleGamepadKey(event))
+      .onKeyPreIme((event: KeyEvent): boolean => this.handleInputKey(event))
+      .onKeyEventDispatch((event: KeyEvent): boolean => this.handleInputKey(event))
       .onFocusAxisEvent((event: FocusAxisEvent): void => this.handleGamepadAxes(event))
   }
 
@@ -17506,8 +17577,8 @@ struct Index {
         contentBuilder: (): void => { this.ActionMenuEmptyContent() }, buttons: this.actionMenuButtons(options, finish) })
         .id('page-action-menu')
     }.focusable(true)
-      .onKeyPreIme((event: KeyEvent): boolean => this.handleGamepadKey(event))
-      .onKeyEventDispatch((event: KeyEvent): boolean => this.handleGamepadKey(event))
+      .onKeyPreIme((event: KeyEvent): boolean => this.handleInputKey(event))
+      .onKeyEventDispatch((event: KeyEvent): boolean => this.handleInputKey(event))
       .onFocusAxisEvent((event: FocusAxisEvent): void => this.handleGamepadAxes(event))
   }
 

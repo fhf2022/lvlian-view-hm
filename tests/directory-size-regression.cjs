@@ -126,6 +126,8 @@ function method(source, name) {
   const pageSource = fs.readFileSync('entry/src/main/ets/pages/Index.ets', 'utf8');
   let dialogProps;
   const { Page } = compile('export class Page {\n' + method(pageSource, 'EntryDetailsDialogContent') + '\n}', {
+    Column() {},
+    focusable: () => ({ onKeyPreIme() { return this; }, onKeyEventDispatch() { return this; }, onFocusAxisEvent() {} }),
     EntryDetailsContent: props => { dialogProps = props; }
   });
   const page = new Page();

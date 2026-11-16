@@ -80,6 +80,9 @@ $typescriptRuntime = 'C:/Program Files/Huawei/DevEco Studio/tools/ohpm/node_modu
 & $nodeRuntime tests/background-transfer-regression.cjs $typescriptRuntime
 & $nodeRuntime tests/timeline-regression.cjs $typescriptRuntime
 & $nodeRuntime tests/proximity-light-regression.cjs $typescriptRuntime
+& $nodeRuntime tests/gamepad-modal-regression.cjs $typescriptRuntime
+& $nodeRuntime tests/gamepad-menu-opening-regression.cjs $typescriptRuntime
+& $nodeRuntime tests/keyboard-shortcuts-regression.cjs $typescriptRuntime
 ```
 
 这些脚本执行生产逻辑并模拟系统服务、文件 IO 或 NAS 故障，适合检查队列、存储、分页、进度和取消竞争；不等同于真实 NAS、ArkUI 渲染或系统授权验证。ArkTS 单元用例位于 `entry/src/test`，设备测试位于 `entry/src/ohosTest`，可使用 IDE 测试入口执行。
@@ -121,6 +124,7 @@ $env:DEVECO_SDK_HOME = "$devecoStudio/sdk"
 
 ## 代码与文档维护
 
+- 键盘快捷键由页面输入入口识别，手柄按键和摇杆沿用各自的导航与焦点逻辑。原生菜单的手柄输入通过 `entry/src/main/cpp/gamepad_menu.cpp` 和菜单内的输入接收组件进入同一套动作回调。键位见[使用说明](USER_GUIDE.md#手柄与键盘1020-起)。
 - 文件访问经过 `repository/` 与 `ugreen/`，网络故障由 `core/network/` 协调；新增页面不要自行再建一套网络探测和重试机制。
 - 缩略图与原图使用不同的缓存、预加载及生命周期策略，先阅读 `media/` 相关模块，再调整加载与返回动画。
 - 文件类型共用文件列表、网格与瀑布流，不按图片、音频各写底部留白。浮动底栏尺寸统一由 `floatingBarContentInset()` 提供：List/Grid 使用内容尾部偏移，WaterFlow 使用同尺寸的原生 footer；目录切换快照必须与真实列表保持相同滚动范围。选择页若把操作栏放在正常布局流中，不能再叠加一份悬浮底栏高度。
