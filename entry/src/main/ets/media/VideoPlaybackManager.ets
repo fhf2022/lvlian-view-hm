@@ -9,6 +9,7 @@ export interface VideoPlaybackCallbacks {
   onSeekDone: (requestedMs: number, actualMs: number) => void
   onState: (state: media.AVPlayerState) => void
   onBuffering: (percent: number) => void
+  onBufferedUntil: (timeMs: number) => void
   onSize: (width: number, height: number) => void
   onFirstFrame: () => void
   onError: (error: Object) => void
@@ -135,6 +136,11 @@ export class VideoPlaybackManager {
         return
       }
       this.callbacks.onBuffering(this.bufferPercent(type, value))
+      // Buffering progress describes filling the decoder's current window.
+      // Only a cached duration can be converted to a point on the timeline.
+      if (type === media.BufferingInfoType.CACHED_DURATION && this.cachedDurationHintMs > 0) {
+        this.callbacks.onBufferedUntil(this.currentTimeHintMs + this.cachedDurationHintMs)
+      }
     })
     player.on('videoSizeChange', (width: number, height: number): void => {
       if (generation !== this.generation || this.callbacks === null) {
@@ -223,7 +229,7 @@ export class VideoPlaybackManager {
     if (this.durationHintMs <= 0 || targetMs < this.durationHintMs - 200) {
       this.completionReported = false
     }
-    this.player.seek(targetMs)
+    this.player.seek(targetMs, media.SeekMode.SEEK_CLOSEST)
   }
 
   setMuted(muted: boolean): void {

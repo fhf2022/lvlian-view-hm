@@ -351,6 +351,7 @@ struct FileSelectionIndicator {
       .unselectedColor(this.dark ? '#99FFFFFF' : '#89919B')
       .width(28)
       .height(28)
+      .focusable(false)
       .hitTestBehavior(HitTestMode.None)
   }
 }
@@ -1094,6 +1095,7 @@ struct Index {
   @State videoWidthPx: number = 0
   @State videoHeightPx: number = 0
   @State videoBufferingPercent: number = 0
+  @State videoBufferedUntilMs: number = 0
   @State @Watch('onContinuationSceneChanged') videoPipActive: boolean = false
   @State @Watch('onContinuationSceneChanged') videoPipBackgrounded: boolean = false
   @State @Watch('onContinuationSceneChanged') videoSeekDragging: boolean = false
@@ -2207,6 +2209,8 @@ struct Index {
         ' tidNow=' + this.fileImageTransitionId(entry, 'grid'))
     }
     this.fileGridCellEvents.click = (entry: FileEntry): void => this.handleFileEntryClick(entry)
+    this.fileGridCellEvents.contextClick = (entry: FileEntry, event: MouseEvent): void =>
+      this.handleEntryContextClick(entry, event)
     this.fileGridCellEvents.visible = (entry: FileEntry, ratio: number): void => {
       const index = this.fileEntryDataSource.indexOfPath(entry.path)
       if (index < 0) { return }
@@ -5748,8 +5752,13 @@ struct Index {
   @Builder
   FileListRowTrailing(entry: FileEntry): void {
     this.VideoTransferIndicator(entry)
-    if (this.selectionMode) { this.SelectionCheckbox(entry) }
-    else if (entry.isDirectory) { this.FileRowChevron() }
+    if (this.selectionMode) {
+      Stack({ alignContent: Alignment.Center }) {
+        this.SelectionCheckbox(entry)
+      }
+      .width(28)
+      .height(FileRowStyle.leadingHeight)
+    } else if (entry.isDirectory) { this.FileRowChevron() }
   }
 
   @Builder
@@ -5994,6 +6003,7 @@ struct Index {
             .id('file-row:' + entry.path)
             .onAreaChange((_, area) => this.recordRowHitArea(entry, index, 'list', area))
             .onClick(() => this.handleFileEntryClick(entry))
+            .onMouse((event: MouseEvent): void => this.handleEntryContextClick(entry, event))
             // 序列组：必须先长按成功，后面的 Pan 才会被识别。所以普通滑动
             // 碰不到它、列表照常滚动；只有长按之后再拖，才是滑动多选。
             .priorityGesture(
@@ -6111,6 +6121,9 @@ struct Index {
             .id('album-upload-task:' + job.id)
             .attributeModifier(new GamepadAction(this.getUIContext(), 'downloads', 'album-task' + ':' + job.id, () => this.activateAlbumUpload(job), (): boolean => !this.isBusy, 'album-upload-task:' + job.id, true,
               { hold: (): void => { this.showAlbumUploadActions(job) } }))
+            .onMouse((event: MouseEvent): void => {
+              if (this.consumeContextClick(event)) { this.showAlbumUploadActions(job) }
+            })
             .priorityGesture(LongPressGesture({ repeat: false }).onAction(() => {
               this.showAlbumUploadActions(job)
             }))
@@ -6799,6 +6812,9 @@ struct Index {
           .onAreaChange((_, area) => {
             this.recordThumbnailArea(entry, this.waterfallEntryIndex(entry), 'waterfall', area)
             this.recordRowHitArea(entry, this.waterfallEntryIndex(entry), 'waterfall', area)
+          })
+          .onMouse((event: MouseEvent): void => {
+            if (this.waterfallResourceResident(entry)) { this.handleEntryContextClick(entry, event) }
           })
           .priorityGesture(
             GestureGroup(GestureMode.Sequence,
@@ -7498,6 +7514,7 @@ struct Index {
     .width('100%')
     .attributeModifier(new GamepadAction(this.getUIContext(), this.settingsGamepadScope(), 'recycle-entry' + ':' + entry.path, () => this.onRecycleEntryClick(entry), (): boolean => !this.isBusy, '', true,
       { hold: (): void => this.showActionMenu(entry, undefined, true) }))
+    .onMouse((event: MouseEvent): void => this.handleEntryContextClick(entry, event))
     .priorityGesture(
       LongPressGesture({ repeat: false })
         .onAction((event: GestureEvent): void => {
@@ -11430,6 +11447,12 @@ struct Index {
     .width('100%')
     .height('100%')
     .clip(true)
+    .onMouse((event: MouseEvent): void => {
+      if (index === this.viewerImageIndex && this.consumeContextClick(event)) {
+        if (!this.imageChromeVisible) { this.setImageChromeVisible(true, false) }
+        this.openImageMoreMenu()
+      }
+    })
     // VisionImageAnalyzer installs its long-press interaction on the child
     // Image. Bind the viewer gestures in parallel so a normal moving finger
     // can reach the vertical pan recognizer while a stationary long press is
@@ -11993,6 +12016,9 @@ struct Index {
             ? HitTestMode.None : HitTestMode.BLOCK_DESCENDANTS)
 
         this.VideoPlayerNativeHeader()
+        if (this.videoFastPlaybackActive) {
+          this.VideoFastPlaybackBadge()
+        }
       }
     }
     // Keep the original XComponent mounted while PiP is active so the system
@@ -12006,6 +12032,26 @@ struct Index {
     .opacity(this.videoPipBackgrounded ? 1 : this.videoOverlayOpacity)
     .hitTestBehavior(this.videoPipBackgrounded ? HitTestMode.None :
       (this.videoOverlayClosing ? HitTestMode.Block : HitTestMode.Default))
+  }
+
+  @Builder
+  VideoFastPlaybackBadge(): void {
+    Row() {
+      Stack({ alignContent: Alignment.Center }) {
+        Text('2x').fontSize(8).fontWeight(FontWeight.Medium).fontColor($r('sys.color.font_primary'))
+      }
+      .width(HeaderStyle.controlHeight / 3)
+      .height(HeaderStyle.controlHeight / 3)
+      .borderRadius(HeaderStyle.controlHeight / 6)
+      .systemMaterial(this.bottomCapsuleMaterial)
+      .id('video-fast-playback-badge')
+      .hitTestBehavior(HitTestMode.None)
+    }
+    .width('100%')
+    .justifyContent(FlexAlign.Center)
+    .margin({ top: this.videoHeaderTopInset() + HeaderStyle.overlayHeight + 4 })
+    .zIndex(4)
+    .hitTestBehavior(HitTestMode.None)
   }
 
   @Builder
@@ -17119,7 +17165,22 @@ struct Index {
     this.openEntry(entry)
   }
 
-  private showActionMenu(entry: FileEntry, event?: GestureEvent, fromGamepad: boolean = false): void {
+  private consumeContextClick(event: MouseEvent): boolean {
+    if (event.button !== MouseButton.Right || event.action !== MouseAction.Release) {
+      return false
+    }
+    event.stopPropagation()
+    return true
+  }
+
+  private handleEntryContextClick(entry: FileEntry, event: MouseEvent): void {
+    if (!this.isBusy && this.consumeContextClick(event)) {
+      this.showActionMenu(entry, undefined, false, event)
+    }
+  }
+
+  private showActionMenu(entry: FileEntry, event?: GestureEvent, fromGamepad: boolean = false,
+    mouse?: MouseEvent): void {
     // The file manager and the recycle bin share this one menu shell — the
     // anchor, the preview and the dismissal lifecycle — because a long press
     // should feel identical in both places. Only the rows inside differ, and
@@ -17140,7 +17201,7 @@ struct Index {
     // appearing is partly under the hand. Fired here rather than at each of
     // the four long-press call sites, and only once the guards above have
     // passed so a swallowed long press stays silent.
-    HapticFeedback.longPress()
+    if (mouse === undefined) { HapticFeedback.longPress() }
 
     this.pendingContextAction = null
     this.contextMenuScrollMoved = false
@@ -17162,10 +17223,12 @@ struct Index {
     const finger = event !== undefined && event.fingerList.length > 0 ? event.fingerList[0] : null
     // Match a press at the center of the focused row when there is no finger.
     const focusArea = fromGamepad ? area : undefined
-    const originX = finger !== null ? finger.globalX - this.mainContentOriginX :
+    const originX = mouse !== undefined ? mouse.windowX - this.mainContentOriginX :
+      finger !== null ? finger.globalX - this.mainContentOriginX :
       (focusArea === undefined ? this.effectivePageWidth() / 2 :
         focusArea.x - this.mainContentOriginX + focusArea.width / 2)
-    const originY = finger !== null ? finger.globalY - this.mainContentOriginY :
+    const originY = mouse !== undefined ? mouse.windowY - this.mainContentOriginY :
+      finger !== null ? finger.globalY - this.mainContentOriginY :
       (focusArea === undefined ? this.pageHeightVp / 2 :
         focusArea.y - this.mainContentOriginY + focusArea.height / 2)
     const fallback: ContextPreviewRect = {
@@ -21258,6 +21321,7 @@ struct Index {
       this.videoWidthPx = 0
       this.videoHeightPx = 0
       this.videoBufferingPercent = 0
+      this.videoBufferedUntilMs = 0
       this.videoPositionPersistAt = 0
       this.videoMediaSessionPositionAt = 0
       this.videoSurfaceWidthPx = 0
@@ -21290,13 +21354,13 @@ struct Index {
             // A saved end position is not resumable. AVPlayer starts that
             // case from zero, so expose zero rather than waiting for a seek
             // operation that the player deliberately does not issue.
-            if (this.videoSeekPending && this.videoDurationMs > 0 &&
+            if (!this.videoTimelineReady && this.videoSeekPending && this.videoDurationMs > 0 &&
               this.videoSeekTargetMs >= this.videoDurationMs) {
               this.videoSeekPending = false
               this.videoSeekTargetMs = 0
               this.videoCurrentMs = 0
             }
-            this.videoTimelineReady = this.videoDurationMs > 0 && !this.videoSeekPending
+            this.videoTimelineReady = this.videoDurationMs > 0 && (this.videoTimelineReady || !this.videoSeekPending)
             this.updateVideoMediaSession(true)
           }
         },
@@ -21333,7 +21397,7 @@ struct Index {
             state === 'completed') {
             this.videoPrepared = true
           }
-          if (state === 'completed') {
+          if (state === 'completed' && !this.videoSeekPending && !this.videoSeekDragging && !this.videoGestureSeeking) {
             this.videoCurrentMs = this.videoDurationMs
             this.syncVideoBackgroundTask()
             this.videoTransferManager.savePlaybackPosition(entry, this.videoCurrentMs)
@@ -21352,6 +21416,11 @@ struct Index {
             this.videoEntry.path === entry.path) {
             this.videoBufferingPercent = Math.max(0, Math.min(100, percent))
             this.updateVideoMediaSession()
+          }
+        },
+        onBufferedUntil: (timeMs: number): void => {
+          if (token === this.videoOpenToken && this.videoEntry?.path === entry.path && !this.videoSeekPending) {
+            this.videoBufferedUntilMs = Math.max(this.videoBufferedUntilMs, timeMs)
           }
         },
         onSize: (width: number, height: number): void => {
@@ -22023,6 +22092,7 @@ struct Index {
     this.videoWidthPx = 0
     this.videoHeightPx = 0
     this.videoBufferingPercent = 0
+    this.videoBufferedUntilMs = 0
     this.videoSurfaceWidthPx = 0
     this.videoSurfaceHeightPx = 0
     this.videoViewportWidthVp = 0
@@ -22436,7 +22506,7 @@ struct Index {
       this.videoGestureFeedback = '亮度 ' + Math.round(value) + '%'
     } else if (kind === 'speed') {
       this.videoFastPlaybackActive = true
-      this.videoGestureFeedback = '2× 加速'
+      this.videoGestureFeedback = ''
       HapticFeedback.longPress()
     } else {
       this.videoGestureFeedback = ''
@@ -26617,14 +26687,6 @@ struct Index {
   }
 
   private videoBufferedTimelineMs(): number {
-    if (this.videoDurationMs <= 0) {
-      return 0
-    }
-    const estimated = this.videoDurationMs *
-      Math.max(0, Math.min(100, this.videoBufferingPercent)) / 100
-    // A BUFFERING_START callback is allowed to report zero while the decoder
-    // is still consuming the last known window. Never draw the buffer behind
-    // the playhead, which would make the progress bar visibly jump backwards.
-    return Math.min(this.videoDurationMs, Math.max(this.videoCurrentMs, estimated))
+    return Math.min(this.videoDurationMs, Math.max(this.videoCurrentMs, this.videoBufferedUntilMs))
   }
 }

@@ -20,7 +20,7 @@
 
 项目与 NAS 品牌方无隶属关系。当前工程的最低兼容与目标版本均为 **API 26**；尚未适配 API 23、24，也不适用于 Android 或旧版兼容 Android 应用的 HarmonyOS 环境。
 
-当前正式版本 **1.0.20**，新增手柄导航和键盘快捷键，改善图片捏合缩放。支持手机、平板与 2in1。详见[更新记录](CHANGELOG.md)。
+当前正式版本 **1.0.21**，修复手柄进入列表多选时的行距变化，改善视频进度跳转和长按倍速提示，并支持鼠标右键菜单。支持手机、平板与 2in1。详见[更新记录](CHANGELOG.md)。
 
 TV 基础布局代码暂时保留，当前发布包不声明 `tv`，不作为智慧屏支持版本上架。详见[开发说明](docs/DEVELOPMENT.md)。
 
@@ -56,7 +56,7 @@ TV 基础布局代码暂时保留，当前发布包不声明 `tv`，不作为智
 
 详细步骤、权限说明和常见问题见[使用说明](docs/USER_GUIDE.md)。
 
-本版正式 HAP 见 [GitHub Release](https://github.com/fhf2022/lvlian-view-hm/releases/tag/v1.0.20)。[跨设备接续](docs/CONTINUATION.md)支持目录、图片、音频和普通视频。建议两端均更新到本版，验证范围见专题文档。
+本版正式 HAP 见 [GitHub Release](https://github.com/fhf2022/lvlian-view-hm/releases/tag/v1.0.21)。[跨设备接续](docs/CONTINUATION.md)支持目录、图片、音频和普通视频。建议两端均更新到本版，验证范围见专题文档。
 
 ## 使用边界
 

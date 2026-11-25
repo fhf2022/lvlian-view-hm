@@ -4,6 +4,7 @@ import { FileGamepadFocusRing } from './FileGamepadFocusRing'
 
 export class FileGridCellEvents {
   click: (entry: FileEntry) => void = (_entry: FileEntry): void => {}
+  contextClick: (entry: FileEntry, event: MouseEvent) => void = (_entry: FileEntry, _event: MouseEvent): void => {}
   visible: (entry: FileEntry, ratio: number) => void = (_entry: FileEntry, _ratio: number): void => {}
   longPress: (entry: FileEntry, event: GestureEvent) => void =
     (_entry: FileEntry, _event: GestureEvent): void => {}
@@ -106,6 +107,7 @@ export struct FileGridCell {
     // scrolling and the existing shared-element thumbnail rectangle.
     .margin({ top: this.topInset })
     .onClick((): void => this.events.click(this.entry))
+    .onMouse((event: MouseEvent): void => this.events.contextClick(this.entry, event))
     .priorityGesture(
       GestureGroup(GestureMode.Sequence,
         LongPressGesture({ repeat: false, duration: 380 })
